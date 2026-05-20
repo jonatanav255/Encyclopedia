@@ -1,0 +1,220 @@
+# req & res
+
+`req` and `res` are the two objects every Express handler receives. `req`
+describes the incoming request; `res` builds the response. They're both
+thin wrappers around Node's native `http.IncomingMessage` and
+`http.ServerResponse`, with a lot of convenience methods bolted on.
+
+## What lives on `req`
+
+<Cheatsheet
+  columns={['Property', 'What it holds', 'Example']}
+  rows={[
+    ['req.method', 'HTTP method', '"GET"'],
+    ['req.path', 'Path without query string', '"/users/42"'],
+    ['req.originalUrl', 'Full URL as received', '"/api/users/42?sort=desc"'],
+    ['req.params', 'Named params from the route', '{ id: "42" }'],
+    ['req.query', 'Parsed query string', '{ sort: "desc" }'],
+    ['req.body', 'Parsed body (needs middleware)', '{ name: "Jon" }'],
+    ['req.headers', 'All request headers (lowercased keys)', '{ "content-type": "..." }'],
+    ['req.ip', 'Client IP (respects trust proxy)', '"203.0.113.7"'],
+    ['req.cookies', 'Parsed cookies (needs cookie-parser)', '{ session: "abc" }'],
+    ['req.get(name)', 'Read a header (case-insensitive)', "req.get('content-type')"],
+  ]}
+  caption="The properties you'll actually use 95% of the time."
+/>
+
+## What lives on `res`
+
+<Cheatsheet
+  columns={['Method', 'What it does', 'Returns']}
+  rows={[
+    ['res.status(code)', 'Set HTTP status', 'res (chainable)'],
+    ['res.json(obj)', 'Send JSON + set Content-Type', 'void (ends response)'],
+    ['res.send(body)', 'Send any body; infers Content-Type', 'void (ends response)'],
+    ['res.sendStatus(code)', 'Set status + send default body', 'void'],
+    ['res.set(name, value)', 'Set a response header', 'res (chainable)'],
+    ['res.cookie(name, value, opts)', 'Set a cookie', 'res (chainable)'],
+    ['res.redirect([code,] url)', 'Send a redirect (default 302)', 'void'],
+    ['res.end()', 'Finalize without a body', 'void'],
+    ['res.locals', 'Per-request data shared with templates/middleware', 'object'],
+  ]}
+  caption="Methods that set headers/state are chainable; methods that send the body end the response."
+/>
+
+## The send-once rule
+
+A response can only be sent **once**. The first call to `res.send`,
+`res.json`, `res.end`, `res.redirect`, or `res.sendStatus` finalizes the
+response and flushes headers to the client. Any second send-call throws
+`ERR_HTTP_HEADERS_SENT`.
+
+<Compare
+  language="js"
+  badTitle="Bug — falls through to next line"
+  goodTitle="Return or else"
+  bad={`app.get('/users/:id', (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({ error: 'missing id' });
+  }
+  // …keeps running, tries to send again
+  res.json(findUser(req.params.id));
+});`}
+  good={`app.get('/users/:id', (req, res) => {
+  if (!req.params.id) {
+    return res.status(400).json({ error: 'missing id' });
+  }
+  res.json(findUser(req.params.id));
+});`}
+  caption="Early returns are the easiest way to make the send-once rule visible."
+/>
+
+## Setting status
+
+`res.status(code)` doesn't send anything — it just stages the status for
+the next send. So:
+
+```js
+res.status(201).json(newUser);   // status 201 + JSON body
+res.status(204).end();            // no content, no body
+res.sendStatus(404);              // status 404 + body "Not Found"
+```
+
+Common gotchas:
+
+- `res.send(404)` does **not** send a 404 status. It sends a body of
+  `"404"` as plain text with status 200. Use `res.sendStatus(404)`.
+- `res.status(204).json({})` is wrong — 204 means no content, but `.json`
+  writes a body anyway. Use `res.status(204).end()`.
+
+## Content negotiation
+
+`res.send` and `res.json` set `Content-Type` for you:
+
+<Cheatsheet
+  columns={['You called', 'Content-Type Express sets']}
+  rows={[
+    ['res.json({...})', 'application/json; charset=utf-8'],
+    ['res.send("hello")', 'text/html; charset=utf-8'],
+    ['res.send(Buffer.from(...))', 'application/octet-stream'],
+    ['res.send({...})', 'application/json (same as res.json)'],
+  ]}
+  caption="When in doubt, be explicit with res.type() or res.set('Content-Type', ...)."
+/>
+
+## req.body needs middleware
+
+`req.body` is `undefined` unless a body-parsing middleware ran first:
+
+```js
+app.use(express.json());                       // for application/json
+app.use(express.urlencoded({ extended: true })); // for form posts
+```
+
+Without these, `req.body` is empty and JSON requests look broken — even
+though the client is sending the body correctly. This is the
+single most common "why is my POST endpoint not working?" answer.
+
+## res.locals — sharing per-request data
+
+`res.locals` is a plain object scoped to one request. Middleware can
+attach data that later handlers (and templates) read:
+
+```js
+app.use((req, res, next) => {
+  res.locals.requestId = randomUUID();
+  next();
+});
+
+app.use((req, res, next) => {
+  res.locals.user = await loadUser(req.headers.authorization);
+  next();
+});
+
+app.get('/me', (req, res) => {
+  res.json(res.locals.user);
+});
+```
+
+`req.user` is the common convention for auth, but `res.locals` is the
+"officially blessed" spot.
+
+## Questions
+
+<QA level="junior" question="Where do path parameters, query string params, and body data each show up?">
+- Path params (from the route pattern `/users/:id`) → `req.params.id`.
+- Query string (`?sort=desc`) → `req.query.sort`.
+- Request body (JSON or form) → `req.body`, but only if a body-parser
+  middleware ran first.
+</QA>
+
+<QA level="junior" question="Why is req.body always undefined for me?">
+You haven't mounted a body parser. Add `app.use(express.json())` (and
+`express.urlencoded()` for form posts) **before** your route handlers.
+Express used to bundle these via `body-parser` automatically; since
+Express 4 you opt in explicitly.
+</QA>
+
+<QA level="mid" question="What's the difference between res.send(404) and res.sendStatus(404)?">
+`res.send(404)` sends a body of `"404"` with status **200** — `send`
+interprets the number as a body unless it sees a string. `res.sendStatus(404)`
+sets status 404 and sends the default reason phrase as the body. To set
+just the status without a body, chain: `res.status(404).end()`.
+</QA>
+
+<QA level="mid" question="When would you use res.locals instead of req.user or req.context?">
+`res.locals` is the framework-blessed slot for per-request data shared
+with templates and downstream middleware. Use it when the data needs to
+appear in views (Pug, EJS) or when you want a stable convention multiple
+teams can rely on. For domain objects like the authenticated user,
+`req.user` is the established convention in the wider Node ecosystem
+(Passport, etc.), so it's the friendlier choice for auth specifically.
+Both work; pick one and document it.
+</QA>
+
+<QA level="senior" question="How do you avoid the 'cannot set headers after they are sent' error in a large codebase?">
+Three habits:
+
+**1. Always `return` after a send.** `return res.json(...)` makes early
+exits visually obvious in code review and prevents accidental fall-through.
+
+**2. Centralize the response.** Don't let arbitrary middleware send
+responses. Have controllers return data; a final response middleware
+serializes it. The error path mirrors this: handlers throw, a single
+error middleware responds.
+
+**3. Type the contract.** With TypeScript, give your handlers a return
+type of `Promise<DataT>` instead of writing to `res` directly. The
+framework converts to a response at the boundary. Once you can't directly
+call `res.send` from a handler, double-send becomes structurally
+impossible.
+</QA>
+
+<QA level="staff" question="Design a response layer that gives you consistent JSON envelopes, automatic correlation IDs, and easy versioning.">
+Four pieces:
+
+**1. A response envelope** — every successful response wraps the payload:
+`{ data, meta: { requestId, version, deprecation? } }`. Errors use a
+parallel shape: `{ error: { code, message, meta }, meta: { requestId } }`.
+Clients can rely on `data` and `error` being mutually exclusive at the
+top level.
+
+**2. Handlers return objects, not responses.** Define a `Handler<T>` type
+that's `async (ctx) => T`. A final `respond(handler)` wrapper invokes the
+handler, wraps its result in the envelope, sets the status (200 default,
+overridable via a thrown `Response` instance), and calls `res.json`.
+Handlers literally cannot call `res.send` because they don't see `res`.
+
+**3. Correlation ID middleware** at the top of the stack attaches
+`req.id` (from `x-request-id` or generated). The respond wrapper copies
+it into `meta.requestId` automatically. The error wrapper does the same.
+
+**4. Versioning via the envelope.** `meta.version` reflects which router
+served the request. When you deprecate, add `meta.deprecation: { sunset:
+'2026-12-01', successor: '/v2/users' }` and the client gets the migration
+hint in every response. No URL gymnastics required.
+
+The result: every endpoint has the same shape automatically, observability
+gets correlation for free, and migrating clients off old versions becomes
+a soft signal in the response rather than a hard cutover.
+</QA>

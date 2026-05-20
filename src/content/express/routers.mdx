@@ -1,0 +1,188 @@
+# Routers
+
+`express.Router()` is how you split a big app into smaller pieces. A
+router is itself just middleware — a bundle of routes and middleware
+that you mount at a path. Express runs it whenever the URL matches the
+mount point.
+
+## The basic shape
+
+```js
+import express from 'express';
+
+const usersRouter = express.Router();
+
+usersRouter.get('/', listUsers);
+usersRouter.get('/:id', getUser);
+usersRouter.post('/', createUser);
+
+const app = express();
+app.use('/api/users', usersRouter);
+// → GET /api/users      runs listUsers
+// → GET /api/users/42   runs getUser
+// → POST /api/users     runs createUser
+```
+
+Inside the router, paths are **relative** to the mount point. The router
+doesn't know — and shouldn't know — that it's mounted at `/api/users`.
+
+## req.url vs req.originalUrl vs req.baseUrl
+
+This is the part that trips everyone up. When Express enters a mounted
+router, it **strips the mount path** from `req.url` so the router can
+work on relative paths. The original full URL is preserved on
+`req.originalUrl`, and the prefix that was stripped lives on `req.baseUrl`.
+
+<Cheatsheet
+  columns={['Inside the router for GET /api/users/42', 'Value']}
+  rows={[
+    ['req.originalUrl', '/api/users/42'],
+    ['req.baseUrl', '/api/users'],
+    ['req.url', '/42'],
+    ['req.path', '/42'],
+    ['req.params.id', '"42"'],
+  ]}
+  caption="The router sees a trimmed URL — the mount prefix moves to baseUrl."
+/>
+
+## Nesting
+
+Routers can mount other routers. Each mount strips its own prefix, so a
+deeply nested router still works on short relative paths.
+
+<Diagram caption="A nested mount strips its prefix each level.">
+  <DBox id="app" x={0} y={0} variant="accent">app</DBox>
+  <DBox id="api" x={1} y={0}>apiRouter (/api)</DBox>
+  <DBox id="users" x={2} y={0}>usersRouter (/users)</DBox>
+  <DBox id="route" x={3} y={0} variant="accent">GET /:id</DBox>
+  <DArrow from="app" to="api" label="GET /api/users/42" />
+  <DArrow from="api" to="users" label="GET /users/42" />
+  <DArrow from="users" to="route" label="GET /42" />
+</Diagram>
+
+```js
+const apiRouter = express.Router();
+const usersRouter = express.Router();
+
+usersRouter.get('/:id', getUser);
+apiRouter.use('/users', usersRouter);
+app.use('/api', apiRouter);
+```
+
+## Router-scoped middleware
+
+A router has its own middleware stack. Anything mounted on it runs only
+for requests that reach the router — perfect for auth, validation, or
+parsing that's specific to a section of the API.
+
+<Compare
+  language="js"
+  badTitle="Repeating auth on every route"
+  goodTitle="Scoped to the router"
+  bad={`app.get('/api/users',      auth, listUsers);
+app.get('/api/users/:id',  auth, getUser);
+app.post('/api/users',     auth, createUser);
+app.put('/api/users/:id',  auth, updateUser);`}
+  good={`const usersRouter = express.Router();
+usersRouter.use(auth);              // applies to all routes below
+usersRouter.get('/',      listUsers);
+usersRouter.get('/:id',   getUser);
+usersRouter.post('/',     createUser);
+usersRouter.put('/:id',   updateUser);
+
+app.use('/api/users', usersRouter);`}
+  caption="Cross-cutting middleware belongs on the router, not repeated per route."
+/>
+
+## mergeParams
+
+By default a router sees only its own path params. If you mount a router
+that needs params from its **parent's** path, pass `mergeParams: true`:
+
+```js
+const commentsRouter = express.Router({ mergeParams: true });
+commentsRouter.get('/', (req, res) => {
+  // req.params.postId is available here, even though "postId"
+  // was matched on the parent router
+  res.json(getComments(req.params.postId));
+});
+
+const postsRouter = express.Router();
+postsRouter.use('/:postId/comments', commentsRouter);
+```
+
+<Callout variant="warn">
+Without `mergeParams: true`, `req.params.postId` is `undefined` inside
+`commentsRouter` — even though the URL clearly contains it. It's the
+single most confusing default in Express.
+</Callout>
+
+## When to split into a router
+
+- A natural resource boundary — `/users`, `/posts`, `/orders`.
+- Shared middleware for a section of the API.
+- A separate file per router so route definitions don't pile up in one
+  giant `app.js`.
+- A versioned API: `app.use('/api/v1', v1Router)` then
+  `app.use('/api/v2', v2Router)`.
+
+## Questions
+
+<QA level="junior" question="What does express.Router() return, and why use it?">
+A mini-app you can attach middleware and routes to and then mount on a
+parent app or router. It exists so you can split a large app across files
+and apply middleware to a section of routes without repeating yourself.
+</QA>
+
+<QA level="junior" question="If a router is mounted at /api, what does req.url look like inside the router?">
+The mount path is stripped. For `GET /api/users/42`, the router sees
+`req.url` as `/users/42`. The original is preserved on `req.originalUrl`
+(`/api/users/42`), and the stripped prefix lives on `req.baseUrl`
+(`/api`).
+</QA>
+
+<QA level="mid" question="A nested router can't see its parent's params. What's the fix?">
+Pass `mergeParams: true` when creating the router:
+`express.Router({ mergeParams: true })`. This is opt-in because most
+routers don't need parent params, and merging by default could cause
+surprising name collisions.
+</QA>
+
+<QA level="mid" question="What's the difference between mounting at app.use('/api', r) versus app.use(r)?">
+The first only runs the router for URLs starting with `/api` and strips
+that prefix before the router sees it. The second runs the router for
+**every** URL — it's effectively "this router is the whole app." Use no
+prefix when the router's responsibility is global (e.g. it owns all
+routes), and a prefix for a sub-resource.
+</QA>
+
+<QA level="senior" question="How would you structure routers for a 20-resource API across multiple teams?">
+One router per resource (`usersRouter`, `postsRouter`, `ordersRouter`),
+each in its own file owned by the responsible team. An `apiRouter`
+imports and mounts all of them. The app file mounts the apiRouter at
+`/api`. Cross-cutting middleware (auth, rate limit, request ID) lives on
+`apiRouter` so it applies once. Versioning gets its own layer:
+`app.use('/api/v1', v1Router)`. The route definition file stays thin —
+URL → controller — and the actual logic lives in controllers/services so
+the same code can be invoked from a CLI, worker, or gRPC server later.
+</QA>
+
+<QA level="staff" question="How do you handle a router that needs different middleware for different methods (e.g. GET is public, POST requires auth)?">
+Two reasonable patterns:
+
+**Per-route middleware**: `router.post('/', auth, createUser);`. Cleanest
+when only one method needs it. Fine for small routers.
+
+**Route chaining for shared paths**: `router.route('/users/:id').get(getUser).put(auth, updateUser).delete(auth, deleteUser);`. Avoids
+repeating the path and reads as "this URL supports these methods."
+
+**Composite routers**: split into a `publicRouter` and a `protectedRouter`,
+mount both at the same prefix, put `auth` middleware only on the
+protected one. Best at scale because the boundary becomes structural:
+adding a new route to `protectedRouter` automatically inherits auth, and
+a reviewer can see at a glance which file's routes need credentials.
+
+The right answer depends on team size and how often the auth boundary
+shifts. Per-route is the most explicit; composite is the most defensible
+when reviewers need to verify "is this endpoint protected?" at a glance.
+</QA>

@@ -1,0 +1,170 @@
+# Error handling
+
+Errors in Express are just another kind of middleware. The framework keeps
+walking the stack normally; when something calls `next(err)` with an
+argument, Express skips ahead to the **error-handling middleware** — any
+function with **four** parameters: `(err, req, res, next)`.
+
+## The signature
+
+```js
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'something broke' });
+});
+```
+
+Three rules:
+
+1. The function must have **exactly four** parameters. Express checks the
+   arity. Three params makes it a regular middleware.
+2. It only runs when something earlier called `next(err)`.
+3. Register it **last** — after all routes and middleware. Express walks
+   top to bottom; an error handler in the middle won't catch errors thrown
+   below it.
+
+## Two ways an error reaches the handler
+
+<Compare
+  language="js"
+  badTitle="Sync — throws"
+  goodTitle="Async — next(err)"
+  bad={`app.get('/users/:id', (req, res) => {
+  if (!isValid(req.params.id)) {
+    throw new Error('bad id');
+  }
+  res.json(findUser(req.params.id));
+});`}
+  good={`app.get('/users/:id', async (req, res, next) => {
+  try {
+    const u = await findUser(req.params.id);
+    res.json(u);
+  } catch (err) {
+    next(err);
+  }
+});`}
+  caption="Express catches sync throws automatically, but async errors must call next(err)."
+/>
+
+This is the #1 Express error bug: an `async` handler throws, the promise
+rejects, and **Express never sees it**. The request hangs. Always
+`try/catch` async handlers, or use a library that wraps them.
+
+## The error-handler chain
+
+You can register multiple error handlers; Express walks them in order just
+like regular middleware. Each can choose to handle the error and respond,
+or pass it along with `next(err)` for the next one.
+
+<Diagram caption="Errors take a different path through the stack.">
+  <DBox id="route" x={0} y={0}>Route handler</DBox>
+  <DBox id="next" x={1} y={0} variant="muted">next(err)</DBox>
+  <DBox id="skip" x={2} y={0} variant="muted">…skipped…</DBox>
+  <DBox id="err" x={3} y={0} variant="accent">Error handler</DBox>
+  <DBox id="client" x={4} y={0} variant="muted">Client</DBox>
+  <DArrow from="route" to="next" />
+  <DArrow from="next" to="skip" dashed />
+  <DArrow from="skip" to="err" dashed />
+  <DArrow from="err" to="client" label="500" />
+</Diagram>
+
+## Express's default error handler
+
+If you don't register one, Express has a built-in fallback: it sends a
+500 with the error's stack trace in development, or a generic message in
+production (controlled by `NODE_ENV`). Fine for prototypes, terrible for
+real apps — you almost always want your own.
+
+<Callout variant="warn">
+After you call `res.status(500).send(...)` inside an error handler, **don't
+call next(err) again**. That sends the response, then hands the same error
+to Express's default handler, which tries to set headers on an
+already-sent response. Result: `ERR_HTTP_HEADERS_SENT`.
+</Callout>
+
+## Common patterns
+
+- **Wrap async routes** so you don't have to `try/catch` in every one.
+  The pattern: `const asyncH = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);`
+- **Differentiate errors by type** — a custom `NotFoundError` (400 family)
+  vs. an unexpected `Error` (500 family). The error handler reads
+  `err.status` or `err instanceof` and chooses the response.
+- **Log first, respond second.** Always log the full error server-side
+  before you decide what to expose to the client.
+
+## Questions
+
+<QA level="junior" question="What's the signature of an Express error handler, and why?">
+Four parameters: `(err, req, res, next)`. Express detects error handlers
+by **function arity** — `length === 4`. A three-param function is treated
+as regular middleware regardless of what it does. This is the only
+"magic" part of the API.
+</QA>
+
+<QA level="junior" question="An async route throws and the request hangs. Why?">
+Express only catches synchronous throws. An async function rejects a
+Promise; Express doesn't see it unless you forward it with `next(err)` or
+attach `.catch(next)`. The route's response is never sent, so the client
+sits waiting until its timeout.
+</QA>
+
+<QA level="mid" question="Why must error handlers be registered last?">
+Because Express walks the middleware stack top-to-bottom. When something
+calls `next(err)`, it skips ahead looking for the **next** error-handling
+middleware. If your error handler sits before some routes, errors thrown
+in those routes have nothing to land on — they fall through to Express's
+default handler.
+</QA>
+
+<QA level="mid" question="What happens if your error handler calls next(err) again?">
+Express looks for the **next** error handler in the stack. If there isn't
+one, the request falls through to Express's built-in default handler,
+which sends a 500 with the stack. Calling `next(err)` after you've
+already sent a response is the classic
+`ERR_HTTP_HEADERS_SENT` cause.
+</QA>
+
+<QA level="senior" question="How would you build a global async-error wrapper that works for any route?">
+A higher-order function that takes a handler and returns a new one which
+forwards any rejection to `next`:
+
+```js
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get('/users/:id', wrap(async (req, res) => {
+  res.json(await findUser(req.params.id));
+}));
+```
+
+This is what `express-async-errors` and similar packages do under the
+hood. The wrapper preserves the original function's signature so it works
+for any handler. Apply it consistently and you can drop `try/catch` from
+every route.
+</QA>
+
+<QA level="staff" question="Design an error-handling strategy for a multi-team API with consistent error shapes, request correlation, and no information leakage.">
+Three layers:
+
+**1. A typed error hierarchy.** A base `AppError(status, code, message, meta)`
+with subclasses like `ValidationError`, `NotFoundError`, `AuthError`,
+`ConflictError`. Teams throw these instead of bare `Error`s. The class
+encodes the HTTP status and a stable error code (`USER_NOT_FOUND`) that
+clients can program against.
+
+**2. A single error-handling middleware** at the bottom of the stack. It
+checks `err instanceof AppError`; if yes, serialize `{ code, message,
+meta }` and the status from the instance. If no, it's an unknown error —
+log the full stack with the request's correlation ID, then respond with a
+generic 500 `{ code: 'INTERNAL', requestId }`. The unknown branch is where
+information leakage gets prevented: stack traces never go to the wire.
+
+**3. Correlation IDs.** A top-of-stack middleware attaches `req.id` (from
+`x-request-id` header or generated). The error handler echoes it in the
+response and in the log line, so a user reporting "I got a 500 at 3pm,
+id abc123" gives you exactly one log line to pull. Bonus: propagate it
+to downstream services as a header so distributed traces stitch together.
+
+The whole thing is invisible to handler code — teams `throw new
+NotFoundError(...)` and the framework does the rest.
+</QA>
