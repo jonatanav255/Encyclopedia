@@ -50,3 +50,71 @@ are sent to the client`. Pick one.
 - Parsing bodies, cookies, multipart uploads
 - CORS, rate limiting, security headers
 - Centralized error handling
+
+## Questions
+
+<QA level="junior" question="What is middleware in Express?">
+A function with the signature `(req, res, next)` that runs between the
+incoming request and the final route handler. It can read or modify `req`
+and `res`, then either call `next()` to pass control to the next middleware
+or send a response itself to end the chain.
+</QA>
+
+<QA level="junior" question="What happens if a middleware forgets to call next()?">
+The request hangs. Downstream middleware and the route handler never run,
+and unless that middleware sent a response, the client will sit waiting until
+its own timeout fires. This is one of the most common Express bugs.
+</QA>
+
+<QA level="mid" question="How does Express tell error-handling middleware apart from regular middleware?">
+By the arity of the function. Middleware with **four** parameters
+(`(err, req, res, next)`) is treated as error-handling. Express only invokes
+it when something earlier calls `next(err)` with an argument, and it skips
+all non-error middleware in between.
+</QA>
+
+<QA level="mid" question="Why does the order of app.use() calls matter?">
+Express walks middleware in registration order. A body parser registered
+**after** a route handler is never seen by that handler. An auth check
+registered **after** the protected route doesn't protect it. The mental
+model is a linear pipeline — anything you want a handler to see must be
+mounted before that handler.
+</QA>
+
+<QA level="senior" question="What's the difference between app.use(fn) and app.use(path, fn), and how does mounting interact with req.url?">
+`app.use(path, fn)` only runs `fn` when the request URL starts with `path`,
+and inside `fn` Express **strips the mount path** from `req.url` (the
+original is preserved on `req.originalUrl`). This is what makes sub-routers
+composable: a router mounted at `/api` can be written as if it owns the
+whole URL space, because everything it sees has `/api` already trimmed off.
+Forgetting this is why people write `/api/users` inside an `/api` router
+and then get 404s.
+</QA>
+
+<QA level="senior" question="Why is sending a response and then calling next() a bug, and what's the failure mode?">
+A response can only be sent once. If middleware calls `res.send(...)` and
+then `next()`, the next handler may try to set headers or send again,
+producing `Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are
+sent to the client`. The subtle version: an early-return path forgets the
+`return` before `next()`, so on the happy path it sends a response **and**
+falls through to the next middleware. The fix is `return res.send(...)` or
+an explicit if/else.
+</QA>
+
+<QA level="staff" question="You inherit a service where a slow middleware is blocking the event loop under load. How do you diagnose and remediate without rewriting the whole stack?">
+Diagnose first: per-route latency histograms (which middleware adds the ms
+— `response-time` plus a per-step timer), event-loop lag (`perf_hooks`
+monitorEventLoopDelay), and CPU profiles under realistic load. Common
+culprits: sync crypto (`bcrypt.hashSync`), sync JSON parsing of large
+bodies, regex catastrophic backtracking in a validator, or a logger doing
+sync disk I/O.
+
+Remediation, in order of cost: move sync calls to their async
+counterparts (`bcrypt.hash`), stream large bodies instead of buffering,
+add a payload size limit so a single request can't dominate the loop,
+move CPU-bound work to a worker thread or a separate service, and cache
+expensive idempotent results. Add a circuit breaker around the slow
+dependency so failures fast-fail instead of compounding queue depth.
+The goal is to keep p99 event-loop lag under ~10ms; anything higher and
+the whole process starts cascading.
+</QA>

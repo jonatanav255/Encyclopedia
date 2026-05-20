@@ -69,3 +69,79 @@ app.use('/users', usersRouter);
 
 Each router is just a mini-app with its own middleware stack — same rules,
 same ordering, just scoped.
+
+## Questions
+
+<QA level="junior" question="What's the difference between app.get and app.use?">
+`app.get(path, handler)` matches only `GET` requests whose URL exactly
+matches `path` (with parameters extracted). `app.use([path,] fn)` matches
+**any** method and treats `path` as a **prefix**, not an exact match — so
+`app.use('/api', router)` runs `router` for `/api`, `/api/users`,
+`/api/anything`. `get` is for terminal handlers, `use` is for middleware
+and mounting.
+</QA>
+
+<QA level="junior" question="What does the ':' do in a route path like /users/:id?">
+It declares a **named path parameter**. Express captures whatever segment
+appears in that position and exposes it on `req.params.id` as a string.
+Parameters are always strings, even if they look like numbers — converting
+to a number is your job.
+</QA>
+
+<QA level="mid" question="Why does putting /users/:id before /users/me cause a bug?">
+Express stops at the **first** matching route. `/users/:id` matches
+`/users/me` (with `req.params.id === 'me'`), so the more specific
+`/users/me` handler registered after it never runs. The fix is to register
+literal paths before parameterized ones, or to validate the param inside
+the `:id` handler and fall through with `next()` when it isn't what you
+expect.
+</QA>
+
+<QA level="mid" question="What's the difference between req.params, req.query, and req.body?">
+- `req.params` — values extracted from the route pattern itself
+  (`/users/:id` → `req.params.id`).
+- `req.query` — parsed query string (`?page=2&sort=desc` →
+  `{ page: '2', sort: 'desc' }`).
+- `req.body` — parsed request body, available only if a body-parsing
+  middleware (`express.json()`, `express.urlencoded()`) ran before the
+  handler. Without that middleware, `req.body` is `undefined`.
+</QA>
+
+<QA level="senior" question="How would you structure routes for a large API — flat app.get calls, nested routers, or something else?">
+Nested `express.Router()` instances mounted by resource: an `apiRouter`
+mounted at `/api`, then `usersRouter` mounted at `/users` inside it, etc.
+Each router owns its middleware (auth, validation, rate limit) so you don't
+re-declare cross-cutting concerns on every handler. Keep route files thin
+— they wire URL → controller — and put logic in controllers/services so
+the same code can be reused by a CLI, a job runner, or a different
+transport. Flat `app.get` calls scale to ~20 routes; past that you want
+the hierarchy.
+</QA>
+
+<QA level="senior" question="What's the order Express uses to find a handler for an incoming request, and where does that put 404 handling?">
+Express walks the registered handlers top-to-bottom. For each one it
+checks: does the method match (or is it `use`/`all`), and does the path
+pattern match the URL? The first match runs; if it calls `next()` without
+an error, Express keeps walking. **404 handling is just a middleware with
+no path that you register last** — if execution reaches it, nothing else
+matched, so it sends a 404. Error handlers (four-arg) come even later and
+only run when someone calls `next(err)`.
+</QA>
+
+<QA level="staff" question="A team wants to add per-route rate limiting, request-scoped tracing, and feature flags to a 500-route Express app without touching each handler. How do you design it?">
+Push everything into composable middleware applied at the **router** level,
+not the handler level. A `traceMiddleware` runs at the top of `app` and
+attaches a request ID + opens an OpenTelemetry span on `req.span`,
+propagating context via async-local storage so deep code can read it
+without parameter-passing. Rate limiting is a factory:
+`rateLimit({ key, max, window })` returns middleware, and each router
+imports it with its own config (`usersRouter.use(rateLimit(...))`).
+
+Feature flags become a small service injected once
+(`app.use(flagsMiddleware(flagsClient))`), exposing `req.flags.isOn('x')`;
+handlers consult it instead of importing a global. The discipline is
+**no handler should know how any of these are implemented** — they just
+read off `req`. That lets you swap the rate limiter from in-memory to
+Redis, or the flags provider from LaunchDarkly to a homegrown service,
+by changing one factory.
+</QA>

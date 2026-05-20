@@ -4,11 +4,13 @@ import { Layout } from './components/layout/Layout';
 import { Home } from './pages/Home';
 import { TopicPage } from './pages/TopicPage';
 import { Callout } from './components/mdx/Callout';
+import { QA } from './components/mdx/QA';
 import { MiddlewarePipeline } from './components/demos/MiddlewarePipeline';
 import { RouteMatcher } from './components/demos/RouteMatcher';
 
 const mdxComponents = {
   Callout,
+  QA,
   MiddlewarePipeline,
   RouteMatcher,
 };
