@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { allQuestions, levels, topics, type Level } from '../content/questions';
 import { TopicPill } from '../components/ui/TopicPill';
+import { Answer } from '../components/practice/Answer';
 
 type TopicFilter = string | 'all';
 type LevelFilter = Level | 'all';
@@ -158,8 +159,8 @@ export function Practice() {
                   </div>
                 </button>
                 {open && (
-                  <div className="px-4 pb-4 pt-3 border-t border-zinc-800 prose-doc text-[0.95em] whitespace-pre-wrap">
-                    {q.answer}
+                  <div className="px-4 pb-4 pt-3 border-t border-zinc-800 text-[0.95em]">
+                    <Answer text={q.answer} />
                   </div>
                 )}
               </div>
