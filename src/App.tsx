@@ -4,6 +4,7 @@ import { MDXProvider } from '@mdx-js/react';
 import { Layout } from './components/layout/Layout';
 import { Home } from './pages/Home';
 import { TopicPage } from './pages/TopicPage';
+import { TopicOverview } from './pages/TopicOverview';
 import { NotFound } from './pages/NotFound';
 import { SearchModal } from './components/search/SearchModal';
 import { Callout } from './components/mdx/Callout';
@@ -51,6 +52,7 @@ export default function App() {
         <Layout onOpenSearch={() => setSearchOpen(true)}>
           <Routes>
             <Route path="/" element={<Home />} />
+            <Route path="/:topic" element={<TopicOverview />} />
             <Route path="/:topic/:name" element={<TopicPage />} />
             <Route path="*" element={<NotFound />} />
           </Routes>

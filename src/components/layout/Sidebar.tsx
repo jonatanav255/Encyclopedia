@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom';
+import { NavLink, Link } from 'react-router-dom';
 import { groups } from '../../lib/content';
 
 export function Sidebar() {
@@ -7,9 +7,12 @@ export function Sidebar() {
       <nav className="p-4 text-sm">
         {groups.map((group) => (
           <div key={group.topic} className="mb-6">
-            <div className="px-2 mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+            <Link
+              to={`/${group.topic}`}
+              className="block px-2 mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+            >
               {group.title}
-            </div>
+            </Link>
             <ul className="space-y-0.5">
               {group.entries.map((entry) => (
                 <li key={entry.slug}>
