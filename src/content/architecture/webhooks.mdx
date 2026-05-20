@@ -42,26 +42,42 @@ verifies the signature:
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
+// Real production code should use Stripe's library:
+//   const event = stripe.webhooks.constructEvent(req.body, sig, secret);
+// This is the hand-rolled version for illustration.
+
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
-  const sig = req.get('Stripe-Signature');
-  const expected = createHmac('sha256', process.env.WEBHOOK_SECRET)
-    .update(req.body)
+  const header = req.get('Stripe-Signature') ?? '';
+  // Stripe-Signature is "t=<timestamp>,v1=<hex>"
+  const v1 = header.match(/v1=([a-f0-9]+)/)?.[1];
+  const t = header.match(/t=(\d+)/)?.[1];
+  if (!v1 || !t) return res.status(401).send('bad signature header');
+
+  const signedPayload = `${t}.${req.body}`;
+  const expected = createHmac('sha256', process.env.STRIPE_WEBHOOK_SECRET)
+    .update(signedPayload)
     .digest('hex');
 
-  if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+  // Buffers must be the same length for timingSafeEqual not to throw
+  const a = Buffer.from(v1, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return res.status(401).send('invalid signature');
   }
   // process the event
 });
 ```
 
-Two things to notice:
+Three things to notice:
 
 1. **`express.raw`** — the signature is over the *raw bytes*. If
    `express.json()` parses first, you compute the signature over the
    reserialized JSON, which won't match.
-2. **`timingSafeEqual`** — comparison must be constant-time.
-   Otherwise a timing attack can guess the signature byte by byte.
+2. **Parse the header** — `Stripe-Signature` is a structured value
+   like `t=1730000000,v1=abc...`. Extract the digest first.
+3. **`timingSafeEqual`** — comparison must be constant-time, and the
+   inputs must be equal length (it throws `RangeError` otherwise).
+   Compare hex-decoded buffers and check `length` first.
 
 Most webhook providers (Stripe, GitHub, Slack) have a library that
 does the verification for you — use it.
