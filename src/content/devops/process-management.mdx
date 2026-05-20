@@ -1,0 +1,467 @@
+export const level = 'mid';
+
+# Process management — PM2, systemd, containers
+
+Node services in production need something that:
+
+1. Starts them on boot.
+2. Restarts them on crash.
+3. Forwards logs.
+4. Handles graceful shutdown signals.
+5. Manages multiple processes if you're running a cluster.
+
+This page covers the three common approaches: **PM2**, **systemd**,
+and **container orchestration**.
+
+## When you need a process manager
+
+For toy projects, `node app.js` is enough. For production:
+
+- The process will crash sometimes. Something needs to restart it.
+- The server reboots. Something needs to bring services back up.
+- You want logs centralized, not lost to stdout.
+- Multiple services on one VM need supervision.
+
+For container-orchestrated apps (Kubernetes, ECS, Fargate),
+**the orchestrator is the process manager**. You don't need PM2.
+For VMs and bare metal, you do.
+
+## PM2
+
+The classic Node process manager:
+
+```bash
+pnpm add -g pm2
+
+pm2 start app.js --name api
+pm2 start "node app.js" --name api --instances 4   # cluster mode
+
+pm2 list
+pm2 logs api
+pm2 restart api
+pm2 reload api    # zero-downtime restart
+pm2 stop api
+pm2 delete api
+
+pm2 save                          # persist current list
+pm2 startup                        # generate boot startup script
+```
+
+PM2 features:
+
+- **Restart on crash** with exponential backoff.
+- **Cluster mode** — runs N instances behind a single listener.
+- **Zero-downtime reload** — `pm2 reload` rolls instances one at a
+  time.
+- **Log aggregation** — all stdout/stderr to files in `~/.pm2/logs/`.
+- **Metrics dashboard** (PM2 Plus, paid).
+
+### `ecosystem.config.cjs`
+
+Declarative config:
+
+```js
+module.exports = {
+  apps: [{
+    name: 'api',
+    script: './dist/index.js',
+    instances: 'max',           // one per CPU
+    exec_mode: 'cluster',
+    watch: false,
+    autorestart: true,
+    max_memory_restart: '500M',
+    env: {
+      NODE_ENV: 'production',
+      PORT: 3000,
+    },
+    env_staging: {
+      NODE_ENV: 'staging',
+    },
+    error_file: '/var/log/api/error.log',
+    out_file: '/var/log/api/out.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+  }],
+};
+```
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 start ecosystem.config.cjs --env staging
+```
+
+### Cluster mode
+
+```bash
+pm2 start app.js -i 4
+```
+
+PM2 forks N Node processes and load-balances HTTP connections
+among them (using `cluster` module internally). Same caveats as
+`cluster`:
+
+- Sessions in memory don't survive — use Redis.
+- Per-process DB pools multiply — tune `max` per pool accordingly.
+
+For container-deployed apps, **don't use PM2 cluster** — container
+orchestrators replicate processes themselves. PM2 cluster inside a
+container is duplicate supervision.
+
+### Graceful reload
+
+```bash
+pm2 reload api
+```
+
+Restarts instances one at a time. Each:
+
+1. Sends `SIGINT` (or configurable).
+2. Waits for the instance to exit (or kills after a timeout).
+3. Starts a new instance.
+4. Moves to the next instance.
+
+For zero-downtime, your app must handle the signal — start refusing
+new connections, drain in-flight, close cleanly. See **Graceful
+shutdown deep**.
+
+PM2's default kill timeout is 1600ms — usually too short for real
+draining. Set `kill_timeout: 30000` (30s) for services with
+in-flight work.
+
+### Pros and cons
+
+**Pros**:
+
+- Easy. `pm2 start app.js` and you're running.
+- All-in-one: supervision + cluster + logs + monitoring.
+- Mature, well-documented.
+
+**Cons**:
+
+- Extra layer. Compared to systemd, it's a Node-specific tool.
+- Not what cloud platforms expect — most use systemd or container
+  orchestration.
+- PM2 itself can fail; recovery requires a separate watchdog.
+
+For single-VM Node deployments, PM2 is convenient. For anything
+cloud-orchestrated, skip it.
+
+## systemd
+
+Linux's standard init system. Every modern Linux distro uses it.
+It's the production-grade way to run Node services on Linux.
+
+### A unit file
+
+```ini
+# /etc/systemd/system/api.service
+[Unit]
+Description=API service
+After=network.target
+
+[Service]
+Type=simple
+User=api
+WorkingDirectory=/opt/api
+ExecStart=/usr/bin/node /opt/api/dist/index.js
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+Environment=NODE_ENV=production
+Environment=PORT=3000
+EnvironmentFile=/etc/api/env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=api
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/api
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=1G
+
+# Graceful shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable api
+systemctl start api
+systemctl status api
+journalctl -u api -f         # follow logs
+```
+
+### Why systemd
+
+- **Standard**. Same tools every Linux admin knows.
+- **Resource limits** (memory, CPU, file descriptors) via cgroups.
+- **Security hardening** (capability bounds, filesystem isolation).
+- **Log aggregation** via journald — searchable, structured.
+- **Boot ordering** via `After=` / `Wants=`.
+- **Restart policies** with rate limiting.
+
+### Graceful shutdown with systemd
+
+```ini
+KillSignal=SIGTERM           # send SIGTERM
+TimeoutStopSec=30             # wait 30s for clean exit
+KillMode=mixed                # then SIGKILL if needed
+```
+
+systemd sends SIGTERM, waits `TimeoutStopSec`, then SIGKILL. Match
+your app's graceful shutdown window.
+
+### Multiple instances
+
+```ini
+# /etc/systemd/system/api@.service  (templated)
+...
+ExecStart=/usr/bin/node /opt/api/dist/index.js --port 300%i
+```
+
+```bash
+systemctl start api@1 api@2 api@3 api@4
+```
+
+Four instances on ports 3001-3004. Front them with nginx.
+
+For cluster-mode (single port across instances), use Node's `cluster`
+module inside one process, or run separate processes on different
+ports with nginx upstream.
+
+### `EnvironmentFile`
+
+```
+# /etc/api/env
+DATABASE_URL=postgres://...
+JWT_SECRET=...
+```
+
+```bash
+chown root:api /etc/api/env
+chmod 640 /etc/api/env
+```
+
+Restrict permissions. Only root and the service user can read.
+Better than passing secrets via command-line args (visible in `ps`).
+
+For secret-store integration, use a wrapper that fetches secrets at
+boot:
+
+```ini
+ExecStartPre=/usr/bin/fetch-secrets > /tmp/api.env
+EnvironmentFile=/tmp/api.env
+```
+
+### Health and watchdog
+
+```ini
+Type=notify
+WatchdogSec=30
+```
+
+```js
+// In Node
+import sd from 'sd-notify';
+sd.ready();
+setInterval(() => sd.watchdog(), 10_000);
+```
+
+If the watchdog isn't pinged for 30s, systemd restarts the process.
+Useful for catching event-loop hangs.
+
+## Container orchestration
+
+For Kubernetes, ECS, Cloud Run, Fly.io, Railway:
+
+- **The container is the process unit.** No PM2, no systemd inside.
+- **Restart policy** declared at the orchestrator level.
+- **Logs** captured from stdout/stderr automatically.
+- **Health checks** (liveness, readiness) drive restart/eviction.
+- **Replication** is the orchestrator's job.
+
+### Dockerfile minimums
+
+```dockerfile
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+
+FROM node:22-slim AS runtime
+WORKDIR /app
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY package.json ./
+
+USER node
+ENV NODE_ENV=production
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+```
+
+- **Non-root user** (`USER node`).
+- **Multi-stage build** to shrink the final image.
+- **CMD as exec form** so signals reach Node.
+
+### Signal handling in Docker
+
+`docker stop` sends SIGTERM, then SIGKILL after 10s by default. For
+Node services with longer drain windows:
+
+```bash
+docker stop --time=30 container_id
+```
+
+In Kubernetes:
+
+```yaml
+terminationGracePeriodSeconds: 60
+```
+
+Coordinate with your app's drain logic.
+
+### Restart policy
+
+```yaml
+restartPolicy: Always
+```
+
+Kubernetes restarts on exit. Pair with liveness/readiness probes to
+catch hung-but-not-crashed states.
+
+## When to pick each
+
+| | PM2 | systemd | Container orchestration |
+| --- | --- | --- | --- |
+| Where | VMs, bare metal | VMs, bare metal | Kubernetes, ECS, Cloud Run |
+| Setup cost | Lowest | Medium | Highest |
+| Cluster mode | Built in | Manual or via Node | Orchestrator scales |
+| Logs | PM2 logs | journald | Container logs / log shipper |
+| Multi-app on one host | Easy | Easy | Each in own container |
+| Auto-scale | No | No | Yes |
+| Modern standard | Aging | Yes | Yes (cloud) |
+
+**Quick recommendation:**
+
+- **Solo VM hobby project**: PM2. It's quick.
+- **Production VM(s)**: systemd. It's the OS-native way.
+- **Cloud / multi-instance / autoscaled**: containers + orchestrator.
+  Skip PM2 and systemd inside.
+
+## Common pitfalls
+
+### PM2 cluster inside a container
+
+Two layers of process replication. Containers want single processes.
+
+### Forgetting `--watch` is dev-only
+
+```bash
+pm2 start app.js --watch
+```
+
+Restarts on file changes. Fine in dev. **Don't** use in prod — small
+edits restart the process.
+
+### systemd `Restart=always` masking bugs
+
+If your app crashes on bad config and systemd restarts it forever,
+you don't notice. Combine with `StartLimitIntervalSec`/
+`StartLimitBurst` so systemd gives up after N crashes in M seconds.
+
+### Container `npm start` instead of `node`
+
+```dockerfile
+CMD ["npm", "start"]
+```
+
+npm spawns Node as a child. Signals don't propagate cleanly — Node
+doesn't get SIGTERM. Use `CMD ["node", "dist/index.js"]` directly.
+
+Same for pnpm. Use `node` directly in production containers.
+
+### Logs to files instead of stdout in containers
+
+```js
+const log = pino({ destination: '/var/log/api.log' });
+```
+
+Inside a container, logs should go to stdout. The orchestrator
+captures them. Files inside containers disappear when the container
+dies.
+
+```js
+const log = pino();   // stdout by default
+```
+
+### Mismatched grace periods
+
+PM2 `kill_timeout: 1600ms` vs your app's 30s drain = PM2 kills mid-
+drain.
+
+Kubernetes `terminationGracePeriodSeconds: 30` vs app drain 60s =
+SIGKILL before clean exit.
+
+systemd `TimeoutStopSec=5` vs slow shutdown = SIGKILL.
+
+Match the layer to your app's actual drain time.
+
+### Running as root
+
+PM2 default: runs as the user that started it. Don't `sudo pm2`.
+
+systemd: explicit `User=`.
+
+Docker: `USER node` (or any non-root user). Default is root, which
+is wrong.
+
+Running Node as root means a code-exec vulnerability owns the box.
+
+### Forgetting to enable systemd unit
+
+```bash
+systemctl start api      # runs now
+systemctl enable api      # runs on boot
+```
+
+Both. After install, both.
+
+## The mental model
+
+Process management is **"who starts, restarts, supervises my Node
+process"**:
+
+- **PM2** for "I want simple, all-in-one, on a single VM."
+- **systemd** for "I want OS-native, hardened, multi-service on a
+  VM."
+- **Container orchestration** for "I want autoscaling, declarative
+  infra, cloud-native."
+
+For 2026 Node, the right default depends on where you deploy:
+
+```
+Self-hosted VM:           systemd or PM2.
+Self-hosted Kubernetes:   container + k8s.
+Cloud (Cloud Run, ECS, Fly.io, Railway): container + platform.
+Serverless (Lambda, Workers): no process manager — the platform is one.
+```
+
+Pick one layer. Don't stack PM2 inside containers inside systemd —
+each layer adds overhead and confusion. Your Node service should
+have **exactly one** supervisor.

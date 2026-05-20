@@ -1,0 +1,426 @@
+export const level = 'mid';
+
+# Event-driven architecture in Node
+
+Node's runtime is event-driven from the ground up — every I/O
+operation completes by firing an event, and the event loop dispatches
+callbacks. `EventEmitter` is the user-facing version of the same
+pattern.
+
+This page is about using `EventEmitter` and event-driven thinking
+in application code.
+
+## `EventEmitter` basics
+
+```js
+import { EventEmitter } from 'node:events';
+
+const emitter = new EventEmitter();
+
+emitter.on('user-signed-up', (user) => {
+  console.log('welcome', user.email);
+});
+
+emitter.emit('user-signed-up', { email: 'a@b.com' });
+```
+
+Synchronous: `emit` calls every registered listener in order, on
+the same tick. There's no queue, no delay.
+
+For async listeners, the emitter doesn't wait:
+
+```js
+emitter.on('event', async (data) => {
+  await save(data);
+});
+
+emitter.emit('event', payload);   // returns immediately
+// save() runs in background; emitter doesn't know if it succeeded
+```
+
+If you need to know listeners finished, use a different pattern
+(promises, await loops).
+
+## Where Node uses it
+
+EventEmitter is the foundation of:
+
+- **HTTP servers**: `server.on('request', ...)`, `server.on('connection', ...)`.
+- **Streams**: `stream.on('data', ...)`, `stream.on('end', ...)`,
+  `stream.on('error', ...)`.
+- **Process**: `process.on('SIGTERM', ...)`, `process.on('uncaughtException', ...)`.
+- **Child processes**: `child.on('exit', ...)`.
+
+Almost every async Node API is an EventEmitter.
+
+## Custom emitters
+
+For in-process pub/sub:
+
+```js
+// events.js
+import { EventEmitter } from 'node:events';
+
+class AppEvents extends EventEmitter {}
+
+export const events = new AppEvents();
+```
+
+```js
+// signup.js
+import { events } from './events.js';
+
+async function signUp(input) {
+  const user = await db.users.create(input);
+  events.emit('user-signed-up', user);
+  return user;
+}
+```
+
+```js
+// welcome-email.js
+import { events } from './events.js';
+
+events.on('user-signed-up', async (user) => {
+  await sendWelcomeEmail(user);
+});
+```
+
+```js
+// analytics.js
+import { events } from './events.js';
+
+events.on('user-signed-up', (user) => {
+  analytics.track('signup', user);
+});
+```
+
+Decoupling: `signUp` doesn't know about email or analytics. New
+listeners hook in without changing the producer.
+
+## When to use events
+
+The right cases:
+
+- **Cross-cutting concerns**: analytics, audit logging, metric
+  emission.
+- **Fanout**: one event triggers many independent reactions.
+- **Lifecycle hooks**: "process is starting up," "app is shutting
+  down."
+
+The wrong cases:
+
+- **Request/response flow**: use direct function calls.
+- **Anything where order matters**: emitter listeners are sync but
+  async work inside them isn't ordered.
+- **Cross-process**: use a message broker (Redis, Kafka, RabbitMQ).
+  EventEmitter is in-process only.
+
+## Async iteration over events
+
+For consumer-side code, `events.on` (the function) returns an async
+iterable:
+
+```js
+import { on } from 'node:events';
+
+for await (const [data] of on(emitter, 'data')) {
+  console.log(data);
+}
+```
+
+The loop pulls events one at a time, waiting between iterations.
+Backpressure flows naturally — if the loop is slow, events queue
+until consumed.
+
+For single events, `events.once`:
+
+```js
+import { once } from 'node:events';
+
+const [data] = await once(emitter, 'data');
+```
+
+Resolves on the first `'data'` event, rejects on `'error'`. Replaces
+the manual "add listener, remove on first fire" pattern.
+
+## Error events
+
+The most important EventEmitter rule: **always handle `error`
+events**. An unhandled `error` event crashes Node:
+
+```js
+emitter.emit('error', new Error('boom'));
+// If no `error` listener, Node crashes with an uncaught exception
+```
+
+```js
+emitter.on('error', (err) => {
+  log.error({ err }, 'emitter error');
+});
+```
+
+For streams especially — a broken socket emits 'error'. Without a
+handler, the whole process dies.
+
+## Max listeners
+
+```js
+emitter.setMaxListeners(20);   // default is 10
+```
+
+If you exceed the max, Node warns:
+
+```
+MaxListenersExceededWarning: Possible EventEmitter memory leak
+detected. 11 'data' listeners added to [HttpServer].
+Use emitter.setMaxListeners() to increase limit
+```
+
+Often a real leak — listeners added without removal. Audit `on()`
+calls; pair with `off()` for transient listeners.
+
+For long-lived emitters with many legitimate listeners (like a
+global event bus), bump the limit.
+
+## Removing listeners
+
+```js
+const handler = (data) => process(data);
+emitter.on('data', handler);
+
+// later
+emitter.off('data', handler);
+// or
+emitter.removeListener('data', handler);   // same as off
+```
+
+`emitter.removeAllListeners('data')` removes everything for that
+event. Use sparingly — might remove listeners other code added.
+
+## `once`
+
+```js
+emitter.once('ready', () => init());
+```
+
+Fires once, then auto-removes. Useful for one-shot signals.
+
+## EventEmitter vs Promises
+
+When you have a single async outcome, use a promise. When you have
+a stream of events over time, use an emitter (or async iterator).
+
+```js
+// Bad — emitter for single outcome
+const downloader = new EventEmitter();
+downloader.on('done', (file) => use(file));
+downloader.on('error', (err) => handle(err));
+downloader.start();
+
+// Better — promise
+const file = await downloader.start();
+```
+
+```js
+// Bad — promise for stream of events
+async function listenForClicks() {
+  return new Promise((resolve) => {
+    button.on('click', resolve);   // only fires once!
+  });
+}
+
+// Better — emitter or async iterable
+for await (const event of clickStream) handleClick(event);
+```
+
+## EventEmitter vs message broker
+
+| | EventEmitter | Broker (Redis/Kafka) |
+| --- | --- | --- |
+| Scope | In-process | Cross-process |
+| Persistence | None | Configurable |
+| Order guarantees | Synchronous | Per-partition/queue |
+| Failure semantics | Lost on listener throw | Retry, DLQ |
+| Setup | Built-in | External service |
+
+For in-process decoupling: emitter. For inter-service: broker.
+
+A common mistake: building an event-driven monolith with
+EventEmitter, hoping to "easily switch to a broker later." The
+listener signature changes, retries appear, ordering shifts. Plan
+the boundary up front.
+
+## Implementing custom events
+
+Subclass for type safety:
+
+```ts
+import { EventEmitter } from 'node:events';
+
+type Events = {
+  'user-signed-up': [user: User];
+  'user-deleted': [userId: string];
+  'error': [err: Error];
+};
+
+class AppEvents extends EventEmitter<Events> {}
+
+const events = new AppEvents();
+events.on('user-signed-up', (user) => {
+  user.email;   // typed
+});
+```
+
+TypeScript types via the generic parameter. Catches "emit('user-signed-down')"
+typos at compile time.
+
+## Async listeners gotchas
+
+```js
+emitter.on('event', async (data) => {
+  await maybeReject();   // unhandled rejection if throws
+});
+```
+
+EventEmitter doesn't catch promise rejections from listeners.
+Wrap:
+
+```js
+emitter.on('event', async (data) => {
+  try {
+    await maybeReject();
+  } catch (err) {
+    log.error({ err }, 'listener failed');
+  }
+});
+```
+
+Or use Node's `captureRejections` option (Node 12.16+):
+
+```js
+const emitter = new EventEmitter({ captureRejections: true });
+emitter.on('error', (err) => log.error({ err }, 'caught'));
+```
+
+With this, rejected promises from listeners emit `'error'`. Cleaner.
+
+## Listener leaks — diagnosis
+
+Symptoms:
+
+- `MaxListenersExceededWarning` in logs.
+- Memory climbs slowly.
+- `process.memoryUsage()` grows; heap snapshot shows many listener
+  closures.
+
+Causes:
+
+- Adding listeners in a hot path without removing.
+- Forgetting `.off()` after `.on()` for transient consumers.
+- Long-lived emitter (process, HTTP server) accumulating listeners
+  per request.
+
+Fix:
+
+- Use `.once()` for single-fire listeners.
+- Pair every `.on()` with `.off()` in cleanup.
+- For HTTP request-scoped listeners, attach to `req` (cleaned up
+  when request ends).
+
+## Event-driven design at the service level
+
+For app architecture, "event-driven" can mean several things:
+
+1. **In-process EventEmitter** — what this page covers. Lightweight
+   decoupling within one Node process.
+2. **Message broker pub/sub** — across services. See **Messaging
+   patterns**.
+3. **Event sourcing** — events are the source of truth, replayable.
+   See **Messaging patterns**.
+
+The patterns scale similarly: producer doesn't know consumers;
+fanout to many independent reactions; loose coupling.
+
+The trade-offs scale too: harder to follow flow, harder to debug,
+eventual consistency. Use when the wins (decoupling, extensibility)
+outweigh the costs.
+
+## Common pitfalls
+
+### Emit with no listeners
+
+```js
+emitter.emit('event', data);
+// no listener — silently nothing happens
+```
+
+Not an error, just no effect. If you expected handling, add a
+test that verifies the listener was registered.
+
+### Synchronous expectations on async listeners
+
+```js
+emitter.emit('event');
+console.log('done?');
+```
+
+If listeners are async, `emit` returns before they complete. The
+"done?" log fires before the listener finishes.
+
+To wait, abandon emitter:
+
+```js
+await Promise.all([fn1(data), fn2(data), fn3(data)]);
+```
+
+Or use a queue with explicit acks.
+
+### Order of listener invocation
+
+EventEmitter invokes listeners in registration order. If order
+matters, register carefully. If it really matters, don't use
+EventEmitter — use explicit calls.
+
+### Re-emitting within a listener
+
+```js
+emitter.on('a', () => {
+  emitter.emit('b');
+});
+emitter.on('b', () => {
+  emitter.emit('a');   // infinite loop
+});
+```
+
+Synchronous re-emit can loop. Add a guard or restructure.
+
+### Sharing emitters across realms
+
+Worker threads have separate event loops. An emitter in the parent
+can't fire listeners in a worker. Use `MessagePort` for cross-thread
+communication.
+
+## The mental model
+
+EventEmitter is **synchronous in-process pub/sub**. Producers emit;
+listeners react. No persistence, no cross-process, no async-wait
+semantics.
+
+The right uses:
+
+- Decouple cross-cutting code (analytics, logging, side effects).
+- Fanout one trigger to multiple reactions.
+- Lifecycle signals.
+
+The right alternatives:
+
+- **Promises** for single async outcomes.
+- **Async iteration** for streams of values over time.
+- **Message brokers** for cross-service communication.
+- **Function calls** for request/response.
+
+Most Node code uses EventEmitter implicitly (via streams, HTTP,
+process). Explicit custom emitters are a tool for the specific
+cases above. Used right, they're a clean decoupling mechanism. Used
+widely, they become hard-to-trace spaghetti.

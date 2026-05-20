@@ -300,5 +300,57 @@ export const bank: QuestionBank = {
       answer:
         '**Throughput is rarely the answer.** A typical request spends < 5% of its time in framework code; DB and downstream calls dominate.\n\n**Express**: ubiquitous, every tutorial assumes it, LLMs generate solid code for it. Express 5 fixed the async-error pain. Massive middleware ecosystem. Pick for teams with Node history, fast onboarding, no exotic requirements.\n\n**Fastify**: JSON schema-based validation + serialization — schema is the contract. Faster output serialization (avoids JSON.stringify reflection). Plugin model with encapsulation. Pick for greenfield teams who want validation-as-architecture.\n\n**Hono**: multi-runtime — same code on Node, Bun, Deno, Cloudflare Workers, Vercel Edge. TypeScript-first with template-literal-typed route params. Tiny core. Pick for edge deployments or full TS-derived routing types.\n\n**Honorable mentions**: tRPC layers type-safe RPC on top of any. NestJS for enterprise structure (DI, decorators, modules) — heavier but standardizes large codebases.\n\n**Honest call**: existing Express → upgrade to v5, stay. Greenfield → Fastify is a defensible default. Need edge → Hono. Pick once, optimize the codebase under it.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'How would you structure a small Express app to avoid one giant `app.js`?',
+      answer:
+        'Organize **by feature, not by layer**. `src/modules/users/{router,service,schemas,errors,index}.ts` for each feature; `src/shared/` for `db`, `redis`, `config`, `logger`. The `router` is Express-aware (validate input, call service, format output). The `service` is pure TypeScript (no `req`/`res`) — testable without Express. The top-level `app.ts` mounts each module\'s router. New features touch one folder; PRs don\'t collide across folders.',
+    },
+    {
+      level: 'junior',
+      question: 'Why send transactional email via a provider like Postmark or Resend instead of raw SMTP?',
+      answer:
+        'Modern email servers (Gmail, Yahoo, Outlook) judge sender reputation. Direct-from-your-VM SMTP usually goes to spam, even with SPF/DKIM/DMARC perfectly configured, because your IP has no warmth. Transactional providers have warm, monitored IP pools; webhook events for bounces/deliveries; suppression lists; and per-message tracing. Cost is small; deliverability difference is large.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'How do you call a third-party API "the right way" from Express?',
+      answer:
+        '**Wrap the client** in one file (`src/integrations/<vendor>/client.ts`) — never call `fetch` directly in handlers. **Validate every response** with Zod at the boundary. **Set timeouts** on every call (`signal: AbortSignal.timeout(5000)`). **Retry idempotent** calls with exponential backoff + jitter; for POST, only retry with an `Idempotency-Key`. **Circuit-break** with `opossum` so a fully-down upstream fails fast. **Per-origin pool** (undici `Pool`) so one slow upstream doesn\'t starve another. **Trace every call** via OpenTelemetry. **Translate errors** to your own types at the seam.',
+    },
+    {
+      level: 'mid',
+      question: 'Where should the email-sending side effect live in a signup flow?',
+      answer:
+        '**Queue it**, don\'t inline it. `app.post(\'/signup\')` does the DB write, enqueues a `welcome-email` job, and responds 201. A worker (`BullMQ`, `pg-boss`, or SQS consumer) picks up the job and calls the email provider. Reasons: email provider outages don\'t break signup; the signup response stays fast; retries on transient failures don\'t require client awareness. For atomicity with the DB write, use the outbox pattern.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'What\'s the right nginx config to put in front of an Express service?',
+      answer:
+        '**`proxy_http_version 1.1`** + `proxy_set_header Connection ""` so upstream keepalive works (default is HTTP/1.0 — no reuse). **`upstream` block with `keepalive 32`** to maintain idle connections to Node. **`X-Forwarded-*`** headers set (pair with `app.set("trust proxy", 1)`). **`client_max_body_size`** matching your largest upload. **`proxy_buffering off`** for SSE / streaming routes. **Match `keepAliveTimeout` on Node > nginx idle timeout** (75s default) to avoid race-condition 502s. TLS terminated at nginx; Node speaks plain HTTP internally.',
+    },
+    {
+      level: 'senior',
+      question: 'When does messaging via a broker beat synchronous HTTP between services?',
+      answer:
+        'When the consumer doesn\'t need to respond in the same request: side effects ("user signed up → send welcome email"), fanout to N independent reactions, work that\'s slow or flaky and benefits from retries with backoff. Broker absorbs producer/consumer speed mismatches. For request/response (read a user, validate something synchronously), HTTP is simpler. Don\'t replace HTTP with messaging just for "decoupling" — async adds eventual consistency, dead-letter handling, and harder debugging.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'You\'re replacing a monolithic Express app with a modular structure. Walk through the steps.',
+      answer:
+        '**1. Label modules** by feature without moving files yet — auth, billing, users, orders. Surface implicit boundaries.\n\n**2. Per-module router**: `modules/<feature>/router.ts` exports an Express Router. Move that feature\'s routes; mount via `app.use(\'/feature\', router)`.\n\n**3. Extract service layer**: thin routers call functions in `service.ts`. Service has no `req`/`res` — pure TypeScript, callable from CLI, worker, tests.\n\n**4. Schemas at the seam**: `schemas.ts` with Zod for input/output; types derived via `z.infer`. Routers parse; services trust.\n\n**5. Module public API**: `index.ts` re-exports the router, service functions, and types. Other modules import from there, never internal files. ESLint rule enforces.\n\n**6. Per-module errors**: `errors.ts` defines `UserNotFoundError extends HttpError(404)`. App-level error middleware translates HttpError → response.\n\n**7. Data ownership**: each module owns its tables; cross-module data goes through the public API. The hardest step — schema review touches everyone.\n\n**8. Optional extract**: only after boundaries are enforced and proven, consider lifting a module to its own service. Cost vs payoff — usually not worth it until team/scale demands it.\n\nThroughout: existing tests stay green; new tests at the service layer (no Express); incremental PRs, never a big-bang rewrite. The result is a monolith you can grow without it growing painful.',
+    },
   ],
 };

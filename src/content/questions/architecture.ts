@@ -76,5 +76,45 @@ export const bank: QuestionBank = {
       answer:
         '**Start with a monolith.** One repo, one deploy, one database. Refactor freely. Microservices add network boundaries (latency, retries, eventual consistency, distributed tracing) before you know where the real boundaries are.\n\n**Move to a modular monolith** when the codebase has 10+ engineers stepping on each other. Same deploy, but enforced internal boundaries — one module owns its tables, others go through its exported API. No new infra to operate.\n\n**Extract a microservice** only when one of:\n- Different scaling needs (the embedding service needs GPUs; the rest is CPU).\n- Different reliability/SLO (payments must stay up while marketing experiments deploy weekly).\n- Independent ownership at the team level — the friction of cross-team coordination outweighs the friction of network calls.\n- Technology divergence (Python ML stack vs Node API).\n\n**Anti-pattern**: extracting microservices because "it\'s best practice." Cost: distributed transactions, eventual consistency, deploys that need orchestration, observability across N services, an order-of-magnitude more failure modes. Pay this cost only when the wins exceed it.\n\nThe modular monolith is undersold — most "we need microservices" situations are actually "we need module boundaries."',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What\'s the difference between a work queue and pub/sub?',
+      answer:
+        '**Work queue (point-to-point)**: each message goes to **exactly one** worker. Scale workers horizontally to process faster. Use for: send email, process upload, generate PDF.\n\n**Pub/sub (fanout)**: each message goes to **every subscriber**. Each consumer is independent. Use for: "user signed up" notifying analytics, billing, mailing list, all from one event.\n\nBullMQ does work queues. Redis Pub/Sub or NATS does fanout. Kafka and RabbitMQ can do both via consumer groups / topic exchanges.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'When would you reach for gRPC instead of REST?',
+      answer:
+        'Internal **high-volume service-to-service** RPCs. Wins: strongly-typed `.proto` contracts shared across languages, HTTP/2 multiplexing, smaller wire size (Protobuf vs JSON ≈ 50–80% smaller), streaming in either direction. Skip for browser-facing APIs (browsers can\'t speak gRPC natively — use REST or Connect-RPC) or for tiny services where REST\'s familiarity wins. Pair with `buf.build` for schema management + breaking-change detection in CI.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s the outbox pattern, and why does it matter?',
+      answer:
+        'For "atomic DB write + send event," the outbox pattern writes to your business table and an `outbox` table **in the same transaction**. A separate worker tails the outbox and publishes to the broker. Either both happen (transaction commits) or neither (rollback) — you never have "DB updated but downstream never notified" or "event sent for work that didn\'t commit." Standard solution for cross-system consistency without distributed transactions. CDC (Debezium) is the streaming variant.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'How do you handle eventual consistency in event-driven architectures?',
+      answer:
+        '**At-least-once delivery** is the default; consumers must be idempotent (dedup by event ID in Redis or DB). **Reasonable staleness windows** in the UI — "your settings will update within a few seconds" beats blocking the write. **Sagas** for multi-step workflows: each step has a compensating action; failure triggers rollback. **Read-your-writes**: route the originating user\'s reads through the primary (or stick them to a "fresh" replica) for a short window. **Observability**: trace event flow across services with W3C `traceparent` propagation. The big mental shift: design for eventual consistency from day one, not as a remediation later.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'You\'re choosing between choreography and orchestration for a multi-step workflow. Trade-offs?',
+      answer:
+        '**Choreography**: each service listens for events, acts, publishes new events. "Order placed" → Inventory reserves → publishes "Inventory reserved" → Payment charges → publishes "Payment succeeded" → Shipping ships. No central coordinator.\n\n**Pros**: decentralized, services don\'t know about each other, easy to add a new step.\n**Cons**: the workflow is implicit. Tracing it requires reading many services. Compensations (rollback when later steps fail) get tangled — who reverses what?\n\n**Orchestration**: a central coordinator drives the flow. Like a state machine with explicit transitions. Tools: **Temporal**, **AWS Step Functions**, **Camunda**.\n\n**Pros**: the workflow is explicit, debuggable, testable. Rollback logic lives in one place. Long-running workflows (days, weeks) handled correctly.\n**Cons**: the coordinator is a coupling point and an operational concern.\n\n**Honest recommendation**: orchestration for anything with > 3 steps, money, or rollback semantics. Choreography for simple "fanout to N reactions" without coordination. Most teams start choreographed and migrate to orchestration when they hit a hairy bug or compliance audit.',
+    },
   ],
 };

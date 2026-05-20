@@ -1,0 +1,400 @@
+export const level = 'mid';
+
+# Debugging Node
+
+Debugging Node ranges from "drop a `console.log`" to attaching Chrome
+DevTools to a running production process. Knowing the full toolkit
+saves hours when you actually need it.
+
+## `console.log` is fine for most cases
+
+It's fast, requires no setup, and works in every environment. The
+right tool 70% of the time.
+
+Tips:
+
+```js
+console.log({ user, count });       // labels via property shorthand
+console.table(rows);                 // formatted table
+console.dir(obj, { depth: null });   // print nested without [Object]
+console.time('label');
+// ... slow code ...
+console.timeEnd('label');            // "label: 12.34 ms"
+```
+
+For production logging, use a structured logger (pino, winston) —
+`console.log` is synchronous on TTYs and blocks the event loop.
+
+## Node's built-in inspector
+
+Start with `--inspect`:
+
+```bash
+node --inspect src/index.js              # listen on 9229
+node --inspect=0.0.0.0:9229 src/index.js # bind all interfaces
+node --inspect-brk src/index.js          # break before user code runs
+```
+
+Then **Chrome DevTools**:
+
+1. Open `chrome://inspect` in Chrome.
+2. Click "Open dedicated DevTools for Node."
+3. Set breakpoints in the Sources tab.
+4. Step through code, inspect variables, evaluate expressions in the
+   console.
+
+This gives you everything browser DevTools gives: call stack, scope,
+watch expressions, conditional breakpoints, blackboxing.
+
+Vim / Neovim, JetBrains, and VS Code also speak the Inspector
+Protocol — see their respective debugger docs.
+
+## Conditional and logpoint breakpoints
+
+In DevTools, right-click a line:
+
+- **Conditional breakpoint**: pauses only when `userId === 42`.
+- **Logpoint**: logs a message without pausing — like a temporary
+  `console.log` you add and remove without redeploying.
+
+For production debugging, logpoints are gold. You don't pause the
+process; you just get a line in the console when execution hits
+your point.
+
+## VS Code debugging
+
+```json
+// .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch app",
+      "skipFiles": ["<node_internals>/**"],
+      "program": "${workspaceFolder}/src/index.js",
+      "outputCapture": "std"
+    },
+    {
+      "type": "node",
+      "request": "attach",
+      "name": "Attach to running",
+      "port": 9229
+    }
+  ]
+}
+```
+
+`F5` launches or attaches. Breakpoints work the same way.
+
+For TypeScript directly: add `"runtimeArgs": ["--experimental-strip-types"]`
+or run `node --inspect-brk --experimental-strip-types src/index.ts`.
+
+## Debugging async code
+
+The tricky part. `async`/`await` makes the stack readable; raw
+callbacks don't.
+
+```js
+async function f() {
+  const x = await stepOne();   // breakpoint here
+  const y = await stepTwo(x);  // breakpoint here
+  return y;
+}
+```
+
+Breakpoint at line 2; the debugger pauses with the call stack
+showing `f` and the await point. Step over (`F10`) waits for the
+promise.
+
+For tracking which call led to an error in a deep async chain:
+
+```js
+Error.captureStackTrace(err);   // includes the current async stack
+```
+
+Modern V8 has `--async-stack-traces` (on by default in Node 18+) —
+errors include the `await` chain that led to them. Much easier to
+trace than callback hell.
+
+## REPL
+
+Drop into a REPL for ad-hoc inspection:
+
+```bash
+node          # interactive prompt
+> .help        # commands
+> .save state.js
+> .load file.js
+> _            # last expression's result
+```
+
+For debugging running services:
+
+```js
+// add to app.js
+import repl from 'node:repl';
+const server = repl.start({ prompt: 'app> ' });
+server.context.db = db;     // expose objects to REPL
+```
+
+Now `node --inspect` + Chrome lets you evaluate arbitrary expressions
+in the live process's context.
+
+Useful for one-off "what's in this cache right now?" or
+"manually trigger this job."
+
+## CPU profiling
+
+For "the app is slow, where is time going?":
+
+```bash
+node --cpu-prof src/index.js
+# produces CPU.YYYYMMDD.cpuprofile file
+```
+
+Load the `.cpuprofile` into Chrome DevTools (Performance tab → Load
+profile) to see a flame chart of where CPU time went.
+
+Or attach DevTools to a live process and use the Profiler tab to
+record on demand.
+
+For sampling-based profiling in production:
+
+```bash
+node --prof src/index.js
+# produces isolate-*.log file
+
+node --prof-process isolate-*.log > processed.txt
+```
+
+Less convenient than `.cpuprofile` but works headlessly.
+
+**Clinic.js** (`pnpm dlx clinic doctor -- node src/index.js`) wraps
+both with a friendlier UI — flames, event-loop lag visualization,
+GC plots in one tool.
+
+## Heap profiling
+
+For "memory is climbing":
+
+```js
+import v8 from 'node:v8';
+
+v8.writeHeapSnapshot('./snapshot.heapsnapshot');
+```
+
+Load into Chrome DevTools (Memory tab → Load) to see:
+
+- All allocated objects.
+- Retainer chains (what's keeping them alive).
+- Shallow size, retained size.
+
+Take two snapshots at different points, **Comparison** view shows
+what grew. Almost every memory leak comes out of this comparison.
+
+In production: trigger via SIGUSR2:
+
+```js
+process.on('SIGUSR2', () => {
+  const path = `/tmp/heap-${Date.now()}.heapsnapshot`;
+  v8.writeHeapSnapshot(path);
+  console.log(`heap snapshot: ${path}`);
+});
+```
+
+Then `kill -USR2 <pid>` from outside. Copy the file off the
+machine; analyze locally.
+
+## Event-loop lag
+
+Symptom: high latency without obvious CPU or DB blame.
+
+```js
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+
+setInterval(() => {
+  console.log({
+    min: h.min,
+    mean: h.mean,
+    max: h.max,
+    p99: h.percentile(99),
+  });
+  h.reset();
+}, 5000);
+```
+
+Numbers in nanoseconds. Anything past ~10ms p99 is user-visible.
+
+Common causes:
+
+- Sync APIs (`fs.readFileSync`, `crypto.pbkdf2Sync`).
+- Tight CPU loops without yielding.
+- Heavy JSON parsing of large payloads.
+- Catastrophic regex backtracking.
+
+Pair with CPU profiling to find the offender.
+
+## Debugging tests
+
+```bash
+node --inspect-brk --test src/foo.test.js
+```
+
+Breaks at the start of the test file. Add breakpoints in DevTools;
+step through assertions.
+
+In VS Code, `--inspect-brk` + an attach config gives the same UX
+without leaving the editor.
+
+## `util.inspect`
+
+For programmatic pretty-printing:
+
+```js
+import util from 'node:util';
+
+util.inspect(obj, { depth: 5, colors: true, compact: false });
+```
+
+`console.log` uses `util.inspect` under the hood. The options let you
+control depth, color, formatting beyond what `JSON.stringify` does
+(handles circular references, shows Map/Set entries).
+
+## `node --watch` plus debugger
+
+```bash
+node --watch --inspect src/index.js
+```
+
+Restart on file change; inspector reattaches. Breakpoints persist
+in DevTools across restarts.
+
+For TS:
+
+```bash
+node --watch --inspect --experimental-strip-types src/index.ts
+```
+
+The closest you get to "edit → save → debug" in modern Node.
+
+## Source maps
+
+If your build emits source maps (`tsc --sourceMap`, esbuild,
+webpack), Node uses them automatically:
+
+```bash
+node --enable-source-maps dist/index.js
+```
+
+Stack traces point at TypeScript source, not compiled JS. Essential
+for debugging built code.
+
+`--experimental-strip-types` doesn't need source maps — the line
+numbers match the original `.ts` because no transformation happens.
+
+## Logging vs debugging
+
+When to reach for which:
+
+- **Logging**: for understanding production behavior. Persistent,
+  searchable, structured.
+- **Debugger**: for understanding a specific bug locally. Set
+  breakpoints, inspect state, step.
+
+In production, you almost always use logs. Attaching to a live
+production process is rare (and risky — pauses the process).
+Logpoints in DevTools give you "log without redeploying" for
+staging/dev.
+
+## Common pitfalls
+
+### Forgetting `--inspect-brk` for "break immediately"
+
+```bash
+node --inspect src/index.js   # listens for inspector, but runs through
+node --inspect-brk src/index.js   # listens AND pauses before user code
+```
+
+For "set breakpoints before code runs," use `--inspect-brk`.
+
+### Trying to debug a child process
+
+If your app spawns child processes, attaching to the parent doesn't
+debug them. Each child needs its own `--inspect=<port>` (different
+port per child).
+
+For `child_process.fork`, pass `execArgv: ['--inspect=9230']` in
+options.
+
+### Inspector exposed publicly
+
+```bash
+node --inspect=0.0.0.0:9229
+```
+
+Anyone on your network can connect and execute arbitrary code.
+Bind to localhost only (`127.0.0.1:9229`) unless you're using SSH
+tunneling.
+
+### Production debugger attached
+
+Attaching pauses the process. Even setting a breakpoint that doesn't
+trigger has overhead. Don't attach inspector to a live production
+process unless absolutely necessary; profile / heap-snapshot from
+within instead.
+
+### Forgetting source maps
+
+```
+TypeError at /app/dist/index.js:5:42
+```
+
+Useless. Add `--enable-source-maps` and you get
+`/app/src/index.ts:8:12`.
+
+### `console.dir` vs `console.log` on deep objects
+
+```js
+console.log({ a: { b: { c: { d: 1 } } } });
+// { a: { b: { c: [Object] } } }    — truncated
+
+console.dir({ a: { b: { c: { d: 1 } } } }, { depth: null });
+// { a: { b: { c: { d: 1 } } } }    — full
+```
+
+For deeply-nested debugging output, use `console.dir` with
+`depth: null`.
+
+### Debugger statement in committed code
+
+```js
+function bug() {
+  debugger;   // forgotten in production
+  // ...
+}
+```
+
+In production, `debugger` is a no-op (no inspector attached). Still
+ugly. Lint rule `no-debugger` catches it.
+
+## The mental model
+
+Node debugging is a stack of tools, each appropriate for a
+different stage:
+
+1. **`console.log` / `console.dir`** — first reach. Cheap, fast.
+2. **Inspector + DevTools / VS Code** — breakpoints, stepping,
+   live evaluation. For understanding a specific bug.
+3. **CPU profile / heap snapshot** — for "the app is slow / using
+   memory." Capture, analyze offline.
+4. **Logging + traces in production** — for understanding behavior
+   you can't reproduce locally.
+
+Master `console.log` patterns + `--inspect` + DevTools and you've
+covered 95% of debugging needs. For the other 5%, profiles and
+snapshots are the next step.

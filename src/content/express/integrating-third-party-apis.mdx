@@ -1,0 +1,465 @@
+export const level = 'senior';
+
+# Integrating with third-party APIs
+
+Most real Node services talk to external APIs: Stripe, SendGrid,
+Twilio, OpenAI, GitHub, internal partner services. The naïve "call
+fetch in a handler" works in dev and falls apart in production.
+This page is the production playbook.
+
+## Wrap the client, don't call fetch everywhere
+
+Bad:
+
+```js
+// scattered across handlers
+const res = await fetch(`${process.env.STRIPE_URL}/v1/charges`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${process.env.STRIPE_KEY}` },
+  body: JSON.stringify({ amount, currency }),
+});
+const data = await res.json();
+```
+
+Good:
+
+```js
+// src/integrations/stripe.ts
+import { z } from 'zod';
+
+const Charge = z.object({ id: z.string(), amount: z.number(), status: z.string() });
+type Charge = z.infer<typeof Charge>;
+
+class StripeClient {
+  constructor(private apiKey: string, private baseUrl = 'https://api.stripe.com') {}
+
+  async createCharge(input: { amount: number; currency: string }): Promise<Charge> {
+    const res = await this.request('POST', '/v1/charges', input);
+    return Charge.parse(res);
+  }
+
+  private async request(method: string, path: string, body?: unknown) {
+    // shared error handling, retry, observability
+  }
+}
+
+export const stripe = new StripeClient(process.env.STRIPE_KEY!);
+```
+
+Now every Stripe call goes through one place. Behavior changes
+(timeouts, retries, logging) happen in one file.
+
+## Validate every response
+
+Third-party APIs change. Even with versioned APIs, fields appear or
+disappear. Validate at the boundary:
+
+```js
+const Charge = z.object({
+  id: z.string(),
+  amount: z.number(),
+  status: z.enum(['pending', 'succeeded', 'failed']),
+});
+
+const data = Charge.parse(await res.json());
+```
+
+The validation:
+
+- Catches API drift early — you see a parse error, not a runtime bug
+  three layers deep.
+- Gives you a real TypeScript type via `z.infer`.
+- Makes your tests easy (Zod schemas double as fixtures).
+
+For OpenAPI-described APIs, generate the schemas with tools like
+`openapi-zod-client`.
+
+## Timeouts on every call
+
+```js
+const res = await fetch(url, {
+  signal: AbortSignal.timeout(5000),   // 5s total
+});
+```
+
+Without timeouts, a slow upstream holds a request thread until the
+TCP keep-alive eventually decides it's dead. With timeouts:
+
+- Quick fail = your service stays responsive.
+- Clear error code (`AbortError`) to catch and translate.
+
+Set them tighter than your own SLO. If your endpoint promises 10s
+p99, downstream calls should be ~2-5s.
+
+## Retry idempotent calls
+
+```js
+import retry from 'p-retry';
+
+const data = await retry(
+  () => fetch(url, { signal: AbortSignal.timeout(5000) }),
+  { retries: 3, minTimeout: 200, maxTimeout: 5000, factor: 2, randomize: true },
+);
+```
+
+Rules:
+
+- Only retry idempotent methods (`GET`, `PUT`, `DELETE`) or `POST`
+  with an `Idempotency-Key` header.
+- Exponential backoff with **jitter**: `delay = min + random(0, factor^n)`.
+  Jitter avoids "thundering herd" when many clients retry in sync.
+- Cap retries (3-5 is typical) and total time.
+- Honor `Retry-After` headers if the upstream sends them.
+- Distinguish retriable errors (network, 5xx, 429) from
+  non-retriable (4xx other than 429).
+
+```js
+const RETRIABLE_STATUSES = new Set([429, 502, 503, 504]);
+
+if (res.status >= 400 && !RETRIABLE_STATUSES.has(res.status)) {
+  throw new NonRetriableError(...);
+}
+```
+
+Don't retry payment charges without an idempotency key — you'll
+charge the customer twice.
+
+## Circuit breakers
+
+When the upstream is fully down, don't keep slamming it. **Open the
+circuit** and fail fast.
+
+```js
+import CircuitBreaker from 'opossum';
+
+const breaker = new CircuitBreaker(
+  (req) => stripe.createCharge(req),
+  { timeout: 5000, errorThresholdPercentage: 50, resetTimeout: 30000 },
+);
+
+breaker.on('open', () => log.warn('stripe circuit opened'));
+breaker.on('halfOpen', () => log.info('stripe circuit half-open, testing'));
+breaker.on('close', () => log.info('stripe circuit closed'));
+
+try {
+  const charge = await breaker.fire({ amount, currency });
+} catch (err) {
+  if (breaker.opened) // circuit is open
+    return res.status(503).json({ error: 'payments unavailable, try later' });
+  throw err;
+}
+```
+
+States:
+
+- **Closed**: requests flow through. Failures counted.
+- **Open**: too many failures recently → reject fast, no upstream
+  calls.
+- **Half-open**: after a cooldown, allow one test request. If it
+  succeeds, close; if not, re-open.
+
+`opossum` is the standard Node breaker. Combines with retries:
+retry inside the breaker, breaker handles "stop trying entirely."
+
+## Bulkheads — bound concurrency per dependency
+
+If your service makes 1000 concurrent calls to a slow upstream, you
+exhaust connections and starve other dependencies.
+
+```js
+import pLimit from 'p-limit';
+
+const limit = pLimit(20);   // max 20 concurrent calls to this API
+
+async function chargeMany(orders) {
+  return Promise.all(orders.map(o => limit(() => stripe.createCharge(o))));
+}
+```
+
+One slow upstream can't drown your service. Other dependencies stay
+healthy.
+
+For undici-level isolation, **separate Pools per upstream**:
+
+```js
+import { Pool } from 'undici';
+
+const stripePool = new Pool('https://api.stripe.com', { connections: 20 });
+const sendgridPool = new Pool('https://api.sendgrid.com', { connections: 10 });
+```
+
+Each upstream has its own connection budget. Slowness in one doesn't
+starve another. See **HTTP client (undici)**.
+
+## Caching responses
+
+For idempotent reads, cache aggressively:
+
+```js
+const cached = await redis.get(`stripe:customer:${id}`);
+if (cached) return Customer.parse(JSON.parse(cached));
+
+const customer = await stripe.getCustomer(id);
+await redis.set(`stripe:customer:${id}`, JSON.stringify(customer), 'EX', 300);
+return customer;
+```
+
+Cuts latency, cuts API costs, cuts rate-limit pressure. Pair with:
+
+- TTL appropriate to the data (customer data: minutes; price list:
+  hours; static lookups: days).
+- Invalidation on writes (your code updates the customer → delete
+  cache key).
+- Stale-while-revalidate for hot paths.
+
+## Rate limits
+
+Most APIs have rate limits. Respect them:
+
+- **Track the headers**: `X-RateLimit-Remaining`, `X-RateLimit-Reset`,
+  `Retry-After`. Many APIs send them.
+- **Throttle ahead of the limit**: if remaining is < 10%, slow down
+  internally.
+- **Honor `429 Too Many Requests`** with `Retry-After`.
+
+For Stripe specifically, the API enforces ~100 RPS by default; ask
+for higher limits if you need them.
+
+Centralize rate-limit handling in your client wrapper.
+
+## Observability per integration
+
+Every integration call should produce:
+
+- **A trace span** with the upstream name, method, path, status,
+  duration.
+- **A metric**: counter of calls, histogram of latency, broken down
+  by upstream + outcome.
+- **A log line on failure** with enough context to reproduce.
+
+```js
+import { trace } from '@opentelemetry/api';
+
+async function tracedRequest(method, path, body) {
+  const tracer = trace.getTracer('integrations');
+  return tracer.startActiveSpan(`stripe.${method} ${path}`, async (span) => {
+    span.setAttribute('stripe.path', path);
+    try {
+      const res = await fetch(this.baseUrl + path, { method, body });
+      span.setAttribute('http.status', res.status);
+      if (!res.ok) span.setStatus({ code: 2, message: `http ${res.status}` });
+      return res;
+    } catch (err) {
+      span.recordException(err);
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+Now your traces show "request → stripe call took 800ms" — exact
+attribution.
+
+## Errors at the boundary
+
+Translate provider errors to your own error types:
+
+```js
+class StripeError extends Error {
+  constructor(public code: string, public stripeMessage: string) {
+    super(`stripe: ${code}: ${stripeMessage}`);
+  }
+}
+
+class StripeRateLimitError extends StripeError {}
+class StripeAuthError extends StripeError {}
+
+// In the client:
+if (res.status === 429) throw new StripeRateLimitError(...);
+if (res.status === 401) throw new StripeAuthError(...);
+```
+
+Now callers can `catch (err) { if (err instanceof StripeRateLimitError) ... }`.
+
+The third-party API's specific error shape stays inside the client
+wrapper. Outside, you have stable error types.
+
+## Secrets handling
+
+```env
+STRIPE_KEY=sk_live_...
+```
+
+In code:
+
+```js
+const stripe = new StripeClient(process.env.STRIPE_KEY!);
+```
+
+Rules:
+
+- **Never commit keys.** `.env` in `.gitignore`. Use a secret manager
+  for production.
+- **Validate at startup**: `z.object({ STRIPE_KEY: z.string() }).parse(process.env)` to fail
+  fast if a key is missing or empty.
+- **Rotate periodically.** Have a rotation playbook ready.
+- **Use sandbox/test keys in non-prod.** Different keys per
+  environment.
+- **Don't log keys.** Mask in error messages.
+
+See **Secrets management** for the full treatment.
+
+## Webhooks (the other direction)
+
+Many integrations send webhooks **to** you (Stripe → "charge succeeded").
+That's its own discipline — signature verification, idempotency,
+async processing. See **Webhook receiver patterns**.
+
+## Testing integrations
+
+```js
+import { MockAgent, setGlobalDispatcher } from 'undici';
+
+const agent = new MockAgent();
+setGlobalDispatcher(agent);
+
+const pool = agent.get('https://api.stripe.com');
+pool.intercept({ path: '/v1/charges', method: 'POST' })
+    .reply(200, { id: 'ch_123', amount: 1000, status: 'succeeded' });
+
+const charge = await stripe.createCharge({ amount: 1000, currency: 'usd' });
+expect(charge.id).toBe('ch_123');
+```
+
+undici's `MockAgent` intercepts all HTTP at the dispatcher level —
+no monkey-patching, no separate mock library.
+
+For more sophisticated test scenarios, **MSW** (Mock Service Worker)
+gives you a unified mock spec for tests + Storybook + dev server.
+
+For integration tests against a sandbox API:
+
+- Use the provider's sandbox/test mode (Stripe test keys, Twilio
+  test credentials).
+- Replay recorded responses with `nock`-style fixtures for
+  deterministic CI.
+
+## Common pitfalls
+
+### No timeout on `fetch`
+
+```js
+await fetch(url);   // can hang forever
+```
+
+Always set a `signal` with timeout. Without it, one slow upstream
+takes down your service.
+
+### Retrying non-idempotent POSTs
+
+```js
+await retry(() => fetch('/api/charges', { method: 'POST', body: ... }));
+```
+
+Without an idempotency key, retries can double-charge. Either:
+
+- Add `Idempotency-Key` header (Stripe et al. support it).
+- Don't retry POST without one.
+- Make the operation idempotent at the data layer.
+
+### Trusting the upstream's response shape
+
+```js
+const data = await res.json();
+return data.charge.amount;   // boom — `data.charge` might be undefined
+```
+
+Validate. Always.
+
+### One pool for everything
+
+```js
+setGlobalDispatcher(defaultAgent);   // shared across all upstreams
+```
+
+A slow upstream consumes all your sockets. Other upstreams suffer.
+Per-origin pools (or per-origin agents) isolate them.
+
+### Logging API responses with secrets
+
+```js
+log.info({ res: await res.json() }, 'got response');
+```
+
+Some API responses contain tokens. Filter what you log, or redact:
+
+```js
+log.info({ status: res.status, id: data.id }, 'created charge');
+```
+
+### Forgetting webhook signature verification
+
+If you also receive webhooks from the same provider, verify with
+HMAC + raw body. See **Webhook receiver patterns**.
+
+### Provider library obesity
+
+Some official SDKs (`stripe`, `@aws-sdk`, `googleapis`) are huge.
+For one or two endpoints, a thin custom client wrapper is much
+lighter than the full SDK. Trade-off: SDK gives you typed methods
+for hundreds of endpoints; your wrapper is targeted.
+
+### Mixing sandbox and prod keys
+
+Easy bug: dev key in prod = charges fail. Prod key in dev = real
+customers charged. Validate the key prefix in your client:
+
+```js
+if (env === 'production' && !key.startsWith('sk_live_'))
+  throw new Error('production must use sk_live_*');
+```
+
+## A reference structure
+
+```
+src/
+  integrations/
+    stripe/
+      client.ts         — class wrapping the API
+      schemas.ts        — Zod schemas for requests/responses
+      errors.ts         — Stripe-specific error types
+      index.ts          — exports just the public surface
+    sendgrid/
+      ...
+    twilio/
+      ...
+  services/
+    payment.ts          — business logic, uses stripe.* internals
+    notification.ts     — uses sendgrid.* and twilio.*
+```
+
+Service-layer code talks to integrations through a typed interface.
+Business logic stays decoupled from API drift. Test by mocking
+integration boundaries.
+
+## The mental model
+
+Every third-party API is **a slow, unreliable service that costs
+money and changes shape without warning**. Your integration layer's
+job is to absorb that:
+
+- Wrap. One client per provider.
+- Validate. Zod at every response.
+- Time out. Always.
+- Retry idempotent. Never POST without a key.
+- Bulkhead. Per-provider pools and concurrency limits.
+- Break. Circuit breakers for cascading failure.
+- Observe. Trace, metric, log per call.
+- Translate. Provider errors to your own taxonomy.
+
+A service that integrates with N APIs is N integration clients +
+business logic that consumes them. Get the clients right and the
+business logic stays stable across API outages, rate-limit
+windows, and provider migrations.

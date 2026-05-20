@@ -1,0 +1,433 @@
+export const level = 'mid';
+
+# Sending email
+
+Sending email from a Node service looks easy ("connect to SMTP, send
+a message") and is full of small landmines: spam filters, deliverability,
+unicode subjects, attachments, bounces, transactional vs marketing
+distinction. This page is the practical 2026 playbook.
+
+## You probably want a transactional email provider, not raw SMTP
+
+Direct SMTP works for "dev / test" but rarely for production at any
+scale. Use a transactional email provider:
+
+- **Postmark** — best deliverability for transactional, expensive.
+- **Resend** — newest entrant, modern API, good DX.
+- **SendGrid** — established, sometimes deliverability issues.
+- **Amazon SES** — cheapest at scale, manual setup.
+- **Mailgun** — solid, mid-tier.
+
+The cost of bad deliverability (your emails go to spam) is much
+higher than the price difference. Try Postmark or Resend first for
+transactional; SES if you have millions of emails a month and
+operations bandwidth.
+
+## Nodemailer
+
+The de-facto Node library — works with SMTP and most providers'
+APIs.
+
+```js
+import nodemailer from 'nodemailer';
+
+const transport = nodemailer.createTransport({
+  host: 'smtp.example.com',
+  port: 587,
+  secure: false,         // true for 465, false for 587
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+await transport.sendMail({
+  from: '"Acme" <noreply@acme.com>',
+  to: 'user@example.com',
+  subject: 'Welcome to Acme',
+  text: 'Welcome! Visit https://acme.com to get started.',
+  html: '<p>Welcome! Visit <a href="https://acme.com">acme.com</a> to get started.</p>',
+});
+```
+
+The two key fields:
+
+- **`from`** — must be an address you're authorized to send from
+  (SPF/DKIM/DMARC configured for the domain — more below).
+- **`text` + `html`** — provide both. Mail clients pick the best
+  format; spam filters penalize HTML-only.
+
+## Provider SDK vs SMTP
+
+For Postmark / Resend / SendGrid / SES, the **provider's SDK** is
+usually a better choice than SMTP through Nodemailer:
+
+```js
+// Resend
+import { Resend } from 'resend';
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+await resend.emails.send({
+  from: 'Acme <noreply@acme.com>',
+  to: 'user@example.com',
+  subject: 'Welcome',
+  html: '<p>Welcome!</p>',
+});
+```
+
+Why SDK over SMTP:
+
+- **Better error reporting** — Bounces, rate limits, blocked
+  addresses surface as structured errors.
+- **Idempotency keys** supported by some providers.
+- **Webhook events** for delivery / bounce / open / click.
+- **Faster** — REST is faster than SMTP for low-volume calls.
+
+## Authentication: SPF, DKIM, DMARC
+
+Without these DNS records, modern email servers (Gmail, Outlook,
+Yahoo) silently send you to spam.
+
+- **SPF** — DNS TXT record listing IPs/domains authorized to send
+  from your domain.
+- **DKIM** — cryptographic signature on the email proving it came
+  from your domain.
+- **DMARC** — policy telling receivers what to do when SPF/DKIM
+  fail (`quarantine` / `reject`).
+
+Every provider has docs for setting these up. Without them in
+2026, your transactional emails routinely land in spam — and Gmail
++ Yahoo now require DMARC for bulk senders.
+
+Quick test: send an email to `https://www.mail-tester.com/` and see
+your score. Anything below 9/10 means you have a DKIM / SPF / DMARC
+issue.
+
+## Transactional vs marketing
+
+Two different beasts:
+
+| | Transactional | Marketing |
+| --- | --- | --- |
+| Triggered by | user action | campaign |
+| Volume | 1 per user event | bulk |
+| Unsubscribe needed | usually no | always (legally required) |
+| List management | none | required |
+| Use | Postmark, Resend, SES | SendGrid, Mailchimp, Klaviyo |
+
+**Never mix them.** Sending marketing from your transactional
+provider can get the IP blacklisted, killing your transactional
+delivery too. Two providers, two IP pools, two domains
+(`noreply@acme.com` for transactional, `news@mail.acme.com` for
+marketing).
+
+## What to send transactionally
+
+The expected types:
+
+- **Account confirmation** — clicking a link verifies an email.
+- **Password reset** — time-limited token in a link.
+- **Receipts** — order confirmations, invoices.
+- **Notifications** — "your X happened" updates.
+- **Magic-link login** — passwordless auth.
+- **Security** — login from new device, password changed.
+
+Keep it relevant. Every unnecessary email is a step toward "user
+unsubscribes from all your emails" / "marks as spam" / "blocks
+domain."
+
+## HTML emails are awful
+
+Email clients support **HTML from 1998**. Gmail strips many CSS
+properties; Outlook uses Word's renderer. Modern web design doesn't
+translate.
+
+Patterns:
+
+- **Use table-based layouts.** Yes, like 2003. CSS Grid / Flexbox
+  don't work reliably.
+- **Inline all CSS.** External stylesheets don't load; `<style>`
+  blocks get stripped in some clients.
+- **Test with `mailtrap.io` or `litmus.com`** to preview across
+  clients.
+- **Use a template engine like `mjml`** — it compiles
+  semi-readable markup to table-based bulletproof HTML.
+
+```jsx
+// MJML
+<mjml>
+  <mj-body>
+    <mj-section>
+      <mj-column>
+        <mj-text>Welcome to Acme</mj-text>
+        <mj-button href="https://acme.com">Get started</mj-button>
+      </mj-column>
+    </mj-section>
+  </mj-body>
+</mjml>
+```
+
+Compiles to ~200 lines of `<table>` mess. You write 10 lines; the
+compiler handles the cross-client horror.
+
+For modern React-first stacks, **`react-email`** lets you write
+emails in React/JSX and compile to email-safe HTML.
+
+## Plain text version
+
+Always provide both:
+
+```js
+await transport.sendMail({
+  from: ...,
+  to: ...,
+  subject: 'Reset your password',
+  text: 'Reset link: https://acme.com/reset?token=abc123',
+  html: '<p>Reset link: <a href="...">click here</a></p>',
+});
+```
+
+Some clients display plain text; spam filters penalize HTML-only
+emails. Most providers auto-generate plain text from HTML if you
+omit `text`, but explicit is better.
+
+## Attachments
+
+```js
+await transport.sendMail({
+  // ...
+  attachments: [
+    {
+      filename: 'invoice.pdf',
+      content: pdfBuffer,
+      contentType: 'application/pdf',
+    },
+  ],
+});
+```
+
+Keep attachments small (< 10MB). For larger files, link to a
+download URL instead. Many providers cap attachment size at 25MB
+total.
+
+## Bounce handling
+
+Real users have full inboxes, typos in addresses, dead accounts.
+Without bounce handling, your sender reputation degrades over time.
+
+**Hard bounce**: address doesn't exist. Permanently remove.
+**Soft bounce**: temporary failure (mailbox full, server down).
+Retry; remove after N failures.
+
+Most providers send webhook events:
+
+```js
+app.post('/webhooks/email-events', (req, res) => {
+  for (const event of req.body) {
+    if (event.type === 'hard_bounce') {
+      db.users.update({ id: event.userId }, { emailValid: false });
+    }
+  }
+  res.sendStatus(200);
+});
+```
+
+Mark users with hard bounces as invalid; stop sending. Modern
+providers (Resend, Postmark) handle suppression automatically — they
+maintain the bounce list and refuse to send to known-bad addresses.
+
+## Anti-spam practices
+
+To stay out of spam:
+
+1. **Configure SPF, DKIM, DMARC.** Non-negotiable.
+2. **Warm up new IPs** — start with low volume, ramp up.
+   Providers like SES require this for new sending domains.
+3. **Don't send to old addresses** — anything inactive > 12 months,
+   skip.
+4. **Honor unsubscribes immediately.** Legally required (CAN-SPAM,
+   GDPR, CASL).
+5. **Match subject to content.** "Re: your refund" for non-refund
+   emails is spam.
+6. **Don't use shouty subject lines** ("URGENT!!! ACT NOW!!!").
+7. **Authenticate every email** — DKIM signed, SPF passing.
+8. **Single sender domain.** Don't send from multiple domains.
+
+## Queues and retries
+
+Sending email synchronously in a request handler:
+
+```js
+app.post('/signup', async (req, res) => {
+  const user = await createUser(req.body);
+  await sendWelcomeEmail(user);   // slow + may fail
+  res.json(user);
+});
+```
+
+Issues:
+
+- Email API is slow (~500ms): your signup is now 500ms slower.
+- Email provider outage: signup fails for unrelated reasons.
+
+The pattern: queue the email work, ack the request immediately:
+
+```js
+app.post('/signup', async (req, res) => {
+  const user = await createUser(req.body);
+  await queue.add('welcome-email', { userId: user.id });
+  res.json(user);
+});
+
+// Worker
+worker.process('welcome-email', async (job) => {
+  const user = await db.users.findById(job.data.userId);
+  await sendWelcomeEmail(user);
+});
+```
+
+Queue handles retries with exponential backoff. Failed jobs go to a
+dead-letter queue for inspection.
+
+For **transactional outbox** pattern (atomic with DB writes), see
+**Background jobs**.
+
+## Validating emails
+
+```js
+// Server-side regex (basic)
+const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+```
+
+The HTML5 `type="email"` is similar. For deeper validation:
+
+- **Disposable email check** — block `mailinator.com`, etc. Libraries:
+  `disposable-email-domains`.
+- **MX record check** — confirm the domain has email servers.
+- **SMTP verification** (try-to-send-without-sending) — slow, often
+  blocked. Avoid.
+- **Send a confirmation link** — the only way to truly verify is a
+  click.
+
+For most signups: regex + send-confirm is enough.
+
+## Internationalization
+
+Subjects with non-ASCII:
+
+```js
+subject: 'Bienvenido a Acme',   // emoji-friendly too
+```
+
+Nodemailer encodes correctly (MIME encoded-word for headers, UTF-8
+in body). Most providers do this transparently.
+
+Don't put bytes you don't want in headers (control chars, CRLF) —
+header injection is a real attack vector. Use library APIs, never
+string concatenate into headers.
+
+## Reply-to
+
+```js
+await transport.sendMail({
+  from: 'noreply@acme.com',
+  replyTo: 'support@acme.com',
+  // ...
+});
+```
+
+`from` for "who sent it"; `replyTo` for "where replies go." Useful
+when sending from a noreply address but you want responses to reach
+support.
+
+## Local development
+
+Don't send real emails from dev. Options:
+
+- **`mailtrap.io`** — fake SMTP server; messages visible in a web
+  UI. Free tier sufficient.
+- **`ethereal.email`** — generates test SMTP accounts on demand.
+- **`maildev`** — local-only, runs as a Docker container.
+
+```js
+const transport = nodemailer.createTransport(
+  process.env.NODE_ENV === 'production'
+    ? prodConfig
+    : await nodemailer.createTestAccount().then(acc => ({
+        host: acc.smtp.host,
+        port: acc.smtp.port,
+        secure: acc.smtp.secure,
+        auth: { user: acc.user, pass: acc.pass },
+      }))
+);
+```
+
+## Common pitfalls
+
+### Sending in a loop without throttling
+
+```js
+for (const user of users) {
+  await sendEmail(user);   // 10,000 users, all at once
+}
+```
+
+Provider rate-limits you; some succeed, some fail. Use the
+provider's bulk send API or batch with concurrency limits.
+
+### Hardcoding subject lines
+
+```js
+subject: `Welcome to ${appName}`,
+```
+
+If `appName` ever has user input, header injection. Sanitize or use
+a template library.
+
+### Missing unsubscribe links in marketing email
+
+Legally required in most jurisdictions. The transactional/marketing
+split matters here — transactional generally doesn't need
+unsubscribe.
+
+### Not testing across email clients
+
+```
+"It looks great in Gmail!"
+"...have you opened it in Outlook?"
+```
+
+Outlook (Word renderer), iOS Mail (mostly works), Yahoo (sometimes
+weird). Use Litmus / Email on Acid for cross-client preview.
+
+### Forgetting bounce handling
+
+Email reputation slowly degrades. By the time you notice, every
+user gets your emails in spam. Wire up webhook events for bounces.
+
+### Sync send in request handler
+
+Covered above. Queue everything.
+
+## The mental model
+
+Email is **a low-trust, eventually-consistent delivery channel**.
+The provider sends; the receiver decides whether to accept. Modern
+deliverability depends on:
+
+1. **Authentication** (SPF, DKIM, DMARC).
+2. **Reputation** (IP, domain, content patterns).
+3. **Honor of unsubscribes and bounces**.
+
+For the engineering side:
+
+- Pick a transactional provider (Postmark / Resend) over raw SMTP.
+- Configure SPF / DKIM / DMARC.
+- Use HTML + plain text both.
+- Queue sends, never inline.
+- Handle bounces via webhook.
+- Test deliverability with mail-tester.
+
+Done well, email "just works" for your transactional needs. Done
+badly, you discover the deliverability problem months later when
+sign-up conversion silently drops.

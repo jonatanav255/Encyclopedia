@@ -1,0 +1,484 @@
+export const level = 'senior';
+
+# Messaging patterns
+
+Services that talk via HTTP request/response work for synchronous
+operations. For everything else — async work, fanout, decoupling,
+event-driven flows — you need **messaging patterns** and a
+**message broker**.
+
+## Synchronous vs asynchronous communication
+
+**Synchronous HTTP**:
+
+```
+A → B (wait for response)
+```
+
+A holds a thread while B works. If B is slow, A's request is slow.
+If B is down, A errors. Coupling is tight.
+
+**Asynchronous messaging**:
+
+```
+A → [broker] → B (when ready)
+```
+
+A drops a message and continues. B processes when it can. No
+shared latency, partial outage tolerance, loose coupling.
+
+For request/response (read a user, create a record), synchronous.
+For "do this work, but I don't need the result right now," async.
+
+## Common patterns
+
+### Point-to-point / work queue
+
+```
+producer → [queue] → worker
+                  ↘ worker
+                  ↘ worker
+```
+
+Each message goes to **exactly one** worker. Workers can scale
+horizontally; each picks the next available message.
+
+Use cases:
+
+- Send an email after signup.
+- Process an uploaded image.
+- Generate a PDF invoice.
+- Index a new document.
+
+Brokers: **BullMQ + Redis**, **AWS SQS**, **RabbitMQ classic queue**.
+
+### Publish/subscribe (fanout)
+
+```
+producer → [topic] → subscriber A
+                  → subscriber B
+                  → subscriber C
+```
+
+Each message goes to **every subscriber**. Subscribers are
+independent — adding one doesn't affect others.
+
+Use cases:
+
+- "User signed up" → notify analytics, billing, mailing list,
+  welcome flow.
+- "Order placed" → update inventory, charge card, notify shipping,
+  send confirmation.
+- Cache invalidation across services.
+
+Brokers: **Redis Pub/Sub**, **NATS**, **Kafka (with consumer
+groups)**, **RabbitMQ topic exchange**, **AWS SNS**.
+
+### Request/reply (async)
+
+```
+client → request[queue] → server
+client ← reply[queue]   ← server
+```
+
+Like RPC but over messaging. Client sends a request with a
+correlation ID and reply-to address; server processes and sends a
+response back.
+
+Use case: rare. Usually if you want request/reply, use HTTP. The
+async version makes sense when:
+
+- The compute is slow and blocking a connection is wasteful.
+- You want load-leveled queueing in front of a finicky service.
+
+Brokers: **RabbitMQ direct reply-to**, **NATS req/rep**.
+
+### Event sourcing
+
+```
+[event log: e1, e2, e3, ...] → replayable
+                              → projections
+                              → subscribers
+```
+
+Instead of storing current state, store the **events that led to
+it**. Replay events to rebuild state, or subscribe to react.
+
+Use cases:
+
+- Audit logs as the source of truth.
+- Time-travel debugging.
+- Multiple read models from one write log.
+
+Brokers: **Kafka**, **EventStoreDB**, **Pulsar**.
+
+Heavy. Pays off in some domains (banking, audit-heavy systems),
+overkill for typical CRUD.
+
+### Choreography vs orchestration
+
+Two ways to coordinate multi-step workflows:
+
+**Choreography**: each service listens for events, acts, publishes
+new events. Decentralized.
+
+```
+"Order placed" → Inventory: reserve → "Inventory reserved"
+"Inventory reserved" → Payment: charge → "Payment succeeded"
+"Payment succeeded" → Shipping: ship → "Order shipped"
+```
+
+Pros: services know nothing about each other.
+Cons: hard to see the whole flow. Compensating actions get tangled.
+
+**Orchestration**: a central coordinator drives the flow.
+
+```
+Saga {
+  reserveInventory();
+  if (success) charge();
+  if (success) ship();
+  if (failure at any step) compensate previous steps;
+}
+```
+
+Pros: explicit flow. Easy to reason about.
+Cons: coordinator is a point of failure / coupling.
+
+For complex workflows (sagas with rollback), orchestration tools
+(**Temporal**, **AWS Step Functions**, **Camunda**) shine.
+
+## Brokers — the landscape
+
+### Redis (Pub/Sub + Streams)
+
+- **Pub/Sub**: fire-and-forget. No persistence. Subscriber down →
+  message lost.
+- **Streams**: persistent log with consumer groups. Like a mini
+  Kafka.
+
+Pros: fast, simple, you probably already run Redis.
+Cons: not durable for Pub/Sub. Streams are durable but no
+multi-tenant cluster like Kafka.
+
+Best for: in-process pub/sub, simple work queues (via BullMQ).
+
+### RabbitMQ
+
+- **Direct exchange**: point-to-point.
+- **Topic exchange**: pub/sub with routing keys.
+- **Fanout exchange**: every subscriber.
+
+Pros: mature, flexible, handles every messaging pattern.
+Cons: complex (exchanges, queues, bindings, routing keys, dead-
+letter exchanges).
+
+Best for: when you need rich routing logic (priority queues,
+dead-letter retries, per-message TTL).
+
+### Kafka
+
+- **Topics with partitions**: ordered within a partition.
+- **Consumer groups**: divide work across consumers.
+- **Long retention**: replay possible.
+
+Pros: high throughput, ordered log, replayable.
+Cons: heavy ops (ZooKeeper / KRaft). Cluster management.
+
+Best for: high-volume event streams, event sourcing, multi-
+consumer log analytics.
+
+### NATS
+
+- **Subject-based pub/sub**.
+- **JetStream** for persistence.
+
+Pros: simple, very fast, lightweight to run.
+Cons: smaller ecosystem.
+
+Best for: in-cluster pub/sub at scale where Redis Pub/Sub isn't
+enough.
+
+### AWS SQS / SNS
+
+- **SQS**: managed queues (FIFO or standard).
+- **SNS**: managed pub/sub.
+
+Pros: zero ops. Integrates with everything in AWS.
+Cons: higher latency than self-hosted. Limited features (no
+priorities, basic dead-letter).
+
+Best for: when you're on AWS and don't want to run Kafka/RabbitMQ.
+
+### Cloud Pub/Sub / Pub/Sub Lite
+
+GCP equivalent. Similar trade-offs.
+
+## Choosing one
+
+A rough decision tree:
+
+1. **Already on Redis?** → Redis Pub/Sub for simple, Streams for
+   durable.
+2. **On AWS?** → SQS for queues, SNS for fanout, EventBridge for
+   routing.
+3. **High volume event streams, event sourcing?** → Kafka.
+4. **Rich routing logic?** → RabbitMQ.
+5. **Simple, fast, in-cluster?** → NATS.
+
+Don't pick a broker first. Pick a pattern that fits the use case,
+then pick the broker that's lightest to operate for your constraints.
+
+## Patterns in Node — examples
+
+### Work queue with BullMQ
+
+```js
+import { Queue, Worker } from 'bullmq';
+
+const queue = new Queue('email', { connection: redisConfig });
+
+// Producer
+await queue.add('welcome', { userId: '42' });
+
+// Worker
+new Worker('email', async (job) => {
+  await sendWelcomeEmail(job.data.userId);
+}, { connection: redisConfig, concurrency: 10 });
+```
+
+Retries, exponential backoff, dead-letter queue, scheduled jobs —
+all built in. The standard choice for "background jobs in Node."
+
+### Pub/sub with Redis
+
+```js
+const pub = redis.duplicate();
+const sub = redis.duplicate();
+
+sub.subscribe('user-events');
+sub.on('message', (channel, msg) => {
+  console.log('event:', JSON.parse(msg));
+});
+
+await pub.publish('user-events', JSON.stringify({ type: 'signup', userId: '42' }));
+```
+
+Fire-and-forget. If `sub` is disconnected when `pub` fires, the
+message is lost. For durable pub/sub, use Streams or a real broker.
+
+### Streams with Redis
+
+```js
+// ioredis (method names use lowercase + subcommand strings)
+// Producer
+await redis.xadd('user-events', '*', 'type', 'signup', 'userId', '42');
+
+// Consumer group setup (idempotent — catch "BUSYGROUP" on re-run)
+await redis.xgroup('CREATE', 'user-events', 'group1', '$').catch(() => {});
+
+while (true) {
+  const messages = await redis.xreadgroup(
+    'GROUP', 'group1', 'consumer1',
+    'COUNT', 10, 'BLOCK', 5000,
+    'STREAMS', 'user-events', '>',
+  );
+  for (const [, entries] of messages ?? []) {
+    for (const [id, fields] of entries) {
+      await process(fields);
+      await redis.xack('user-events', 'group1', id);
+    }
+  }
+}
+```
+
+`node-redis` v4+ uses camelCase methods (`xGroupCreate`,
+`xReadGroup`) with options objects — check your client's docs.
+
+Durable. Consumer groups distribute work. Acknowledgements track
+progress.
+
+### Kafka with KafkaJS
+
+```js
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ brokers: ['kafka:9092'] });
+
+// Producer
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({
+  topic: 'user-events',
+  messages: [{ key: '42', value: JSON.stringify({ type: 'signup' }) }],
+});
+
+// Consumer
+const consumer = kafka.consumer({ groupId: 'analytics' });
+await consumer.subscribe({ topic: 'user-events' });
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    const event = JSON.parse(message.value!.toString());
+    await processEvent(event);
+  },
+});
+```
+
+## Message design
+
+### Schemas
+
+Don't ship raw JSON blobs forever. Use a schema:
+
+- **JSON Schema** for JSON messages.
+- **Protobuf** for binary, polyglot environments.
+- **Avro** for Kafka schema-registry workflows.
+
+The schema is the contract. Breaking changes are visible.
+
+### Idempotent consumers
+
+Messages can be delivered more than once (at-least-once). Consumers
+must be idempotent:
+
+```js
+new Worker('email', async (job) => {
+  const key = `processed:email:${job.data.eventId}`;
+  const isNew = await redis.set(key, '1', 'NX', 'EX', 86400);
+  if (!isNew) return;   // already processed
+  await sendEmail(...);
+});
+```
+
+See **Idempotency middleware** for the pattern.
+
+### Dead-letter queues
+
+After N failed retries, move the message somewhere for inspection:
+
+```js
+new Worker('jobs', async (job) => {
+  // process
+}, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+  removeOnFail: false,
+});
+```
+
+Manually inspect dead-letter messages periodically. The reason for
+failure is often a code bug that needs fixing before re-processing.
+
+### Ordering
+
+Guaranteed message order is hard:
+
+- **Per-partition** (Kafka, Kinesis): order within a partition. Key
+  by entity ID for "per-user order."
+- **FIFO queues** (SQS FIFO): ordered, deduped, lower throughput.
+- **No ordering** (most pub/sub): consumers see whatever order
+  arrives.
+
+For "process user 42's events in order," route by user ID to the
+same partition or queue.
+
+## Common pitfalls
+
+### Treating messaging as faster HTTP
+
+```
+For "give me user 42's profile," use HTTP.
+For "do this work and tell me when," use messaging.
+```
+
+Don't replace synchronous calls with async ones just because
+async is fashionable. Async adds eventual consistency complexity.
+
+### No idempotency on consumers
+
+Most brokers deliver at-least-once. Consumers must dedupe.
+Otherwise the same email gets sent 5 times under retry.
+
+### Unbounded queue depth
+
+```js
+await queue.add('job', payload);   // queue fills faster than worker drains
+```
+
+The queue grows without bound. Eventually you OOM the broker.
+
+Either:
+
+- Scale workers.
+- Throttle producers.
+- Set a max queue size.
+
+Monitor queue depth as a first-class metric.
+
+### Missing dead-letter handling
+
+Without a dead-letter queue, failed messages either retry forever or
+disappear. Both bad. Always configure DLQs.
+
+### Wrong delivery semantics
+
+- **At-most-once**: fast, may lose messages. Pub/Sub default.
+- **At-least-once**: durable, may duplicate. Most production
+  systems.
+- **Exactly-once**: hard. Requires idempotency keys + careful
+  consumer + broker support.
+
+Most "exactly-once" claims actually mean "at-least-once + idempotent
+consumers."
+
+### Synchronous wait on async
+
+```js
+await queue.add('process', payload);
+// then wait for it to finish?
+```
+
+If you need a synchronous result, don't use a queue. Or use
+request/reply patterns explicitly.
+
+### Tight coupling via event payloads
+
+```
+Service A publishes: { type: 'user_signed_up', user: { id, email, internal_id, segment, marketing_opt_in, ... } }
+Service B reads: event.user.email
+Service C reads: event.user.id
+```
+
+Every consumer depends on the full shape. A's schema is now load-
+bearing for everyone. Either:
+
+- Publish only IDs; consumers look up the full data.
+- Treat the event schema as a public API; version it; deprecate
+  fields carefully.
+
+## The mental model
+
+Messaging patterns are **service interaction shapes**:
+
+- **Point-to-point**: one producer, one consumer per message.
+  Work queues.
+- **Pub/sub**: one producer, many independent subscribers.
+  Fanout.
+- **Request/reply**: async RPC.
+- **Event sourcing**: events are the source of truth.
+- **Saga**: choreographed or orchestrated multi-step workflows.
+
+Pick the pattern from the problem. Pick the broker from the
+operational constraints. Both choices matter; neither is
+permanent.
+
+For 2026 Node services:
+
+- **Simple background jobs**: BullMQ + Redis.
+- **In-process pub/sub**: Redis Streams or NATS.
+- **High-volume event log**: Kafka.
+- **On AWS, low setup cost**: SQS + SNS + EventBridge.
+- **Complex sagas**: Temporal.
+
+Stay synchronous (HTTP) until you have a clear reason to go async.
+When you do, idempotency and dead-letter queues are non-negotiable.

@@ -1,0 +1,398 @@
+export const level = 'senior';
+
+# gRPC in Node
+
+gRPC is a high-performance RPC framework using HTTP/2 for transport
+and Protocol Buffers for serialization. For service-to-service
+communication inside a network you control, it's typically faster
+and more strongly typed than JSON-over-HTTP.
+
+For service-to-browser, REST/GraphQL still win — browsers don't
+speak gRPC natively (gRPC-Web is the workaround). For
+backend-to-backend, gRPC is a strong choice.
+
+## When to pick gRPC over HTTP+JSON
+
+**gRPC wins:**
+
+- High RPC volume between services (less wire overhead, HTTP/2
+  multiplexing).
+- Strongly-typed contracts mandatory (the `.proto` file *is* the
+  contract).
+- Streaming in either direction (server, client, or bidirectional).
+- Polyglot environments (Go, Java, Python, Node all consume the
+  same `.proto`).
+
+**HTTP+JSON wins:**
+
+- Browser clients (gRPC-Web has trade-offs).
+- Casual API exploration (curl, browser, Postman work directly).
+- Existing REST tooling investment (API gateways, OpenAPI).
+- Public APIs (third parties expect REST/JSON).
+
+## A minimal example
+
+```protobuf
+// proto/users.proto
+syntax = "proto3";
+
+package users;
+
+service UserService {
+  rpc GetUser (GetUserRequest) returns (User);
+  rpc StreamUsers (StreamUsersRequest) returns (stream User);
+}
+
+message GetUserRequest { string id = 1; }
+message StreamUsersRequest { string filter = 1; }
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}
+```
+
+Server:
+
+```js
+import grpc from '@grpc/grpc-js';
+import protoLoader from '@grpc/proto-loader';
+
+const packageDef = protoLoader.loadSync('proto/users.proto');
+const proto = grpc.loadPackageDefinition(packageDef);
+
+const server = new grpc.Server();
+
+server.addService(proto.users.UserService.service, {
+  async getUser(call, callback) {
+    const user = await db.users.findById(call.request.id);
+    if (!user) return callback({ code: grpc.status.NOT_FOUND, message: 'user not found' });
+    callback(null, user);
+  },
+  streamUsers(call) {
+    const users = db.users.stream({ filter: call.request.filter });
+    users.on('data', (u) => call.write(u));
+    users.on('end', () => call.end());
+  },
+});
+
+server.bindAsync(
+  '0.0.0.0:50051',
+  grpc.ServerCredentials.createInsecure(),
+  () => server.start()
+);
+```
+
+Client:
+
+```js
+const client = new proto.users.UserService(
+  'localhost:50051',
+  grpc.credentials.createInsecure()
+);
+
+const user = await new Promise((resolve, reject) => {
+  client.getUser({ id: '42' }, (err, response) => {
+    if (err) reject(err);
+    else resolve(response);
+  });
+});
+```
+
+Most clients wrap the callback-style API in a promise.
+
+## Modern alternative: `connect-rpc` / `ts-proto`
+
+`@grpc/grpc-js` is the official Google client. It's callback-based,
+verbose for TypeScript users. Modern alternatives:
+
+- **`ts-proto`** generates strongly-typed TypeScript from `.proto`.
+- **`connectrpc.com`** (by Buf, inspired by Twitch's Twirp) — a
+  simpler protocol that's compatible with gRPC and gRPC-Web.
+  Excellent TypeScript story.
+- **`buf.build`** — the toolchain (linter, breaking-change
+  detection, code generation) most teams adopt with gRPC in 2026.
+
+```ts
+// With ts-proto-generated types
+import { createPromiseClient } from '@connectrpc/connect';
+import { UserService } from './gen/users_connect';
+
+const client = createPromiseClient(UserService, transport);
+const user = await client.getUser({ id: '42' });   // fully typed
+```
+
+Cleaner. For new gRPC projects in 2026, Connect-RPC + buf.build is
+the default.
+
+## Schema-driven workflow
+
+1. **Define `.proto` files** in a shared repo (or a `proto/`
+   subdirectory).
+2. **Generate code** for each language (Node, Go, Python, ...) via
+   `buf generate` or `protoc`.
+3. **Both sides compile** against the same generated types.
+4. **Breaking changes detected** via `buf breaking` — refuses to
+   compile or fails CI if you remove/rename a field.
+
+The schema is enforced at code-generation time. There's no "did I
+remember to update the API spec?" gap.
+
+## Streaming
+
+gRPC supports four call patterns:
+
+- **Unary**: one request, one response. Like an HTTP POST.
+- **Server streaming**: one request, many responses. Like SSE.
+- **Client streaming**: many requests, one response. Like a file
+  upload.
+- **Bidirectional streaming**: both sides stream. Like a chat or
+  game protocol.
+
+```protobuf
+service ChatService {
+  rpc SendMessage (Message) returns (Ack);                              // unary
+  rpc StreamUpdates (SubscribeRequest) returns (stream Update);        // server stream
+  rpc UploadFile (stream FileChunk) returns (UploadComplete);          // client stream
+  rpc Chat (stream Message) returns (stream Message);                  // bidi
+}
+```
+
+For real-time pub/sub patterns between services, gRPC server-stream
+or bidi often beats Kafka in latency. For event log + replay, Kafka
+wins.
+
+## Errors
+
+gRPC has a fixed set of status codes:
+
+```
+OK = 0
+CANCELLED = 1
+UNKNOWN = 2
+INVALID_ARGUMENT = 3
+DEADLINE_EXCEEDED = 4
+NOT_FOUND = 5
+ALREADY_EXISTS = 6
+PERMISSION_DENIED = 7
+RESOURCE_EXHAUSTED = 8
+FAILED_PRECONDITION = 9
+ABORTED = 10
+OUT_OF_RANGE = 11
+UNIMPLEMENTED = 12
+INTERNAL = 13
+UNAVAILABLE = 14
+DATA_LOSS = 15
+UNAUTHENTICATED = 16
+```
+
+Server returns one of these + a message. Clients pattern-match.
+
+```js
+return callback({
+  code: grpc.status.INVALID_ARGUMENT,
+  message: 'email must be present',
+});
+```
+
+```js
+try {
+  await client.getUser({ id: '42' });
+} catch (err) {
+  if (err.code === grpc.status.NOT_FOUND) return null;
+  throw err;
+}
+```
+
+For rich error details, gRPC supports `google.rpc.Status` with
+nested message fields. Less common than just status code + message.
+
+## Deadlines / cancellation
+
+Every gRPC call should have a deadline:
+
+```js
+const deadline = new Date(Date.now() + 5000);
+client.getUser({ id: '42' }, { deadline }, callback);
+```
+
+If the deadline expires, the call cancels and returns
+`DEADLINE_EXCEEDED`. The server's call object lets handlers check
+`call.cancelled`.
+
+Deadlines propagate across services if the framework's deadline
+propagation is enabled. A `5s` deadline at the edge means every
+downstream gRPC call respects what time remains.
+
+## TLS
+
+Production gRPC uses TLS via `ServerCredentials.createSsl(...)` and
+client `credentials.createSsl(...)`. mTLS is the norm — both
+client and server have certs, both verify the other. Service mesh
+(Istio, Linkerd) handles this transparently.
+
+For internal-only services on a trusted network, plain `Insecure`
+is sometimes acceptable. For anything cross-network, TLS.
+
+## Observability
+
+`opentelemetry-instrumentation-grpc` instruments both client and
+server automatically:
+
+- One span per RPC.
+- Status code, deadline, peer.
+- W3C `traceparent` propagation works across gRPC metadata.
+
+Pair with `pino` + `traceId` correlation (see **OpenTelemetry
+Node**). Now your traces show "HTTP request → gRPC call → DB query"
+across services.
+
+## Auth
+
+gRPC has **call credentials** for per-call tokens:
+
+```js
+const creds = grpc.credentials.combineCallCredentials(
+  grpc.credentials.createSsl(),
+  grpc.credentials.createFromMetadataGenerator((params, callback) => {
+    const metadata = new grpc.Metadata();
+    metadata.set('authorization', 'Bearer ' + getToken());
+    callback(null, metadata);
+  })
+);
+```
+
+The token attaches to every call. Server reads from `call.metadata`.
+
+For mTLS, each service has its own cert; identity is the cert's
+common name / SAN. No tokens needed; the TLS layer is the auth.
+
+## Performance vs JSON
+
+For typical payloads (a few KB):
+
+- **Wire size**: protobuf is 50–80% smaller than JSON.
+- **Parse time**: protobuf is 3–10× faster.
+- **HTTP/2 multiplexing**: one TCP connection handles many parallel
+  RPCs. Less overhead than HTTP/1.1 + connection pooling.
+
+For large payloads (MB+), protobuf's advantage shrinks (most cost is
+in the bytes themselves).
+
+Don't pick gRPC for performance alone unless you've measured. For
+typical request rates, JSON-over-HTTP is fast enough.
+
+## Browser support
+
+Browsers can't speak gRPC's HTTP/2 framing directly. Two
+workarounds:
+
+- **gRPC-Web**: a translation layer at the LB. Browser talks HTTP/1.1
+  + protobuf; the proxy converts to gRPC. Limited features (no
+  client streaming or bidi).
+- **Connect-RPC**: protocol that works natively in browsers (over
+  HTTP/1.1 or HTTP/2). Same generated code can serve gRPC and
+  Connect clients.
+
+For a Node service exposed to browsers, **Connect-RPC** is the
+modern path.
+
+## When gRPC is the wrong choice
+
+- **Browser-direct APIs**: REST or Connect-RPC are better.
+- **Polyglot mess**: if your services have wildly different gRPC
+  ecosystem maturity (e.g., Ruby gRPC has had quality issues
+  historically), simpler protocols might be more uniform.
+- **Public APIs**: REST or GraphQL — gRPC isn't broadly consumable
+  without your SDK.
+- **Tiny services / startups**: REST is faster to debug, easier to
+  deploy, and has more tooling.
+
+For internal high-volume service-to-service, gRPC pays off. For
+edges and public APIs, stay with REST/GraphQL/Connect.
+
+## Common pitfalls
+
+### Forgetting deadlines
+
+```js
+client.getUser({ id }, (err, res) => { ... });   // no deadline
+```
+
+The call can hang forever. Always pass `{ deadline }` to client
+calls; check `call.cancelled` in server handlers.
+
+### Callback-style with no error handling
+
+```js
+client.getUser({ id }, (err, res) => {
+  console.log(res);   // err ignored
+});
+```
+
+Always handle the error first. Use promise wrappers or Connect-RPC
+to avoid callback-style entirely.
+
+### Bidirectional streaming as fire-and-forget
+
+```js
+const call = client.chat();
+call.write({ text: 'hi' });
+// no end(), no error handler
+```
+
+Streams need explicit `end()` to flush, error handlers, and
+`call.on('end')` for close. Treat them like any duplex stream.
+
+### Naming all methods `Get*`
+
+```protobuf
+service Foo {
+  rpc GetUsers (GetUsersRequest) returns (UsersResponse);
+  rpc GetUser (GetUserRequest) returns (User);
+  rpc CreateUser (CreateUserRequest) returns (User);
+}
+```
+
+Stick to verb names: `GetUser`, `ListUsers`, `CreateUser`,
+`UpdateUser`, `DeleteUser`. Follow Google's API design guide for
+consistency.
+
+### Treating `Get*` as side-effect-free
+
+The gRPC convention: `Get*` should be idempotent. Don't tie writes
+to a `Get`-named method; use `Create*` or `Update*`.
+
+### Schema drift
+
+Without `buf breaking`, a developer can add a required field and
+break every consumer. Wire `buf` into CI; treat breaking changes as
+non-mergeable without explicit consumer migration.
+
+### gRPC-Web limitations
+
+If you adopt gRPC and a browser consumer joins later, you'll
+discover gRPC-Web doesn't do bidirectional. Either redesign without
+bidi or use a different protocol for browser-facing endpoints.
+
+## The mental model
+
+gRPC is **RPC with strict schemas, HTTP/2 transport, and four call
+shapes** (unary, server-stream, client-stream, bidi). The
+`.proto` is the contract; codegen produces typed clients and
+stubs.
+
+For 2026 Node, the typical setup:
+
+- **Internal high-volume RPCs**: gRPC via Connect-RPC + buf.build.
+- **Browser-facing APIs**: REST or Connect (which works in browsers).
+- **Service mesh handles TLS, retries, deadlines** at the network
+  layer.
+
+The win is type safety end-to-end and lower wire/parse cost. The
+cost is operational complexity: codegen pipelines, schema repos,
+generated code in your repo, and an unfamiliar debug experience
+(no curl).
+
+For most teams, start with REST. Add gRPC for the specific
+service-to-service hops where the throughput / typing wins matter.

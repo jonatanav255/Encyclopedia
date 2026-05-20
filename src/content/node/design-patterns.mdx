@@ -1,0 +1,515 @@
+export const level = 'senior';
+
+# Design patterns in Node
+
+Most "design patterns" in JS are deeply unfashionable language-
+neutral concepts from 1994. But several patterns *are* idiomatic
+in Node — they're how the standard library, popular frameworks,
+and large codebases organize themselves.
+
+This page covers the patterns that actually appear in Node code.
+
+## Factory
+
+A function that creates objects, hiding the construction details.
+
+```js
+function createUserService(db, logger) {
+  return {
+    async findById(id) {
+      logger.info({ id }, 'finding user');
+      return db.users.findById(id);
+    },
+    async create(input) {
+      logger.info({ input }, 'creating user');
+      return db.users.insert(input);
+    },
+  };
+}
+
+const userService = createUserService(db, logger);
+```
+
+vs. class:
+
+```js
+class UserService {
+  constructor(db, logger) {
+    this.db = db;
+    this.logger = logger;
+  }
+  async findById(id) { ... }
+}
+```
+
+Both work. Factories are slightly more idiomatic in modern Node
+because:
+
+- No `this` to worry about.
+- Closures hide private state.
+- Functions compose; classes need more ceremony.
+- Easier to mock for tests (just pass mocked deps).
+
+For dependency injection without a framework, factory functions
+are the lightweight option.
+
+## Singleton
+
+One instance shared across the app.
+
+In Node, **the module system is a built-in singleton**:
+
+```js
+// db.js
+import { Pool } from 'pg';
+export const db = new Pool({ ... });
+```
+
+Any file importing `db` gets the same instance. No "Singleton
+class" needed.
+
+This works because Node caches modules — the second `import './db.js'`
+returns the same exports. The pattern's just `export const x = new
+X()`.
+
+Common singletons in Node services:
+
+- Database pool.
+- Redis client.
+- Logger.
+- HTTP client (undici Agent).
+
+Avoid testing pitfalls: singletons make tests harder if they hold
+state. For test isolation, accept dependencies as arguments
+(factory + DI).
+
+## Observer / EventEmitter
+
+The publish-subscribe pattern, built into Node.
+
+```js
+import { EventEmitter } from 'node:events';
+
+const events = new EventEmitter();
+
+events.on('user-created', (user) => sendWelcomeEmail(user));
+events.on('user-created', (user) => trackAnalytics(user));
+
+events.emit('user-created', { id: '42', email: 'a@b.com' });
+```
+
+Used by:
+
+- `http.Server` ('request', 'connection', etc).
+- Streams ('data', 'end', 'error').
+- Process ('SIGTERM', 'uncaughtException').
+
+Custom emitters are common for in-process pub/sub. For cross-
+process, use a message broker (see **Messaging patterns**).
+
+### Pitfalls
+
+- **Forgetting `error` event handlers** — unhandled `error` events
+  crash Node.
+- **Listener leaks** — `emitter.setMaxListeners(...)` if you have
+  many.
+- **Memory leaks** — listeners hold closures; remove with `off()`
+  when done.
+
+For modern code, async iteration via `events.on(emitter, 'data')`
+is often cleaner than manual listener management.
+
+## Strategy
+
+Different algorithms behind a common interface, picked at runtime.
+
+```js
+const compressors = {
+  gzip: (data) => zlib.gzipSync(data),
+  brotli: (data) => zlib.brotliCompressSync(data),
+  none: (data) => data,
+};
+
+function compress(data, algorithm) {
+  return compressors[algorithm](data);
+}
+```
+
+Used everywhere config drives behavior:
+
+- Authentication strategies in Passport.
+- Body parsers in Express.
+- Hashing algorithms in crypto utilities.
+
+JavaScript's first-class functions make this pattern trivial — just
+a map of functions. No "Strategy interface" needed.
+
+## Decorator
+
+Wrap a function or object to add behavior without changing it.
+
+```js
+function withLogging(fn) {
+  return async (...args) => {
+    log.info({ args }, `calling ${fn.name}`);
+    const start = Date.now();
+    try {
+      return await fn(...args);
+    } finally {
+      log.info({ ms: Date.now() - start }, `${fn.name} done`);
+    }
+  };
+}
+
+const findUser = withLogging(async (id) => db.users.findById(id));
+```
+
+Used for:
+
+- Logging.
+- Retries.
+- Caching / memoization.
+- Auth checks.
+- Rate limiting.
+
+Higher-order functions are the decorator pattern in JS. No need
+for ES decorator syntax for most cases.
+
+Express middleware is the decorator pattern at the framework level
+— each middleware wraps the request/response handling.
+
+## Adapter
+
+Convert one interface to another.
+
+```js
+// Internal storage interface
+interface Storage {
+  get(key: string): Promise<Buffer>;
+  put(key: string, data: Buffer): Promise<void>;
+}
+
+class S3Adapter implements Storage {
+  async get(key) {
+    const obj = await s3.getObject({ Bucket: '...', Key: key });
+    return Buffer.from(await obj.Body.transformToByteArray());
+  }
+  async put(key, data) {
+    await s3.putObject({ Bucket: '...', Key: key, Body: data });
+  }
+}
+
+class LocalFsAdapter implements Storage {
+  async get(key) { return fs.readFile(path.join('/data', key)); }
+  async put(key, data) { await fs.writeFile(path.join('/data', key), data); }
+}
+```
+
+Common in Node for:
+
+- Abstracting cloud providers (S3, GCS, Azure Blob behind one
+  interface).
+- Database drivers (Postgres vs MySQL vs SQLite behind one
+  repository interface).
+- HTTP clients (undici, axios, native fetch behind one shape).
+
+The win: the rest of the code talks to the interface; swap the
+adapter for dev vs prod, for migrations, for tests.
+
+## Module pattern
+
+The original "private state" pattern in JS — predates ES modules.
+
+```js
+const counter = (() => {
+  let count = 0;
+  return {
+    inc: () => ++count,
+    get: () => count,
+  };
+})();
+
+counter.inc();
+counter.get();   // 1
+counter.count;   // undefined — private
+```
+
+The IIFE creates a closure. State is invisible outside.
+
+Replaced by ES modules:
+
+```js
+// counter.js
+let count = 0;
+export const inc = () => ++count;
+export const get = () => count;
+```
+
+Same idea, ES modules built-in. The IIFE pattern is mostly
+historical; modules are the modern equivalent.
+
+## Repository
+
+A class/object that wraps DB access for one entity, exposing
+domain operations.
+
+```js
+class UserRepository {
+  constructor(private db: Pool) {}
+
+  async findById(id: string): Promise<User | null> {
+    const { rows } = await this.db.query('SELECT * FROM users WHERE id = $1', [id]);
+    return rows[0] ?? null;
+  }
+
+  async create(input: CreateUserInput): Promise<User> {
+    const id = randomUUID();
+    await this.db.query('INSERT INTO users (id, name, email) VALUES ($1, $2, $3)',
+      [id, input.name, input.email]);
+    return { id, ...input };
+  }
+}
+```
+
+Used for:
+
+- Centralizing DB queries per entity.
+- Easy mocking for tests.
+- Switching DB engines (write a new repo implementation).
+
+Pure ORMs (Prisma, Drizzle, TypeORM) include repository methods.
+You wrap them in a class only if you want to add domain logic.
+
+## Middleware chain
+
+Express's signature pattern: a series of `(req, res, next)`
+functions composed.
+
+```js
+function logger(req, res, next) { ... next(); }
+function auth(req, res, next) { ... next(); }
+function handler(req, res) { res.json(...); }
+
+app.use(logger);
+app.use(auth);
+app.get('/users', handler);
+```
+
+The chain decorates the request through layers. Each layer can
+short-circuit (send a response) or pass to the next.
+
+Generalizes to any pipeline pattern (database query interceptors,
+event-handler chains, GraphQL resolvers).
+
+## Async iterator / Generator
+
+Lazy sequences. See **Iterators and generators**.
+
+```js
+async function* paginate(url) {
+  let next = url;
+  while (next) {
+    const res = await fetch(next);
+    const data = await res.json();
+    for (const item of data.items) yield item;
+    next = data.nextPage;
+  }
+}
+
+for await (const item of paginate('/api/feed')) {
+  process(item);
+}
+```
+
+Cleanly expresses "yield values as they come, until done." The
+consumer doesn't care about pagination, batching, retries —
+encapsulated in the generator.
+
+Used for:
+
+- Paginated API consumption.
+- Streaming database results.
+- Log tailing.
+- Event sources.
+
+## Pipeline / chain
+
+Multiple transforms composed in sequence.
+
+```js
+import { pipeline } from 'node:stream/promises';
+
+await pipeline(
+  fs.createReadStream('big.log'),
+  csvParser(),
+  filterErrors(),
+  toJSON(),
+  fs.createWriteStream('errors.json'),
+);
+```
+
+Backpressure flows through. Errors propagate. Each stage does one
+thing.
+
+Stream pipelines are the canonical example. The pattern
+generalizes to any "data through transforms" use case.
+
+## Plugin
+
+A way to extend functionality without modifying core code.
+
+```js
+// Fastify-style plugin
+async function myPlugin(app, opts) {
+  app.get('/health', (req, reply) => reply.send({ ok: true }));
+}
+
+await app.register(myPlugin);
+```
+
+Used by:
+
+- Fastify (its whole API is plugins).
+- Vite, Webpack, Rollup, esbuild (build plugins).
+- ESLint (rule plugins).
+
+For Node libraries that want extensibility, the plugin pattern
+beats monolithic config. Express middleware is essentially a
+plugin model.
+
+## Builder / fluent
+
+Methods chain to build up an object:
+
+```js
+const query = builder
+  .from('users')
+  .where('age', '>', 18)
+  .orderBy('name')
+  .limit(10)
+  .build();
+```
+
+Used by:
+
+- Knex.js (SQL).
+- Kysely (typed SQL).
+- HTTP client libraries (request builders).
+
+Pleasant to write. The implementation uses method chaining
+(`return this`).
+
+## Common pitfalls
+
+### Singleton everywhere
+
+```js
+// db.js
+export const db = new Pool();
+```
+
+Fine for production. **Painful for tests** if the singleton holds
+real state.
+
+Pattern: factory + composition root. Boot constructs one instance
+and injects it.
+
+```js
+function buildApp({ db, redis }) {
+  const userService = createUserService(db);
+  // ...
+}
+```
+
+Tests pass mocks. Prod passes real instances.
+
+### Overusing classes
+
+```js
+class StringReverser {
+  reverse(s) { return [...s].reverse().join(''); }
+}
+
+const reverser = new StringReverser();
+reverser.reverse('hi');
+```
+
+vs.
+
+```js
+function reverse(s) { return [...s].reverse().join(''); }
+```
+
+Classes when you have state. Functions when you don't. Don't put
+stateless logic in classes "for organization."
+
+### Pattern theater
+
+```js
+class UserServiceFactoryBuilder {
+  build() { return new UserServiceFactory(...); }
+}
+
+const factory = new UserServiceFactoryBuilder().build();
+const service = factory.create();
+```
+
+If you can't say what the pattern is solving in plain language, the
+pattern isn't earning its keep. JavaScript's flexibility means
+patterns that require ceremony in Java/C# often reduce to one
+function in JS.
+
+### Inheritance over composition
+
+```js
+class Animal { ... }
+class Dog extends Animal { ... }
+class Labrador extends Dog { ... }
+```
+
+Deep inheritance trees in JS are usually wrong. Composition (one
+object using others via props/closures) is more flexible and easier
+to refactor.
+
+React removed class inheritance entirely; hooks compose behavior.
+Same lesson applies to Node services.
+
+### Decorator-pattern with ES decorators
+
+```js
+@logged
+@cached
+async function expensiveCall(x) { ... }
+```
+
+ES decorators (Stage 3 as of 2026) work in TC39 but aren't broadly
+supported. Higher-order function wrapping (`logged(cached(fn))`) is
+equivalent and works today.
+
+## The mental model
+
+Most "design patterns" in Node are **idiomatic uses of language
+features**:
+
+- **Factory** = function returning an object.
+- **Strategy** = lookup table of functions.
+- **Decorator** = higher-order function.
+- **Observer** = EventEmitter or pub/sub.
+- **Singleton** = `export const x = ...`.
+- **Adapter** = object implementing an interface.
+
+You don't have to learn "the Gang of Four patterns"; you have to
+know the language. The patterns are just names for shapes that fall
+out of writing readable JS.
+
+For 2026 Node:
+
+- Factories + DI for testable services.
+- Closures for private state.
+- EventEmitter for in-process pub/sub.
+- Higher-order functions for cross-cutting concerns.
+- Async iterators for lazy sequences.
+- Streams + pipeline for data transforms.
+
+Most other patterns are unnecessary ceremony. Pick the simplest
+shape that works.

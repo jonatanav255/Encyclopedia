@@ -1,0 +1,462 @@
+export const level = 'senior';
+
+# GraphQL in Node
+
+GraphQL is a query language where the client specifies what data it
+wants and the server returns exactly that. Strongly-typed schema,
+single endpoint (`/graphql`), introspectable.
+
+For complex frontends fetching nested data, it eliminates over-
+fetching and round-trips. For simple APIs, it adds machinery
+without payoff.
+
+## When GraphQL wins
+
+- **Complex client UIs** that need fragments of many related
+  resources per view (a dashboard pulling user + recent orders +
+  notifications + permissions in one query).
+- **Multiple clients with different needs** — mobile wants thin
+  payloads; web wants more. One endpoint serves both.
+- **Schema-first development** — frontend and backend agree on
+  shape via the `.graphql` schema.
+- **Federation** — multiple services contribute to one graph
+  (Apollo Federation, GraphOS).
+
+## When REST wins
+
+- **Simple CRUD**: a list, a detail page, a create. REST is fewer
+  moving parts.
+- **Caching**: REST plays well with HTTP caches; GraphQL queries are
+  POSTs (or you adopt persisted queries).
+- **Browser tools**: curl, browser, Postman work directly with REST;
+  GraphQL needs a client.
+- **Versioning**: REST has a long-established versioning story;
+  GraphQL prefers continuous deprecation.
+
+## Schema basics
+
+```graphql
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  posts(first: Int = 10): [Post!]!
+}
+
+type Post {
+  id: ID!
+  title: String!
+  body: String!
+  author: User!
+}
+
+type Query {
+  user(id: ID!): User
+  posts(authorId: ID): [Post!]!
+}
+
+type Mutation {
+  createPost(title: String!, body: String!): Post!
+}
+
+type Subscription {
+  postAdded: Post!
+}
+```
+
+`!` means non-null. `[Post!]!` means a non-null list of non-null
+posts. The schema is the API contract.
+
+## Server: GraphQL Yoga or Apollo Server
+
+In 2026, **Yoga** is the lightweight choice; **Apollo Server v5**
+is the full-featured one.
+
+```ts
+// With GraphQL Yoga (lighter)
+import { createYoga, createSchema } from 'graphql-yoga';
+import express from 'express';
+
+const yoga = createYoga({
+  schema: createSchema({
+    typeDefs: /* GraphQL */ `
+      type Query { hello: String! }
+    `,
+    resolvers: {
+      Query: { hello: () => 'world' },
+    },
+  }),
+});
+
+const app = express();
+app.use('/graphql', yoga);
+app.listen(3000);
+```
+
+For richer features (subscriptions, custom transports, federation):
+
+```ts
+// Apollo Server v5 — the Express integration moved to a separate package
+import { ApolloServer } from '@apollo/server';
+import { expressMiddleware } from '@as-integrations/express5';
+
+const server = new ApolloServer({ typeDefs, resolvers });
+await server.start();
+app.use('/graphql', expressMiddleware(server, { context }));
+```
+
+(For Apollo Server v4, the integration was `@apollo/server/express4`.
+v5 extracted it to `@as-integrations/express4` / `@as-integrations/express5`.)
+
+Both are mature. Yoga is leaner; Apollo has more ecosystem
+(federation, Apollo Studio).
+
+## Resolvers
+
+Resolvers are the functions that fulfill schema fields:
+
+```ts
+const resolvers = {
+  Query: {
+    user: async (_parent, { id }, ctx) => {
+      return ctx.db.users.findById(id);
+    },
+    posts: async (_parent, { authorId }, ctx) => {
+      return ctx.db.posts.findByAuthor(authorId);
+    },
+  },
+  User: {
+    posts: async (user, { first }, ctx) => {
+      return ctx.db.posts.findByAuthor(user.id, { limit: first });
+    },
+  },
+  Mutation: {
+    createPost: async (_parent, args, ctx) => {
+      if (!ctx.user) throw new GraphQLError('unauthorized', { extensions: { code: 'UNAUTHORIZED' } });
+      return ctx.db.posts.create({ ...args, authorId: ctx.user.id });
+    },
+  },
+};
+```
+
+The shape mirrors the schema. Each field has a resolver; nested
+fields cascade.
+
+## Context
+
+Per-request data threaded through every resolver:
+
+```ts
+const context = async ({ req }) => ({
+  db,
+  redis,
+  user: await getUserFromToken(req.headers.authorization),
+});
+```
+
+Resolvers read auth, request ID, DB connection from `ctx`. Same
+pattern as Express middleware-attached fields.
+
+## The N+1 problem
+
+The classic GraphQL footgun:
+
+```graphql
+{ posts { author { name } } }
+```
+
+Naïve resolver: one query for all posts, then one query *per post*
+for the author. For 100 posts, 101 queries.
+
+**DataLoader** solves it:
+
+```ts
+import DataLoader from 'dataloader';
+
+function createUserLoader(db) {
+  return new DataLoader(async (ids) => {
+    const users = await db.users.findByIds(ids);
+    const byId = new Map(users.map(u => [u.id, u]));
+    return ids.map(id => byId.get(id) ?? null);
+  });
+}
+
+const context = async ({ req }) => ({
+  db,
+  userLoader: createUserLoader(db),   // new loader per request
+});
+
+// In the resolver:
+Post: {
+  author: (post, _args, ctx) => ctx.userLoader.load(post.authorId),
+}
+```
+
+DataLoader batches `load()` calls within a tick into one fetch.
+The 100 separate author lookups become 1 query for all 100 author IDs.
+
+**Always use DataLoader for any cross-entity field.** Without it,
+the simple-looking query above can hammer your database.
+
+## Validation and auth in resolvers
+
+```ts
+Mutation: {
+  createPost: async (_parent, args, ctx) => {
+    if (!ctx.user) {
+      throw new GraphQLError('unauthorized', {
+        extensions: { code: 'UNAUTHORIZED', http: { status: 401 } },
+      });
+    }
+    const input = CreatePostSchema.parse(args);   // Zod
+    return ctx.db.posts.create({ ...input, authorId: ctx.user.id });
+  },
+},
+```
+
+Per-field auth is fine for small schemas. For larger ones, use a
+**schema directive** or middleware library:
+
+```graphql
+type Query {
+  privateData: String! @requireAuth(role: ADMIN)
+}
+```
+
+The directive's implementation enforces auth before the resolver
+runs. Reduces per-resolver boilerplate.
+
+## Queries vs mutations vs subscriptions
+
+- **Query**: read. Idempotent. Can be cached.
+- **Mutation**: write. Has side effects. Run sequentially within a
+  request.
+- **Subscription**: long-lived stream of updates. Over WebSockets
+  by default; SSE is an option in some implementations.
+
+```ts
+Subscription: {
+  postAdded: {
+    subscribe: (_parent, _args, ctx) => ctx.pubsub.asyncIterator(['POST_ADDED']),
+  },
+},
+
+// Triggered elsewhere:
+pubsub.publish('POST_ADDED', { postAdded: newPost });
+```
+
+Subscriptions need a pubsub backend (Redis, NATS, in-memory).
+
+## Persisted queries
+
+For production, send the **query hash** instead of the full query
+text:
+
+```http
+GET /graphql?id=abc123&variables=%7B%22id%22%3A%2242%22%7D
+```
+
+Server has the query mapped to its hash. Benefits:
+
+- Smaller wire size (hash vs multi-KB query).
+- Cacheable (it's a GET).
+- Whitelist: only known queries run (security).
+
+Apollo Persisted Queries (APQ) and Relay's persisted queries handle
+this.
+
+## File uploads
+
+GraphQL has no built-in file upload. The community spec
+`graphql-multipart-request-spec` handles multipart uploads:
+
+```graphql
+scalar Upload
+
+type Mutation {
+  uploadAvatar(file: Upload!): User!
+}
+```
+
+With `graphql-upload` middleware. Or, more commonly, **upload
+out-of-band**: client gets a signed URL from GraphQL → uploads to
+S3 → calls GraphQL with the URL.
+
+## Caching
+
+GraphQL queries are POSTs by default — uncacheable by HTTP caches.
+Solutions:
+
+- **Persisted queries** as GETs (covered above).
+- **Apollo Client cache** on the client side — normalized by ID.
+- **Server-side response cache** (Apollo Server response cache
+  plugin, Yoga's response cache plugin) — caches per-query-result
+  for short TTLs.
+
+The lack of HTTP-level caching is one of GraphQL's biggest
+operational trade-offs vs REST.
+
+## Federation
+
+For large orgs, **Apollo Federation** lets multiple services
+contribute to one supergraph:
+
+```graphql
+# users-service.graphql
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+}
+
+# orders-service.graphql
+extend type User @key(fields: "id") {
+  id: ID! @external
+  orders: [Order!]!
+}
+```
+
+The supergraph (Apollo Router / Apollo Gateway) merges them. The
+frontend queries one endpoint that's actually composed across N
+services.
+
+Federation is heavy. For 3 services, it's overkill. For 30, it's
+how you avoid one giant monolithic GraphQL service.
+
+## TypeScript with GraphQL
+
+**Generate types from schema**:
+
+```bash
+pnpm dlx graphql-codegen
+```
+
+Produces TypeScript types for queries, mutations, and resolvers.
+Client gets typed queries; server gets typed resolvers.
+
+Or use **Pothos** to define schemas in code-first style with native
+TS:
+
+```ts
+import SchemaBuilder from '@pothos/core';
+
+const builder = new SchemaBuilder({});
+
+builder.objectType(User, {
+  name: 'User',
+  fields: (t) => ({
+    id: t.exposeID('id'),
+    name: t.exposeString('name'),
+    posts: t.field({
+      type: [Post],
+      args: { first: t.arg.int() },
+      resolve: (user, { first }) => db.posts.findByAuthor(user.id, { limit: first }),
+    }),
+  }),
+});
+```
+
+The TypeScript and the schema are one. No codegen step.
+
+For 2026 type-first GraphQL in Node, **Pothos** is the modern
+default.
+
+## Common pitfalls
+
+### Not using DataLoader
+
+N+1 queries. Slow GraphQL endpoints. Almost every "GraphQL is slow"
+ticket is missing DataLoader.
+
+### Exposing every entity field
+
+```graphql
+type User {
+  id: ID!
+  password: String!     # uh oh
+  internalNotes: String
+}
+```
+
+GraphQL fetches whatever the client asks for. Mark sensitive fields
+private (don't include them in the schema), or guard with a
+directive.
+
+### Untyped resolvers
+
+```ts
+const resolvers = {
+  Query: {
+    user: async (_p, args) => db.users.findById(args.id),   // args is any
+  },
+};
+```
+
+Use `graphql-codegen` or Pothos for typed resolver signatures. Catch
+"oops, args.userId instead of args.id" at compile time.
+
+### Single endpoint for everything
+
+`/graphql` is the convention. Tooling expects it. Don't mount at
+non-standard paths unless you have a specific reason.
+
+### Persisting full queries in production
+
+Without persisted queries, malicious clients can send arbitrarily
+deep queries (`{ users { posts { author { posts { author { ... } } } } } }`)
+that exhaust the server.
+
+Mitigations:
+
+- **Query depth limit** (`graphql-depth-limit`).
+- **Query complexity limit** (`graphql-query-complexity`).
+- **Persisted queries** — only known queries run.
+- **Rate limiting** by user.
+
+All of these are essential for public GraphQL endpoints.
+
+### Subscriptions without backpressure
+
+```ts
+postAdded: () => infiniteFirehoseOfEvents();
+```
+
+Slow consumer + fast producer = memory growth in the server. Apply
+backpressure or sample.
+
+### Forgetting query timeouts
+
+Long-running queries hold connections, exhaust DB pools. Cap
+query execution time at the resolver / DataLoader level. Use
+`AbortSignal` propagation.
+
+### Treating GraphQL like REST
+
+```graphql
+mutation { deleteUser(id: "42") }
+```
+
+For one-resource-at-a-time, REST is simpler. GraphQL's wins come
+from nested queries and field selection. If you're not using those,
+the GraphQL overhead isn't paying off.
+
+## The mental model
+
+GraphQL is **a query language + type system + single endpoint**.
+The schema is the contract. Resolvers fulfill it. Clients ask for
+what they need.
+
+For 2026 Node:
+
+- **Server**: GraphQL Yoga or Apollo Server v5.
+- **TypeScript**: Pothos for code-first; graphql-codegen for
+  schema-first.
+- **N+1**: DataLoader. Mandatory.
+- **Production**: persisted queries, depth/complexity limits,
+  rate-limiting.
+- **Federation**: only at scale (30+ services).
+
+The wins are large when the client side actually uses them. The
+costs (DataLoader discipline, missing HTTP cache, deeper learning
+curve) are real. For a typical CRUD-backed app, REST is simpler
+and faster to ship. For a complex client with deep nested needs,
+GraphQL earns its keep.

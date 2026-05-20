@@ -76,5 +76,45 @@ export const bank: QuestionBank = {
       answer:
         '**Two deployments**: `app-stable` and `app-canary`, same image except for the canary running the new version. Both behind one service.\n\n**Traffic split**: a service mesh (Istio, Linkerd) or a smart Ingress (Argo Rollouts, Flagger) routes a small percentage (e.g., 1%) to canary. Without a mesh, you can split via two Services + weighted DNS or a feature flag in the client.\n\n**Health metrics**: define **SLIs** for canary success — error rate, p95 latency, saturation. Compare canary vs stable continuously.\n\n**Automated promotion / rollback** (Flagger or Argo Rollouts):\n- Every N minutes, evaluate canary metrics against stable.\n- If within tolerance, bump traffic (1% → 5% → 25% → 100%).\n- If outside, rollback automatically — scale canary to zero, route 100% to stable.\n\n**Bake time**: at each step, wait long enough to see real traffic patterns (typically 10–30 minutes). Don\'t promote a canary that\'s only seen idle traffic.\n\n**Database/migrations**: canaries must work with both old and new schema. Migrate forward in a backward-compatible way (add nullable column, deploy code reading old + new, deploy code writing new, drop old column). Don\'t do destructive migrations during a canary.\n\n**Customer impact**: log which traffic was canary so you can attribute support issues correctly.\n\n**Postmortem**: even auto-rolled-back canaries should generate a discussion — what triggered the rollback, was it real, did the SLI catch it correctly?',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'When do you need a process manager like PM2 or systemd?',
+      answer:
+        'When the process must restart on crash, start on boot, log to a known location, and run on a VM that\'s yours. **PM2** is quick: `pm2 start app.js`. **systemd** is the OS-native, production-grade way (resource limits, security hardening, journald logs). **For containers and Kubernetes, you don\'t need either** — the orchestrator is the process manager. Don\'t stack PM2 inside containers.',
+    },
+    {
+      level: 'junior',
+      question: 'Why use Prettier and ESLint together?',
+      answer:
+        'They do different jobs. **Prettier formats** — whitespace, quotes, semicolons, line breaks. No opinions about logic. **ESLint lints** — catches bugs, enforces patterns, auto-fixes some issues. Use `eslint-config-prettier` (last in the config array) to silence ESLint\'s formatting rules so they don\'t fight Prettier. On save: Prettier formats, then ESLint auto-fixes. In CI: both run. Result: code that\'s consistent without anyone debating semicolons.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'What does ESLint\'s `no-floating-promises` catch?',
+      answer:
+        'Promises that aren\'t awaited or `.then`-handled — fire-and-forget async work where errors silently disappear. `db.update(x); next()` runs the update without waiting; if it rejects, the error vanishes. With the rule, you must `await db.update(x)` or `.catch(...)`. Catches a real class of bug that\'s nearly invisible in code review. Turn it on for any TypeScript project.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'How do you set up zero-downtime deploys on a single VM?',
+      answer:
+        '**Two paths**:\n\n**PM2 reload**: `pm2 reload api` restarts instances one at a time in cluster mode. Each receives SIGINT (or configured signal), drains, exits; PM2 starts a new one before moving on. Set `kill_timeout: 30000` in `ecosystem.config.cjs` — default 1600ms is usually too short for real draining.\n\n**systemd + reverse proxy**: run two systemd units on different ports. Update unit A, restart it, wait for healthy, then update B. nginx upstream block sees both and round-robins. With active health checks (HAProxy or NGINX Plus), the proxy stops sending to a restarting instance automatically.\n\nBoth require your app to handle SIGTERM/SIGINT with proper draining — fail readiness probe, close idle keep-alive connections, await in-flight, close DB pool. The orchestration handles the routing; the app handles the cleanup. See "Graceful shutdown deep" topic.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Compare PM2, systemd, and Kubernetes for process supervision.',
+      answer:
+        'These solve the same problem at different layers.\n\n**PM2**: Node-specific, quick setup, built-in cluster mode + log aggregation. Good for single-VM hobby projects or small production setups. Showing its age in 2026 — most teams have moved to containers.\n\n**systemd**: Linux-native init system. Standard tooling, cgroup-based resource limits, security hardening (`ProtectSystem`, `NoNewPrivileges`), journald log integration, watchdog support. The right choice for "I own this VM and want OS-grade supervision." Used heavily in self-hosted setups.\n\n**Kubernetes (or ECS/Cloud Run/Fly)**: container orchestrator handles process supervision, autoscaling, rolling deploys, health-check-driven eviction, declarative infra. The right choice for any cloud-native deployment. No PM2 or systemd inside the container — duplicate supervision is just confusion.\n\n**Decision rule**:\n- Hobby / single VM → PM2.\n- Production VM(s) → systemd.\n- Cloud / multi-instance / autoscaled → containers + orchestrator.\n- Serverless (Lambda, Workers, Cloud Run jobs) → no process manager; platform is one.\n\nPick **one layer**. Stacking PM2 inside containers inside k8s is "Inception" — operational complexity without payoff.',
+    },
   ],
 };

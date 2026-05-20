@@ -1,0 +1,493 @@
+export const level = 'mid';
+
+# Project structure for Express services
+
+The Express docs show "everything in app.js." Tutorials make that
+work. Production codebases of 5+ engineers stop working with it
+fast. This page is about **how to organize an Express service**
+that scales with the team.
+
+## The MVC trap
+
+Old Node tutorials suggested folders by **layer**:
+
+```
+src/
+  controllers/
+  models/
+  views/
+  routes/
+  middleware/
+  services/
+```
+
+Add a feature → touch a file in each folder. The "user" code is
+scattered across 6 directories. Multi-developer PRs collide in
+`controllers/`.
+
+This is fine for the first 5 endpoints. Past that, it doesn't
+scale.
+
+## Organize by feature, not by layer
+
+```
+src/
+  modules/
+    auth/
+      router.ts        — Express Router with auth-related routes
+      service.ts        — pure business logic (no req/res)
+      schemas.ts        — Zod schemas
+      types.ts          — TypeScript types
+      errors.ts         — auth-specific error classes
+      index.ts          — public API of this module
+    users/
+      router.ts
+      service.ts
+      schemas.ts
+      ...
+    orders/
+      ...
+  shared/
+    db.ts
+    redis.ts
+    config.ts
+    logger.ts
+    middleware/
+      authMiddleware.ts
+      requestId.ts
+  app.ts                — wires modules together
+  server.ts             — starts the HTTP server
+```
+
+Add a feature → touch one folder. PRs in different modules don't
+conflict. New devs read one module to understand a feature.
+
+## The layers inside a module
+
+Within `modules/users/`:
+
+```
+router.ts — Express-aware. Validates input, calls service, formats output.
+service.ts — Pure TypeScript. No req/res. Testable without Express.
+schemas.ts — Zod schemas. Source of truth for input/output shapes.
+types.ts   — `type User = z.infer<typeof UserSchema>`.
+errors.ts  — `class UserNotFoundError extends HttpError`.
+index.ts   — re-exports just the public surface.
+```
+
+Why split:
+
+- **Tests** of the service don't need Express, supertest, or
+  request mocks. Just function calls.
+- **Reusable** — a CLI command, a queue worker, another module can
+  call `users.findById(id)` directly.
+- **Express isolation** — switching to Fastify / Hono / direct
+  HTTP server means rewriting routers, not the business logic.
+
+## A skeleton module
+
+```ts
+// modules/users/schemas.ts
+import { z } from 'zod';
+
+export const CreateUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+});
+
+export const UserSchema = z.object({
+  id: z.string().uuid(),
+  email: z.string().email(),
+  name: z.string(),
+  createdAt: z.date(),
+});
+
+export type CreateUserInput = z.infer<typeof CreateUserSchema>;
+export type User = z.infer<typeof UserSchema>;
+```
+
+```ts
+// modules/users/service.ts
+import { db } from '../../shared/db';
+import { UserSchema, type CreateUserInput, type User } from './schemas';
+import { UserNotFoundError, DuplicateEmailError } from './errors';
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+  const existing = await db.users.findByEmail(input.email);
+  if (existing) throw new DuplicateEmailError(input.email);
+
+  const row = await db.users.insert({ ...input, id: crypto.randomUUID() });
+  return UserSchema.parse(row);
+}
+
+export async function findUserById(id: string): Promise<User> {
+  const row = await db.users.findById(id);
+  if (!row) throw new UserNotFoundError(id);
+  return UserSchema.parse(row);
+}
+```
+
+```ts
+// modules/users/router.ts
+import { Router } from 'express';
+import { CreateUserSchema } from './schemas';
+import * as service from './service';
+
+const router = Router();
+
+router.post('/', async (req, res) => {
+  const input = CreateUserSchema.parse(req.body);
+  const user = await service.createUser(input);
+  res.status(201).json(user);
+});
+
+router.get('/:id', async (req, res) => {
+  const user = await service.findUserById(req.params.id);
+  res.json(user);
+});
+
+export { router };
+```
+
+```ts
+// modules/users/index.ts
+export { router as usersRouter } from './router';
+export * from './service';      // expose service for cross-module use
+export type * from './schemas';  // expose types
+```
+
+Now elsewhere:
+
+```ts
+import { usersRouter, findUserById } from './modules/users';
+
+app.use('/users', usersRouter);
+```
+
+## The composition root: `app.ts`
+
+```ts
+// app.ts
+import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import pinoHttp from 'pino-http';
+
+import { usersRouter } from './modules/users';
+import { authRouter } from './modules/auth';
+import { ordersRouter } from './modules/orders';
+
+import { requestIdMiddleware } from './shared/middleware/requestId';
+import { errorHandler } from './shared/middleware/errorHandler';
+
+export function buildApp() {
+  const app = express();
+
+  app.set('trust proxy', 1);
+  app.use(requestIdMiddleware);
+  app.use(pinoHttp());
+  app.use(helmet());
+  app.use(cors({ origin: process.env.ALLOWED_ORIGINS!.split(',') }));
+  app.use(express.json({ limit: '100kb' }));
+
+  app.use('/users', usersRouter);
+  app.use('/auth', authRouter);
+  app.use('/orders', ordersRouter);
+
+  app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
+  app.use((req, res) => res.status(404).json({ error: 'not found' }));
+  app.use(errorHandler);
+
+  return app;
+}
+```
+
+```ts
+// server.ts
+import { buildApp } from './app';
+import { config } from './shared/config';
+
+const app = buildApp();
+const server = app.listen(config.port);
+
+// graceful shutdown handlers — see Graceful shutdown topic
+```
+
+The split:
+
+- `app.ts` builds the Express app — wireable, testable.
+- `server.ts` boots the HTTP listener.
+- Tests can `buildApp()` without starting the server.
+
+## Where shared things go
+
+`src/shared/` for everything that crosses modules:
+
+```
+shared/
+  config.ts             — env validation (Zod), exported as `config`
+  db.ts                 — DB pool instance
+  redis.ts              — Redis client
+  logger.ts             — pino instance
+  middleware/
+    requestId.ts        — request ID assignment
+    auth.ts             — `requireAuth(role?)` middleware
+    errorHandler.ts     — 4-arg error middleware
+  errors.ts             — base error classes (HttpError, etc.)
+  http/
+    httpClient.ts       — undici Pool factory
+```
+
+The rule: **shared exports primitives**, not business logic.
+Modules import primitives. Business logic stays in modules.
+
+## Cross-module dependencies
+
+Module A needs something from Module B → import its public API:
+
+```ts
+// modules/orders/service.ts
+import { findUserById } from '../users';   // OK — via public index.ts
+import { findUserById } from '../users/service';   // BAD — bypasses public API
+```
+
+Lint rule (`eslint-plugin-import` with custom restricted-paths) can
+enforce: only `import from '../<module>'`, never `import from '../<module>/internal'`.
+
+Once enforced, modules become refactorable in isolation. Move
+`users/` to a separate service later? Easy — only the public API
+matters.
+
+## Configuration
+
+```ts
+// shared/config.ts
+import { z } from 'zod';
+
+const Schema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url(),
+  SESSION_SECRET: z.string().min(32),
+  ALLOWED_ORIGINS: z.string(),
+  STRIPE_KEY: z.string(),
+});
+
+export const config = Schema.parse(process.env);
+```
+
+The app **fails to boot** if any env var is missing/malformed. Far
+better than discovering at the first request that `STRIPE_KEY` is
+undefined.
+
+Import `config` everywhere; never `process.env.X` outside this file.
+
+## Where tests live
+
+Two valid conventions:
+
+### Co-located
+
+```
+modules/users/
+  router.ts
+  router.test.ts
+  service.ts
+  service.test.ts
+```
+
+Pro: tests live next to code. Easier to find. Easier to refactor a
+module (test moves with it).
+
+Con: production bundle might pick them up if your build isn't
+configured to exclude `*.test.ts`.
+
+### Mirrored
+
+```
+src/
+  modules/users/...
+tests/
+  unit/
+    modules/users/...
+  integration/
+    modules/users/...
+```
+
+Pro: clean separation. Easy to set up different runners per test
+type.
+
+Con: rename a module → update two directories.
+
+For new projects, co-located is the modern default. Use
+`*.test.ts` (or `*.spec.ts`) and exclude from the build via
+`tsconfig.build.json` or bundler config.
+
+## TypeScript config split
+
+```
+tsconfig.json           — base, used by IDE
+tsconfig.build.json     — builds dist/, excludes tests
+tsconfig.test.json      — looser settings for tests if needed
+```
+
+`package.json`:
+
+```json
+{
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file=.env dist/server.js",
+    "test": "node --test src/**/*.test.ts",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+## When to split into multiple packages (monorepo)
+
+When:
+
+- Multiple services share modules (shared schemas, integration
+  clients).
+- You're deploying things separately and want to enforce boundaries.
+
+Use **pnpm workspaces**:
+
+```
+project-root/
+  pnpm-workspace.yaml
+  packages/
+    schemas/     — shared Zod schemas
+    db/          — DB client
+  services/
+    api/         — Express service
+    worker/      — background worker
+    cli/         — admin CLI
+```
+
+`packages/*` are libraries; `services/*` are deployables that
+depend on `packages/*`.
+
+Note: this project deliberately doesn't have a `pnpm-workspace.yaml`.
+If pnpm writes a broken stub during prompts, delete it.
+
+For most services, **stay single-package** until you have a clear
+reason to split. Premature monorepo adds friction.
+
+## Where view templates go
+
+If you use server-side templates (Pug, Handlebars, EJS):
+
+```
+src/
+  modules/...
+  views/
+    layouts/
+      main.pug
+    users/
+      profile.pug
+    auth/
+      login.pug
+```
+
+Views co-located by feature: `modules/users/views/`. Or centralized
+under `views/`. Both work; centralized is more conventional.
+
+For SPA backends serving an API only, no `views/` folder needed.
+
+## Common pitfalls
+
+### Mixing Express and business logic
+
+```ts
+// Bad
+export async function createUser(req: Request, res: Response) {
+  const user = await db.users.insert(...);
+  res.json(user);
+}
+```
+
+Now you can't unit-test without Express. You can't call from a CLI.
+The service is tangled with HTTP concerns.
+
+Split: `service.ts` does the work; `router.ts` adapts it to HTTP.
+
+### Circular dependencies between modules
+
+```ts
+// modules/users/service.ts
+import { sendOrderConfirmation } from '../orders';
+
+// modules/orders/service.ts
+import { findUser } from '../users';
+```
+
+`A → B → A`. Either:
+
+- One module depends on the other (one-way).
+- Extract shared functionality to a third module.
+- Use events: `orders` publishes "order created"; `users` (or
+  `notifications`) subscribes.
+
+### One giant `routes.js`
+
+```ts
+// routes.js — 2000 lines
+app.get('/users', ...);
+app.get('/orders', ...);
+app.get('/products', ...);
+// ...
+```
+
+A 100-line `app.ts` mounting 10 routers reads better than one
+2000-line route file. Split early.
+
+### Everything in `app.js`
+
+The Express tutorial pattern. Fine for the first hour. Painful by
+month two.
+
+Split into modules from day one. The cost is low; the cleanup later
+is high.
+
+### Importing private internals across modules
+
+```ts
+import { internalHelper } from '../users/_internal';
+```
+
+Defeats module boundaries. Every module's public surface is its
+`index.ts`. Anything else is internal.
+
+ESLint enforces. Use `eslint-plugin-import`'s `no-internal-modules`
+or a custom restricted-paths rule.
+
+### Forgetting to validate `process.env`
+
+```ts
+const port = process.env.PORT;   // string | undefined
+app.listen(+port);                // NaN if missing
+```
+
+Validate at boot. Zod schema. Crash fast on missing config.
+
+## The mental model
+
+A production Express service is **modules of cohesive features +
+shared primitives + a thin composition root**. Each module owns its
+router, service, schemas, and errors. Routers stay Express-aware;
+services stay pure. Cross-module imports go through public
+indexes.
+
+The win: a 50-file codebase organized this way reads like 10
+modules of 5 files each. New developers ramp on one module at a
+time. Refactors stay scoped. Tests run fast and don't drag in
+unrelated state.
+
+The cost: one extra file per module (the public `index.ts`) and
+the discipline to put HTTP-aware code only in `router.ts`. Cheap
+overhead for the structural benefit.

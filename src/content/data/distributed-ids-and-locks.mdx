@@ -1,0 +1,390 @@
+export const level = 'senior';
+
+# Distributed IDs and locks
+
+In a single-process app, IDs come from an auto-increment column and
+locks come from `SELECT ... FOR UPDATE`. In a distributed system,
+both get complicated — you need IDs that don't collide across N
+processes, and locks that work across services.
+
+## ID generation problem
+
+Why not `SERIAL` / `AUTO_INCREMENT`?
+
+- **Single point of failure** — the DB is now the bottleneck for
+  every insert.
+- **Pre-write coordination** — you can't know the ID until the DB
+  assigns it. Bad for client-generated requests.
+- **Cross-shard collisions** — if you shard, you can't share a
+  single auto-increment.
+
+For distributed systems, you want IDs that are:
+
+1. **Unique** across the entire system.
+2. **Sortable** (roughly time-ordered) so they index well.
+3. **Generated without coordination** (locally, no DB round-trip).
+4. **Compact** (string or 64-bit int, not a 36-char UUID).
+
+## UUIDs
+
+```js
+import { randomUUID } from 'node:crypto';
+const id = randomUUID();   // "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+```
+
+Version 4 UUIDs (`randomUUID`): 122 bits of randomness. Effectively
+unique. But:
+
+- **Not sortable** — random. Hurts B-tree index locality.
+- **Long** — 36 characters as a string, 16 bytes as binary.
+- **Hard for humans** to compare.
+
+Fine for many use cases. Skip for high-write tables where insert
+locality matters (UUIDs cause B-tree index pages to be hot all over
+the tree, hurting cache behavior).
+
+## UUID v7 — sortable UUIDs
+
+Node's built-in `crypto.randomUUID()` still produces v4 only. For
+v7, use the `uuid` package:
+
+```js
+import { v7 } from 'uuid';
+const id = v7();   // "018f3a3d-7a82-7000-..."
+```
+
+Postgres 18+ has a native `uuidv7()` function — if your DB
+generates IDs, use it server-side.
+
+UUID v7 is **time-ordered**: the high bits are a millisecond
+timestamp. IDs sort chronologically, indexes stay hot at the right
+edge of the tree.
+
+The modern default for distributed IDs. Sortable, unique, no
+coordination.
+
+## Snowflake IDs
+
+Twitter's classic distributed-ID scheme. 64 bits divided into:
+
+- 41 bits timestamp (milliseconds since custom epoch).
+- 10 bits machine ID.
+- 12 bits sequence (per-millisecond counter, resets each ms).
+
+Result: a 64-bit integer, sortable by time, unique per machine.
+
+```js
+class Snowflake {
+  #lastTs = 0;
+  #seq = 0;
+  constructor(private machineId: number) {}
+
+  next() {
+    let ts = Date.now();
+    if (ts === this.#lastTs) {
+      this.#seq = (this.#seq + 1) & 0xfff;
+      if (this.#seq === 0) {
+        // Spin until next ms
+        while (Date.now() <= ts) {}
+        ts = Date.now();
+      }
+    } else {
+      this.#seq = 0;
+    }
+    this.#lastTs = ts;
+    return (BigInt(ts - EPOCH) << 22n) | (BigInt(this.machineId) << 12n) | BigInt(this.#seq);
+  }
+}
+```
+
+64-bit IDs fit in a `bigint`. Twitter, Discord, Instagram use
+Snowflake-derived schemes.
+
+Trade-offs vs UUID v7:
+
+- **Smaller** — 64 bits vs 128 bits.
+- **Requires machine ID assignment** — need a coordination service
+  or unique-per-deploy config.
+- **Timestamp ceiling** at 41 bits ≈ 69 years from epoch. Plenty.
+
+For pure-JS Node, UUID v7 is simpler. For high-throughput systems
+where 8 bytes vs 16 bytes matters per row, Snowflake.
+
+## KSUID, ULID, CUID
+
+Other sortable-ID schemes:
+
+- **KSUID** — 27-char string. Timestamp + random. Used by Segment.
+- **ULID** — 26-char string. Crockford base32. Easier to type than
+  UUID.
+- **CUID2** — collision-resistant URL-safe IDs.
+
+All are roughly equivalent. Pick one, stick with it. UUID v7 is
+becoming standard; the others are still seen in older systems.
+
+## Database-generated IDs
+
+Sometimes the DB itself can be the source:
+
+- **Postgres `gen_random_uuid()`** — uses random or v4.
+- **Postgres `uuidv7()`** — v7 in 18+ (or via extensions earlier).
+- **`COMPOUND` keys** — `(shard_id, local_id)`.
+
+The downside: you don't know the ID until after `INSERT RETURNING
+id`. For client-generated IDs (the client makes one, sends it with
+the request), the database can't help.
+
+## Distributed locks
+
+When multiple processes need to coordinate access to a shared
+resource (a file, a row, a counter), you need a distributed lock.
+
+The wrong answer: in-memory mutex. Each process has its own; no
+coordination.
+
+The right answer: a coordination service that all processes talk to.
+
+## Redis `SET NX EX`
+
+The simplest distributed lock:
+
+```js
+const acquired = await redis.set(
+  `lock:${resource}`,
+  workerId,
+  'NX', 'EX', 30   // set if not exists, expire after 30s
+);
+
+if (acquired === 'OK') {
+  try {
+    // do the work
+  } finally {
+    // release — only if we still own the lock
+    await redis.eval(`
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      else
+        return 0
+      end
+    `, 1, `lock:${resource}`, workerId);
+  }
+}
+```
+
+The Lua script checks ownership before deleting — prevents "I'm
+slow, my lock expired, another worker took it, I shouldn't release
+theirs."
+
+Good for:
+
+- Short critical sections.
+- "Run this scheduled job once across N replicas."
+- "Don't process the same webhook twice."
+
+## Redlock
+
+For higher safety guarantees across multiple Redis nodes, Antirez
+(Redis's author) proposed **Redlock**:
+
+```js
+import Redlock from 'redlock';
+
+const redlock = new Redlock([redis1, redis2, redis3], { retryCount: 5 });
+
+const lock = await redlock.acquire(['lock:resource'], 30_000);
+try {
+  // critical section
+} finally {
+  await lock.release();
+}
+```
+
+Acquires the lock from a quorum (3 of 5 nodes). Tolerates one or
+two node failures.
+
+The Redlock algorithm has been controversial — Martin Kleppmann
+(author of *Designing Data-Intensive Applications*) wrote a famous
+critique. For mission-critical correctness (like "don't double-
+charge customer"), **don't rely on locks alone** — combine with
+idempotency keys and atomic DB operations.
+
+For most use cases ("run this cron once," "don't duplicate jobs"),
+plain Redis `SET NX` is fine.
+
+## Postgres advisory locks
+
+If you're already on Postgres, you don't need Redis for locks:
+
+```sql
+SELECT pg_try_advisory_lock(42);   -- acquire lock ID 42
+-- do work
+SELECT pg_advisory_unlock(42);
+```
+
+Or session-scoped (auto-release on disconnect):
+
+```sql
+SELECT pg_advisory_xact_lock(42);   -- held until transaction ends
+```
+
+`pg_advisory_lock(int)` or `pg_advisory_lock(int, int)`. The IDs are
+just numbers; you derive them from a string with a hash.
+
+Advisory locks are:
+
+- **Fast** — no separate service.
+- **Reliable** — Postgres handles failover.
+- **Auto-released** on disconnect / transaction end.
+
+For Postgres-backed apps, this is often simpler than Redis locks.
+
+## Atomic operations
+
+Sometimes you don't need a lock; you need **atomic operations**.
+
+```js
+// BAD — race condition
+const balance = await getBalance(userId);
+if (balance >= amount) {
+  await setBalance(userId, balance - amount);
+}
+
+// GOOD — atomic DB operation
+const result = await db.query(`
+  UPDATE accounts
+  SET balance = balance - $1
+  WHERE id = $2 AND balance >= $1
+  RETURNING balance
+`, [amount, userId]);
+
+if (result.rowCount === 0) {
+  throw new InsufficientFundsError();
+}
+```
+
+The DB enforces "balance >= amount" atomically. No lock needed.
+Faster, simpler, correct.
+
+Redis `INCR` / `DECR` are atomic. Postgres `UPDATE ... WHERE` with
+the constraint inline is atomic. **Reach for these before locks.**
+
+## Compare-and-swap / optimistic locking
+
+```sql
+UPDATE accounts
+SET balance = $1, version = version + 1
+WHERE id = $2 AND version = $3
+```
+
+Client reads version, computes new balance, writes with the version
+constraint. If another writer beat them, `rowCount = 0` — retry.
+
+No locks. Scales to high concurrency. Suitable for low-contention
+data.
+
+## Saga / two-phase commit alternatives
+
+For multi-resource transactions across services, locks rarely work:
+
+- **Saga pattern**: compensating actions. "Charge card → reserve
+  inventory → ship." If shipping fails, refund (compensate).
+- **Outbox pattern**: write to DB + outbox in one transaction;
+  background worker publishes from outbox. See **Background jobs**.
+- **Idempotency keys + retries**: make each step idempotent; retry
+  until success.
+
+Distributed transactions across services are an anti-pattern. Design
+the workflow to be eventually consistent and idempotent.
+
+## Common pitfalls
+
+### Lock held forever
+
+```js
+await redis.set('lock', workerId, 'NX');   // no EX
+// process crashes — lock never released
+```
+
+Always set a TTL (`EX <seconds>`). Pick TTL > expected work
+duration + safety margin.
+
+### Lock leaks after slow work
+
+```js
+await redis.set('lock', workerId, 'NX', 'EX', 5);
+await slowWork();   // takes 10s — lock expired at 5s
+// Another worker acquired; you don't realize
+await redis.del('lock');   // BAD — you just deleted their lock
+```
+
+The Lua-script check-and-delete pattern prevents this. Verify
+ownership before releasing.
+
+### Using locks for things that should be atomic
+
+```js
+await acquireLock();
+const balance = await getBalance();
+await setBalance(balance - 10);
+await releaseLock();
+```
+
+Use an atomic update. Locks add coordination cost; atomic operations
+don't.
+
+### UUID as primary key without considering index locality
+
+For high-write tables, random UUIDs scatter inserts across the
+B-tree index. Pages thrash through the buffer pool. Inserts slow
+down at scale.
+
+UUID v7, KSUID, ULID, Snowflake — all sortable — keep inserts at the
+right edge of the index. Hot pages stay hot.
+
+### Generating IDs in the DB then sending them to the client
+
+Round-trip per insert. If you can, generate IDs client-side or in
+the app (UUID v7) and send the full row to insert. One round-trip
+instead of two.
+
+### Treating UUID strings as opaque
+
+In Postgres, store UUIDs as the `uuid` type, not `varchar`. 16
+bytes vs 36 characters. Indexed comparisons are integer-style fast,
+not string-style slow.
+
+### Confusing lock with semaphore
+
+```js
+// Lock: at most one holder
+await redis.set('lock', id, 'NX', 'EX', 30);
+
+// Semaphore: at most N holders — different primitive
+const count = await redis.incr('sem');
+if (count > N) {
+  await redis.decr('sem');
+  // back off
+}
+```
+
+If you want "at most 5 workers can run this job concurrently," that's
+a semaphore, not a lock. Different patterns.
+
+## The mental model
+
+Distributed IDs and locks are about **avoiding the database as a
+coordination point**.
+
+- **IDs**: generate locally with a sortable, unique scheme (UUID v7
+  is the modern default). Skip auto-increment for high-write
+  distributed systems.
+- **Locks**: use Redis `SET NX EX` for simple cases, Postgres
+  advisory locks if you're already on Postgres. Save Redlock for
+  multi-Redis safety.
+- **Better than locks**: atomic operations (`UPDATE ... WHERE`),
+  optimistic locking (version columns), idempotency keys,
+  sagas/outbox.
+
+The principle: **the less coordination, the more scalable**. Use
+locks only where you genuinely need mutual exclusion. Use atomic
+operations and idempotency for everything else.

@@ -1,0 +1,313 @@
+export const level = 'mid';
+
+# `node:net` and `node:dgram` — raw sockets
+
+For the rare cases when HTTP isn't the right tool — custom protocols,
+game servers, IoT devices, DNS, syslog — Node exposes raw TCP and
+UDP via `node:net` and `node:dgram`.
+
+Most Node services never touch these. When you do, this page is the
+map.
+
+## When you'd use them
+
+- **Custom binary protocols** — game servers, real-time control
+  systems, hardware integrations.
+- **Implementing a protocol Node doesn't ship** — IRC, MQTT-on-TCP,
+  Memcached client.
+- **DNS servers, syslog receivers, NTP-like services** — UDP-based.
+- **TCP proxies / reverse proxies in Node** — when nginx/HAProxy
+  isn't the right fit.
+- **Connecting to legacy systems** speaking raw TCP.
+
+For 99% of web work, stick with HTTP. For the 1%, raw sockets give
+you the full control.
+
+## TCP server (`node:net`)
+
+```js
+import net from 'node:net';
+
+const server = net.createServer((socket) => {
+  console.log('client connected:', socket.remoteAddress, socket.remotePort);
+
+  socket.on('data', (data) => {
+    console.log('received:', data.toString());
+    socket.write('echo: ' + data);
+  });
+
+  socket.on('end', () => console.log('client disconnected'));
+  socket.on('error', (err) => console.error('socket error:', err));
+});
+
+server.listen(8080, () => console.log('listening on :8080'));
+```
+
+The callback fires per connection. `socket` is a duplex stream —
+read with `'data'`, write with `socket.write()`. Same backpressure
+rules as any stream.
+
+## TCP client
+
+```js
+import net from 'node:net';
+
+const client = net.createConnection({ host: 'example.com', port: 80 }, () => {
+  client.write('GET / HTTP/1.0\r\nHost: example.com\r\n\r\n');
+});
+
+client.on('data', (data) => process.stdout.write(data));
+client.on('end', () => console.log('disconnected'));
+```
+
+Lower-level than `fetch`. You're writing raw bytes. For HTTP, use
+`fetch`/`undici`. For custom protocols, this is the layer.
+
+## UDP (`node:dgram`)
+
+UDP is connectionless — send datagrams without establishing a
+session. Faster, less reliable.
+
+```js
+import dgram from 'node:dgram';
+
+const server = dgram.createSocket('udp4');
+
+server.on('message', (msg, rinfo) => {
+  console.log(`got ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
+  server.send('ack', rinfo.port, rinfo.address);
+});
+
+server.on('listening', () => {
+  const addr = server.address();
+  console.log(`listening on ${addr.address}:${addr.port}`);
+});
+
+server.bind(41234);
+```
+
+```js
+// Client
+const client = dgram.createSocket('udp4');
+client.send('hello', 41234, 'localhost', () => client.close());
+```
+
+No connection. No retransmits. Each `send` is one packet. If the
+packet is lost, you don't know — UDP doesn't ack.
+
+For applications that need reliability over UDP, the protocol on
+top has to provide it (QUIC, custom retry logic, etc.).
+
+## Framing — TCP is a byte stream
+
+TCP doesn't deliver "messages" — it delivers bytes. If you write
+two `socket.write('hello')` calls in a row, the receiver might get:
+
+```
+'hellohello'
+```
+
+…in one `'data'` event. Or:
+
+```
+'hel' + 'lohello'
+```
+
+…across two events. **TCP has no message boundaries.**
+
+Application protocols add framing:
+
+- **Length-prefix**: `[4-byte length][payload]`. Read 4 bytes, then
+  read N more.
+- **Delimiter**: terminate each message with `\n` or `\0`. Buffer
+  until you see one.
+- **Self-describing**: protobuf with varint length, JSON-lines, etc.
+
+A length-prefix parser:
+
+```js
+class FrameParser {
+  #buf = Buffer.alloc(0);
+
+  push(chunk) {
+    this.#buf = Buffer.concat([this.#buf, chunk]);
+    const messages = [];
+    while (this.#buf.length >= 4) {
+      const len = this.#buf.readUInt32BE(0);
+      if (this.#buf.length < 4 + len) break;
+      messages.push(this.#buf.subarray(4, 4 + len));
+      this.#buf = this.#buf.subarray(4 + len);
+    }
+    return messages;
+  }
+}
+
+socket.on('data', (chunk) => {
+  for (const msg of parser.push(chunk)) handle(msg);
+});
+```
+
+Every binary TCP protocol needs framing. Get it right; the rest is
+just bytes.
+
+## Backpressure
+
+```js
+socket.write(largeBuffer);    // returns false if buffered too much
+```
+
+Same rule as any writable stream: if `write()` returns false, wait
+for `'drain'` before more. See **Backpressure**.
+
+For high-throughput producers:
+
+```js
+async function send(data) {
+  if (!socket.write(data)) {
+    await new Promise(r => socket.once('drain', r));
+  }
+}
+```
+
+## TLS (`node:tls`)
+
+TLS-wrapped TCP for encrypted connections:
+
+```js
+import tls from 'node:tls';
+
+const server = tls.createServer({
+  cert: readFileSync('cert.pem'),
+  key: readFileSync('key.pem'),
+}, (socket) => {
+  socket.write('hello\n');
+});
+
+server.listen(8443);
+```
+
+```js
+// Client
+const socket = tls.connect({ host: 'example.com', port: 443 }, () => {
+  if (!socket.authorized) console.warn('cert not authorized');
+  socket.write('GET / HTTP/1.1\r\nHost: example.com\r\n\r\n');
+});
+```
+
+Same API as `net` plus TLS handshake. Used internally by Node's
+`https` module.
+
+## Multicast and broadcast (UDP)
+
+```js
+const sock = dgram.createSocket('udp4');
+sock.bind(41234, () => {
+  sock.setBroadcast(true);
+  sock.send('hello', 41234, '255.255.255.255');
+});
+```
+
+For multicast groups:
+
+```js
+sock.addMembership('224.0.0.114');
+```
+
+LAN service discovery, network status broadcasts. Less common in
+modern stacks (most use mDNS or a registry service).
+
+## Common pitfalls
+
+### Assuming message boundaries on TCP
+
+Covered above. `'data'` is bytes, not messages. Frame every
+protocol.
+
+### Forgetting backpressure
+
+`socket.write()` returns false → keep writing → memory balloons.
+Always check the return.
+
+### No timeouts
+
+```js
+socket.setTimeout(30_000, () => {
+  socket.destroy(new Error('idle timeout'));
+});
+```
+
+Without timeouts, idle / dead peers hold sockets forever. File
+descriptors leak; eventually `EMFILE` errors.
+
+### Listening on `0.0.0.0` by accident
+
+```js
+server.listen(8080);   // binds to 0.0.0.0 — public
+server.listen(8080, '127.0.0.1');   // localhost only
+```
+
+For internal-only services, bind to localhost or a private
+interface. Don't expose them publicly by default.
+
+### UDP packet size
+
+Most networks fragment UDP packets > MTU (~1500 bytes). For
+reliability, keep payloads small (< 1400 bytes) or implement
+reassembly.
+
+### No retry on UDP
+
+UDP doesn't retransmit. If your app needs reliable delivery, build
+it on TCP, QUIC, or implement acks + retries on top of UDP.
+
+### Mixing UTF-8 and binary
+
+```js
+socket.write('hello');   // encoded as UTF-8 by default
+```
+
+For binary protocols, use Buffer:
+
+```js
+socket.write(Buffer.from([0x01, 0x02, 0x03]));
+```
+
+Strings get UTF-8-encoded; bytes that aren't valid UTF-8 (in
+strings) get mangled.
+
+## When to use Node for this at all
+
+Reasons to write a TCP/UDP server in Node:
+
+- You're already a Node shop and don't want a new runtime.
+- The protocol logic is simple and the JavaScript is concise.
+- Throughput requirements are modest (< 10k qps).
+
+Reasons not to:
+
+- High throughput, low latency (Go, Rust, C++ win).
+- Complex binary protocols with state machines (other languages have
+  more rigorous tooling).
+- You need fine-grained socket options (TCP_NODELAY, SO_LINGER) —
+  Node exposes some but not all.
+
+For HTTP, gRPC, WebSocket — use those. For raw sockets in Node,
+start small, profile, and consider switching languages if perf
+demands it.
+
+## The mental model
+
+`node:net` and `node:dgram` are **the layer below HTTP**. Raw byte
+streams over TCP; datagrams over UDP. Backpressure, framing,
+timeouts, encoding — all manual.
+
+For the rare cases when you need them, the API is straightforward
+once you've internalized:
+
+- TCP = byte stream, frame it yourself.
+- UDP = datagrams, no delivery guarantees.
+- Set timeouts and backpressure-handling.
+- Use Buffer for binary, string for text.
+
+For everything else, HTTP / WebSocket / gRPC give you these
+primitives with battle-tested protocol implementations on top.

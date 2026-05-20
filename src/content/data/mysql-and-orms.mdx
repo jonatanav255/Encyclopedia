@@ -1,0 +1,423 @@
+export const level = 'mid';
+
+# MySQL and ORMs in Node
+
+Postgres has been the encyclopedia's default — but plenty of Node
+services run MySQL/MariaDB. This page covers MySQL-specific Node
+patterns plus the broader ORM landscape (Sequelize, TypeORM, Prisma,
+Drizzle, Kysely).
+
+## MySQL drivers
+
+Two main choices:
+
+- **`mysql2`** — async/promise API, prepared statements, fast,
+  active maintenance.
+- **`mysql`** — older, callback-based, less maintained.
+
+Use `mysql2` for any new code.
+
+```bash
+pnpm add mysql2
+```
+
+```js
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: 'secret',
+  database: 'myapp',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
+
+const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [42]);
+console.log(rows);
+```
+
+Note `mysql2/promise` — the promise-based subexport. The default
+import is callback-based.
+
+## Parameterized queries
+
+```js
+// Good
+await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+
+// BAD — SQL injection
+await pool.query(`SELECT * FROM users WHERE email = '${email}'`);
+```
+
+`?` placeholders escape values safely. Never concatenate user input
+into SQL — same rule as Postgres. See **SQL injection**.
+
+## Connection pools
+
+```js
+const pool = mysql.createPool({
+  connectionLimit: 10,
+  waitForConnections: true,
+  queueLimit: 0,            // unlimited queue
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0,
+});
+```
+
+Pool sizing is the same problem as Postgres: too few = queueing,
+too many = MySQL hits `max_connections`. See **Connection pooling**
+for the math.
+
+For MySQL specifically, the default `max_connections` is 151. Set
+your per-process pool size accordingly across all your replicas.
+
+## Prepared statements
+
+```js
+const conn = await pool.getConnection();
+// `execute()` internally prepares + caches by SQL text, so repeating
+// the same statement reuses the prepared form.
+for (const id of ids) {
+  const [rows] = await conn.execute('SELECT * FROM users WHERE id = ?', [id]);
+}
+conn.release();
+```
+
+For explicit control, mysql2 exposes a `Statement` object via
+`conn.prepare()` — but most code just uses `execute()` and lets the
+driver cache.
+
+Prepared statements skip parse overhead on repeated queries.
+Marginal at low volume; meaningful at thousands of queries per
+second.
+
+## Transactions
+
+```js
+const conn = await pool.getConnection();
+try {
+  await conn.beginTransaction();
+  await conn.query('UPDATE accounts SET balance = balance - ? WHERE id = ?', [amount, fromId]);
+  await conn.query('UPDATE accounts SET balance = balance + ? WHERE id = ?', [amount, toId]);
+  await conn.commit();
+} catch (err) {
+  await conn.rollback();
+  throw err;
+} finally {
+  conn.release();
+}
+```
+
+Same pattern as Postgres. The `getConnection`/`release` is essential
+— transactions need a dedicated connection.
+
+MySQL's default isolation level is `REPEATABLE READ` (different
+from Postgres's `READ COMMITTED`). For lower-isolation reads:
+
+```js
+await conn.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+```
+
+See **Transactions** for isolation levels.
+
+## MySQL vs Postgres in Node
+
+| | MySQL | Postgres |
+| --- | --- | --- |
+| Node driver | `mysql2` | `pg` |
+| Placeholder | `?` | `$1`, `$2`, ... |
+| RETURNING | Limited (MySQL 8+) | Yes |
+| JSON type | `JSON` (works) | `JSON`, `JSONB` (richer) |
+| Full-text | `FULLTEXT` indexes | `tsvector` + GIN |
+| Sequences | `AUTO_INCREMENT` | `SERIAL`, sequences, identity |
+| Strict mode | optional | always strict |
+| Default isolation | `REPEATABLE READ` | `READ COMMITTED` |
+
+For new Node services in 2026, Postgres is the more common choice —
+richer types, better JSON support, stronger SQL feature set. MySQL
+is fine and ubiquitous; Postgres is where the modern features land
+faster.
+
+## The ORM landscape
+
+Beyond raw drivers, ORMs / query builders save boilerplate. The
+2026 options:
+
+### Prisma
+
+```ts
+// schema.prisma
+model User {
+  id    Int     @id @default(autoincrement())
+  email String  @unique
+  posts Post[]
+}
+
+model Post {
+  id        Int     @id @default(autoincrement())
+  title     String
+  authorId  Int
+  author    User    @relation(fields: [authorId], references: [id])
+}
+```
+
+```ts
+const user = await prisma.user.findUnique({
+  where: { email: 'a@b.com' },
+  include: { posts: true },
+});
+```
+
+Pros:
+
+- Declarative schema in `.prisma` file.
+- Generated TypeScript types — fully typed queries.
+- Built-in migrations.
+- Excellent DX.
+
+Cons:
+
+- Generates a binary engine (Rust). Cold-start cost on serverless.
+- Heavier than raw SQL or thin query builders.
+- Some advanced SQL (window functions, CTEs) limited.
+
+For new TypeScript projects, Prisma is the most common choice.
+
+### Drizzle
+
+```ts
+import { drizzle } from 'drizzle-orm/postgres-js';
+import { pgTable, serial, text, integer } from 'drizzle-orm/pg-core';
+
+const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  email: text('email').notNull().unique(),
+});
+
+const result = await db.select().from(users).where(eq(users.email, 'a@b.com'));
+```
+
+Pros:
+
+- Schema in TypeScript (no separate language).
+- Generated SQL is close to raw SQL.
+- No engine binary — runs in-process.
+- Edge-runtime friendly.
+
+Cons:
+
+- Younger than Prisma; ecosystem still growing.
+- More verbose for complex relations.
+
+Drizzle is the modern challenger to Prisma. Worth considering for
+new projects, especially edge/serverless.
+
+### Kysely
+
+```ts
+const users = await db
+  .selectFrom('user')
+  .innerJoin('post', 'user.id', 'post.authorId')
+  .where('user.email', '=', 'a@b.com')
+  .select(['user.email', 'post.title'])
+  .execute();
+```
+
+Pros:
+
+- Pure type-safe SQL builder (not an ORM).
+- Near-perfect TypeScript types from schema.
+- No code generation step.
+- Closer to raw SQL than Prisma/Drizzle.
+
+Cons:
+
+- No migrations baked in (use a separate tool).
+- No relation traversal — you write joins explicitly.
+
+For teams that prefer SQL and want type safety, Kysely is excellent.
+
+### TypeORM
+
+```ts
+@Entity()
+class User {
+  @PrimaryGeneratedColumn() id: number;
+  @Column({ unique: true }) email: string;
+  @OneToMany(() => Post, post => post.author) posts: Post[];
+}
+```
+
+Decorator-based, popular with NestJS. Active development but a
+mixed reputation — some edges around relation loading and query
+generation.
+
+For NestJS apps, TypeORM is the default. Elsewhere, Prisma or
+Drizzle usually win.
+
+### Sequelize
+
+```js
+const User = sequelize.define('User', {
+  email: { type: DataTypes.STRING, unique: true, allowNull: false },
+});
+```
+
+The veteran. Active but showing its age — APIs feel dated, type
+support is bolted-on.
+
+For maintaining legacy code, fine. For new projects, prefer
+Prisma/Drizzle/Kysely.
+
+### Choosing
+
+| | Best for |
+| --- | --- |
+| **Prisma** | TypeScript-first; greenfield; best DX |
+| **Drizzle** | Edge runtimes; SQL-close; in-process |
+| **Kysely** | "I want to write SQL with types" |
+| **TypeORM** | NestJS projects, decorator style |
+| **Raw `pg`/`mysql2`** | Maximum control, simplest deps |
+| **Sequelize** | Legacy code |
+
+For most new Node + TS services in 2026: **Prisma** or **Drizzle**.
+
+## Migrations
+
+ORMs come with migration tooling:
+
+- **Prisma**: `prisma migrate dev` / `prisma migrate deploy`.
+- **Drizzle**: `drizzle-kit generate` / `drizzle-kit push`.
+- **TypeORM**: `typeorm migration:generate`.
+- **Sequelize**: `sequelize db:migrate`.
+- **Kysely**: bring your own (`umzug`, `kysely-migration-cli`).
+
+Discipline:
+
+- **Generated migrations in version control.**
+- **Forward-only** in production (don't `migrate down` against prod).
+- **Backward-compatible** changes (deploy code that handles both
+  shapes; then migrate; then remove old-shape code).
+
+See **Migrations** for the full strategy.
+
+## MySQL-specific gotchas
+
+### Strict mode
+
+```sql
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+```
+
+MySQL has historically been lenient — silently truncating data,
+inserting zero dates. Modern MySQL 8+ defaults to strict, but
+double-check.
+
+### Collation and character sets
+
+```sql
+CREATE TABLE users (email VARCHAR(255)) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+Use `utf8mb4`, not legacy `utf8` (which is 3-byte and breaks
+emoji). `utf8mb4_unicode_ci` is case-insensitive Unicode-aware
+ordering. `utf8mb4_bin` for case-sensitive exact match.
+
+### Auto-increment gaps
+
+`AUTO_INCREMENT` skips numbers on failed inserts and transactions.
+Don't rely on sequence numbers being contiguous. For visible
+sequential IDs (invoices), use a separate counter table.
+
+### `ON DUPLICATE KEY UPDATE`
+
+MySQL's upsert:
+
+```sql
+INSERT INTO users (email, name) VALUES (?, ?)
+ON DUPLICATE KEY UPDATE name = VALUES(name)
+```
+
+Postgres equivalent is `INSERT ... ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name`.
+
+## Common pitfalls
+
+### Treating MySQL like Postgres
+
+Same SQL works mostly. Same DBA tooling doesn't. Same Node code
+mostly works. But `RETURNING` is limited; `JSONB` doesn't exist;
+some Postgres functions aren't in MySQL.
+
+Stick to ANSI SQL where possible; reach for vendor-specific
+features deliberately.
+
+### Pool exhaustion
+
+```js
+const conn = await pool.getConnection();
+// forgot conn.release()
+```
+
+Connections leak; pool fills; new requests hang. Always `release()`
+in `finally`. ORMs do this for you; raw driver code doesn't.
+
+### Mixing query builder and raw SQL
+
+```js
+const users = await db.select().from(users).where(...);   // ORM
+const raw = await db.query('SELECT * FROM users WHERE...'); // raw
+```
+
+Both work but parameter binding might differ (Drizzle's bound
+parameters vs raw `?`). Stick to one within a query.
+
+### Forgetting connection pooling on serverless
+
+```js
+// Lambda handler
+export const handler = async () => {
+  const pool = mysql.createPool({...});   // new pool every invocation!
+  // ...
+  await pool.end();
+};
+```
+
+Create the pool **outside** the handler. Reuse across invocations.
+
+For very high-concurrency serverless, the pool model breaks down —
+use a connection pooler (PgBouncer, RDS Proxy) or HTTP-based DB
+clients (Neon, PlanetScale).
+
+### Reading replica lag
+
+```sql
+SELECT * FROM read_replica WHERE id = ?
+```
+
+Replication lag means reads might miss recent writes. For
+read-your-writes consistency, route certain reads to the primary
+or stick the request to the primary for N seconds after a write.
+
+## The mental model
+
+For 2026 Node + MySQL/Postgres:
+
+- **Driver**: `mysql2` or `pg`. Don't write the protocol yourself.
+- **Pool**: per-process, sized empirically (default 10 is fine for
+  many).
+- **ORM**: Prisma or Drizzle for new code; raw SQL for hot paths or
+  full control.
+- **Migrations**: generated, version-controlled, forward-only in
+  prod.
+- **Strict mode**: on. Always.
+- **Charset**: `utf8mb4` for MySQL. Default for Postgres.
+
+The deeper SQL skills — indexing, query plans, N+1, connection
+pooling — apply equally to both engines. See **SQL basics**,
+**Indexing**, **N+1 queries**.
+
+The driver/ORM choice is the easy part. The hard part is schema
+design and query performance, which the encyclopedia covers under
+**Data** in detail.

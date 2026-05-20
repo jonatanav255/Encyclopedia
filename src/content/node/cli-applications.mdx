@@ -1,0 +1,532 @@
+export const level = 'mid';
+
+# CLI applications in Node
+
+Node is a fine platform for command-line tools: cross-platform,
+huge ecosystem, fast startup with strip-types or SEA. This page is
+about the practical patterns for building CLIs that are pleasant to
+use and ship.
+
+## A minimal CLI
+
+```js
+#!/usr/bin/env node
+// bin/mytool.js
+
+const [, , ...args] = process.argv;
+
+if (args.includes('--help')) {
+  console.log('usage: mytool <command>');
+  process.exit(0);
+}
+
+console.log('hello', args[0] ?? 'world');
+```
+
+In `package.json`:
+
+```json
+{
+  "name": "mytool",
+  "bin": {
+    "mytool": "./bin/mytool.js"
+  }
+}
+```
+
+`pnpm link --global` (or publishing) installs `mytool` to PATH.
+
+`#!/usr/bin/env node` is the shebang — makes the file directly
+executable on Unix. Windows uses the `bin` mapping.
+
+## Argument parsing
+
+`process.argv` raw is awkward. Modern Node has built-in
+**`util.parseArgs`**:
+
+```js
+import { parseArgs } from 'node:util';
+
+const { values, positionals } = parseArgs({
+  options: {
+    name: { type: 'string', short: 'n' },
+    verbose: { type: 'boolean', short: 'v', default: false },
+    output: { type: 'string', short: 'o' },
+  },
+  allowPositionals: true,
+});
+
+console.log(values.name, values.verbose, positionals);
+```
+
+```bash
+mytool --name jon -v file.txt
+# values = { name: 'jon', verbose: true }
+# positionals = ['file.txt']
+```
+
+Stable in Node 18+. Replaces `yargs`, `commander`, `minimist` for
+simple CLIs.
+
+For complex CLIs (subcommands, automatic help, completion, type-
+inference):
+
+- **`commander`** — popular, full-featured.
+- **`yargs`** — fluent API, generates help.
+- **`citty`** — modern, TypeScript-first.
+- **`clipanion`** — class-based, used by Yarn.
+
+For a one-or-two-command tool, `parseArgs` is enough. For a
+full-blown CLI, `commander` or `citty`.
+
+## Subcommands
+
+```js
+// mytool init <name>
+// mytool deploy [--env=prod]
+// mytool logs
+
+const [command, ...rest] = process.argv.slice(2);
+
+switch (command) {
+  case 'init':
+    return init(rest);
+  case 'deploy':
+    return deploy(rest);
+  case 'logs':
+    return logs(rest);
+  default:
+    console.error(`unknown command: ${command}`);
+    process.exit(1);
+}
+```
+
+For real CLIs, `commander` is much cleaner:
+
+```js
+import { Command } from 'commander';
+
+const program = new Command();
+
+program
+  .command('init <name>')
+  .description('initialize a new project')
+  .option('-t, --template <template>', 'project template', 'default')
+  .action(async (name, options) => {
+    await initProject(name, options);
+  });
+
+program
+  .command('deploy')
+  .option('--env <env>', 'environment', 'staging')
+  .action(async (options) => {
+    await deploy(options);
+  });
+
+program.parse();
+```
+
+Automatic `--help`, error handling, type inference.
+
+## Exit codes
+
+```js
+process.exit(0);   // success
+process.exit(1);   // generic error
+process.exit(2);   // misuse of shell built-ins (convention)
+```
+
+Standard codes:
+
+- **0**: success.
+- **1**: general error.
+- **2**: misuse.
+- **126**: command not executable.
+- **127**: command not found.
+- **128 + N**: terminated by signal N (`SIGTERM` = 143).
+
+For piped CLIs (`mytool | jq`), exit code matters — `jq` aborts on
+upstream failure if you set `set -o pipefail`.
+
+```js
+try {
+  await main();
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
+```
+
+Don't `console.error` then `process.exit(0)` — callers can't detect
+the failure.
+
+## Stdin / pipes
+
+```js
+import { stdin, stdout } from 'node:process';
+
+if (stdin.isTTY) {
+  console.log('no piped input');
+} else {
+  // read piped data
+  const chunks = [];
+  for await (const chunk of stdin) chunks.push(chunk);
+  const input = Buffer.concat(chunks).toString();
+}
+```
+
+`stdin.isTTY` tells you whether the input is a terminal or a pipe.
+Useful for "if I'm piped to, read input; if interactive, prompt."
+
+For line-by-line streaming:
+
+```js
+import readline from 'node:readline';
+
+const rl = readline.createInterface({ input: stdin });
+for await (const line of rl) {
+  console.log('got:', line);
+}
+```
+
+## Interactive prompts
+
+For CLIs that ask questions, **`inquirer`** is the classic; modern
+alternatives are **`@clack/prompts`** and **`enquirer`**.
+
+```js
+import { intro, outro, select, text, confirm } from '@clack/prompts';
+
+intro('Create a new project');
+
+const name = await text({
+  message: 'Project name?',
+  validate: (v) => v.length > 0 ? undefined : 'Required',
+});
+
+const template = await select({
+  message: 'Template?',
+  options: [
+    { value: 'react', label: 'React' },
+    { value: 'vue', label: 'Vue' },
+    { value: 'vanilla', label: 'Vanilla JS' },
+  ],
+});
+
+const proceed = await confirm({ message: 'Continue?' });
+
+if (!proceed) {
+  outro('Aborted.');
+  process.exit(0);
+}
+
+outro('Done!');
+```
+
+Clack is what modern tools (Vite create, shadcn-ui) use. Aesthetic,
+pleasant, handles non-TTY gracefully.
+
+## Colors and styling
+
+**`picocolors`** is the modern minimal choice (~600 bytes, zero
+deps):
+
+```js
+import pc from 'picocolors';
+
+console.log(pc.green('success'));
+console.log(pc.red('error'));
+console.log(pc.bold(pc.cyan('important')));
+```
+
+`chalk` was the classic but is heavier. `picocolors` API is
+similar.
+
+For full TUIs (interactive boxes, layouts), reach for **`ink`**
+(React for CLIs) or **`blessed`**.
+
+## Spinners and progress
+
+```js
+import { spinner } from '@clack/prompts';
+
+const s = spinner();
+s.start('Loading data');
+await fetchData();
+s.stop('Loaded');
+```
+
+Or **`ora`**:
+
+```js
+import ora from 'ora';
+
+const spinner = ora('Loading').start();
+await work();
+spinner.succeed('Done');
+```
+
+For progress bars, **`cli-progress`**:
+
+```js
+import cliProgress from 'cli-progress';
+
+const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
+bar.start(100, 0);
+for (let i = 0; i <= 100; i++) {
+  await work();
+  bar.update(i);
+}
+bar.stop();
+```
+
+## File I/O patterns
+
+```js
+import { readFile, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+const configPath = resolve(process.cwd(), 'config.json');
+const config = JSON.parse(await readFile(configPath, 'utf8'));
+
+await writeFile(join(process.cwd(), 'output.txt'), result);
+```
+
+Always use `path.resolve` / `path.join` — don't hand-construct paths
+with `/` (breaks on Windows).
+
+For `~` home expansion (`~/.myconfig`):
+
+```js
+import { homedir } from 'node:os';
+const configPath = join(homedir(), '.myconfig');
+```
+
+For locating files relative to the CLI itself (e.g., bundled
+templates):
+
+```js
+const __dirname = import.meta.dirname;
+const templatePath = join(__dirname, 'templates', 'default');
+```
+
+## Running shell commands
+
+```js
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+
+const { stdout, stderr } = await exec('git', ['status', '--porcelain']);
+```
+
+`execFile` is safer than `exec` — it takes args as an array, no
+shell interpretation. Don't use `exec(`git ${userInput}`)` — shell
+injection.
+
+For streaming output:
+
+```js
+import { spawn } from 'node:child_process';
+
+const child = spawn('npm', ['install'], { stdio: 'inherit' });
+child.on('exit', (code) => process.exit(code ?? 1));
+```
+
+`stdio: 'inherit'` passes stdout/stderr through — user sees output in
+real time.
+
+## Config files
+
+Most CLIs accept config from multiple sources, in priority order:
+
+1. CLI flags.
+2. Environment variables.
+3. Config file (`.myrc`, `config.json`, `package.json` field).
+4. Defaults.
+
+`cosmiconfig` standardizes this:
+
+```js
+import { cosmiconfig } from 'cosmiconfig';
+
+const explorer = cosmiconfig('mytool');
+const result = await explorer.search();
+const config = result?.config ?? defaults;
+```
+
+Searches `package.json`, `.mytoolrc`, `.mytoolrc.json`,
+`.mytoolrc.yaml`, `mytool.config.js` automatically.
+
+## Testing CLIs
+
+```js
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+
+test('mytool init creates a directory', async () => {
+  const { stdout } = await exec('node', ['./bin/mytool.js', 'init', 'test-project']);
+  assert.ok(stdout.includes('Created'));
+  await fs.stat('test-project');   // exists
+});
+```
+
+For unit-testing CLI internals, split them out of the bin file:
+
+```js
+// src/cli.js
+export async function run(argv) {
+  // logic, returns exit code
+}
+
+// bin/mytool.js
+import { run } from '../src/cli.js';
+const code = await run(process.argv);
+process.exit(code);
+```
+
+Now `run` is a pure function — testable without spawning child
+processes.
+
+## Distribution
+
+### `npm publish`
+
+```json
+{
+  "name": "mytool",
+  "bin": "./bin/mytool.js",
+  "files": ["bin", "src", "templates"],
+  "publishConfig": { "access": "public" }
+}
+```
+
+Users: `pnpm dlx mytool` (one-off) or `pnpm add -g mytool`.
+
+### Single Executable Applications (SEA)
+
+Bundle Node + your CLI into one binary. No Node install needed.
+See **Single Executable Applications**. Heavy (~80MB) but trivial
+for users.
+
+### Bun / Deno compile
+
+Both have a `compile` command that produces a smaller binary
+(~50MB). Pure-JS CLIs migrate easily.
+
+## Common pitfalls
+
+### Forgetting the shebang
+
+```js
+// bin/mytool.js — no shebang
+const args = process.argv.slice(2);
+```
+
+Without `#!/usr/bin/env node`, the binary isn't directly executable
+on Unix. `bin` mapping in package.json adds a shim, but the shebang
+is still expected.
+
+### Missing `chmod +x`
+
+After `pnpm publish`, the bin file needs execute permission. pnpm
+handles this for `bin` entries. For locally-linked CLIs, you might
+need `chmod +x ./bin/mytool.js`.
+
+### Not handling stdin properly
+
+```js
+const input = process.argv[2];   // requires an argument
+mytool foo                       // works
+echo foo | mytool                # nothing happens
+```
+
+Detect piped input via `process.stdin.isTTY`. Support both.
+
+### Slow startup
+
+Loading 50 dependencies on a CLI that prints help is slow. Defer
+imports:
+
+```js
+if (args.includes('--help')) {
+  console.log(HELP_TEXT);
+  process.exit(0);
+}
+
+// Lazy-load heavy deps only when needed
+const { execute } = await import('./command.js');
+await execute(args);
+```
+
+For tools that run many times (e.g., a git hook), startup matters.
+
+### Buffering output for piping
+
+```js
+console.log(line);
+// or
+process.stdout.write(line + '\n');
+```
+
+`console.log` is fine. For piping into another tool, flush behavior
+matters less in Node than Python (no `-u` equivalent needed).
+
+But for output that should appear in real time (progress, logs),
+write directly and avoid buffering layers.
+
+### Cross-platform path issues
+
+```js
+const path = 'config/' + name;   // breaks on Windows
+const path = join('config', name);   // works everywhere
+```
+
+Always `path.join` / `path.resolve`. Forward slashes work in URLs,
+not file paths.
+
+### Forgetting to handle SIGINT
+
+```js
+const cleanup = () => { /* close files, etc. */ };
+process.on('SIGINT', () => {
+  cleanup();
+  process.exit(130);
+});
+```
+
+If your CLI holds resources (DB connections, file handles), clean
+up on Ctrl-C. 130 is the conventional exit code for SIGINT.
+
+## The mental model
+
+A good CLI:
+
+- **Parses args** with `parseArgs` or a library.
+- **Reads stdin** when piped, prompts when interactive.
+- **Writes useful output** with colors, spinners, progress where
+  helpful.
+- **Exits non-zero on failure** so shell pipelines work.
+- **Has a `--help`** that's quick.
+- **Is fast to start** for tools used in tight loops.
+- **Handles SIGINT** to clean up.
+- **Ships as one file** via SEA or as an npm package.
+
+For 2026, the modern stack:
+
+- **`util.parseArgs`** for simple args, **`commander`** or
+  **`citty`** for complex.
+- **`@clack/prompts`** for interactive UI.
+- **`picocolors`** for color.
+- **`cosmiconfig`** for config files.
+- **`node:test`** for testing.
+- **SEA** for distribution (or just `pnpm dlx`).
+
+Node CLIs are a sweet spot: fast iteration, full npm ecosystem,
+trivial cross-platform distribution. Worth the investment for any
+team-internal tooling.

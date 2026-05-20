@@ -88,5 +88,57 @@ export const bank: QuestionBank = {
       answer:
         '**Workload analysis first** — what\'s read 10–100× more than written? Cache those. Don\'t cache uniformly.\n\n**Topology**: Redis cluster in front of the DB, sized for the working set (LFU eviction). Application checks Redis first, falls back to DB on miss, writes back to Redis with a TTL. For very hot keys, a per-process in-memory cache (LRU, 1–10s TTL) cuts Redis round trips.\n\n**Invalidation**: the hard problem. Two patterns:\n- **TTL + best-effort invalidation**: short TTLs (30s–5min). On write, delete the cache key. Tolerates briefly stale reads. Works for "user profile" type data.\n- **Versioned keys**: cache key includes a version (`user:42:v17`). On write, bump the version. Old key remains in cache to expire naturally; readers see fresh data on the new key immediately.\n\n**Stampede prevention**: when a hot key expires, 1000 requests would all rebuild it. Mitigate via probabilistic early refresh (refresh at 80% of TTL with small chance), or single-flight (a Redis lock; one rebuilds, others wait and read).\n\n**Negative caching**: cache "not found" with a shorter TTL to prevent repeated DB hits for bad IDs.\n\n**Observability**: hit ratio per cache layer, latency, evictions, memory pressure. Hit ratio < 95% means you\'re probably caching the wrong things.\n\n**Failure mode**: if Redis is down, fall back to DB and serve directly. Bound concurrency to the DB so a cache outage doesn\'t cause a cascade.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'Why is UUID v7 preferred over UUID v4 for database IDs?',
+      answer:
+        'UUID v4 is fully random — inserts scatter across the B-tree index, hurting cache locality. UUID v7 puts a millisecond timestamp in the high bits, so IDs sort chronologically. New inserts cluster at the right edge of the index; hot pages stay hot. Same uniqueness guarantees, much better insert performance at scale. Postgres 18+ has native `uuidv7()`. In Node, use the `uuid` package (`v7()`) — `crypto.randomUUID()` is still v4 only.',
+    },
+    {
+      level: 'junior',
+      question: 'What\'s the difference between MySQL\'s `utf8` and `utf8mb4`?',
+      answer:
+        'MySQL\'s `utf8` is a 3-byte encoding — it can\'t store 4-byte characters like emoji or some CJK characters. `utf8mb4` is true UTF-8 (up to 4 bytes per character). Always use `utf8mb4` for new tables: `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`. The legacy `utf8` name exists only for backwards compat; it\'s a footgun in 2026.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'How do you implement a distributed lock with Redis?',
+      answer:
+        '`SET key value NX EX seconds` atomically claims the lock (set-if-not-exists + TTL). To release safely, **check ownership first** via a Lua script: `if redis.call(\'GET\', KEYS[1]) == ARGV[1] then return redis.call(\'DEL\', KEYS[1]) end`. Otherwise you might delete someone else\'s lock if yours expired mid-work. For multi-Redis safety, **Redlock** acquires from a quorum — but Martin Kleppmann\'s critique is worth reading; combine locks with idempotency keys for mission-critical correctness.',
+    },
+    {
+      level: 'mid',
+      question: 'Pick an ORM for a new TypeScript-first Node service. Why?',
+      answer:
+        '**Prisma** if you want the best DX — declarative `.prisma` schema, generated types, built-in migrations, but ships a Rust engine binary (cold-start cost on serverless). **Drizzle** if you want SQL-close + edge-runtime compatible (TS-defined schema, in-process, no codegen step). **Kysely** if you prefer hand-written SQL with full type safety (no relation traversal, you write joins). For most teams in 2026, Prisma or Drizzle. Reach for Kysely when you want SQL-shaped types and the ORM relation magic feels heavy.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'What\'s wrong with using `SELECT ... FOR UPDATE` to prevent lost updates?',
+      answer:
+        'It works, but it\'s often the wrong tool. The pessimistic-lock pattern (`BEGIN; SELECT ... FOR UPDATE; check; UPDATE; COMMIT`) holds a row lock for the entire transaction — under concurrency, callers queue. The better pattern: **atomic UPDATE with the predicate inline** — `UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1 RETURNING balance`. The DB enforces "balance >= amount" without holding a row lock for read-then-write. Rowcount 0 = insufficient funds. Faster, simpler, correct. Save `FOR UPDATE` for cases where the predicate can\'t be expressed inline.',
+    },
+    {
+      level: 'senior',
+      question: 'Your distributed system needs a global ID. Compare Snowflake and UUID v7.',
+      answer:
+        '**Snowflake**: 64-bit integer = 41-bit timestamp + 10-bit machine ID + 12-bit sequence. Smaller storage, fits in `bigint`, sortable by time. Requires a machine ID assignment scheme.\n\n**UUID v7**: 128-bit, sortable, no coordination needed (the high bits are timestamp + the rest is random).\n\nFor most Node apps, UUID v7 wins on simplicity — no machine IDs to manage, native support in Postgres 18+. For very high-throughput systems where 8 bytes vs 16 bytes per row matters (a billion-row table), Snowflake. Otherwise UUID v7.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design caching for a read-heavy API with strict consistency on writes.',
+      answer:
+        '**Two-tier cache**: per-process LRU (1–5s TTL) for hottest keys + Redis cluster for shared cache. App reads LRU → Redis → DB. Writes go to DB first, then invalidate the cache key. The brief window where readers see stale (< LRU TTL) is the consistency trade-off you accept for performance.\n\n**Stricter alternative**: **versioned keys**. Each entity has a `version` counter; cache key includes it (`user:42:v17`). On write, atomically bump the version in DB and let the old cache key expire naturally. Readers always look up `current_version`, then cache key for that version → no stale reads possible.\n\n**Strictest** (read-your-writes): for the user who just wrote, route their reads to the primary (or skip cache for a short window after a write — set a per-user "recent write" timestamp in their session). Other users tolerate eventual consistency.\n\n**Stampede protection**: probabilistic early refresh (refresh at 80% of TTL with small chance) or single-flight Redis lock (one rebuilds; others wait + read result).\n\n**Failure**: if Redis is down, serve from DB with a concurrency cap (so DB doesn\'t collapse under cache-miss load).\n\n**Observability**: hit ratio per layer, miss latency, stampede counts, memory eviction rate.',
+    },
   ],
 };

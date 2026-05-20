@@ -212,5 +212,75 @@ export const bank: QuestionBank = {
       answer:
         '**Auto-instrument first.** Install `@opentelemetry/sdk-node` and `@opentelemetry/auto-instrumentations-node`; create an `instrumentation.js` that boots the SDK with a service name and an OTLP exporter pointed at your collector. Run with `node --import ./instrumentation.js src/index.js` so instrumentation patches modules **before** they\'re used. You immediately get spans for HTTP server/client, Express routes, DB queries, Redis — no app changes.\n\n**Then propagation.** Auto-instr handles inbound `traceparent` and outbound HTTP. For queues (BullMQ, etc.), explicitly inject/extract via `propagation.inject(context.active(), headers)` at enqueue and `propagation.extract` at consumer.\n\n**Then sampling.** Default 100% in dev. In prod, tail-based sampling at the Collector — keep all errors, all slow requests (> p99), and 10% probabilistic. This needs a separate Collector process; worth running.\n\n**Then logs correlation.** Configure pino to inject `traceId`/`spanId` from the active span. Now every log line joins a trace.\n\n**Then custom spans.** For business operations (process order, charge payment), wrap with `tracer.startActiveSpan(...)`. Use `setAttribute` for IDs and outcomes; `recordException` on error.\n\n**Then dashboards.** Latency by route, error rate, dependency latency, throughput. Wire SLOs to burn-rate alerts.\n\nCost: 1-2 sprints if existing code is reasonable. Payoff: every "where is time going?" question becomes a trace lookup.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'How do you start a Node debugging session for a script?',
+      answer:
+        '`node --inspect-brk src/index.js` starts the inspector and pauses before any user code runs. Open `chrome://inspect` in Chrome, click "Open dedicated DevTools for Node," and you get breakpoints, stepping, watch expressions, and a console attached to the live process. VS Code and JetBrains IDEs use the same Inspector Protocol via launch configs. For tests: `node --inspect-brk --test src/foo.test.js`.',
+    },
+    {
+      level: 'junior',
+      question: 'What is `EventEmitter` used for in Node?',
+      answer:
+        'The pub-sub primitive baked into Node — `emitter.on(event, handler)` to subscribe, `emitter.emit(event, data)` to fire. Synchronous, in-process. Used by HTTP servers (`server.on(\'request\')`), streams (`\'data\'`, `\'end\'`, `\'error\'`), and `process` (`SIGTERM`, `uncaughtException`). For app code, useful for decoupling cross-cutting concerns (analytics, logging). For cross-process pub/sub, use a broker, not EventEmitter.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why does Node\'s `console.log` block in some contexts?',
+      answer:
+        'On a TTY (terminal), `console.log` is **synchronous** on Linux/macOS — the write completes before the next line of JS runs. On a pipe, it\'s async. In production behind a process manager (PM2, systemd, container logs), it\'s effectively async, but heavy logging still pressures the event loop. Use a structured logger (`pino`) that writes async with batching for production. Treat `console.log` as a dev/debug tool.',
+    },
+    {
+      level: 'mid',
+      question: 'How do you grab a heap snapshot from a running Node process?',
+      answer:
+        'Either: (1) `v8.writeHeapSnapshot(\'/tmp/heap.heapsnapshot\')` from inside the process — wire to a `SIGUSR2` handler so you can trigger from outside with `kill -USR2 <pid>`. (2) Attach Chrome DevTools via `--inspect` and use Memory tab → "Take heap snapshot." Load the file into DevTools, compare two snapshots ("Comparison" view) to find what grew between them. The top retainers reveal the leak.',
+    },
+    {
+      level: 'mid',
+      question: 'When would you reach for a CLI library vs `util.parseArgs`?',
+      answer:
+        '`util.parseArgs` (stable in Node 20+) covers flags, short options, and positionals — enough for simple tools. For subcommands, automatic `--help`, type inference, or interactive prompts, use **commander** or **citty**. Combined with `@clack/prompts` for interactive UI and `picocolors` for color, you get a modern CLI in ~50 lines.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s the right way to parse messages off a TCP socket in Node?',
+      answer:
+        'TCP is a **byte stream**, not a message stream. Two `socket.write(\'hello\')` calls can arrive as `\'hellohello\'` or `\'hel\' + \'lohello\'`. Every binary TCP protocol needs framing: length-prefix (`[4-byte length][payload]`), delimiter (`\\n` or `\\0`), or self-describing (protobuf with varint length). Buffer incoming chunks; emit messages only when a full frame is available.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'When would you choose Connect-RPC over gRPC?',
+      answer:
+        'When you need browser support. Connect (by Buf) is an HTTP-based protocol compatible with gRPC servers but speaks plain HTTP/1.1 + Protobuf, so it works natively in browsers without the gRPC-Web translation layer. Same generated code can serve gRPC and Connect clients simultaneously. For 2026 RPC stacks that include browsers + services, Connect is the modern path; gRPC remains good for pure backend-to-backend hops.',
+    },
+    {
+      level: 'senior',
+      question: 'How do you avoid the N+1 query problem in GraphQL?',
+      answer:
+        '**DataLoader.** For every cross-entity field (`Post.author`, `User.posts`), create a per-request loader: `new DataLoader(async ids => db.users.findByIds(ids))`. The loader batches `.load(id)` calls within a tick into one fetch. Without it, a query like `{ posts { author { name } } }` for 100 posts triggers 101 queries. With it, 2. Mandatory for any non-trivial GraphQL schema. The loader is per-request to scope the cache correctly.',
+    },
+    {
+      level: 'senior',
+      question: 'How do `Promise.withResolvers` and EventEmitter compare for "wait for event"?',
+      answer:
+        'For a **single-fire signal**, `events.once(emitter, \'name\')` returns a promise — same as `Promise.withResolvers` + wiring resolve into a listener. For a stream of events, use async iteration: `for await (const [data] of events.on(emitter, \'name\'))`. `Promise.withResolvers` shines when there\'s no event source yet — building a queue, a deferred init, or bridging callback-style APIs to promises. Pick the tool that matches the cardinality (one-shot vs stream).',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'You inherit an event-driven monolith built on EventEmitter and need to break it into services. What\'s the migration plan?',
+      answer:
+        '**1. Catalogue the events.** Each `emitter.emit(\'name\', payload)` becomes a candidate contract. Document who emits and who listens — the implicit interfaces between modules.\n\n**2. Add explicit schemas.** Migrate each event payload to a Zod/Protobuf schema. Now changes are visible; consumers stop silently breaking on producer changes.\n\n**3. Move emitter to abstraction.** Replace direct `events.emit` / `.on` with a thin `bus.publish` / `bus.subscribe` interface. Implementation is still in-process EventEmitter.\n\n**4. Swap to a broker per event.** Identify candidates: events with multiple listeners, async listeners, or owners in different modules. Move those to a broker (Redis Streams, NATS, Kafka). In-process emitter stays for fast in-module pub/sub.\n\n**5. Add idempotency.** Network = at-least-once delivery. Every consumer dedups by event ID.\n\n**6. Carve services out.** Now that an event is broker-backed and schema\'d, the consumer can be extracted to its own service. Producer doesn\'t care.\n\n**Throughout**: traces propagated via OpenTelemetry; dead-letter queues monitored; broker dashboards. The migration is incremental — you ship working code at every step, you never freeze features.',
+    },
   ],
 };

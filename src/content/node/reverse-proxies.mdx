@@ -1,0 +1,399 @@
+export const level = 'senior';
+
+# Reverse proxies in front of Node
+
+A reverse proxy (nginx, HAProxy, Envoy, Caddy, Cloudflare) sits
+between the internet and your Node service. It does the things Node
+shouldn't — TLS termination, static file caching, request buffering,
+load balancing, rate limiting at the edge. Almost every production
+Node service has one.
+
+## Why you want one
+
+Node is fast at JavaScript but bad at:
+
+- **TLS termination at scale**: OpenSSL via Node is slower than
+  dedicated proxies. And rotating certs without restarting Node is
+  painful.
+- **Static files**: nginx serves them with `sendfile()` — zero
+  copies. `express.static` is fine for low traffic, not for
+  high-volume CDN-origin loads.
+- **Slow-client buffering**: a slow uploader holds a Node socket
+  while it dribbles bytes in. nginx can buffer the full request
+  before handing it to Node — Node only sees fast, complete
+  requests.
+- **Load balancing**: spreading traffic across N Node processes
+  (cluster, containers) needs something in front.
+- **Edge rate limiting**: rejecting abusive traffic before it hits
+  Node saves CPU.
+
+For most services, "Node behind nginx" or "Node behind ALB" is the
+default.
+
+## A reasonable nginx config
+
+```nginx
+upstream node_app {
+    server 127.0.0.1:3000;
+    server 127.0.0.1:3001;
+    server 127.0.0.1:3002;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    ssl_certificate /etc/ssl/cert.pem;
+    ssl_certificate_key /etc/ssl/key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 10m;
+    client_body_buffer_size 1m;
+
+    location / {
+        proxy_pass http://node_app;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";       # enable keepalive to upstream
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    # Static files served directly by nginx
+    location /static/ {
+        alias /var/www/static/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+```
+
+Key pieces:
+
+- **`upstream` block**: lists Node processes. nginx round-robins (or
+  use `least_conn` for least-busy).
+- **`keepalive 32`** to upstream: maintains 32 idle TCP connections
+  to Node. Each new request reuses them — no TCP+TLS-equivalent
+  handshake per request.
+- **`proxy_http_version 1.1` + `Connection ""`**: required for
+  keepalive to work. Without these, nginx talks HTTP/1.0 with no
+  reuse.
+- **`X-Forwarded-*`**: tell Node what the original request looked
+  like. Pair with `app.set('trust proxy', 1)` in Express. See **Trust
+  proxy deep**.
+- **`client_max_body_size`**: caps request body size at the proxy.
+  Defends against giant uploads before they hit Node.
+
+## Health checks
+
+nginx (with the open-source build) does passive health checks only:
+
+```nginx
+upstream node_app {
+    server 127.0.0.1:3000 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:3001 max_fails=3 fail_timeout=10s;
+}
+```
+
+After 3 failures in 10s, nginx stops sending to that server for
+10s.
+
+For **active health checks** (nginx polls `/healthz`), use:
+
+- **NGINX Plus** (commercial).
+- **HAProxy** (free, has active checks).
+- **Envoy / Linkerd / Istio** (service mesh).
+- **Cloud LBs** (ALB, GCP LB).
+
+Active checks find dead Node processes before any user request fails.
+
+## HAProxy
+
+A common alternative for HTTP load balancing:
+
+```
+global
+    maxconn 50000
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    option httpchk GET /healthz
+
+frontend http_front
+    bind *:443 ssl crt /etc/ssl/cert.pem
+    default_backend node_back
+
+backend node_back
+    balance leastconn
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https
+    server n1 127.0.0.1:3000 check
+    server n2 127.0.0.1:3001 check
+    server n3 127.0.0.1:3002 check
+```
+
+HAProxy's strength: **active health checks** (`check`), **detailed
+stats** (`stats` endpoint), and **higher throughput** for pure-TCP
+balancing.
+
+For HTTP load balancing without the complexity of a service mesh,
+HAProxy is the choice.
+
+## Cloud LBs
+
+ALB (AWS), GCP HTTPS LB, Azure App Gateway — managed L7 proxies.
+
+Pros:
+
+- Manage themselves.
+- Health checks + autoscaling integration.
+- Geographic / multi-region routing.
+
+Cons:
+
+- 60-second default idle timeout. **Set Node's `keepAliveTimeout`
+  to 65 seconds or more** or you get random 502s. See **HTTP server
+  internals**.
+- Per-LB cost.
+
+For most cloud-deployed services, ALB or equivalent is the default
+choice over self-managed nginx/HAProxy.
+
+## Sticky sessions
+
+If your Node service stores session in memory (default
+`express-session`), a client routed to different Node processes
+sees inconsistent state.
+
+Options:
+
+1. **Move session to Redis** (`connect-redis`). Stateless Node. Any
+   process serves any client. **Strongly preferred.**
+2. **Sticky sessions** at the proxy: same client → same Node process.
+   nginx: `ip_hash`. HAProxy: `cookie SERVERID insert indirect
+   nocache`.
+
+Sticky sessions tie load balancing to client identity — uneven
+distribution if a few clients send a lot of traffic. Redis-backed
+sessions distribute evenly.
+
+## Draining
+
+When you take a Node process down (deploy, restart):
+
+1. **Remove from rotation** at the proxy first.
+   - nginx: edit config + reload (`nginx -s reload`).
+   - HAProxy: set server to `drain` via stats socket
+     (`set server backend/srv state drain`).
+   - ALB: deregister target.
+2. **Wait** for in-flight to finish.
+3. **Stop the Node process** (SIGTERM → graceful shutdown).
+
+For k8s, the readiness probe handles step 1 automatically. See
+**Graceful shutdown deep**.
+
+## Compression
+
+Compress at the proxy, not in Node:
+
+```nginx
+gzip on;
+gzip_vary on;
+gzip_min_length 1024;
+gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+```
+
+Saves Node CPU. Disable `compression()` middleware in Express when
+behind a proxy that does it.
+
+For brotli, nginx needs the brotli module; Cloudflare does it for
+free.
+
+**Exception**: SSE / streaming endpoints shouldn't be compressed.
+Configure the proxy to skip them, or set `Cache-Control: no-transform`
+in the Express response.
+
+## Header sanitization
+
+Hostile clients can send headers that confuse Node:
+
+```
+X-Forwarded-For: 1.2.3.4, attacker-spoofed
+```
+
+Configure the proxy to **rewrite, not append**:
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;   # replace, don't append
+```
+
+Or use a known-good header (`X-Real-IP`) that the proxy controls.
+Combined with Express's `app.set('trust proxy', N)` for the exact
+number of trusted hops, spoofing is structurally blocked.
+
+## TLS configuration
+
+At the proxy:
+
+- **TLS 1.3** only, or 1.2 + 1.3 for compatibility.
+- **Strong cipher suites** (Mozilla SSL config generator —
+  "intermediate" or "modern").
+- **HSTS** header (`Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`).
+- **OCSP stapling** (`ssl_stapling on; ssl_stapling_verify on;`).
+- **Cert rotation** via Let's Encrypt + certbot (or AWS ACM for ALB).
+
+Node sees plain HTTP from the proxy. Lighter Node, easier ops.
+
+## WebSocket upgrades
+
+```nginx
+location /ws {
+    proxy_pass http://node_app;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 86400;   # 24h for long-lived WebSockets
+}
+```
+
+`Upgrade` and `Connection` headers are required for WebSocket
+upgrade. Increase `proxy_read_timeout` since WS connections don't
+send data for long stretches.
+
+Same for SSE — increase `proxy_read_timeout` and disable buffering:
+
+```nginx
+location /sse {
+    proxy_pass http://node_app;
+    proxy_http_version 1.1;
+    proxy_buffering off;        # stream events as-they-arrive
+    proxy_read_timeout 86400;
+}
+```
+
+`proxy_buffering off` is critical for SSE. Without it, nginx buffers
+events until the buffer is full — delaying them by seconds.
+
+## Caddy
+
+A modern alternative with **automatic TLS** via Let's Encrypt:
+
+```
+api.example.com {
+    reverse_proxy 127.0.0.1:3000 127.0.0.1:3001
+    encode gzip zstd
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
+```
+
+That's it. Caddy provisions and renews the cert automatically.
+
+For small services or staging environments, Caddy's "zero config"
+TLS is great. For complex setups (custom routing, sticky sessions,
+detailed health checks), nginx/HAProxy give more control.
+
+## Common pitfalls
+
+### Forgetting `proxy_http_version 1.1`
+
+```nginx
+proxy_pass http://node_app;
+# no proxy_http_version set → defaults to 1.0
+```
+
+HTTP/1.0 has no keepalive. Every request opens a new TCP connection
+to Node. Latency spikes; Node thread pool gets pressured.
+
+Always set `proxy_http_version 1.1; proxy_set_header Connection "";`.
+
+### Mismatched timeouts
+
+nginx idle: 60s. Node `keepAliveTimeout`: 5s (default). Result:
+intermittent 502s when nginx tries to reuse a TCP connection Node
+just closed.
+
+Set Node's `keepAliveTimeout` to **higher** than the proxy's idle
+(nginx ~75s, ALB 60s). And `headersTimeout` higher than
+`keepAliveTimeout`. See **HTTP server internals**.
+
+### `proxy_buffering on` for streams
+
+nginx default buffers responses. For SSE and large file downloads,
+disable per-location.
+
+### Forgetting `trust proxy` in Express
+
+Without `app.set('trust proxy', 1)`, Express ignores `X-Forwarded-For`
+and `X-Forwarded-Proto`. `req.ip` is the proxy's IP. Rate-limiting
+breaks; secure cookies refuse to attach.
+
+### Cert auto-renewal failing silently
+
+Let's Encrypt expires in 90 days. If your auto-renewal cron fails,
+you find out when the cert expires. Set up monitoring on cert
+expiry; alert at 14 days remaining.
+
+### Mixing TLS termination places
+
+```
+Cloudflare → nginx → Node
+```
+
+Each can do TLS. Pick one. Usually Cloudflare or the LB handles
+TLS to the world; everything inside the trust boundary is plain
+HTTP. Mixing has more places for cert issues.
+
+### `client_max_body_size 1m` (default)
+
+nginx default is 1MB. Larger uploads return 413. If your Node
+service expects 10MB uploads, bump it.
+
+### Forgetting WebSocket `Upgrade` headers
+
+Without `proxy_set_header Upgrade $http_upgrade; proxy_set_header
+Connection "upgrade";`, WebSocket upgrades fail. The first HTTP
+request works; the protocol upgrade doesn't.
+
+## The mental model
+
+A reverse proxy is **the boundary between the internet and your
+Node service**. It does what proxies are good at:
+
+- TLS termination.
+- Static file serving.
+- Compression.
+- Buffering slow clients.
+- Load balancing across N Node processes.
+- Header normalization.
+- Edge rate limiting.
+
+Node does what Node is good at: running JavaScript business logic.
+
+For a typical production deployment in 2026:
+
+```
+[Cloudflare or ALB] → [nginx or Envoy or ALB] → [N Node processes]
+        |                       |                       |
+   DDoS / WAF                Health checks         Application logic
+   TLS                       Per-route routing
+   Rate limiting             TLS to LB only
+```
+
+Adopt the layers you need. For most services: cloud LB +
+containerized Node behind it. For dedicated VMs: nginx + multiple
+Node processes.
+
+The exact proxy matters less than the patterns: HTTP/1.1 with
+keepalive, coordinated timeouts, forwarded headers, draining on
+deploy.
