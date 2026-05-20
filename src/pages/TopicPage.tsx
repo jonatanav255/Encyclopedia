@@ -1,6 +1,7 @@
 import { Suspense, lazy, useMemo } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import { findBySlug } from '../lib/content';
+import { NotFound } from './NotFound';
 
 export function TopicPage() {
   const params = useParams();
@@ -12,16 +13,7 @@ export function TopicPage() {
     return lazy(() => entry.load().then((m) => ({ default: m.default })));
   }, [entry]);
 
-  if (!entry || !Lazy) {
-    return (
-      <div>
-        <h1>Not found</h1>
-        <p>
-          No entry for <code>{slug}</code>. <Link to="/">Back to home</Link>.
-        </p>
-      </div>
-    );
-  }
+  if (!entry || !Lazy) return <NotFound />;
 
   return (
     <Suspense fallback={<div className="text-zinc-500">Loading…</div>}>
