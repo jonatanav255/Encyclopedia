@@ -154,5 +154,57 @@ export const bank: QuestionBank = {
       answer:
         'Code: Zod (or Valibot) schemas at every boundary — HTTP handlers parse the body via a schema, fetch wrappers parse the response, `process.env` is parsed at boot. Types come from `z.infer<typeof Schema>`, so the schema is the source of truth and the type follows.\n\nLinting: ban raw `JSON.parse`, `as`, and `any` outside of designated boundary files via custom ESLint rules or `@typescript-eslint/no-explicit-any`, `no-unsafe-assignment`, etc.\n\nReview: a checklist for "where does data enter? what validates it?" in every PR touching new endpoints or integrations.\n\nObservability: log schema validation failures with enough context to fix the upstream contract.\n\nDocumentation: make the pattern explicit in CONTRIBUTING and a couple of example PRs. New engineers see the convention immediately.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What does "types are sets" mean?',
+      answer:
+        'A type is the set of all possible values it can hold. `string` is the set of all strings. `\'admin\'` is the set with one element. `\'admin\' | \'user\'` is the set with two. Assignability is subset checking: you can assign narrower (smaller set) to wider (larger set), not the reverse. This frame explains most TS behavior — including why `A & B` for object types means "has fields of both" (intersection is more restrictive), why `never` is the bottom (empty set), and why narrowing makes types smaller.',
+    },
+    {
+      level: 'junior',
+      question: 'What\'s the first step when migrating a JavaScript codebase to TypeScript?',
+      answer:
+        'Install TypeScript, run `tsc --init`, set `allowJs: true` and `checkJs: false` in tsconfig, and `noEmit: true`. Now TS runs against your project without breaking anything — all JS still works. Write **new files in `.ts`** from this point. Convert leaf files (no complex imports) gradually. Start with loose strictness; tighten flags one at a time (`noImplicitAny`, then `strictNullChecks`, then full `strict`). Avoid big-bang rewrites.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'What does `infer` do, and where can it appear?',
+      answer:
+        '`infer` is pattern matching for types. Inside a conditional type (`T extends Pattern ? ... : ...`), `infer X` binds a name to part of the pattern. Examples: `T extends (...args: any[]) => infer R ? R : never` (extract return type), `T extends Promise<infer U> ? U : T` (unwrap promise), `T extends [infer H, ...any[]] ? H : never` (head of tuple), `T extends \\`${string}@${infer D}\\` ? D : never` (parse a template literal). Powers `ReturnType`, `Parameters`, `Awaited`, and most other "extract part of a type" utilities.',
+    },
+    {
+      level: 'mid',
+      question: 'When would you use Stage 3 decorators vs the legacy ones?',
+      answer:
+        '**Legacy** (`experimentalDecorators: true` + `emitDecoratorMetadata`) for NestJS, TypeORM, MobX, class-validator — frameworks that mandate them and use `reflect-metadata` for runtime type info (DI, validation, ORM mapping). **Stage 3** for new code without a legacy-decorator framework: they\'re the standardized future, work in V8 and TypeScript 5+ without flags. Don\'t mix flavors in one project. If you\'re building a service in NestJS, legacy is forced. For anything else, Stage 3.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'You\'re typing a utility function that takes a function and returns a function with a Promise-wrapped return. How?',
+      answer:
+        '```ts\nfunction asyncify<T extends (...args: any[]) => any>(\n  fn: T,\n): (...args: Parameters<T>) => Promise<ReturnType<T>> {\n  return (...args) => Promise.resolve(fn(...args));\n}\n```\n\nGeneric `T` constrained to "any function." `Parameters<T>` extracts the args tuple via `infer`. `ReturnType<T>` extracts the return via `infer`. The result has the same arg signature but the return is wrapped in `Promise`. Compose this kind of utility from the built-in helpers — they\'re all `infer`-based.',
+    },
+    {
+      level: 'senior',
+      question: 'How do you incrementally migrate a 50k-line JavaScript codebase to TypeScript?',
+      answer:
+        '**Set up** TS with `allowJs: true`, `checkJs: false`, `noEmit: true`, `strict: false`. No code breaks. **Write all new code in `.ts`** — that stops the bleeding.\n\n**Convert per feature**, not per layer: take one feature end-to-end, rename `.js` → `.ts`, fix the errors, ship. Repeat. Each PR is small; reviewers focus.\n\n**Tighten strictness** one flag at a time: `noImplicitAny` first, then `strictNullChecks`, then full `strict`. Each flag generates a wave of errors — tackle in focused PRs.\n\n**Use `// @ts-expect-error`** (not `@ts-ignore`) for unavoidable suppressions — it errors if the underlying issue gets fixed, prompting cleanup.\n\n**For files staying JS**, add `// @ts-check` + JSDoc types. You get most of the safety without renaming.\n\n**CI** must run `tsc --noEmit`. Track `any` count and `@ts-expect-error` count over time — drive them down.\n\nExpect weeks to months spread across normal feature work. The team that "spent a month on TS" went too fast or too slow.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'A library author wants to expose strongly-typed event names so consumers get autocomplete. How?',
+      answer:
+        'Two main techniques. **Generic interface + keyof**:\n\n```ts\ninterface EventMap {\n  click: { x: number; y: number };\n  hover: { target: string };\n}\n\nclass Emitter<M> {\n  on<K extends keyof M>(name: K, handler: (data: M[K]) => void) { ... }\n  emit<K extends keyof M>(name: K, data: M[K]) { ... }\n}\n\nconst e = new Emitter<EventMap>();\ne.on(\'click\', (data) => data.x);   // data is typed { x: number; y: number }\n```\n\nThe map maps event names to payload types. `keyof M` enumerates event names; `M[K]` looks up the payload. Consumers get autocomplete on `name` and typed `data` in the handler.\n\nFor union-shaped payloads where the payload type varies based on the discriminant:\n\n```ts\ntype Event =\n  | { type: \'click\'; x: number; y: number }\n  | { type: \'hover\'; target: string };\n\nfunction handle<E extends Event>(e: E) { /* discriminated narrowing inside */ }\n```\n\nFor consumer ergonomics, the `Map` approach is cleaner. For library internals that switch on type, the discriminated union is better. Many libraries (Node\'s `EventEmitter`, TypedEmitter, mitt) use generic-map approaches. Pair with template literal types for typed name patterns (`on\\`user.${string}\\``).',
+    },
   ],
 };

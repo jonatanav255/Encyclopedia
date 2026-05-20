@@ -1,0 +1,392 @@
+export const level = 'senior';
+
+# Metaprogramming with Proxy and Reflect
+
+`Proxy` and `Reflect` let you intercept and customize fundamental
+object operations: property reads, writes, method calls, `in`
+checks, function invocation. Combined with `Reflect`, you can build
+observable state, validation layers, ORMs, mocks, and reactivity
+systems.
+
+It's the engine behind Vue 3's reactivity, MobX, Immer, Solid's
+stores, and many TypeScript-runtime-validation libraries.
+
+## The basic idea
+
+```js
+const target = { name: 'jon' };
+
+const proxy = new Proxy(target, {
+  get(obj, key) {
+    console.log('read', key);
+    return Reflect.get(obj, key);
+  },
+  set(obj, key, value) {
+    console.log('write', key, value);
+    return Reflect.set(obj, key, value);
+  },
+});
+
+proxy.name;           // logs "read name"; returns "jon"
+proxy.name = 'jen';   // logs "write name jen"
+```
+
+`Proxy` wraps an object with a **handler** — a set of "trap"
+functions. When code touches the proxy, the corresponding trap
+fires instead of the default operation.
+
+## Traps
+
+The handler can intercept:
+
+- `get(target, prop, receiver)` — property read.
+- `set(target, prop, value, receiver)` — property write.
+- `has(target, prop)` — `prop in proxy`.
+- `deleteProperty(target, prop)` — `delete proxy.prop`.
+- `apply(target, thisArg, args)` — calling a function proxy.
+- `construct(target, args, newTarget)` — `new ProxyFunction(...)`.
+- `ownKeys(target)` — `Object.keys`, `for...in`.
+- `getOwnPropertyDescriptor(target, prop)` — descriptor introspection.
+- `defineProperty(target, prop, descriptor)` — `Object.defineProperty`.
+- `getPrototypeOf(target)`, `setPrototypeOf(target, proto)`.
+- `isExtensible(target)`, `preventExtensions(target)`.
+
+Each trap mirrors a `Reflect.*` method. If you omit a trap, the
+proxy falls through to the default behavior.
+
+## Why `Reflect`?
+
+`Reflect` is a built-in object exposing every fundamental operation
+as a function: `Reflect.get(obj, key)` instead of `obj[key]`.
+
+It exists so traps can perform the *default* behavior cleanly:
+
+```js
+get(target, prop, receiver) {
+  // ... custom logic
+  return Reflect.get(target, prop, receiver);
+}
+```
+
+`Reflect.get(target, prop, receiver)` handles the receiver
+correctly for getters defined via `Object.defineProperty` and
+prototype chains. Hand-rolling `target[prop]` skips that.
+
+**Rule**: in a Proxy trap, default to `Reflect.<method>(...)` with
+all three arguments.
+
+## Practical examples
+
+### Observable / reactive state
+
+Vue 3, MobX, Solid all use Proxy for reactivity:
+
+```js
+function reactive(obj) {
+  const listeners = new Set();
+  return new Proxy(obj, {
+    get(t, p, r) {
+      track(p);   // record this read
+      return Reflect.get(t, p, r);
+    },
+    set(t, p, v, r) {
+      const result = Reflect.set(t, p, v, r);
+      trigger(p);   // notify listeners that p changed
+      return result;
+    },
+  });
+}
+
+const state = reactive({ count: 0 });
+
+effect(() => console.log('count is', state.count));
+state.count = 1;   // automatically re-runs the effect
+```
+
+The proxy turns plain object operations into observable events. No
+explicit `setCount()` calls.
+
+### Default values
+
+```js
+const dict = new Proxy({}, {
+  get(target, key) {
+    return key in target ? target[key] : 0;
+  },
+});
+
+dict.anything;   // 0, not undefined
+```
+
+Python's `defaultdict` for JavaScript. Useful for counters,
+histograms.
+
+### Validation
+
+```js
+const validated = new Proxy({}, {
+  set(target, key, value) {
+    if (key === 'age' && typeof value !== 'number') {
+      throw new TypeError('age must be a number');
+    }
+    return Reflect.set(target, key, value);
+  },
+});
+
+validated.age = 30;     // OK
+validated.age = '30';   // throws
+```
+
+Per-property runtime validation. Zod and similar libraries do
+something heavier; Proxy is the primitive.
+
+### Property access logging
+
+```js
+function withLogging(obj, label) {
+  return new Proxy(obj, {
+    get(t, p, r) {
+      const value = Reflect.get(t, p, r);
+      console.log(`${label}.${String(p)} → ${value}`);
+      return value;
+    },
+  });
+}
+
+const user = withLogging({ name: 'jon', age: 30 }, 'user');
+user.name;   // logs "user.name → jon"
+```
+
+Useful in debugging to see what code reads what.
+
+### Mock objects for tests
+
+```js
+function createMock() {
+  return new Proxy(() => {}, {
+    get(target, key) {
+      return createMock();  // any property returns a new mock
+    },
+    apply() {
+      return undefined;     // calls return undefined
+    },
+  });
+}
+
+const m = createMock();
+m.foo.bar.baz();          // no error; chains forever
+```
+
+Like `jest.fn()` but recursive. Useful for spy-everything tests.
+
+### Function-call interception (`apply` trap)
+
+```js
+function withRetry(fn, n = 3) {
+  return new Proxy(fn, {
+    apply(target, thisArg, args) {
+      for (let i = 0; i < n; i++) {
+        try { return Reflect.apply(target, thisArg, args); }
+        catch (err) { if (i === n - 1) throw err; }
+      }
+    },
+  });
+}
+
+const wrappedFetch = withRetry(fetch);
+await wrappedFetch('/api/data');
+```
+
+`apply` intercepts function calls. The proxy is callable like a
+function.
+
+### Constructor interception
+
+```js
+const Logged = new Proxy(User, {
+  construct(target, args, newTarget) {
+    console.log('creating User with', args);
+    return Reflect.construct(target, args, newTarget);
+  },
+});
+
+const u = new Logged('jon');   // logs "creating User with ['jon']"
+```
+
+### "Negative" array indexing
+
+```js
+function negativeArray(arr) {
+  return new Proxy(arr, {
+    get(t, key) {
+      if (typeof key === 'string' && /^-\d+$/.test(key)) {
+        return t[t.length + +key];
+      }
+      return Reflect.get(t, key);
+    },
+  });
+}
+
+const a = negativeArray([1, 2, 3, 4, 5]);
+a[-1];   // 5
+a[-2];   // 4
+```
+
+JavaScript doesn't natively support negative indices like Python.
+Proxy does it in 5 lines.
+
+## Performance
+
+Proxy operations are slower than direct property access by a factor
+of ~2-5×, depending on the engine. For hot code paths, prefer
+direct access. For occasional intercepts (logging, validation at
+boundaries), the cost is invisible.
+
+V8 has some optimization for proxies, but they don't get the same
+hidden-class fast paths as plain objects.
+
+## Common pitfalls
+
+### Forgetting to use `Reflect` in traps
+
+```js
+get(target, prop) {
+  return target[prop];   // BAD — skips receiver handling
+}
+```
+
+For simple objects this works. For receivers, prototype chains,
+getters defined with `Object.defineProperty` — broken. Use
+`Reflect.get(target, prop, receiver)`.
+
+### Proxy on non-extensible target
+
+If the target is sealed/frozen/non-extensible, some traps must
+return values consistent with the target's actual state. Otherwise
+JS throws.
+
+```js
+const sealed = Object.seal({ x: 1 });
+const proxy = new Proxy(sealed, {
+  get() { return 'lying'; },   // OK for existing props
+  getOwnPropertyDescriptor() { return undefined; },  // throws — target HAS x
+});
+```
+
+Don't lie about properties the target actually has. Read the spec
+invariants if you go advanced.
+
+### `this`-binding in proxied methods
+
+```js
+class Counter {
+  count = 0;
+  inc() { this.count++; }
+}
+
+const c = new Counter();
+const p = new Proxy(c, {});
+
+const fn = p.inc;
+fn();   // `this` is undefined — same as plain methods
+p.inc();   // works — method-call form
+```
+
+Proxies don't fix the `this`-loss problem. Same rules as **`this`
+basics**.
+
+### Memory leaks via revocable proxies
+
+```js
+const { proxy, revoke } = Proxy.revocable(target, handler);
+// use proxy
+revoke();  // any future operation throws
+```
+
+If you don't call `revoke()`, the proxy keeps the target alive.
+For sensitive references (auth tokens, capabilities), call
+`revoke()` when done.
+
+### Proxying built-ins
+
+```js
+const arr = new Proxy([], { ... });
+arr.push(1);   // method calls on arr go through the proxy
+```
+
+Works, but some internals (like the spread operator on `Array.from`)
+behave oddly with proxies in specific engine versions. For
+performance-critical built-in subclassing, test thoroughly.
+
+### Equality
+
+```js
+const target = {};
+const proxy = new Proxy(target, {});
+proxy === target;   // false
+```
+
+Proxies are distinct objects. `target === proxy` is always false.
+Identity-based code (Maps, Sets, `instanceof`) might surprise you.
+
+### Async traps
+
+Traps are synchronous. You can't `await` inside `get`/`set`. If you
+need async behavior (lazy-load a property from a DB), return a
+Promise from the trap and have callers `await` it — but that
+changes the API. Most reactive systems avoid async traps for this
+reason.
+
+## `Reflect` standalone
+
+`Reflect` is useful even without `Proxy`. It mirrors many
+`Object.*` static methods with cleaner semantics:
+
+```js
+Reflect.has(obj, 'key');                  // 'key' in obj
+Reflect.ownKeys(obj);                     // all own keys, incl symbols
+Reflect.deleteProperty(obj, 'key');       // delete obj.key
+Reflect.getPrototypeOf(obj);              // proto
+Reflect.set(obj, 'key', value);           // returns boolean (success)
+Reflect.defineProperty(obj, key, desc);   // returns boolean
+```
+
+The boolean returns are easier to handle than `Object.defineProperty`'s
+throw-on-failure. Many libraries use `Reflect` for safer property
+manipulation.
+
+## When NOT to use Proxy
+
+- **Hot loops** with millions of property accesses. The overhead
+  matters.
+- **Replacing plain getters/setters** when you just need one
+  intercept point. `class { get foo() {} }` is simpler.
+- **"Just because"** — Proxy can encode anything, but most of the
+  time direct code is clearer.
+
+Reach for Proxy when:
+
+- You need to intercept *unknown* properties (the whole point — you
+  don't know the key ahead of time).
+- You're building a framework or library where users define the
+  data shape.
+- You need observable / reactive state.
+- You need transparent wrapping (logging, validation, caching)
+  without changing the API surface.
+
+## The mental model
+
+`Proxy` is **a customizable wrapper around an object**. Operations
+go through the handler; the handler decides what to do (with
+`Reflect.*` as the "default" fallback).
+
+The trade-off: power vs predictability. Proxies can break
+assumptions code makes ("`obj.foo === obj.foo` is the same value
+twice"), make debugging harder, and slow down hot code. Use
+sparingly, and document at the type level so users know they're
+talking to a proxy.
+
+For 2026 JavaScript, Proxy is mostly invisible — it powers reactive
+state in every major framework, but most app code doesn't write
+proxies directly. When you do, it's because you've hit a problem
+that other tools can't solve.

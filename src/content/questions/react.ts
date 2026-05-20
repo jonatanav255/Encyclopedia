@@ -172,5 +172,57 @@ export const bank: QuestionBank = {
       answer:
         '**Auth state** in a `useAuth` hook that wraps a context (user, role, login, logout). On boot, validate the session/token with the server; surface `loading` while validating.\n\n**Protected routes** as a wrapper component (or router loader/guard): if not authenticated, redirect to `/login`. If authenticated but not authorized for the route, show 403.\n\n**Tokens**: prefer HttpOnly cookies for session — JS can\'t read them, mitigating XSS. If using JWT in localStorage, accept the XSS risk and never put refresh tokens there.\n\n**SSR/server components**: validate the session server-side (cookie passed in the request); pass user info down to client components via props or a server-injected context.\n\n**Refresh**: refresh tokens on a background interval or transparently on 401 in your fetch wrapper. Avoid auth state lag in the UI.\n\n**Testing**: MSW handlers for `/auth/me`, `/login`, `/logout`. Component tests render protected routes with a mocked authenticated context.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'Why does React use a virtual DOM instead of updating the real DOM directly?',
+      answer:
+        'Directly updating the DOM on every change is expensive — each touch can trigger layout, paint, and synchronous reflow. React builds a lightweight tree of objects (the virtual DOM / fiber tree) in memory, computes the diff between the new tree and the previous one, and applies only the **minimum set of mutations** to the real DOM. The win isn\'t that virtual DOM is "faster than the DOM" — it\'s that batching changes and minimizing mutations is faster than naïve "update everything on every event."',
+    },
+    {
+      level: 'junior',
+      question: 'You added `useEffect(() => { fetch(url).then(setData); }, [id])` and the data sometimes shows the wrong user. Why?',
+      answer:
+        'Race condition. If `id` changes from 1 to 2 while the request for 1 is still in flight, both fetches resolve and the slower one (potentially for the older id) wins, overwriting state. Fix with a cleanup flag: `let cancelled = false; ... if (!cancelled) setData(...);` plus `return () => { cancelled = true; }`. Or use `AbortController`. Or use a data library (TanStack Query, SWR) that handles this for you.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'What is React Fiber and why does it matter?',
+      answer:
+        'Fiber is React\'s reconciler architecture (since React 16). Replaces the old recursive renderer with a work-loop approach: each piece of work is a "fiber" (a JS object); React processes them one at a time and can **pause between fibers** to let the browser handle animation or input, then resume. Enables time-slicing, concurrent rendering, and `useTransition`. Two trees (current + work-in-progress) let React build the new tree atomically and commit it all at once — users never see half-rendered state.',
+    },
+    {
+      level: 'mid',
+      question: 'When would you reach for TanStack Query over plain `useEffect`-based fetching?',
+      answer:
+        'Any app that fetches data more than trivially. TanStack Query handles caching by `queryKey`, race-condition protection, cancellation, background refetch on focus/reconnect/mount, stale-while-revalidate, mutations with optimistic updates, DevTools — all things you\'d eventually reinvent badly. For 2026 React, `useEffect + fetch` is for tutorials; real apps use a data layer.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'Why does React run effects twice in development?',
+      answer:
+        'Strict Mode double-invokes effects to surface uncleanable setup. The intent: any effect should work correctly when mounted, unmounted, and re-mounted. If your effect adds a subscription without cleanup, the second mount adds a duplicate; you notice immediately. The fix is **always return a cleanup function** from the effect, not to disable Strict Mode. In production, effects run once per mount. The double-invocation in dev is rehearsing a scenario (component remount via key change, hot reload, future React behavior) that can happen in production.',
+    },
+    {
+      level: 'senior',
+      question: 'When you add `React.memo` to a component, why does it sometimes not prevent re-renders?',
+      answer:
+        '`React.memo` does a **shallow comparison of props**. If the parent passes a new object or function reference each render — `<Memoed config={{ url }} />` or `<Memoed onClick={() => ...} />` — the prop "changes" by reference every time, defeating memo. Two fixes: (1) `useMemo`/`useCallback` in the parent to stabilize references. (2) `React.compiler` (when adopted) auto-memoizes. Memo also doesn\'t help when context changes — `React.memo` checks props only; context updates re-render consumers regardless.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a data-fetching strategy for a modern Next.js App Router (or Remix v3 / TanStack Start) application.',
+      answer:
+        '**Server components fetch directly.** No `useEffect`, no client cache for initial data: `export default async function Page() { const user = await db.users.findById(id); return <UserView user={user} />; }`. The server fetches; the result streams to the client; first paint shows real data.\n\n**Suspense for streaming.** Wrap each independent section in `<Suspense fallback={<Skeleton />}>` so fast sections render first, slow ones replace skeletons as data arrives. Avoid a single root spinner.\n\n**Client-side TanStack Query** for interactive data (real-time updates, polling, optimistic mutations, infinite scroll). Initial state hydrated from server fetch via `HydrationBoundary`; client-side from then on.\n\n**Server actions for mutations.** `\'use server\'` functions called from `<form action={...}>` or via the typed RPC pattern. Skip the JSON-API layer for internal use.\n\n**`revalidatePath` / `revalidateTag`** after mutations to invalidate server-rendered pages; TanStack Query\'s invalidate for client-side caches. Two cache layers; both need explicit invalidation.\n\n**Edge cases**: stale-while-revalidate for slow but tolerable data; aggressive caching on truly static (CDN-friendly) routes; long-running streaming responses (LLM token streams) via SSE outside of the RSC layer.\n\nThe result: SEO-friendly server rendering + interactive client behavior, with one data layer per concern and no rendering waterfalls.',
+    },
   ],
 };

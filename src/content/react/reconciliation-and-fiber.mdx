@@ -1,0 +1,436 @@
+export const level = 'staff';
+
+# Reconciliation and Fiber
+
+React's **reconciler** decides what to update in the DOM when state
+changes. The current architecture is called **Fiber** (since React
+16, 2017). It enables concurrent rendering, time-slicing, and the
+modern Suspense / transition features.
+
+Most React work doesn't require knowing how Fiber works. But for
+performance debugging, library development, or understanding *why*
+hooks work the way they do, this page is the map.
+
+## What reconciliation does
+
+When state changes, React doesn't replace the DOM. It:
+
+1. **Re-runs the affected component** functions, producing a new
+   element tree (the "virtual DOM").
+2. **Diffs** the new tree against the previous one.
+3. **Computes the minimum set of DOM mutations** needed.
+4. **Applies** those mutations to the real DOM.
+
+The reconciler is the diff-and-apply engine.
+
+## Before Fiber: stack-based reconciliation
+
+React 15 and earlier used a **synchronous, recursive** reconciler.
+When state changed, React walked the component tree top-to-bottom,
+applying updates as it went. Once started, it couldn't be paused or
+interrupted.
+
+Result: a large render took as long as it took. If your render
+trees were big, the main thread blocked — animations stuttered,
+inputs lagged.
+
+## What Fiber added
+
+Fiber rewrote reconciliation as an **interruptible, work-loop-based
+process**. Each unit of work is a "fiber" — a JS object representing
+one piece of the rendering job.
+
+The reconciler:
+
+1. Walks the tree depth-first via `child` → `sibling` → `return`
+   pointers, processing one fiber at a time.
+2. **Checks if it should yield** between fibers — if the browser
+   needs to do something (animation, input), React pauses.
+3. **Resumes** later when the browser is idle.
+4. Commits the result to the DOM **all at once** when ready.
+
+This is "time-slicing": render work spread across multiple frames,
+with the main thread free to do other things in between.
+
+## The Fiber object
+
+A simplified mental model:
+
+```ts
+interface Fiber {
+  type: Function | string;   // the component or HTML tag
+  key: string | null;
+  child: Fiber | null;
+  sibling: Fiber | null;
+  return: Fiber | null;       // parent (yes, the field is called "return")
+  stateNode: any;             // the DOM node or class instance
+  memoizedState: any;         // the hooks linked list, for function components
+  pendingProps: any;
+  memoizedProps: any;
+  alternate: Fiber | null;    // the "other tree" (work-in-progress vs current)
+  flags: number;              // bit flags for "needs update", "needs deletion", etc.
+}
+```
+
+Fibers form a **doubly-linked-list-traversable tree** — you can
+walk to children, siblings, and parents. This lets the reconciler
+yield work and resume at the right place.
+
+## The two trees: current and work-in-progress
+
+React maintains two parallel trees:
+
+- **Current tree** — what's on screen.
+- **Work-in-progress tree** — what's being computed.
+
+When you call `setState`, React creates a new work-in-progress tree
+by walking the current tree and updating affected fibers. The old
+tree stays untouched until the new one is fully built and
+committed.
+
+This is why React feels "atomic": even if rendering is paused
+mid-way, the user sees the old tree. The DOM doesn't show
+half-rendered state.
+
+`fiber.alternate` is the link between the two — each fiber in the
+current tree has an `alternate` in the work-in-progress tree (and
+vice versa).
+
+## The two phases: render and commit
+
+Reconciliation has two distinct phases:
+
+### Render (interruptible)
+
+React builds the work-in-progress tree. This is the part that:
+
+- Calls your component functions.
+- Computes diffs.
+- Decides what to update.
+- **Can be paused, resumed, or abandoned.**
+
+If you call `setState` during this phase (or React decides to start
+fresh), the in-progress work is discarded.
+
+### Commit (synchronous)
+
+React applies the changes to the DOM. This is:
+
+- DOM mutations (`appendChild`, `removeChild`, attribute updates).
+- Running `useEffect` cleanup from the previous render.
+- Running `useEffect` of the new render.
+- Firing lifecycle methods (`componentDidMount`, etc. for classes).
+
+**Commit is synchronous and not interruptible.** Once committed,
+the DOM matches the new tree.
+
+This is why **side effects in render are bad**: render may run
+twice (interruption + restart). Side effects belong in `useEffect`,
+which fires in commit (and only once).
+
+## How diffing works
+
+The reconciler uses heuristics, not optimal algorithms.
+
+### Different types → unmount and remount
+
+```jsx
+{isActive ? <div /> : <section />}
+```
+
+Switching between `<div>` and `<section>` destroys the div and its
+descendants. State is lost.
+
+```jsx
+{isActive ? <Comp variant="active" /> : <Comp variant="inactive" />}
+```
+
+Same component, different prop. State is preserved.
+
+### Same type → update props
+
+```jsx
+<button className={isActive ? 'a' : 'b'}>{text}</button>
+```
+
+React updates the className attribute and the text content. The
+DOM node is reused.
+
+### Children: match by key
+
+```jsx
+{items.map(i => <Item key={i.id} item={i} />)}
+```
+
+The `key` tells React which fiber corresponds to which item across
+renders. With stable keys, reordering moves DOM nodes; without
+(using index keys on a reorderable list), React matches by
+position — state, focus, animations break.
+
+See **Keys and reconciliation** for the user-side view.
+
+## Priorities and lanes
+
+Fiber assigns updates to **lanes** — buckets representing urgency:
+
+- **SyncLane** — highest priority. Input handling, layout effects.
+- **InputContinuousLane** — typing, scrolling.
+- **DefaultLane** — normal state updates.
+- **TransitionLane** — `useTransition`, `useDeferredValue` updates.
+- **IdleLane** — lowest priority. Background work.
+
+When state changes, the update goes into a lane. React processes
+high-priority lanes first; lower lanes can be paused mid-render to
+make room.
+
+This is what makes `useTransition` work:
+
+```jsx
+function App() {
+  const [query, setQuery] = useState('');
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    setQuery(e.target.value);                              // sync — high priority
+    startTransition(() => setFilteredList(filter(query))); // transition — lower
+  }
+}
+```
+
+The input update fires immediately (input feels snappy). The
+filter computation is in a transition — interruptible, lower
+priority. If the user types again before the filter completes,
+React abandons the in-flight transition and starts fresh.
+
+## How hooks fit in
+
+Each function component's fiber has a `memoizedState` field — a
+**linked list of hook state objects**.
+
+When `useState`, `useEffect`, `useMemo` etc. are called during
+render, React walks this list in order. Each hook reads / writes
+the corresponding node.
+
+This is why **hooks must be called in the same order every render**.
+If you skip one based on a condition:
+
+```jsx
+if (cond) useState(0);   // BAD
+const x = useState(1);
+```
+
+…the linked list mismatches. The wrong hook reads the wrong state.
+That's the entire "rules of hooks" explained at the implementation
+level.
+
+The lint rule `react-hooks/rules-of-hooks` enforces it because the
+underlying mechanism is fragile by design (linked list of state,
+indexed by call order).
+
+## Why React doesn't do "smart diffs"
+
+React's diffing is O(n) per render — proportional to tree size, not
+to the actual changes. A perfect diff algorithm would be O(n³) in
+general (tree edit distance).
+
+The heuristics ("different types → remount," "match children by
+key") are cheap and usually correct. When they're wrong (you used
+an index key on a reorderable list), the result is "subtle bugs"
+rather than "slow renders." Trade-off.
+
+## Concurrent rendering — what changed
+
+React 18 made concurrent rendering opt-in (via `createRoot` + APIs
+like `useTransition`). Key shifts:
+
+- **Render is no longer atomic** with respect to your code. It can
+  be paused and restarted.
+- **`useEffect` continues to fire only after commit** — but commit
+  may happen later than you'd expect (after multiple yields).
+- **Strict mode double-renders** components to catch impure
+  patterns. Effects also fire double in dev to test
+  cleanup-and-resetup.
+
+The shift to concurrent is invisible for most code. It matters when
+you have **side effects in render** (which were always wrong) or
+when you rely on **render timing** (which was always implementation
+detail).
+
+## React Server Components and reconciliation
+
+Server components don't reconcile — they render once on the server,
+output a serialized tree, and stream to the client. The client
+reconciler integrates server-rendered HTML with client-rendered
+components seamlessly.
+
+See **Server components** for the protocol details. Reconciliation
+on the client still works the same way for client components.
+
+## Practical implications
+
+### Why state survives between renders
+
+The fiber persists across renders. The state lives in
+`memoizedState`. Each `useState` reads from / writes to its slot in
+the linked list.
+
+### Why component identity matters
+
+```jsx
+{isActive ? <Comp /> : null}
+```
+
+Each render of `<Comp />` creates a *new fiber* if it didn't exist
+before. State doesn't survive across mount/unmount.
+
+```jsx
+<Comp visible={isActive} />
+```
+
+The fiber persists. State survives.
+
+### Why `key` forces remount
+
+A different key tells the reconciler "this is a different fiber."
+Old fiber is unmounted; new one is mounted with fresh state.
+
+### Why effects run after commit
+
+The DOM must be updated before effects fire, because effects can
+read DOM measurements (`ref.current.offsetHeight`). Commit happens,
+then effects.
+
+### Why concurrent rendering can run components twice
+
+To prepare for interruption, React might start rendering, abandon
+the work, and start again with newer data. Your component function
+might execute multiple times for one "render." Strict mode forces
+this in dev to surface bugs.
+
+This is why **render must be pure**. Side effects in render can
+fire 1, 2, or 3 times unpredictably.
+
+## React Compiler
+
+The experimental React Compiler (stable in late 2024 / 2025)
+analyzes your component code and **automatically memoizes**:
+
+- Skips re-renders when props are reference-equal.
+- Memoizes derived values without `useMemo`.
+- Memoizes callbacks without `useCallback`.
+
+In a compiler-enabled project, you write the dumb version; the
+compiler inserts the optimizations.
+
+The reconciler is unchanged — the compiler just produces components
+that re-render less often. Same Fiber, fewer wasted renders.
+
+## Profiling the reconciler
+
+React DevTools' **Profiler** records each render:
+
+- Which components rendered.
+- How long each took.
+- Why it rendered (props change, state change, parent re-rendered).
+
+For deep performance work, the browser's **Performance** tab shows
+the actual frame timing, including React's render and commit
+phases. React 18+ adds user-timing marks for "render," "commit,"
+and effect boundaries — visible as labeled timing entries.
+
+## Common pitfalls
+
+### Side effects in render
+
+```jsx
+function Component() {
+  fetch('/api/data');   // BAD — runs every render, may run twice
+  return <div />;
+}
+```
+
+Move to `useEffect`. Even if it only runs once normally, concurrent
+rendering can call your render function multiple times.
+
+### Mutating props or state
+
+```jsx
+function Component({ items }) {
+  items.sort();   // mutates the parent's data
+  return <List items={items} />;
+}
+```
+
+The reconciler relies on reference equality and purity. Mutating
+inputs breaks both. Always create new objects/arrays.
+
+### Inline objects as props to memoized children
+
+```jsx
+<MemoChild config={{ url: '/api' }} />
+```
+
+`config` is a new object each render. `React.memo` sees prop
+change. Memo defeated.
+
+Wrap in `useMemo` or hoist out of render.
+
+### Conditional hooks
+
+```jsx
+if (cond) useState(0);
+```
+
+Breaks the hook linked list. ESLint rule catches it.
+
+### Relying on render order
+
+React doesn't guarantee how many times components render or in
+what exact order under concurrent mode. Don't:
+
+```jsx
+let counter = 0;   // module scope
+function Component() {
+  counter++;
+  // ...
+}
+```
+
+Component code must be pure with respect to render side effects.
+
+### Expecting `useEffect` to run before paint
+
+`useEffect` runs **after** commit and paint. For something that
+must happen before paint (DOM measurement, sync DOM mutation), use
+`useLayoutEffect`. See **`useEffect`**.
+
+## The mental model
+
+React's reconciler is **a work loop that builds a new fiber tree,
+diffs it against the current tree, and commits the minimum DOM
+changes**. Fiber makes this interruptible — render work can yield
+to the browser for animations and input, then resume.
+
+Two phases:
+
+1. **Render** — interruptible, builds work-in-progress tree, calls
+   your components. May run more than once.
+2. **Commit** — synchronous, applies DOM changes, fires effects.
+
+The implications for your code:
+
+- **Render is pure**. No side effects.
+- **State lives in fibers**. Component identity matters for state
+  survival.
+- **Keys identify items** across renders.
+- **Effects are post-commit**. They see the new DOM.
+- **Concurrent mode** assumes purity. Strict mode enforces it.
+
+For typical React work, you don't think about Fiber directly. For
+performance debugging, library development, or "why doesn't my code
+work in concurrent mode" issues — knowing the architecture turns
+mystery bugs into understood behaviors.
+
+The deeper story (lanes, scheduling, hydration, server components)
+builds on this foundation. The two trees + work loop + linked-list
+state is the core mental model.

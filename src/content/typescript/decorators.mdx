@@ -1,0 +1,476 @@
+export const level = 'senior';
+
+# Decorators in TypeScript
+
+Decorators are functions that **wrap or modify classes, methods,
+properties, or parameters** at definition time. In 2026, two
+flavors exist:
+
+- **Stage 3 decorators** — the ECMAScript spec (shipping in V8 and
+  TypeScript 5+).
+- **Legacy decorators** — the `experimentalDecorators: true` flag,
+  used by NestJS, TypeORM, MobX.
+
+This page covers both and when to use each.
+
+## Why decorators
+
+Add cross-cutting behavior to classes declaratively:
+
+```ts
+class UserService {
+  @logged
+  @cached
+  async findUser(id: string): Promise<User> {
+    return db.users.findById(id);
+  }
+}
+```
+
+Without decorators, you'd wrap manually:
+
+```ts
+class UserService {
+  findUser = withLogging(withCache(async (id: string) => {
+    return db.users.findById(id);
+  }));
+}
+```
+
+Decorators are visual / declarative; manual wrapping is explicit /
+imperative. Same idea.
+
+## Stage 3 decorators (modern)
+
+Available in TS 5.0+ without the experimental flag, and in V8 (Node
+22+).
+
+### Method decorators
+
+```ts
+function logged<This, Args extends any[], Return>(
+  target: (this: This, ...args: Args) => Return,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>,
+) {
+  const methodName = String(context.name);
+
+  return function(this: This, ...args: Args): Return {
+    console.log(`calling ${methodName}`);
+    const result = target.call(this, ...args);
+    console.log(`${methodName} done`);
+    return result;
+  };
+}
+
+class User {
+  @logged
+  greet(name: string) {
+    return `hi ${name}`;
+  }
+}
+
+new User().greet('jon');
+// logs: "calling greet" → returns "hi jon" → "greet done"
+```
+
+The decorator:
+
+- Receives the original method (`target`).
+- Receives a `context` object with metadata (`name`, `kind`,
+  `private`, etc.).
+- Returns the replacement function.
+
+### Class decorators
+
+```ts
+function logged<T extends new (...args: any[]) => any>(
+  target: T,
+  context: ClassDecoratorContext,
+): T {
+  console.log(`class ${context.name} created`);
+  return class extends target {
+    constructor(...args: any[]) {
+      console.log(`constructing ${context.name}`);
+      super(...args);
+    }
+  } as T;
+}
+
+@logged
+class User {
+  constructor(public name: string) {}
+}
+
+new User('jon');
+// logs "constructing User"
+```
+
+Class decorators wrap or extend the class itself.
+
+### Field decorators (with initializers)
+
+```ts
+function defaultValue<T>(value: T) {
+  return function (target: undefined, context: ClassFieldDecoratorContext) {
+    return function (initial: T) {
+      return initial ?? value;
+    };
+  };
+}
+
+class Config {
+  @defaultValue('localhost')
+  host!: string;
+}
+```
+
+Field decorators get an "initializer" — they can transform the
+initial value or replace it entirely.
+
+### Accessor decorators
+
+For getters/setters:
+
+```ts
+function bound(target: Function, context: ClassMethodDecoratorContext) {
+  context.addInitializer(function () {
+    this[context.name] = target.bind(this);
+  });
+}
+
+class Counter {
+  count = 0;
+
+  @bound
+  inc() { this.count++; }
+}
+
+const c = new Counter();
+const fn = c.inc;
+fn();   // works — `this` is bound
+```
+
+`addInitializer` lets the decorator run code when the instance is
+created.
+
+### Decorator context
+
+```ts
+context = {
+  kind: 'method' | 'class' | 'field' | 'getter' | 'setter' | 'accessor',
+  name: string | symbol,
+  private: boolean,
+  static: boolean,
+  access: { get?, set?, has? },
+  addInitializer(fn): void,
+  metadata: Record<symbol, any>,
+}
+```
+
+The `context.metadata` object is shared across decorators on the
+same class — used by frameworks for cross-decorator coordination
+(e.g., NestJS uses metadata to wire up DI).
+
+## Legacy decorators (`experimentalDecorators`)
+
+The old flavor, still used by NestJS, TypeORM, MobX, class-validator.
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}
+```
+
+```ts
+function Logged(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value;
+  descriptor.value = function (...args: any[]) {
+    console.log(`calling ${propertyKey}`);
+    return original.apply(this, args);
+  };
+  return descriptor;
+}
+
+class User {
+  @Logged
+  greet(name: string) {
+    return `hi ${name}`;
+  }
+}
+```
+
+Differences from Stage 3:
+
+- **API shape** — legacy gets `(target, propertyKey, descriptor)`;
+  Stage 3 gets `(target, context)`.
+- **`emitDecoratorMetadata`** lets decorators read TS type info at
+  runtime (via `reflect-metadata`). Stage 3 doesn't have this.
+- **Available everywhere** TS exists, no flag needed in V8.
+
+The `emitDecoratorMetadata` + `reflect-metadata` combo is what
+powers NestJS's DI:
+
+```ts
+class UserService {
+  constructor(private db: Database) {}
+  //              ^ TS emits type info; NestJS reads it to inject
+}
+```
+
+Without `emitDecoratorMetadata`, NestJS would need explicit `@Inject`
+on every dependency.
+
+## Which to use
+
+### Use Stage 3 if:
+
+- You're not using NestJS, TypeORM, MobX, class-validator, or any
+  framework that mandates legacy.
+- You want the standardized, future-proof syntax.
+- You're targeting modern Node / browsers.
+
+### Use legacy if:
+
+- You're using NestJS or similar — they require it.
+- You need `reflect-metadata` for DI or schema introspection.
+- You're maintaining existing code that uses them.
+
+You can't easily mix both flavors in the same file. Pick one per
+project.
+
+## Decorator factories
+
+A decorator factory is a function that *returns* a decorator. Lets
+you pass arguments:
+
+```ts
+function logged(level: 'info' | 'debug') {
+  return function (target: Function, context: ClassMethodDecoratorContext) {
+    return function (this: any, ...args: any[]) {
+      console[level](`${String(context.name)}`);
+      return target.apply(this, args);
+    };
+  };
+}
+
+class User {
+  @logged('debug')
+  greet() { return 'hi'; }
+}
+```
+
+Almost every real decorator is a factory — fixed-argument decorators
+are rare.
+
+## Order of execution
+
+Decorators run **bottom-to-top**:
+
+```ts
+class C {
+  @first
+  @second
+  @third
+  method() {}
+}
+```
+
+`third` runs first (innermost wrap). Then `second` wraps the result.
+Then `first` wraps that. Like `first(second(third(method)))`.
+
+For mental ordering: read decorators top-down for declarative
+intent; remember execution is bottom-up.
+
+## Common use cases
+
+### Validation
+
+```ts
+class CreateUserDto {
+  @IsEmail()
+  email: string;
+
+  @MinLength(8)
+  password: string;
+}
+
+const dto = await validateOrReject(plainToInstance(CreateUserDto, req.body));
+```
+
+Used by class-validator + class-transformer + NestJS.
+
+### DI
+
+```ts
+@Injectable()
+class UserService {
+  constructor(@Inject(LOGGER) private log: Logger) {}
+}
+```
+
+NestJS, InversifyJS, tsyringe.
+
+### Routing
+
+```ts
+@Controller('/users')
+class UsersController {
+  @Get(':id')
+  async findOne(@Param('id') id: string) { ... }
+}
+```
+
+NestJS, routing-controllers.
+
+### Caching / memoization
+
+```ts
+class UserService {
+  @memoize({ ttl: 60_000 })
+  async findUser(id: string) {
+    return db.users.findById(id);
+  }
+}
+```
+
+### Logging / metrics
+
+```ts
+class PaymentService {
+  @traced
+  @timed('payment.charge')
+  async charge(input: ChargeInput) { ... }
+}
+```
+
+OpenTelemetry instrumentation libraries often offer decorator
+versions for class methods.
+
+## When NOT to use decorators
+
+- **Pure functions** — wrap them: `const logged = withLogging(fn)`.
+  Decorators are class-only in Stage 3 (function decorators were
+  in older drafts but removed).
+- **Single-use behavior** — if you'd only use the decorator once,
+  just inline.
+- **Cross-cutting concerns that aren't class-shaped** — middleware
+  patterns (Express middleware, function composition) are cleaner
+  than forcing classes.
+
+## TypeScript-specific concerns
+
+### `this` typing in decorators
+
+```ts
+function logged(target: Function, context: ClassMethodDecoratorContext) {
+  return function (this: unknown, ...args: any[]) {
+    console.log(`called on`, this);
+    return target.apply(this, args);
+  };
+}
+```
+
+The `this: unknown` parameter tells TS what `this` is at the call
+site. For type-safe decorators, see the full type-parameter-heavy
+example at the top.
+
+### Inferred return types
+
+Method decorators that change the return type are tricky to express
+in TS. Often easier to keep the type signature:
+
+```ts
+function memoize<T extends Function>(method: T): T {
+  // implementation
+  return method;
+}
+```
+
+For decorators that genuinely change the signature, declare
+explicitly.
+
+### Decorators on getters/setters
+
+Stage 3 supports both, via `getter`/`setter`/`accessor` kinds.
+Legacy supports them too. Less common in practice.
+
+## Common pitfalls
+
+### Forgetting to return from a class decorator
+
+```ts
+function logged<T extends new (...args: any[]) => any>(target: T): T {
+  console.log('decorating');
+  // forgot to return target
+}
+```
+
+Returns `undefined`; class becomes `undefined`. Always return the
+class (or the wrapped version).
+
+### Side effects at decoration time
+
+```ts
+function track(target: any, context: any) {
+  registry.push(context.name);   // runs when class is *defined*
+}
+
+class X { @track method() {} }
+```
+
+The push happens when the class is parsed, not when called. Useful
+for collection-style registration (route handlers, validators). But
+beware of "this didn't fire when I expected" — decoration timing
+is at class definition.
+
+### Mixing Stage 3 and legacy
+
+The TS compiler can't easily emit both shapes. Pick a flavor per
+project; document it.
+
+### `this` lost on extracted methods
+
+```ts
+class User {
+  @logged
+  greet(name: string) { return this.name; }
+}
+
+const u = new User();
+const fn = u.greet;
+fn('jon');   // this is undefined
+```
+
+Decorators don't fix `this`-binding. Either bind in the constructor,
+use arrow-function class fields, or write a `@bound` decorator.
+
+### Performance
+
+Decorators add overhead per call (wrapping, extra closures). For
+hot paths with thousands of calls per second, profile. For typical
+service methods (DB queries, HTTP calls), the overhead is invisible.
+
+## The mental model
+
+Decorators are **higher-order functions for classes**. They wrap
+or modify class members at definition time.
+
+For 2026 TypeScript:
+
+- **Stage 3 decorators** are the standard going forward. Use them
+  in new projects unless a framework demands otherwise.
+- **Legacy decorators** are still everywhere because NestJS,
+  TypeORM, MobX, class-validator depend on them.
+- **`emitDecoratorMetadata`** is the legacy-only feature that
+  powers DI containers.
+
+For most code, you'll **use** decorators (from a framework) more
+often than **write** them. Writing decorators is a library concern;
+consuming them is an app concern.
+
+When you do write one, the Stage 3 signature is the future. Legacy
+is for compatibility with the existing decorator-heavy ecosystem.

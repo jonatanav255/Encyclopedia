@@ -202,5 +202,57 @@ export const bank: QuestionBank = {
       answer:
         '**Profile first** with `--prof` or DevTools to confirm where time goes. **Then:** keep object shapes consistent (initialize all fields in constructor, never delete properties) so V8 keeps a single hidden class — monomorphic property access is dramatically faster than megamorphic. **Pack arrays** (no holes, consistent element type — SMI vs double matters). **Pool objects** if you allocate per iteration. **Avoid try/catch in hot loops** in old V8s. **Inline small functions** by letting TurboFan inline them; that means keeping them small and called with consistent types. **`--trace-deopt`** to find what\'s bailing out of optimization.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'How do you find an element in the DOM?',
+      answer:
+        '`document.querySelector(selector)` for the first match, `document.querySelectorAll(selector)` for all matches (returns a static NodeList). Selectors use CSS syntax: `.class`, `#id`, `[data-x="1"]`, `ul > li:first-child`. Older APIs (`getElementById`, `getElementsByClassName`) still work but `querySelector` is the modern default. Note: `getElementsByClassName` returns a *live* collection that updates as the DOM changes; `querySelectorAll` returns a snapshot.',
+    },
+    {
+      level: 'junior',
+      question: 'What\'s the safer alternative to `el.innerHTML = userInput`?',
+      answer:
+        '`el.textContent = userInput`. `innerHTML` parses the string as HTML, so any tags or `<script>` in user input execute — an XSS vulnerability. `textContent` sets the literal string as text only. If you genuinely need to render user HTML, sanitize first with **DOMPurify**: `el.innerHTML = DOMPurify.sanitize(userInput)`.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'When would you reach for currying or composition in JavaScript?',
+      answer:
+        'When you have many small, named functions that compose into data pipelines: `pipe(filter(isPaid), map(addTotal), sortBy(date), take(10))`. Currying enables partial application — preconfigure a function once, slot the result into `map`/`filter` calls. Skip currying for single-argument functions (no benefit) or single-use code (just inline). Reach for `Ramda` or `lodash/fp` when you commit to the style across a codebase.',
+    },
+    {
+      level: 'mid',
+      question: 'How do you avoid stack overflow with recursive code in V8?',
+      answer:
+        'V8 doesn\'t implement tail-call optimization (the spec says it should; Safari does, V8/Chrome/Node don\'t). For deep recursion, you must convert to iteration with an explicit stack, or use a **trampoline** (recursive function returns a thunk; an outer loop unwraps thunks until it gets a real value). For tree/graph traversal where depth is bounded (DOM, AST, divide-and-conquer with log-n depth), plain recursion is fine. The danger is linear recursion on unbounded input.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'How does Proxy / Reflect enable reactivity in libraries like Vue and MobX?',
+      answer:
+        'A `Proxy` wraps an object and intercepts every property `get`/`set`. In `get`, the library records that the current effect depends on this property (`track()`); in `set`, it notifies all dependent effects (`trigger()`). The Proxy returns a wrapped value via `Reflect.get`/`Reflect.set` so receiver/getter semantics stay correct. Result: plain object operations (`state.count = 1`) automatically re-run dependent code, with zero ceremony. Vue 3 reactivity, MobX, Solid stores, Immer drafts — all use this pattern.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s the difference between `Reflect.get(target, key, receiver)` and `target[key]` in a Proxy trap?',
+      answer:
+        '`Reflect.get(target, key, receiver)` correctly handles the `receiver` argument when the property is defined via `Object.defineProperty` with a getter, or when the target has a prototype chain. `target[key]` ignores the receiver. For Proxies wrapping objects with prototype-chain getters, `target[key]` returns the wrong `this` inside getters. **Rule**: in any Proxy trap, default to `Reflect.<method>(target, ...args, receiver)` instead of accessing the target directly.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Build a custom EventEmitter with Proxy semantics — what\'s the case for and against?',
+      answer:
+        '**For**: a `Proxy`-based emitter lets consumers write `emitter.userSignedUp.emit(user)` and `emitter.userSignedUp.on(handler)` — the proxy generates each event\'s API lazily. Cleaner API surface, no string-typo bugs, TypeScript can declare the shape of available events. Used by some modern libraries (event-emitter-like APIs in test mocks, RxJS-style typed event streams).\n\n**Against**: the Proxy adds overhead per access; static type generation is more complex; debugging is harder (stack traces show through the proxy); the implicit "generate handler bag on first access" can lead to memory holding stale event keys. For high-volume internal eventing, the built-in `EventEmitter` is simpler and faster.\n\nFor library APIs aimed at developer ergonomics where event volumes are modest (UI events, lifecycle hooks), Proxy-backed event objects are a clean choice. For service-internal pub/sub at scale, the plain emitter wins.',
+    },
   ],
 };

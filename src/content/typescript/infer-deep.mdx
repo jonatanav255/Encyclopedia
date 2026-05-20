@@ -1,0 +1,390 @@
+export const level = 'senior';
+
+# The `infer` keyword (deep dive)
+
+`infer` is one of TypeScript's most expressive features. Inside a
+conditional type, it **binds a name to a part of the input type**,
+letting you extract or pattern-match against type shapes.
+
+It's the engine behind `ReturnType`, `Parameters`, `Awaited`,
+`InstanceType`, and most other "extract a piece" utility types.
+
+## The basics
+
+```ts
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+type A = ReturnType<() => string>;        // string
+type B = ReturnType<() => Promise<User>>; // Promise<User>
+type C = ReturnType<number>;              // never
+```
+
+Reads as: "If T is a function returning some type R, give me R.
+Otherwise, never."
+
+The `infer R` is the binding. R is a fresh type variable that the
+compiler fills in based on how T matches the pattern.
+
+## Where `infer` can appear
+
+`infer` only works inside the *extends* clause of a conditional
+type. You can infer from many positions:
+
+### Function returns
+
+```ts
+type Ret<T> = T extends (...args: any[]) => infer R ? R : never;
+```
+
+### Function arguments
+
+```ts
+type Args<T> = T extends (...args: infer A) => any ? A : never;
+
+type R = Args<(a: number, b: string) => void>;   // [a: number, b: string]
+```
+
+### Specific parameter positions
+
+```ts
+type First<T> = T extends (a: infer A, ...rest: any[]) => any ? A : never;
+
+type R = First<(a: number, b: string) => void>;   // number
+```
+
+### Tuple positions
+
+```ts
+type Head<T> = T extends [infer H, ...any[]] ? H : never;
+type Tail<T> = T extends [any, ...infer R] ? R : never;
+type Last<T> = T extends [...any[], infer L] ? L : never;
+
+type A = Head<[1, 2, 3]>;   // 1
+type B = Tail<[1, 2, 3]>;   // [2, 3]
+type C = Last<[1, 2, 3]>;   // 3
+```
+
+### Array element type
+
+```ts
+type Element<T> = T extends (infer E)[] ? E : never;
+
+type R = Element<number[]>;   // number
+type S = Element<string[]>;   // string
+```
+
+### Promise unwrapping
+
+```ts
+type Awaited<T> = T extends Promise<infer U> ? U : T;
+
+type A = Awaited<Promise<string>>;   // string
+type B = Awaited<string>;             // string (not a promise)
+```
+
+For deeply nested promises:
+
+```ts
+type DeepAwait<T> = T extends Promise<infer U> ? DeepAwait<U> : T;
+
+type R = DeepAwait<Promise<Promise<string>>>;   // string
+```
+
+Recursive `infer` — the built-in `Awaited<T>` does this.
+
+### Constructor parameters
+
+```ts
+type CtorArgs<T> = T extends new (...args: infer A) => any ? A : never;
+
+class User { constructor(name: string, age: number) {} }
+type R = CtorArgs<typeof User>;   // [name: string, age: number]
+```
+
+### Class instance type
+
+```ts
+type Instance<T> = T extends new (...args: any[]) => infer R ? R : never;
+
+type R = Instance<typeof User>;   // User
+```
+
+### Template literal positions
+
+```ts
+type Domain<T> = T extends `${string}@${infer D}` ? D : never;
+
+type R = Domain<'jon@example.com'>;   // 'example.com'
+type S = Domain<'no-at'>;              // never
+```
+
+Split a string by pattern. Used heavily in typed routers and CSS-in-JS.
+
+### Multiple `infer` in one pattern
+
+```ts
+type Split<S extends string, D extends string> =
+  S extends `${infer Head}${D}${infer Tail}` ? [Head, ...Split<Tail, D>] : [S];
+
+type R = Split<'a/b/c', '/'>;   // ['a', 'b', 'c']
+```
+
+Two `infer`s — head and tail. Recurse on the tail.
+
+## `infer extends` — constrained inference
+
+TS 4.7+ lets you constrain the inferred type:
+
+```ts
+type FirstString<T> = T extends [infer F extends string, ...any[]] ? F : never;
+
+type A = FirstString<['hi', 1]>;   // 'hi'
+type B = FirstString<[1, 'hi']>;   // never (1 isn't a string)
+```
+
+Only matches if the inferred type satisfies the constraint. Useful
+for asserting shape in compound patterns.
+
+## Building utility types with `infer`
+
+### `Promised<T>` — wrap method returns in promises
+
+```ts
+type Promised<T> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R
+    ? (...args: A) => Promise<R>
+    : T[K];
+};
+
+interface Sync {
+  greet(name: string): string;
+  age: number;
+}
+
+type Async = Promised<Sync>;
+// { greet: (name: string) => Promise<string>; age: number }
+```
+
+Mapped type + `infer` on each method.
+
+### `Spread<A, B>` — merge object types
+
+```ts
+type Spread<A, B> = {
+  [K in keyof A | keyof B]: K extends keyof B
+    ? B[K]
+    : K extends keyof A
+      ? A[K]
+      : never;
+};
+
+type R = Spread<{ a: 1; b: 2 }, { b: 'two'; c: 3 }>;
+// { a: 1; b: 'two'; c: 3 }
+```
+
+Like `Object.assign` at the type level.
+
+### `Curry<T>` — type-level currying
+
+```ts
+type Curry<T> = T extends (a: infer A, ...rest: infer R) => infer Ret
+  ? R extends []
+    ? (a: A) => Ret
+    : (a: A) => Curry<(...args: R) => Ret>
+  : never;
+
+type R = Curry<(a: number, b: string, c: boolean) => Date>;
+// (a: number) => (b: string) => (c: boolean) => Date
+```
+
+Recursive `infer` unwraps the arguments one at a time.
+
+## Distribution and `infer`
+
+Conditional types distribute over unions:
+
+```ts
+type ToArray<T> = T extends any ? T[] : never;
+
+type R = ToArray<string | number>;
+// (string[]) | (number[])   — distributed
+```
+
+`infer` inside a distributive conditional gets a fresh binding per
+union member:
+
+```ts
+type Box<T> = T extends infer U ? { value: U } : never;
+
+type R = Box<string | number>;
+// { value: string } | { value: number }
+```
+
+If you want to *not* distribute, wrap in a tuple:
+
+```ts
+type AllBoxes<T> = [T] extends [infer U] ? { values: U } : never;
+
+type R = AllBoxes<string | number>;
+// { values: string | number }   — not distributed
+```
+
+The `[T] extends [...]` pattern is the standard "opt out of
+distribution" trick.
+
+## `infer` from variadic tuples
+
+TS 4.0+ added variadic tuple types. `infer` can pull from them:
+
+```ts
+type Init<T extends unknown[]> = T extends [...infer I, any] ? I : never;
+type Drop<T extends unknown[]> = T extends [any, ...infer D] ? D : never;
+
+type A = Init<[1, 2, 3, 4]>;   // [1, 2, 3]
+type B = Drop<[1, 2, 3, 4]>;   // [2, 3, 4]
+```
+
+`[...infer I, any]` matches "everything except the last." `[any,
+...infer D]` matches "everything except the first."
+
+This enables type-level list operations — reverse, concat, length
+— at compile time.
+
+## Limitations
+
+### Inference depth
+
+Conditional types can recurse, but TS caps recursion depth (~50–100
+levels):
+
+```ts
+type DeepUnwrap<T> = T extends Promise<infer U> ? DeepUnwrap<U> : T;
+```
+
+For deeply-nested types, you might hit "Type instantiation is
+excessively deep." Refactor or accept the limit.
+
+### Multiple infers in incompatible positions
+
+```ts
+type Bad<T> = T extends Map<infer K, infer V> ? [K, V] : never;
+```
+
+This works. But:
+
+```ts
+type Bad<T> = T extends [infer X, infer X] ? X : never;
+```
+
+Two `infer X` for the same name — TS unifies them (X is the union
+of both positions, in the contravariant case the intersection). The
+behavior is correct but can be surprising. Use distinct names if
+you mean distinct types.
+
+### `infer` outside conditional types
+
+```ts
+type R = infer X;   // ERROR — outside extends clause
+```
+
+`infer` only works inside `T extends Pattern ? ... : ...`.
+
+### Pattern must match structurally
+
+```ts
+type R = ReturnType<{ call(): string }>;   // never
+```
+
+`ReturnType` looks for `(...args: any[]) => infer R`. An object
+with a `call` method doesn't match (different shape). Be careful
+about what "function-like" means in your context.
+
+## Performance considerations
+
+Heavy use of `infer` (especially with recursion + distributive
+unions) can slow TypeScript compilation noticeably. Symptoms:
+
+- Editor "checking types..." takes seconds.
+- `tsc` runs for minutes on large projects.
+
+Mitigations:
+
+- Cache intermediate types with named aliases. The compiler
+  memoizes.
+- Avoid recursive `infer` over unbounded inputs.
+- Limit distributive depth — wrap with `[T] extends [...]` where
+  you can.
+- Use `--extendedDiagnostics` to find slow types.
+
+For library authors: profile your types. For app authors: prefer
+simple shapes; let library types do the heavy lifting.
+
+## Common pitfalls
+
+### `infer` outside `extends`
+
+```ts
+type Bad<T> = infer X;   // ERROR
+```
+
+Only inside conditionals.
+
+### Inferring from incomplete patterns
+
+```ts
+type R<T> = T extends (...args: any) => infer R ? R : never;
+// missing [] in args
+```
+
+`(...args: any) => ...` doesn't match all functions. Use
+`(...args: any[]) => ...` or `(...args: never) => ...` (which is
+more correct contravariantly).
+
+### Forgetting the fallback case
+
+```ts
+type R<T> = T extends Promise<infer U> ? U : ?
+```
+
+For non-promises, what should the result be? `never`? The original
+`T`? Pick deliberately:
+
+- `: never` — "this type only makes sense for promises."
+- `: T` — "if it's not a promise, return it as-is" (the
+  `Awaited<T>` pattern).
+
+### Inferring tuple elements vs array elements
+
+```ts
+type A = [string, number, boolean] extends (infer E)[] ? E : never;
+// E is string | number | boolean
+```
+
+Inferring `(infer E)[]` on a tuple gives the *union* of element
+types. For "the tuple type itself," infer a tuple pattern:
+
+```ts
+type Tuple<T> = T extends [...infer Items] ? Items : never;
+```
+
+## The mental model
+
+`infer` is **pattern matching for types**. Inside `T extends Pattern
+? ... : ...`, you can name parts of the pattern with `infer X`.
+Those bindings are usable on the true branch.
+
+It's how TypeScript expresses "extract part of a type":
+
+- `infer R` in a function return position → "the return type."
+- `infer A` in `(...args: infer A) => any` → "the arguments tuple."
+- `infer U` in `Promise<infer U>` → "the resolved type."
+- `infer K, V` in `Map<infer K, infer V>` → "key and value types."
+- `infer S` in a template-literal pattern → "the matched part of a string."
+
+For library authors, `infer` is essential. For app authors, you use
+it via utilities (`ReturnType`, `Parameters`, `Awaited`) far more
+often than you write it directly.
+
+The deepest payoff is in recursive utility types — `Awaited`,
+`DeepReadonly`, type-level parsers — where `infer` + recursion +
+distribution combine into compile-time computation.

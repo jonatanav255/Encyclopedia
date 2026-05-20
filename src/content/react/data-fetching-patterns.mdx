@@ -1,0 +1,480 @@
+export const level = 'senior';
+
+# Data fetching patterns
+
+React doesn't ship data fetching. The community has converged on a
+few patterns and libraries that handle the hard parts: caching,
+loading states, error states, refetching on focus, deduplication,
+and stale-while-revalidate.
+
+This page covers the modern stack in 2026.
+
+## What "data fetching" actually involves
+
+The naïve version:
+
+```jsx
+function UserProfile({ id }) {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`/api/users/${id}`)
+      .then(r => r.json())
+      .then(data => { setUser(data); setLoading(false); });
+  }, [id]);
+
+  if (loading) return <Spinner />;
+  return <div>{user.name}</div>;
+}
+```
+
+What's missing:
+
+- **Error handling** — what if fetch fails?
+- **Race conditions** — if `id` changes mid-fetch, the old response
+  might overwrite the new one.
+- **Cancellation** — fetch keeps running even if the component
+  unmounts.
+- **Caching** — every mount re-fetches; visit the same user twice,
+  two requests.
+- **Stale data** — what if the user updates? You re-fetch on mount,
+  but not on visibility / focus.
+- **Loading flashes** — `loading: true` flickers if the fetch is
+  fast.
+- **Mutations** — when you update the user, the UI doesn't sync.
+
+Every "real" data-fetching layer solves these.
+
+## TanStack Query (formerly React Query)
+
+The dominant library. Hooks-based, framework-agnostic, batteries
+included.
+
+```jsx
+import { useQuery } from '@tanstack/react-query';
+
+function UserProfile({ id }) {
+  const { data: user, isLoading, error } = useQuery({
+    queryKey: ['user', id],
+    queryFn: () => fetch(`/api/users/${id}`).then(r => r.json()),
+  });
+
+  if (isLoading) return <Spinner />;
+  if (error) return <Error />;
+  return <div>{user.name}</div>;
+}
+```
+
+Out of the box you get:
+
+- **Caching by `queryKey`** — same key reuses the result.
+- **Background refetch** on window focus, reconnect, mount (configurable).
+- **Stale-while-revalidate**: show cached data immediately, refetch
+  if stale.
+- **Race condition protection** — cancellation, ordering guarantees.
+- **DevTools** for inspecting the cache.
+- **Mutations** with optimistic updates.
+
+For 2026, TanStack Query is the default for client-side React data
+fetching.
+
+## Mutations
+
+```jsx
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+
+function EditUser({ id }) {
+  const queryClient = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: (input: UserInput) =>
+      fetch(`/api/users/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      }).then(r => r.json()),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['user', id], data);
+      // or
+      queryClient.invalidateQueries({ queryKey: ['user', id] });
+    },
+  });
+
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); mutation.mutate(formData); }}>
+      ...
+      <button disabled={mutation.isPending}>Save</button>
+    </form>
+  );
+}
+```
+
+Two ways to update the cache after a mutation:
+
+1. **`setQueryData`** — manually write the new data. Instant; no
+   refetch.
+2. **`invalidateQueries`** — mark queries as stale; the next access
+   refetches. Slight delay; freshness guaranteed.
+
+For optimistic UI, see "Optimistic updates" below.
+
+## Optimistic updates
+
+```jsx
+const mutation = useMutation({
+  mutationFn: updateTodo,
+  onMutate: async (newTodo) => {
+    await queryClient.cancelQueries({ queryKey: ['todos'] });
+    const prev = queryClient.getQueryData(['todos']);
+    queryClient.setQueryData(['todos'], (old: Todo[]) =>
+      old.map(t => t.id === newTodo.id ? newTodo : t)
+    );
+    return { prev };
+  },
+  onError: (_err, _newTodo, context) => {
+    queryClient.setQueryData(['todos'], context.prev);
+  },
+  onSettled: () => {
+    queryClient.invalidateQueries({ queryKey: ['todos'] });
+  },
+});
+```
+
+`onMutate` updates the cache immediately (UI changes). If the
+mutation fails, `onError` rolls back. `onSettled` refetches to
+sync with the server.
+
+The result: the UI feels instant. The network round-trip happens
+in the background. Rollback is automatic on failure.
+
+## SWR — the alternative
+
+Vercel's library. Similar concept, simpler API:
+
+```jsx
+import useSWR from 'swr';
+
+function UserProfile({ id }) {
+  const { data: user, error, isLoading } = useSWR(`/api/users/${id}`, fetcher);
+
+  if (isLoading) return <Spinner />;
+  if (error) return <Error />;
+  return <div>{user.name}</div>;
+}
+```
+
+Lighter than TanStack Query. Stale-while-revalidate baked in. Less
+feature-rich for complex mutation flows.
+
+For simple read-heavy apps, SWR. For complex state-mutating apps,
+TanStack Query.
+
+## React 19 — the `use` hook
+
+React 19 adds `use(promise)` for reading promises inline:
+
+```jsx
+import { use, Suspense } from 'react';
+
+function UserProfile({ userPromise }: { userPromise: Promise<User> }) {
+  const user = use(userPromise);
+  return <div>{user.name}</div>;
+}
+
+function App() {
+  const promise = fetchUser('42');   // cached upstream
+  return (
+    <Suspense fallback={<Spinner />}>
+      <UserProfile userPromise={promise} />
+    </Suspense>
+  );
+}
+```
+
+`use` suspends until the promise resolves. The nearest `<Suspense>`
+shows the fallback. Cleaner than `useEffect` + state.
+
+But — `use(fetch(...))` re-runs the fetch every render. You need
+upstream caching:
+
+- TanStack Query's `useSuspenseQuery`.
+- React Server Components (caches naturally).
+- A handwritten promise cache.
+
+`use` alone isn't a data-fetching layer; it's the primitive that
+data-fetching layers can build on.
+
+## Server Components — the new way
+
+In React 19 + Next.js App Router (or TanStack Start, Remix v3),
+the recommended pattern:
+
+```jsx
+// Server component
+export default async function UserProfile({ params }) {
+  const user = await fetchUser(params.id);   // runs on the server
+  return <div>{user.name}</div>;
+}
+```
+
+No `useEffect`, no client cache, no loading state. The server
+fetches, renders, streams HTML to the client. Initial paint shows
+real data, not a loading spinner.
+
+Pair with Suspense for streaming:
+
+```jsx
+function Page({ params }) {
+  return (
+    <>
+      <Suspense fallback={<UserSkeleton />}>
+        <UserProfile id={params.id} />
+      </Suspense>
+      <Suspense fallback={<PostsSkeleton />}>
+        <UserPosts id={params.id} />
+      </Suspense>
+    </>
+  );
+}
+```
+
+Each section fetches independently. The fast ones appear first;
+slow ones replace skeletons as data arrives.
+
+For mutations, server components pair with **server actions**:
+
+```jsx
+'use server';
+
+async function updateUser(formData: FormData) {
+  await db.users.update(formData.get('id'), { name: formData.get('name') });
+  revalidatePath('/users');
+}
+```
+
+```jsx
+<form action={updateUser}>
+  <input name="id" type="hidden" value={user.id} />
+  <input name="name" defaultValue={user.name} />
+  <button type="submit">Save</button>
+</form>
+```
+
+The form submits directly to the server action. No client-side
+fetch boilerplate.
+
+See **Server components** for the broader treatment.
+
+## Patterns
+
+### Pagination
+
+```jsx
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+  queryKey: ['posts'],
+  queryFn: ({ pageParam }) => fetch(`/api/posts?cursor=${pageParam}`).then(r => r.json()),
+  initialPageParam: '',
+  getNextPageParam: (lastPage) => lastPage.nextCursor,
+});
+```
+
+`useInfiniteQuery` in TanStack handles cursor-based pagination.
+Combine with `IntersectionObserver` for infinite scroll:
+
+```jsx
+const sentinelRef = useRef(null);
+useEffect(() => {
+  const io = new IntersectionObserver(([entry]) => {
+    if (entry.isIntersecting && hasNextPage) fetchNextPage();
+  });
+  io.observe(sentinelRef.current);
+  return () => io.disconnect();
+}, [fetchNextPage, hasNextPage]);
+```
+
+### Polling
+
+```jsx
+const { data } = useQuery({
+  queryKey: ['live-status'],
+  queryFn: fetchStatus,
+  refetchInterval: 5000,        // poll every 5s
+  refetchIntervalInBackground: false,   // pause when tab inactive
+});
+```
+
+For server-pushed updates, SSE or WebSockets are usually better than
+polling. See **Server-Sent Events**.
+
+### Search-as-you-type
+
+```jsx
+const [query, setQuery] = useState('');
+const debouncedQuery = useDebounce(query, 300);
+
+const { data: results } = useQuery({
+  queryKey: ['search', debouncedQuery],
+  queryFn: () => fetch(`/api/search?q=${debouncedQuery}`).then(r => r.json()),
+  enabled: debouncedQuery.length > 0,
+});
+```
+
+The `enabled` option prevents fetching for empty queries. The
+debounce prevents firing a request per keystroke.
+
+For React 18+ concurrent rendering, `useDeferredValue` can replace
+`useDebounce`:
+
+```jsx
+const deferredQuery = useDeferredValue(query);
+const { data } = useQuery({
+  queryKey: ['search', deferredQuery],
+  queryFn: () => fetch(`/api/search?q=${deferredQuery}`).then(r => r.json()),
+  enabled: deferredQuery.length > 0,
+});
+```
+
+React defers `deferredQuery` updates when busy. The UI stays
+snappy.
+
+### Dependent queries
+
+```jsx
+const { data: user } = useQuery({ queryKey: ['user', id], queryFn: fetchUser });
+
+const { data: posts } = useQuery({
+  queryKey: ['posts', user?.id],
+  queryFn: () => fetchPosts(user.id),
+  enabled: !!user?.id,
+});
+```
+
+The second query waits for the first via `enabled`. Combined with
+Suspense / streaming, you can chain queries while keeping the UX
+snappy.
+
+### Parallel queries
+
+```jsx
+const [{ data: user }, { data: posts }] = useQueries({
+  queries: [
+    { queryKey: ['user', id], queryFn: fetchUser },
+    { queryKey: ['posts', id], queryFn: fetchPosts },
+  ],
+});
+```
+
+Both fire in parallel. Loading until both resolve (or you handle
+per-query).
+
+## Common pitfalls
+
+### Refetching in `useEffect` without cancellation
+
+```jsx
+useEffect(() => {
+  fetch(`/api/users/${id}`).then(r => r.json()).then(setUser);
+}, [id]);
+```
+
+If `id` changes from 1 to 2 quickly, two requests fire. Whichever
+returns last "wins" — possibly displaying user 1 when you wanted
+user 2.
+
+Fix: AbortController + check before setState. Or use a data library
+that handles this.
+
+### Fetching in render
+
+```jsx
+function Component() {
+  const data = fetch('/api/data');   // fires every render
+  // ...
+}
+```
+
+Render must be pure. Move to `useEffect` or a data library.
+
+### Manual cache invalidation everywhere
+
+```jsx
+// After every mutation
+setData(null);
+setLoading(true);
+fetch(...).then(setData);
+```
+
+Reinventing TanStack Query, badly. Use the library.
+
+### Treating data libraries as global state
+
+```jsx
+queryClient.setQueryData(['theme'], 'dark');
+```
+
+Don't put UI state (theme, sidebar open, modal visible) in TanStack
+Query. Use `useState`, Context, or Zustand. TanStack Query is for
+*server data*.
+
+### Loading flashes
+
+```jsx
+if (isLoading) return <Spinner />;
+```
+
+For fast fetches (< 200ms), the spinner flashes annoyingly. Either:
+
+- Show old data while refetching (`placeholderData: keepPreviousData`).
+- Delay the spinner: `setTimeout(() => setShowSpinner(true), 200)`.
+- Use Suspense with a delay.
+
+### Fetching on every keystroke
+
+Without debounce or `useDeferredValue`, search inputs hammer the
+server. Mandatory delay.
+
+### Ignoring race conditions
+
+```jsx
+useEffect(() => {
+  fetch(url).then(setData);
+}, [id]);
+```
+
+If `id` changes during a slow fetch, you can show the wrong data.
+Add a cancellation flag:
+
+```jsx
+useEffect(() => {
+  let cancelled = false;
+  fetch(url).then(data => { if (!cancelled) setData(data); });
+  return () => { cancelled = true; };
+}, [id]);
+```
+
+Or use a library that handles it.
+
+## The mental model
+
+Data fetching in React is **not "call fetch in useEffect"**. It's a
+system that handles:
+
+- Cache (avoid duplicate requests).
+- Race conditions (newest request wins).
+- Cancellation (don't update unmounted components).
+- Loading / error states (consistent UI patterns).
+- Refetching (focus, reconnect, mutation, polling).
+- Mutations (update server + cache atomically).
+- Optimistic UI (show changes before server confirms).
+
+For 2026:
+
+- **Server components** when your framework supports them — fetch in
+  the component body. No client-side state machine.
+- **TanStack Query** for client-side fetching with mutations.
+- **SWR** if TanStack Query is overkill.
+- **`use(promise)` + Suspense** when you want a streaming-friendly
+  inline read (paired with upstream caching).
+
+Naïve `fetch` in `useEffect` is for tutorials. Real apps use a
+data layer.

@@ -1,0 +1,469 @@
+export const level = 'senior';
+
+# Migrating JavaScript to TypeScript
+
+Adding TypeScript to an existing JavaScript codebase isn't an
+all-or-nothing rewrite. The right strategy is **incremental**:
+adopt TS for new code, gradually convert existing code, never block
+a release on type errors.
+
+## The minimum-viable migration
+
+For a JS-only codebase:
+
+```bash
+pnpm add -D typescript @types/node
+pnpm exec tsc --init
+```
+
+`tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "noEmit": true
+  },
+  "include": ["src/**/*"]
+}
+```
+
+Key flags:
+
+- **`allowJs: true`** — compiler accepts `.js` files alongside
+  `.ts`.
+- **`checkJs: false`** — don't type-check `.js` (yet).
+- **`noEmit: true`** — `tsc` is just for type checking; let your
+  bundler (or native Node + `--experimental-strip-types`) handle
+  emit.
+
+Result: TypeScript runs against your codebase without breaking
+anything. You can start writing new files as `.ts`; existing `.js`
+stays as-is.
+
+## Incremental conversion: file by file
+
+Pick a leaf file (no imports from other files you care about, or
+simple imports). Rename `.js` → `.ts`. Watch the compiler errors
+appear.
+
+Steps to convert:
+
+1. Rename.
+2. Fix import paths if needed (`./foo` might need `./foo.js`).
+3. Add type annotations to function parameters.
+4. Add return types to exported functions.
+5. Type any `any` away gradually.
+
+Don't try to convert everything at once. Each file is its own PR.
+Reviewers can focus.
+
+## Allow gradual strictness
+
+You can ship TS code with loose checking, then tighten over time.
+Start with:
+
+```json
+{
+  "strict": false,
+  "noImplicitAny": false,
+  "strictNullChecks": false
+}
+```
+
+This is "TS with training wheels." Most JS converts cleanly.
+
+Then turn on one flag at a time:
+
+1. **`noImplicitAny: true`** — every parameter needs a type. Fix
+   each call site.
+2. **`strictNullChecks: true`** — null and undefined are distinct.
+   Fix every "might be null" path.
+3. Other strict flags one by one.
+
+Each flag generates a wave of errors. Tackle them in a focused PR.
+
+Eventually reach `strict: true`. Then optionally enable
+`noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` for the
+strictest setup.
+
+## `// @ts-check` and JSDoc
+
+For files staying `.js` but wanting type checking:
+
+```js
+// @ts-check
+/** @param {string} name */
+function greet(name) {
+  return `hi, ${name}`;
+}
+```
+
+`// @ts-check` at the top tells TS to type-check this file. JSDoc
+annotations supply types. No rename needed.
+
+```js
+/**
+ * @typedef {{ id: number; name: string }} User
+ * @param {User} user
+ * @returns {string}
+ */
+function fmt(user) { return `${user.name} (${user.id})`; }
+```
+
+JSDoc supports types, generics, return values, interfaces — most
+of what TS does. Useful when:
+
+- You can't rename to `.ts` (e.g., legacy build pipeline).
+- Library files where you don't want to ship `.d.ts` separately.
+- Open-source projects that want to stay JS-source-of-truth.
+
+Many large codebases (Webpack, Babel, npm CLI) use JSDoc + ts-check
+instead of `.ts` files.
+
+## `// @ts-ignore`, `// @ts-expect-error`, `// @ts-nocheck`
+
+Escape hatches during migration:
+
+```ts
+// @ts-ignore — Stripe SDK has bad types for this endpoint
+const result = stripe.weird.api();
+```
+
+`@ts-ignore` silences the next line's error. `@ts-expect-error`
+silences the next line **and errors if there's no error to
+silence** — better, because if you fix the underlying issue, you
+know to remove the comment.
+
+```ts
+// @ts-nocheck
+// disable for the whole file (top line only)
+```
+
+`@ts-nocheck` disables checking for a whole file. Useful for
+hard-to-convert files; track them in a list to revisit.
+
+Resist the urge to sprinkle these everywhere. Each is a place where
+TS isn't helping. Audit before merge; ideally drive to zero.
+
+## Where to start
+
+The pragmatic order:
+
+1. **New code in `.ts`** — every new file. No exceptions.
+2. **Utility / pure code** — functions without side effects, no DOM,
+   no external APIs. Easy to type.
+3. **Domain models** — types for the data your app handles. Once
+   typed, every consumer benefits.
+4. **API boundaries** — HTTP handlers, DB queries. Validate +
+   type at the seam.
+5. **Components / UI** — usually last. Many React components have
+   complex prop types that take time to nail.
+
+Avoid converting:
+
+- **Generated code** (build outputs, GraphQL codegen targets).
+- **Vendor scripts** (third-party JS you didn't write).
+- **Soon-to-be-replaced code** (don't type what you're about to
+  delete).
+
+## Strategy: per-feature vs per-folder
+
+Two common approaches:
+
+### Per-feature
+
+Convert one feature end-to-end: `features/auth/*.js` → `*.ts`. The
+feature is fully typed; the rest of the app stays JS.
+
+Pro: feature owners can move at their own pace. New features ship
+typed.
+
+Con: cross-feature imports might cross JS/TS boundary unpredictably.
+
+### Per-layer
+
+Convert all schemas, then all services, then all controllers, then
+UI. Each layer fully typed before moving on.
+
+Pro: consistent type quality at each level. Easier to reason
+about.
+
+Con: takes longer to see end-to-end TS in the user-facing parts.
+
+For most teams, **per-feature** works better. The "fully typed
+slice through the stack" gives the team confidence and reveals
+issues.
+
+## Don't fight the types
+
+```ts
+// Tempting but wrong
+function processUser(user: any) {
+  return user.name.toUpperCase();
+}
+```
+
+`any` defeats TS. Use `unknown` and narrow:
+
+```ts
+function processUser(user: unknown) {
+  if (
+    typeof user === 'object' &&
+    user !== null &&
+    'name' in user &&
+    typeof user.name === 'string'
+  ) {
+    return user.name.toUpperCase();
+  }
+  throw new Error('bad user');
+}
+```
+
+Verbose. So extract a type guard or use Zod:
+
+```ts
+const User = z.object({ name: z.string() });
+function processUser(input: unknown) {
+  const user = User.parse(input);   // throws on invalid
+  return user.name.toUpperCase();
+}
+```
+
+The migration is also a chance to put proper validation at
+boundaries. Zod schemas double as types.
+
+## Common patterns to convert
+
+### Anonymous object parameters
+
+```js
+function fetchPage(opts) {
+  return fetch(opts.url, { signal: opts.signal });
+}
+```
+
+→
+
+```ts
+function fetchPage(opts: { url: string; signal?: AbortSignal }) {
+  return fetch(opts.url, { signal: opts.signal });
+}
+```
+
+Or extract a type:
+
+```ts
+interface FetchPageOptions {
+  url: string;
+  signal?: AbortSignal;
+}
+
+function fetchPage(opts: FetchPageOptions) { ... }
+```
+
+### Class fields without declarations
+
+```js
+class User {
+  constructor(id) {
+    this.id = id;
+    this.posts = [];
+  }
+}
+```
+
+→
+
+```ts
+class User {
+  id: string;
+  posts: Post[] = [];
+
+  constructor(id: string) {
+    this.id = id;
+  }
+}
+```
+
+Or with `strictPropertyInitialization`:
+
+```ts
+class User {
+  id: string;
+  posts: Post[];
+
+  constructor(id: string) {
+    this.id = id;
+    this.posts = [];
+  }
+}
+```
+
+### Untyped third-party libraries
+
+If a library has no `@types/*`:
+
+```ts
+// types/some-lib.d.ts
+declare module 'some-lib' {
+  export function doThing(x: string): number;
+}
+```
+
+Or use `// @ts-ignore` on the import (less recommended).
+
+For partial typing of huge libraries, declare only what you use:
+
+```ts
+declare module 'big-lib' {
+  export function specificFunc(x: string): void;
+  // ... only the parts you call
+}
+```
+
+### JSON imports
+
+```ts
+import config from './config.json' with { type: 'json' };
+```
+
+The `with` attribute is required. TS understands this with
+`resolveJsonModule: true`.
+
+For type-checking the JSON, use:
+
+```ts
+import config from './config.json' with { type: 'json' };
+const Config = z.object({ port: z.number() });
+const validated = Config.parse(config);   // typed + validated
+```
+
+## Bundling and build
+
+If you're already using a bundler (Webpack, Vite, esbuild, swc),
+just point it at `.ts` entry points:
+
+```js
+// vite.config.ts
+export default {
+  build: { lib: { entry: 'src/index.ts' } },
+};
+```
+
+For Node + native TS:
+
+```bash
+node --experimental-strip-types src/index.ts
+```
+
+For TS as a separate compile step (rare for new code, common in
+legacy):
+
+```bash
+pnpm exec tsc -p tsconfig.build.json
+```
+
+The migration is mostly **declaring TS**, not changing how you
+build. Most modern build tools were TS-aware from day one.
+
+## Testing during migration
+
+Tests need to keep passing as you convert. Two strategies:
+
+1. **Convert tests alongside code**. Test file becomes `.test.ts`;
+   imports work.
+2. **Keep tests in `.js` and only convert source**. Set
+   `allowJs: true`; tests import compiled / strip-typed source.
+
+For Vitest / `node:test`: both run `.ts` and `.js` natively or with
+config tweaks. No migration overhead in the runner.
+
+## Common pitfalls
+
+### Big-bang rewrite
+
+Don't. "Let's convert everything to TS this sprint" loses focus,
+ships bugs, demoralizes. Incremental wins.
+
+### Adding TS without `strict`
+
+Without strict, you've added build complexity without much
+safety. The wins (null safety, exhaustive checks, inference) come
+from `strict: true`. Aim there from the start; flip flags one at a
+time.
+
+### Defaulting to `any`
+
+```ts
+function fetchUser(id: any): any {
+  return fetch(`/users/${id}`).then(r => r.json());
+}
+```
+
+You typed it; it adds no safety. `unknown` + narrowing is the
+right pattern.
+
+### Skipping `tsc --noEmit` in CI
+
+Without it, type errors slip through. Add as a CI step:
+
+```yaml
+- run: pnpm exec tsc --noEmit
+- run: pnpm test
+```
+
+`tsc` is your type linter. Treat as you'd treat ESLint.
+
+### Forgetting to update tooling
+
+```json
+// .eslintrc
+{
+  "parser": "@typescript-eslint/parser",
+  "plugins": ["@typescript-eslint"],
+  "extends": ["plugin:@typescript-eslint/recommended"]
+}
+```
+
+Lint rules need to understand TS. Same for Prettier (which is
+TS-native already).
+
+### Mass-using `@ts-ignore`
+
+The temptation: silence every error to make a PR green. The
+discipline: prefer `@ts-expect-error` (it'll yell at you when the
+underlying issue gets fixed) and audit during code review.
+
+## The mental model
+
+Migrating JS to TS is **adding a type checker to existing code**.
+The runtime doesn't change. Tests still run. Imports still work.
+The compiler is a new step that catches a class of bugs.
+
+The migration mindset:
+
+- **No rewrites.** Convert files; don't redesign.
+- **Strict gradually.** Loose first, tighten over time.
+- **New code in `.ts`** always. Stops the bleeding.
+- **Track `any` and `@ts-ignore`** counts. Drive them down.
+- **Type at boundaries first** (HTTP, DB, env vars). Internal code
+  follows.
+
+The reward: refactoring becomes safe, IDE support is dramatically
+better, a category of runtime errors (typos, missing fields,
+nullable confusion) gets caught before commit.
+
+For most JS codebases, full TS conversion takes weeks to months
+spread across many PRs — alongside normal feature work. The team
+that "spent a month on TS" went too fast or too slow. Done right,
+the migration is invisible to users; only the team feels the
+quality lift.

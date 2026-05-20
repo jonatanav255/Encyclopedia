@@ -1,0 +1,384 @@
+export const level = 'mid';
+
+# Recursion and tail calls
+
+Recursion is when a function calls itself. In JavaScript, the
+language *spec* requires **tail-call optimization** (TCO) — but
+**most engines don't implement it**. Knowing the difference between
+"recursion works" and "recursion blows the stack" is the practical
+skill.
+
+## A simple recursion
+
+```js
+function factorial(n) {
+  if (n <= 1) return 1;
+  return n * factorial(n - 1);
+}
+
+factorial(5);   // 120
+```
+
+The function pushes a stack frame per call. For `factorial(10000)`,
+that's 10000 stack frames before any return — stack overflow.
+
+## What "tail call" means
+
+A **tail call** is a function call in the *last position* of another
+function — nothing remains to be done after the call returns:
+
+```js
+function tail() {
+  return otherFn();   // tail call — nothing after
+}
+
+function notTail() {
+  return otherFn() + 1;   // NOT tail — must add 1 after return
+}
+```
+
+The spec says: if the call is in tail position, the engine *can*
+reuse the current stack frame instead of pushing a new one. That's
+**tail-call optimization** — recursion without growing the stack.
+
+## Most engines don't do TCO
+
+JavaScriptCore (Safari) implements TCO. V8 (Chrome, Node, Edge),
+SpiderMonkey (Firefox), and most other engines do not — they planned
+to, then backed out citing debuggability issues (stack traces lose
+frames).
+
+So in practice:
+
+- **In Node and Chrome**: recursion uses real stack frames. Deep
+  recursion → stack overflow.
+- **In Safari**: TCO works; tail-recursive functions don't grow the
+  stack.
+
+You **can't rely on TCO** for cross-engine code. Treat JavaScript
+recursion as "the stack grows."
+
+## The maximum stack depth
+
+```js
+function depth(n = 0) {
+  try { return depth(n + 1); } catch { return n; }
+}
+
+console.log(depth());
+```
+
+On Node 22, this prints around 10000-15000 (depends on flags, what
+the closure captures, OS). For "real" code with arguments and
+locals, the limit is lower.
+
+The point: if your recursion depth correlates with input size and
+that input can be large, you need to convert to iteration.
+
+## Converting recursion to iteration
+
+The classic factorial:
+
+```js
+function factorial(n) {
+  let result = 1;
+  for (let i = 2; i <= n; i++) result *= i;
+  return result;
+}
+```
+
+No stack growth. Same result.
+
+For tree / graph traversal:
+
+```js
+// Recursive — stack-bounded depth
+function walk(node) {
+  for (const child of node.children) walk(child);
+  process(node);
+}
+
+// Iterative with explicit stack
+function walk(root) {
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    for (const child of node.children) stack.push(child);
+    process(node);
+  }
+}
+```
+
+The "explicit stack" version moves the call stack into the heap
+(an array). The heap is bounded only by memory; the call stack is
+bounded by ~10K frames.
+
+## Trampoline pattern
+
+When you want to keep recursive-looking code without stack growth,
+use a **trampoline**:
+
+```js
+function trampoline(fn) {
+  return (...args) => {
+    let result = fn(...args);
+    while (typeof result === 'function') result = result();
+    return result;
+  };
+}
+
+function factorial(n, acc = 1) {
+  if (n <= 1) return acc;
+  return () => factorial(n - 1, n * acc);   // return a thunk
+}
+
+const safeFactorial = trampoline(factorial);
+safeFactorial(100000);   // works — no stack overflow
+```
+
+Each "recursive call" returns a function instead of calling.
+`trampoline` loops, calling each returned function until you get a
+non-function result.
+
+Uglier than direct recursion. Useful for "I really need this to be
+recursive in shape but not in stack usage." Rare in practice.
+
+## Tail-call rewriting
+
+Most tail-recursive functions can be rewritten as iteration with an
+accumulator:
+
+```js
+// Recursive
+function sum(arr, i = 0) {
+  if (i === arr.length) return 0;
+  return arr[i] + sum(arr, i + 1);   // NOT tail (adds after return)
+}
+
+// Tail-recursive (helps in Safari, not elsewhere)
+function sum(arr, i = 0, acc = 0) {
+  if (i === arr.length) return acc;
+  return sum(arr, i + 1, acc + arr[i]);   // tail call
+}
+
+// Iterative (always works)
+function sum(arr) {
+  let acc = 0;
+  for (const x of arr) acc += x;
+  return acc;
+}
+```
+
+In modern JS, just write the iterative form. Or `arr.reduce(...)`.
+
+## When recursion is the right shape
+
+For inherently recursive data (trees, ASTs, JSON), recursion reads
+much better than manual stack management:
+
+```js
+function depthFirst(node, visit) {
+  visit(node);
+  for (const child of node.children ?? []) {
+    depthFirst(child, visit);
+  }
+}
+```
+
+If your tree is bounded depth (e.g., DOM, configuration ASTs,
+parsed JSON < 10MB), the recursion is safe. Stack limits are
+generous for typical depths.
+
+Same for divide-and-conquer:
+
+```js
+function mergeSort(arr) {
+  if (arr.length <= 1) return arr;
+  const mid = arr.length >> 1;
+  return merge(mergeSort(arr.slice(0, mid)), mergeSort(arr.slice(mid)));
+}
+```
+
+Depth is `O(log n)`. For `n = 1 million`, depth is ~20 — no
+overflow risk.
+
+## Mutual recursion
+
+```js
+function isEven(n) { return n === 0 ? true : isOdd(n - 1); }
+function isOdd(n) { return n === 0 ? false : isEven(n - 1); }
+
+isEven(10000);   // stack overflow without TCO
+```
+
+Mutual recursion has the same issues. If depth is bounded, fine. If
+not, convert to a loop.
+
+## Closures over recursive functions
+
+```js
+function makeFactorial() {
+  return function factorial(n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);   // refers to itself
+  };
+}
+```
+
+Named function expressions can reference themselves by name from
+inside. This is reliable; `arguments.callee` (the old way) is
+deprecated and forbidden in strict mode.
+
+## `Function.prototype` not stack-tracking
+
+You can't programmatically check "am I in a tail position?" The
+engine decides. Just trust the structure of the code: tail position
+is "the last thing the function does, nothing after the call."
+
+## Async recursion
+
+```js
+async function loadAll(ids) {
+  if (ids.length === 0) return [];
+  const head = await load(ids[0]);
+  const rest = await loadAll(ids.slice(1));
+  return [head, ...rest];
+}
+```
+
+Each `await` creates a new microtask continuation — no stack
+growth! Async functions don't have the same stack-depth limit. The
+recursion is OK for very deep input.
+
+But: this version is **sequential** (each load waits for the
+previous). Faster:
+
+```js
+async function loadAll(ids) {
+  return Promise.all(ids.map(load));
+}
+```
+
+For "process items recursively but in parallel," use `Promise.all`
+or async iteration.
+
+## Common pitfalls
+
+### Forgetting the base case
+
+```js
+function recurse(n) {
+  return recurse(n - 1);   // never stops
+}
+```
+
+Stack overflow immediately. Always have a termination condition.
+
+### Counter-productive memoization
+
+```js
+function fib(n) {
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
+}
+
+fib(50);   // exponential time
+```
+
+Without memoization, this is `O(2^n)`. Add a cache:
+
+```js
+const cache = new Map();
+function fib(n) {
+  if (n < 2) return n;
+  if (cache.has(n)) return cache.get(n);
+  const result = fib(n - 1) + fib(n - 2);
+  cache.set(n, result);
+  return result;
+}
+```
+
+Or just iterate:
+
+```js
+function fib(n) {
+  let [a, b] = [0, 1];
+  for (let i = 0; i < n; i++) [a, b] = [b, a + b];
+  return a;
+}
+```
+
+`O(n)` time, `O(1)` space.
+
+### Recursing through an array with slice
+
+```js
+function processAll(arr) {
+  if (!arr.length) return;
+  process(arr[0]);
+  processAll(arr.slice(1));   // O(n) per recursion → O(n²)
+}
+```
+
+`slice` copies. Use an index instead:
+
+```js
+function processAll(arr, i = 0) {
+  if (i >= arr.length) return;
+  process(arr[i]);
+  processAll(arr, i + 1);
+}
+```
+
+Or just iterate.
+
+### Async recursion with `.then` chains
+
+```js
+function loadAll(ids) {
+  if (!ids.length) return Promise.resolve([]);
+  return load(ids[0]).then(head =>
+    loadAll(ids.slice(1)).then(rest => [head, ...rest])
+  );
+}
+```
+
+Each `.then` creates a microtask hop — fine for stack, but the
+sequential nature is usually wrong. Same as the async/await
+example: use `Promise.all` for parallel.
+
+## When recursion is appropriate in JavaScript
+
+- **Tree / graph traversal** where depth is bounded.
+- **AST manipulation** (parsers, transformers).
+- **Divide-and-conquer** with `O(log n)` depth.
+- **Backtracking algorithms** (sudoku, N-queens).
+- **JSON traversal** for arbitrary nesting.
+
+When NOT:
+
+- **Linear list traversal** (use `for`/`while` or array methods).
+- **Anything with potentially deep input** without converting to
+  iteration.
+- **When you assumed TCO would save you** — it won't, outside
+  Safari.
+
+## The mental model
+
+In JavaScript, recursion is **a structural tool, not an efficient
+tool**. Use it when the problem is recursive in shape (trees, AST,
+divide-and-conquer with log-n depth). For linear traversal, use
+loops or array methods.
+
+Two practical rules:
+
+1. **Convert tail-recursive linear traversal to iteration.** Don't
+   rely on TCO — it's not in V8.
+2. **Verify depth is bounded.** If user input could push it past
+   ~10K, refactor.
+
+For 2026 Node + browsers, the recursive style is alive in framework
+internals (React Fiber reconciliation, Vue's reactivity tree walks)
+but heavily managed — Fiber explicitly works in chunks to avoid
+deep recursion. Your code should do the same when depth could be
+unbounded.
