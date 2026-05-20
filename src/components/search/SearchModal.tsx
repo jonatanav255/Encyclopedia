@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { fuse, snippet } from '../../lib/search';
 import { entries } from '../../lib/content';
+import { TopicPill } from '../ui/TopicPill';
 
 type Props = {
   open: boolean;
@@ -100,10 +101,7 @@ export function SearchModal({ open, onClose }: Props) {
                     ].join(' ')}
                   >
                     <div className="flex items-center gap-2 text-sm">
-                      <span className="text-xs uppercase tracking-wider text-zinc-500">
-                        {r.entry.topic}
-                      </span>
-                      <span className="text-zinc-400">/</span>
+                      <TopicPill topic={r.entry.topic} />
                       <span className="font-medium text-zinc-900 dark:text-zinc-100">
                         {r.entry.title}
                       </span>
