@@ -7,6 +7,7 @@ import { Callout } from './components/mdx/Callout';
 import { QA } from './components/mdx/QA';
 import { Compare } from './components/mdx/Compare';
 import { Steps, Step } from './components/mdx/Steps';
+import { Diagram, DBox, DArrow } from './components/mdx/Diagram';
 import { MiddlewarePipeline } from './components/demos/MiddlewarePipeline';
 import { RouteMatcher } from './components/demos/RouteMatcher';
 
@@ -16,6 +17,9 @@ const mdxComponents = {
   Compare,
   Steps,
   Step,
+  Diagram,
+  DBox,
+  DArrow,
   MiddlewarePipeline,
   RouteMatcher,
 };
