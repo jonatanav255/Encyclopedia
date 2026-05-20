@@ -8,6 +8,7 @@ import { QA } from './components/mdx/QA';
 import { Compare } from './components/mdx/Compare';
 import { Steps, Step } from './components/mdx/Steps';
 import { Diagram, DBox, DArrow } from './components/mdx/Diagram';
+import { Cheatsheet } from './components/mdx/Cheatsheet';
 import { MiddlewarePipeline } from './components/demos/MiddlewarePipeline';
 import { RouteMatcher } from './components/demos/RouteMatcher';
 
@@ -20,6 +21,7 @@ const mdxComponents = {
   Diagram,
   DBox,
   DArrow,
+  Cheatsheet,
   MiddlewarePipeline,
   RouteMatcher,
 };
