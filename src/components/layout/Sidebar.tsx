@@ -72,7 +72,7 @@ export function Sidebar() {
           to="/practice"
           className={({ isActive }) =>
             [
-              'block rounded px-2 py-1.5 mb-6 font-semibold transition-colors',
+              'block rounded px-2 py-1.5 mb-3 font-semibold transition-colors',
               isActive
                 ? 'bg-zinc-800 text-zinc-100'
                 : 'text-zinc-200 hover:bg-zinc-900',
@@ -86,7 +86,7 @@ export function Sidebar() {
           const topicKey = `topic:${group.topic}`;
           const topicCollapsed = collapsed.has(topicKey);
           return (
-            <div key={group.topic} className="mb-6">
+            <div key={group.topic} className="mb-3">
               <div className="flex items-center justify-between mb-2 px-2 group">
                 <Link to={`/${group.topic}`}>
                   <TopicPill topic={group.topic} />
