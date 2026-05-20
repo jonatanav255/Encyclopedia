@@ -2,5 +2,118 @@ export const level = 'junior';
 
 # JSON Bodies
 
-_Placeholder._ How `express.json()` parses request bodies, why `req.body` is
-undefined without it, and the size-limit trade-off.
+Out of the box, Express does **not** parse request bodies. `req.body` is
+`undefined` until you mount a parser. For JSON APIs that parser is
+`express.json()`.
+
+## The setup
+
+```js
+import express from 'express';
+const app = express();
+
+app.use(express.json());
+
+app.post('/users', (req, res) => {
+  console.log(req.body); // { name: 'Jon', email: '...' }
+  res.status(201).json({ id: 1, ...req.body });
+});
+```
+
+What `express.json()` actually does on every request:
+
+1. Look at `Content-Type`. If it's `application/json` (or matches the
+   configured type), proceed. Otherwise leave `req.body` alone.
+2. Buffer the request body up to a size limit (default 100kb).
+3. `JSON.parse` the buffer. On success, set `req.body` and call `next()`.
+   On failure, call `next(err)`.
+
+## Order matters
+
+The parser must be registered **before** the route that needs it:
+
+```js
+// Wrong — req.body is undefined inside the handler
+app.post('/users', (req, res) => { /* ... */ });
+app.use(express.json());
+
+// Right
+app.use(express.json());
+app.post('/users', (req, res) => { /* ... */ });
+```
+
+Routes registered later in the file can also call `app.use(express.json())`
+inline as route-level middleware, but global is the normal pattern.
+
+## The size limit
+
+The default is 100kb. Anything bigger fails with `413 Payload Too Large`.
+
+```js
+app.use(express.json({ limit: '1mb' }));
+```
+
+<Callout variant="warning">
+Don't raise the limit casually. Larger payloads mean larger buffers in memory,
+which means a single malicious client can pin RAM and stall the event loop on
+the synchronous `JSON.parse`. Set the limit to the largest *legitimate* size
+you actually accept. If you genuinely need to receive megabytes, use a
+streaming parser or a different endpoint that uploads to object storage.
+</Callout>
+
+## What if the body isn't JSON?
+
+If the client sends `Content-Type: text/plain`, `express.json()` skips the
+request — `req.body` stays `undefined`. To accept JSON regardless of the
+content-type header (don't do this lightly):
+
+```js
+app.use(express.json({ type: '*/*' }));
+```
+
+For non-JSON bodies you'll want other parsers:
+
+- `express.urlencoded({ extended: true })` for HTML form posts
+- `multer` for file uploads (`multipart/form-data`)
+- `express.text()` for plaintext
+- `express.raw()` for binary
+
+## Malformed JSON
+
+A `SyntaxError` from `JSON.parse` is forwarded to `next(err)`. Catch it in
+your error handler:
+
+```js
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'malformed JSON' });
+  }
+  next(err);
+});
+```
+
+Without this, the default Express error handler returns a 400 with an HTML
+error page — fine for development, ugly for an API.
+
+## Strict mode
+
+`express.json()` uses strict parsing by default — it only accepts arrays and
+objects at the top level. `JSON.parse('"hello"')` is technically valid JSON
+but rejected by `express.json()`. Loosen with `strict: false` if you actually
+need that (you probably don't).
+
+## What about `req.body` in middleware vs the handler?
+
+By the time `express.json()` has called `next()`, `req.body` is set. Any
+middleware registered **after** the parser sees the parsed body. Anything
+**before** sees nothing.
+
+```js
+app.use(authMiddleware);                // req.body is undefined here
+app.use(express.json());
+app.use(auditMiddleware);               // req.body is parsed here
+app.post('/users', handler);
+```
+
+This affects auth: if you want to authenticate based on a body field,
+mount the parser first.

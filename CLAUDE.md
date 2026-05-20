@@ -16,36 +16,45 @@ rationale, and conventions live in `PROJECT.md`.
 ## How content discovery works (so you don't try to register things)
 
 - **MDX topics**: filesystem-driven. Drop a file at
-  `src/content/<topic>/<entry>.mdx` and the sidebar, homepage, search
-  index, and topic overview rebuild automatically via
+  `src/content/<topic>/<entry>.mdx` and everything rebuilds via
   `import.meta.glob('../content/**/*.mdx')` in `src/lib/content.ts`.
-  No manual registration.
-- **Question banks**: typed data files, not MDX. Drop
-  `src/content/questions/<topic>.ts` exporting `bank: QuestionBank`.
-  The `/practice` route's index loader aggregates them via
-  `import.meta.glob('./*.ts', { eager: true })`.
-- **Demos and MDX building blocks**: React components. Anything used
-  as a JSX tag inside an `.mdx` file **must** be added to the
-  `mdxComponents` map in `src/App.tsx`. Forgetting this fails at
-  render time, not build time — the file compiles fine, then throws
-  "Expected component `Foo` to be defined" when the page is viewed.
+- **MDX level**: each file declares
+  `export const level = 'junior' | 'mid' | 'senior' | 'staff'`. Read
+  via a separate eager glob with `{ import: 'level' }`. Missing
+  levels fall into "Other" in the sidebar.
+- **Question banks**: drop `src/content/questions/<topic>.ts`
+  exporting `bank: QuestionBank`. Aggregated by an eager glob.
+- **Practice answers** are strings rendered through
+  `src/components/practice/Answer.tsx` — fenced ` ```lang ` (Shiki),
+  inline backticks, `**bold**`, `\n\n` paragraphs. Don't reach for a
+  full markdown lib.
+- **MDX components**: anything used as a JSX tag inside `.mdx` must
+  be in `mdxComponents` in `src/App.tsx`. Missing components throw at
+  render time, not build time.
 
 ## Things that have already bitten — don't repeat
 
-- **`as: 'raw'` is deprecated** in newer Vite. We use it in
-  `src/lib/content.ts` for the search index. When upgrading Vite,
-  switch to `{ query: '?raw', import: 'default', eager: true }`.
+- **Don't parse `.mdx` files via `?raw` for metadata.** The MDX plugin
+  has `enforce: 'pre'` and claims `.mdx` before Vite's raw loader.
+  We've been bitten twice. For named exports (like `level`), use
+  `import.meta.glob('...', { import: '<name>', eager: true })` —
+  pulls just that export without breaking code splitting.
+- **Layout must use `h-screen`, not `min-h-screen`.** Otherwise the
+  sidebar's `overflow-y-auto` has no fixed parent height to constrain
+  it, and the whole page scrolls instead of the sidebar.
+- **Sidebar collapse state** lives in `localStorage` under
+  `sidebar.collapsed.v1` (keys: `topic:<name>`, `level:<topic>:<level>`).
+  Bump the version suffix if the schema changes.
 - **The MDX `<button>` rule.** A `<button>` cannot wrap block-level
   elements (paragraphs, lists, code blocks). `<QA>` learned this the
   hard way — the header is a button, the answer is a sibling div.
 - **Shiki ships every language grammar by default**, which bloats the
-  bundle. If we ever want to deploy, restrict languages in
-  `vite.config.ts` to `['js', 'ts', 'tsx', 'json', 'bash']`.
-- **The middleware/route distinction is a teaching simplification.**
-  In Express, routes *are* middleware with a path filter — they live in
-  the same ordered stack. The encyclopedia teaches this explicitly in
-  `src/content/express/routing.mdx`. Don't redraw diagrams that imply
-  middleware and routes are separate phases.
+  bundle. Before deploying, restrict languages in `vite.config.ts` to
+  `['js', 'ts', 'tsx', 'json', 'bash']`.
+- **Routes ARE middleware** in Express. They live in the same ordered
+  stack with a method+path filter. `src/content/express/routing.mdx`
+  teaches this explicitly. Don't redraw diagrams implying middleware
+  and routes are separate phases.
 
 ## Demo authoring conventions
 
@@ -65,8 +74,9 @@ rationale, and conventions live in `PROJECT.md`.
 - `src/content/<topic>/*.mdx` — topic pages
 - `src/content/questions/<topic>.ts` — question banks
 - `src/components/demos/` — interactive demos used in MDX
-- `src/components/mdx/` — presentation primitives (Compare, Steps,
-  Diagram, Cheatsheet, Term, QA, Callout)
+- `src/components/mdx/` — MDX primitives (Compare, Steps, Diagram,
+  Cheatsheet, Term, QA, Callout)
+- `src/components/practice/` — Practice-route components (Answer)
 - `src/components/layout/` — Header, Sidebar, page shell
 - `src/components/search/` — Cmd+K modal
 - `src/components/ui/` — small shared primitives (TopicPill)
