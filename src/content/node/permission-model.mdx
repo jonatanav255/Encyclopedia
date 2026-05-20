@@ -1,0 +1,243 @@
+export const level = 'senior';
+
+# Node permission model
+
+Node's permission model (`--permission`, active development — no longer flagged as experimental in 23+, full stability still being declared) lets you
+restrict what the process can do at runtime — what files it reads,
+which child processes it spawns, what it can connect to over the
+network. It's the OS-level sandbox Node never had.
+
+It's particularly valuable post-Shai-Hulud and other supply-chain
+attacks: even if a dependency turns malicious, the permission model
+caps what it can do.
+
+## The basics
+
+```bash
+node --permission --allow-fs-read=/etc/myapp --allow-net app.js
+```
+
+By default, `--permission` denies everything. You explicitly allow
+what the process needs.
+
+## What you can allow
+
+```bash
+--allow-fs-read=/path           # read this path (or with --allow-fs-read=*)
+--allow-fs-write=/path          # write
+--allow-child-process           # spawn / fork / exec
+--allow-worker                  # worker_threads
+--allow-net                     # net + tls + http
+--allow-addons                  # native addons (.node files)
+```
+
+Each flag can be repeated; paths are matched as prefixes.
+
+A typical web service:
+
+```bash
+node \
+  --permission \
+  --allow-fs-read=/etc/ssl/certs \
+  --allow-fs-read=./node_modules \
+  --allow-fs-read=./dist \
+  --allow-fs-write=./logs \
+  --allow-net \
+  app.js
+```
+
+The process can read its own code and certs, write its logs, talk to
+the network, and nothing else. If a dependency tries to read `/etc/passwd`,
+Node throws.
+
+## Checking inside the process
+
+```js
+if (!process.permission.has('fs.read', '/etc/myapp')) {
+  console.error('missing required permission');
+  process.exit(1);
+}
+```
+
+Useful for clear startup errors instead of cryptic failures mid-
+request.
+
+## What it doesn't protect against
+
+The permission model is **process-level**. It can't:
+
+- Stop in-memory exploits (data exfiltration via `process.env`
+  read).
+- Prevent CPU exhaustion (a runaway loop still hangs).
+- Sandbox network *targets* — `--allow-net` is binary (everything or
+  nothing). For per-host restrictions, use an egress firewall.
+
+For dangerous environments (running untrusted code), you want
+container-level isolation in addition (gVisor, Kata Containers, or
+process sandboxes).
+
+## Pairs well with
+
+- **`--frozen-intrinsics`** — freezes prototypes so dependencies
+  can't poison built-ins. Pairs with permission model for hardened
+  runs.
+- **`--disable-proto=delete`** — removes `__proto__` access entirely
+  to defend against prototype pollution.
+- **`--no-addons`** — refuse to load native modules. Pair with
+  permissioning if you can.
+
+Combined:
+
+```bash
+node \
+  --permission \
+  --frozen-intrinsics \
+  --disable-proto=delete \
+  --allow-fs-read=./ \
+  --allow-net \
+  app.js
+```
+
+For a hardened-by-default deployment. Adopting all of these adds
+maybe 1% overhead.
+
+## What breaks
+
+In experimentation, the model exposes "we didn't actually need
+this":
+
+- Libraries that read random tmp files for caching.
+- Postinstall scripts (you don't run those at runtime, but worth
+  checking if they're still in `node_modules`).
+- Debug instrumentation that opens an inspector.
+
+Each is a one-line allow. The exercise of writing the allowlist
+makes you aware of what your code actually does.
+
+## Per-environment policy
+
+Different envs, different needs:
+
+```bash
+# Dev
+node --permission --allow-fs-read=. --allow-fs-write=. --allow-net app.js
+
+# Prod
+node --permission --allow-fs-read=./dist --allow-fs-write=/logs --allow-net app.js
+```
+
+Pin in your start command or container config. Adding new permissions
+should be a PR review item.
+
+## `worker_threads` and child processes
+
+Workers and child processes don't automatically inherit the parent's
+permission set:
+
+```js
+// Parent has --allow-fs-read=/data
+new Worker('./worker.js');   // worker has NO permissions by default
+```
+
+Pass `--permission` explicitly when spawning, or run them in the same
+process if you can.
+
+For workers:
+
+```bash
+node --permission --allow-worker app.js
+```
+
+`--allow-worker` lets you spawn workers; the workers themselves run
+under the same restrictions as the parent.
+
+## Limitations
+
+- **Experimental → stable**, but minor flag changes happen across
+  versions. Lock to a Node LTS.
+- **Some built-ins still work without permissions** — e.g., DNS
+  (resolution), basic I/O. The model focuses on disk and network,
+  not all syscalls.
+- **No granular network policy.** `--allow-net` is all-or-nothing.
+
+For more sophisticated policy, layer:
+
+```
+Network: egress firewall (allowed hosts)
+Disk:    Node --permission --allow-fs-read=...
+Memory:  cgroups / container limits
+CPU:     cgroups / container limits
+```
+
+## Common pitfalls
+
+### Forgetting `--allow-fs-read` for source
+
+Node has to read your script and its dependencies. If you turn on
+`--permission` and forget to allow `./`, it can't even start.
+
+Minimum: allow read of your project root and `node_modules`.
+
+### Catching the EACCES too broadly
+
+```js
+try {
+  await fs.readFile('/etc/passwd');
+} catch (err) {
+  // err.code === 'ERR_ACCESS_DENIED'
+}
+```
+
+Permission violations throw with `ERR_ACCESS_DENIED`. Catch and log;
+don't `catch (err) {}` — silent rejection of access errors hides
+configuration mistakes.
+
+### Permission flags after `--`
+
+```bash
+node app.js --permission --allow-net   # WRONG — these are app args
+node --permission --allow-net app.js   # right — Node flags before script
+```
+
+Node parses flags up to the script path. Permission flags must come
+before the script.
+
+### Overscoping during dev to "make it work"
+
+Resist the urge to `--allow-fs-read=/`. Track down what's being
+read; allow the narrowest path. The exercise is the value.
+
+### Assuming it sandboxes JavaScript itself
+
+The model restricts **syscalls**, not JavaScript semantics. A
+malicious dependency can still read your in-memory secrets, exfil
+data via `console.log`, or hang the process. For deeper sandboxing,
+isolate at the OS layer.
+
+## When to adopt
+
+- **New services**: turn it on. The work of allowlisting at the
+  start is small.
+- **Existing services**: try with `--permission` in dev. Watch
+  what breaks; allow each thing intentionally.
+- **Untrusted code execution** (running user scripts, plugins):
+  essential.
+- **Internal tools, scripts**: lower priority, but a nice defense
+  in depth.
+
+## The mental model
+
+The permission model is **least privilege for Node**. Each capability
+(filesystem read/write, child process, worker, network, addon) is
+opt-in. Code that doesn't need a capability can't accidentally use
+it — and a compromised dependency can't either.
+
+It's not a replacement for container-level isolation, OS-level
+sandboxes, or careful dependency review. It *is* a meaningful layer
+of defense that's cheap to adopt and shrinks attack surface
+immediately.
+
+For a production-hardened Node service in 2026, `--permission` +
+`--frozen-intrinsics` + `--disable-proto=delete` is the default
+boot. The cost is a one-time allowlist, written once, reviewed when
+you add a capability.

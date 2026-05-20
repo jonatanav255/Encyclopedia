@@ -1,0 +1,350 @@
+export const level = 'staff';
+
+# Supply chain hardening
+
+The largest threat to a Node service in 2026 isn't a remote
+exploit. It's a malicious or compromised dependency executing
+during install or runtime. Recent incidents (Shai-Hulud, the
+February 2024 worm campaign, ongoing `npm` typosquatting) made
+supply chain attacks a top-tier risk.
+
+The defense is layered: package manager choice, install behavior,
+runtime restrictions, monitoring.
+
+## Why pnpm
+
+This project (and our global `~/.claude/CLAUDE.md`) mandates pnpm
+over npm. Reasons:
+
+- **Content-addressable store**: dependencies live in a global
+  store hardlinked into projects. A package can't be silently
+  swapped per-project.
+- **Strict `node_modules`**: projects only see explicitly declared
+  dependencies. Phantom dependencies (using something you didn't
+  declare) fail at install — same as runtime.
+- **Better postinstall behavior**: pnpm 9+ requires explicit
+  `pnpm approve-builds` for postinstall scripts. The default is
+  "don't run scripts."
+- **Faster + lockfile rigor**: `pnpm-lock.yaml` is more
+  deterministic than `package-lock.json`.
+
+The Shai-Hulud-class attacks worked partly because postinstall
+scripts ran arbitrary code at `npm install`. pnpm's approve-builds
+model breaks that vector by default.
+
+## Block postinstall scripts
+
+```bash
+pnpm install --ignore-scripts
+```
+
+Or in `.npmrc` / `.pnpmrc`:
+
+```
+ignore-scripts=true
+```
+
+Then explicitly allow specific packages to run scripts:
+
+```bash
+pnpm approve-builds
+```
+
+pnpm 9+ has interactive approval per package. This is the modern
+default — postinstall is opt-in, not opt-out.
+
+The trade-off: some legitimate packages need postinstall
+(`esbuild`, `puppeteer`, native bindings). Approve them once,
+never again unless they change.
+
+## Lockfile discipline
+
+```bash
+# CI must use frozen lockfile
+pnpm install --frozen-lockfile
+```
+
+Without `--frozen-lockfile`, CI can resolve to a newer version than
+the lockfile specifies. That's how malicious updates slip past
+review.
+
+`--frozen-lockfile` fails if the lockfile is stale (e.g., a
+dependency was added but lockfile not regenerated). Catches "I
+forgot to commit pnpm-lock.yaml" issues.
+
+In `package.json`:
+
+```json
+{
+  "scripts": {
+    "ci": "pnpm install --frozen-lockfile && pnpm test && pnpm build"
+  }
+}
+```
+
+## `pnpm audit`
+
+```bash
+pnpm audit
+pnpm audit --audit-level=high
+pnpm audit --fix     # tries to bump
+```
+
+Audits the lockfile against known advisories. Run in CI:
+
+```bash
+pnpm audit --audit-level=high --prod
+```
+
+`--prod` ignores dev dependencies. False positives common (CVEs in
+deeply-transitive deps with no practical exploit path); read the
+output, don't blindly fix.
+
+For larger projects, **Snyk**, **Socket**, or **Dependabot** monitor
+continuously and open PRs.
+
+## npm provenance / Sigstore
+
+Modern npm packages can include **provenance attestations** —
+cryptographic proof that the package was built from a specific
+commit by a specific CI pipeline.
+
+```bash
+npm view <package> dist.signatures
+npm install <package> --foreground-scripts
+```
+
+In `package.json` (for publishers):
+
+```json
+{
+  "publishConfig": {
+    "provenance": true
+  }
+}
+```
+
+CI environments (GitHub Actions) attach the attestation
+automatically. Consumers can verify the package was built from
+official sources, not modified.
+
+This is opt-in adoption. As of 2026, ~30% of top packages publish
+with provenance. Increasingly the default.
+
+## Dependency review process
+
+For new dependencies:
+
+1. **Read the source.** First-time deps especially. The package is
+   small enough; spend 10 minutes.
+2. **Check maintenance signals.** Last commit, last release,
+   downloads, open issues. Abandoned packages are silent risks.
+3. **Check transitive deps.** `pnpm why <package>` shows what pulls
+   it in. A package with 20 transitive deps is 20× the surface.
+4. **Prefer fewer deps.** If a small task can be done in 10 lines of
+   code, write the 10 lines. The npm ecosystem normalized "every
+   utility is a package" — that's the supply chain risk.
+
+For existing dependencies:
+
+- **Renovate** or **Dependabot** for automated PRs.
+- **Grouping rules** so minor versions auto-merge after CI passes
+  but major versions require review.
+- **`pnpm outdated`** monthly to see what's drifted.
+
+## Runtime hardening
+
+Beyond install-time, harden the runtime:
+
+### `--permission`
+
+```bash
+node --permission \
+  --allow-fs-read=./dist \
+  --allow-fs-read=./node_modules \
+  --allow-net \
+  app.js
+```
+
+Limits what the process can do, even if a dep is compromised. See
+**Permission model**.
+
+### `--frozen-intrinsics`
+
+```bash
+node --frozen-intrinsics app.js
+```
+
+Freezes JavaScript built-in prototypes (`Object.prototype`,
+`Array.prototype`, etc.). Prototype pollution attacks via
+`__proto__` injection can't modify them.
+
+### `--disable-proto`
+
+```bash
+node --disable-proto=delete app.js
+```
+
+Removes access to `__proto__` entirely. Stronger than just freezing —
+the property doesn't exist.
+
+### `--no-addons`
+
+```bash
+node --no-addons app.js
+```
+
+Refuses to load native add-ons (`.node` files). For services that
+don't need them, this eliminates a category of attack vectors
+(compromised native binaries).
+
+### Combined
+
+```bash
+node \
+  --permission \
+  --allow-fs-read=./dist \
+  --allow-fs-read=./node_modules \
+  --allow-net \
+  --frozen-intrinsics \
+  --disable-proto=delete \
+  app.js
+```
+
+About 1% overhead, substantial defense-in-depth.
+
+## Monitoring
+
+For continuous awareness:
+
+- **Socket** — passive monitoring of installed deps; alerts on
+  suspicious behavior (network calls from packages that shouldn't,
+  obfuscated code).
+- **GitHub Dependabot alerts** — basic but free.
+- **Snyk** — paid, broader checks.
+- **`npm-audit-resolver`** — internal allowlist of acknowledged false
+  positives.
+
+## CI configuration
+
+```yaml
+# .github/workflows/ci.yml
+- run: corepack enable pnpm
+- run: pnpm install --frozen-lockfile --ignore-scripts
+- run: pnpm audit --audit-level=high --prod
+- run: pnpm test
+- run: pnpm build
+```
+
+Notes:
+
+- `corepack enable pnpm` uses the pnpm version pinned in
+  `package.json` (`"packageManager"`). Prevents version drift.
+- `--ignore-scripts` in CI runs **without postinstall**. If your CI
+  needs them (esbuild, etc.), explicitly approve.
+- `--audit-level=high` lets low-severity advisories slide; tune
+  per team risk tolerance.
+
+## Deno / Bun alternatives
+
+Some teams move security-sensitive workloads to **Deno** (per-perm
+sandboxing built-in) or **Bun** (also sandboxed).
+
+For pure Node, the permission model + pnpm hardening gets you most of
+the way without changing runtime. Switching runtimes is a much
+larger commitment.
+
+## Common pitfalls
+
+### Defaulting to `npm install` "just to test"
+
+Even in dev, this can run malicious postinstall scripts. Stay with
+pnpm always. The global `~/.claude/CLAUDE.md` enforces this.
+
+### Trusting CI without `--frozen-lockfile`
+
+Without the flag, CI can install different versions than dev.
+Discrepancies are how stealth attacks succeed (look for the
+freshly-bumped dep in the lockfile diff).
+
+### "Auto-merge minor updates"
+
+Sounds safe, often isn't. Minor versions can introduce malicious
+code if the package was compromised. Auto-merge **only** if:
+
+- CI runs your tests against the new version.
+- You've checked the package's release notes (no surprise major
+  changes labeled minor).
+- The dep is from a trusted publisher.
+
+Otherwise require a human review even for minors.
+
+### Ignoring `pnpm audit` warnings
+
+Audit output is noisy; ignore-fatigue is real. Triage instead of
+ignoring: each finding gets a one-line note in a tracking doc with
+either "acknowledge, no fix" or "TODO bump."
+
+### Trusting `package.json` engine constraints
+
+```json
+{ "engines": { "node": ">=18" } }
+```
+
+Engine constraints are advisory in npm/pnpm by default. A package
+can claim "Node 18+" and still break on Node 22. Test against your
+actual Node version.
+
+### Embedding secrets in package.json
+
+```json
+{ "scripts": { "postinstall": "curl ... TOKEN=abc" } }
+```
+
+Anything in `package.json` is visible to anyone who clones. Use
+environment variables, not literals.
+
+## When you're compromised
+
+If you discover a malicious dep in your install:
+
+1. **Rotate every secret** the process had access to. Database
+   passwords, API keys, GitHub tokens. Anything in `process.env`.
+2. **Audit logs** for anything the process did after install. Outbound
+   requests, file writes.
+3. **Remove the dep** and any descendants.
+4. **Force-update the lockfile** (`pnpm install`).
+5. **Inform the team** and post a public advisory if you have
+   downstream consumers.
+
+The blast radius depends on what the process could do.
+`--permission` and least-privilege deployments cap it; otherwise
+assume full compromise.
+
+## The mental model
+
+Supply chain hardening is **defense in depth** at the dependency
+layer:
+
+- **Install time**: pnpm, `--ignore-scripts`, `--frozen-lockfile`.
+- **Lockfile**: review every diff in PR. Block auto-merge for
+  unknowns.
+- **Audit**: continuous monitoring (Socket, Snyk, Dependabot).
+- **Runtime**: `--permission`, `--frozen-intrinsics`,
+  `--disable-proto`.
+- **Process**: limited credentials per service, monitored egress,
+  fast rotation on incident.
+
+No single layer is enough. Together they make supply chain attacks
+costly and visible. The most-attacked teams in 2025 had multiple of
+these missing; the least-impacted had them all.
+
+For a new Node service in 2026, the boot script enforces:
+
+```bash
+pnpm install --frozen-lockfile --ignore-scripts
+node --permission --frozen-intrinsics --disable-proto=delete --allow-net dist/index.js
+```
+
+The marginal cost is 30 minutes of setup. The marginal benefit is
+"we're not the next Shai-Hulud headline."

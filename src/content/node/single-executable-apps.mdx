@@ -1,0 +1,326 @@
+export const level = 'senior';
+
+# Single Executable Applications (SEA)
+
+Node ships a feature called **SEA** that lets you produce a **single
+executable binary** containing your application code, embedded into
+the Node executable itself. The result is one file you can run on a
+machine without installing Node.
+
+Use cases:
+
+- **CLI tools** distributed to users who don't have Node.
+- **Self-contained deployments** where pulling Node + npm install at
+  runtime isn't acceptable.
+- **Container minimization**: bundle the app into the binary, no
+  `node_modules` to ship.
+
+Stable in Node 22+ (experimental in 20).
+
+## How it works
+
+The workflow:
+
+1. **Bundle your app** into a single JS file (esbuild, rollup,
+   etc.). SEA needs a single entry; it doesn't bundle for you.
+2. **Generate a "blob"** containing your code and config:
+   ```bash
+   node --experimental-sea-config sea-config.json
+   ```
+3. **Inject the blob** into a copy of the Node binary using
+   `postject`.
+4. **Sign** (macOS / Windows).
+
+The result is a binary that, when run, starts Node and immediately
+executes your embedded code.
+
+## Step-by-step
+
+### 1. Bundle
+
+```bash
+pnpm dlx esbuild src/index.ts \
+  --bundle \
+  --platform=node \
+  --target=node22 \
+  --outfile=dist/bundle.js
+```
+
+`dist/bundle.js` is one file with everything inlined.
+
+### 2. Config
+
+`sea-config.json`:
+
+```json
+{
+  "main": "dist/bundle.js",
+  "output": "dist/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": true
+}
+```
+
+- `main` — the bundled JS.
+- `output` — where to put the generated blob.
+- `useCodeCache: true` — embed V8 code cache for faster startup.
+- `useSnapshot: false` — V8 snapshot is faster but more complex; off
+  unless you need the startup time.
+
+Generate the blob:
+
+```bash
+node --experimental-sea-config sea-config.json
+```
+
+### 3. Copy Node and inject
+
+```bash
+cp $(command -v node) my-app
+postject my-app NODE_SEA_BLOB dist/sea-prep.blob \
+  --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 \
+  --macho-segment-name NODE_SEA   # macOS only
+```
+
+`postject` is a separate package (`pnpm dlx postject`). It writes
+the blob into the Node binary's resource section.
+
+### 4. Sign
+
+```bash
+# macOS
+codesign --sign - my-app
+
+# Windows
+signtool sign /a my-app.exe
+```
+
+Required for binaries to run without warnings on macOS / Windows.
+Without code signing, Gatekeeper or SmartScreen blocks the
+executable.
+
+### 5. Run
+
+```bash
+./my-app
+```
+
+Your bundled app runs. No Node required on the target machine.
+
+## Embedded assets
+
+SEA can include arbitrary assets (templates, static files, embedded
+SQLite databases):
+
+```json
+{
+  "main": "dist/bundle.js",
+  "output": "dist/sea-prep.blob",
+  "assets": {
+    "config.json": "config/prod.json",
+    "favicon.ico": "assets/favicon.ico"
+  }
+}
+```
+
+Access in JS:
+
+```js
+import { getAsset } from 'node:sea';
+
+const config = JSON.parse(getAsset('config.json', 'utf8'));
+```
+
+The assets live in the binary. No `fs.readFile` on disk.
+
+## Trade-offs
+
+### Binary size
+
+A SEA binary is **the size of Node (~80MB)** plus your app. There's
+no way to shrink Node itself meaningfully — it's V8, libuv, OpenSSL,
+zlib, c-ares, etc., all linked in.
+
+For comparison:
+
+- `node` binary: ~80MB.
+- Your typical app bundled: 1–10MB.
+- SEA result: ~80–90MB.
+
+If size matters (mobile, embedded), Node SEA isn't the right tool.
+For "CLI tool for developers" or "container," 80MB is fine.
+
+### Startup time
+
+A SEA binary starts roughly as fast as `node bundle.js`. The
+`useCodeCache: true` option pre-compiles the JS and saves a few
+hundred ms.
+
+For sub-second startup, V8 snapshots (`useSnapshot: true`) help —
+but they're more complex (require a snapshot-friendly bundle).
+
+### Build pipeline
+
+SEA isn't a bundler. You still need esbuild / rollup / webpack to
+create the single JS file. SEA's job is "wrap it in a binary."
+
+For CLIs, `pkg` and `nexe` have long handled this in user space.
+SEA is the official, Node-team-maintained path.
+
+### Dynamic require / dynamic import
+
+Bundlers usually handle this fine: `import('./plugin')` is replaced
+with the inlined module. But `require(userInput)` or
+`fs.readFile(somePath)` at runtime can't find files that aren't
+embedded.
+
+Either avoid dynamic loading or use `getAsset()` for embedded
+assets.
+
+### Native modules
+
+Native add-ons (`.node` files via `napi`) **work** in SEA — they're
+loaded at runtime from `node_modules/` or the working directory.
+
+But that means you have to ship the `.node` files alongside the
+binary, defeating "single executable." Workaround: link native deps
+statically (rebuild Node with them), which is non-trivial.
+
+For pure-JS deps, SEA is straightforward. Native deps push you
+toward containerization instead.
+
+## When SEA shines
+
+- **Standalone CLIs** for developers: `my-cli init`, distributed
+  via GitHub releases or Homebrew.
+- **Self-contained server binaries** for environments without
+  package managers (some on-prem hosts).
+- **Single-file deploys** where pulling deps at runtime is too slow
+  or risky.
+
+## When containers are better
+
+- **Web services on Kubernetes / ECS / Cloud Run**: container is
+  the unit anyway. The 80MB savings vs `node:slim` is small.
+- **Apps with native dependencies**: containerize.
+- **Hot reloading in dev**: SEA is build-once, not for development.
+
+## When SEA isn't the right call
+
+- **You need < 5MB binaries**: try Bun's compile feature (~50MB
+  smaller) or Deno's compile.
+- **You need cross-compilation**: SEA binaries are platform-
+  specific. Build on the target OS or use a CI matrix.
+- **You're shipping to end-user desktops**: Electron or Tauri
+  handle the desktop story better.
+
+## Code cache vs snapshot
+
+`useCodeCache: true`:
+
+- Pre-compiles your JS to V8 bytecode.
+- Startup improvement: ~100ms for a typical app.
+- Build: simple, no special considerations.
+
+`useSnapshot: true`:
+
+- Captures a V8 heap snapshot — global state pre-initialized.
+- Startup improvement: ~500ms for cold start.
+- Build: requires snapshot-friendly bundle (no top-level
+  side effects beyond what V8 captures).
+
+For most CLIs, code cache is enough. For maximum startup speed (CI
+runners, lambda-like), snapshots help — but they're a debugging
+challenge.
+
+## Comparison with `pkg` and `nexe`
+
+| | SEA | `pkg` | `nexe` |
+| --- | --- | --- | --- |
+| Maintained by | Node team | Vercel (deprecated 2023) | community |
+| Modern Node | yes | partial | yes |
+| ESM | yes | partial | yes |
+| Cross-compile | no | yes | yes |
+| Bundle included | no (BYO) | yes | yes |
+| Code cache | yes | no | partial |
+
+SEA is the right path going forward. `pkg` is deprecated; `nexe`
+exists but lags features.
+
+## Common pitfalls
+
+### Forgetting to bundle
+
+```bash
+node --experimental-sea-config sea-config.json  # main: 'src/index.js'
+```
+
+If `src/index.js` does `require('./helper')`, the SEA binary won't
+find the helper. SEA includes only what you pointed at. Bundle
+first; point SEA at the bundle.
+
+### Forgetting code signing
+
+On macOS, an unsigned binary runs but the OS shows scary warnings.
+On Windows 11, SmartScreen blocks unsigned binaries by default.
+Always sign for distribution.
+
+### Mistaking SEA for a security boundary
+
+Embedded code is still readable from the binary (strings command
+works). Don't put secrets in your bundle. SEA is for distribution
+convenience, not code protection.
+
+### Native modules in `node_modules`
+
+```js
+import sharp from 'sharp';   // native
+```
+
+`sharp` has a `.node` file. Bundling `sharp` doesn't bundle the
+native part. Either:
+
+- Ship `node_modules/sharp/` alongside the binary.
+- Use a pure-JS alternative.
+- Statically link (advanced).
+
+### Cross-platform builds
+
+You can't build a Windows SEA from macOS without Wine / a Windows
+runner. Use CI with platform matrices to produce per-OS binaries.
+
+### Asset paths
+
+```js
+// Embedded asset
+const config = getAsset('config.json', 'utf8');
+
+// NOT this — runtime file read fails because file doesn't exist
+const config = fs.readFileSync('config.json', 'utf8');
+```
+
+Files referenced in your bundle must either be inlined by the
+bundler or embedded via SEA's `assets` config.
+
+## The mental model
+
+SEA is **wrapping your bundled app in a copy of Node so it runs
+without dependencies on the target**. The Node binary is the
+runtime; your JS is the payload.
+
+For CLI tools and self-contained deploys, it removes the "install
+Node first" friction. For containers and orchestrated services, the
+80MB binary is no improvement over `node:slim` plus your app.
+
+The build pipeline is:
+
+```
+TypeScript → bundle → SEA config → blob → inject into Node binary → sign
+```
+
+Six steps; the first three are normal bundler work. The last three
+are SEA-specific.
+
+For 2026, SEA is the official Node story for single-executable
+distribution. `pkg` is dead; SEA is the path.

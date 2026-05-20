@@ -1,0 +1,390 @@
+export const level = 'senior';
+
+# ESM/CJS interop, practical
+
+Node has two module systems coexisting. **ESM** (`import`/`export`)
+is the standard, **CJS** (`require`/`module.exports`) is the legacy.
+The interop between them was painful for years; Node 22 finally
+made `require(esm)` work synchronously. This page is the practical
+2026 guide.
+
+## The current state
+
+- **New code should be ESM.** `"type": "module"` in `package.json`.
+- **CJS still works** and is the right choice for some libraries
+  (deep dual-package compatibility).
+- **`require(esm)` works** in Node 22+ for ESM without top-level
+  await. Synchronous, unflagged in 23.
+- **`import()` of CJS** always works.
+
+The interop is no longer a build pipeline problem. Most apps just
+write ESM and import whatever.
+
+## ESM defaults
+
+```json
+{
+  "type": "module"
+}
+```
+
+In this package, all `.js` files are ESM. Use `.cjs` for CJS files;
+use `.mjs` for explicitly-ESM files (rare given the default).
+
+```js
+// src/index.js
+import express from 'express';
+import { readFile } from 'node:fs/promises';
+
+const app = express();
+// ...
+```
+
+Standard. Works in modern Node, modern browsers, modern bundlers.
+
+## CJS interop in ESM
+
+### Importing a CJS module
+
+```js
+import express from 'express';   // express is CJS; works
+import { Router } from 'express'; // CJS named exports — works in modern Node
+```
+
+Modern Node (22+) supports named exports from CJS via static analysis.
+For libraries that don't analyze cleanly (dynamic `module.exports`),
+fall back to default + destructure:
+
+```js
+import expressPkg from 'express';
+const { Router } = expressPkg;
+```
+
+### Importing JSON
+
+```js
+import config from './config.json' with { type: 'json' };
+```
+
+The `with { type: 'json' }` import attribute is required in modern
+ESM. Node, browsers, bundlers all support it.
+
+### Importing native modules
+
+```js
+import bcrypt from 'bcrypt';   // works
+```
+
+Native modules (`.node` files via N-API) work via CJS; ESM imports
+them through Node's CJS bridge.
+
+## ESM in CJS
+
+### Synchronous `require` of ESM (Node 22+)
+
+```js
+// CommonJS file
+const lib = require('./lib.mjs');
+```
+
+Works if `lib.mjs` doesn't use top-level `await`. If it does, you
+get:
+
+```
+Error: Cannot require() an ES Module with top-level await
+```
+
+Solutions:
+
+- Remove the top-level await (refactor to a deferred init function).
+- Use dynamic `import()`:
+  ```js
+  const { foo } = await import('./lib.mjs');
+  ```
+  `import()` is always async, always works.
+
+### Dynamic `import` always works
+
+```js
+// CommonJS
+const { something } = await import('./esm-only-module.mjs');
+```
+
+`import()` returns a promise; works for any ESM, including with TLA.
+Used to be the only way; still works.
+
+## `__dirname` and `__filename`
+
+CJS has them as globals:
+
+```js
+// CJS
+console.log(__dirname);
+console.log(__filename);
+```
+
+ESM **doesn't** by default. Either:
+
+```js
+// ESM (modern)
+import.meta.dirname;
+import.meta.filename;
+```
+
+Available in Node 20.11+. Stable in 22.
+
+Or the older pattern:
+
+```js
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+```
+
+Use `import.meta.dirname` / `import.meta.filename` in new code.
+
+## Dual-package publishing
+
+Libraries shipping both ESM and CJS:
+
+```json
+{
+  "name": "my-lib",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  }
+}
+```
+
+Consumers using ESM get the `.mjs`; CJS gets `.cjs`. Same source,
+different builds (esbuild / rollup / tsup).
+
+### The dual-package hazard
+
+If you publish both, and someone:
+
+```js
+const lib = require('my-lib');     // CJS module
+import lib from 'my-lib';          // ESM module
+```
+
+…they get **two different module instances**. State (singletons, caches)
+isn't shared. Confusing bugs.
+
+Mitigations:
+
+- Pick one (ESM-only is increasingly viable).
+- Or design to be stateless.
+- Or use `package.json` exports to force the right entry per
+  consumer type.
+
+For new libraries, **ESM-only** is the modern default. CJS-only
+consumers can use dynamic `import()`.
+
+## Top-level await
+
+```js
+// In ESM only
+const data = await loadData();
+export { data };
+```
+
+Works in ESM modules. Anything importing this module waits for the
+await.
+
+Consequences:
+
+- `require(this-module)` from CJS **fails** (sync require can't wait).
+- `import()` from anywhere works (it's async).
+
+Use sparingly. Top-level await is convenient but propagates startup
+delays.
+
+## File extensions
+
+ESM requires explicit extensions:
+
+```js
+import { foo } from './foo.js';   // works
+import { foo } from './foo';       // works only if config allows
+```
+
+Node's strict ESM resolution wants the extension. TypeScript with
+`"moduleResolution": "Bundler"` lets you omit. With
+`"moduleResolution": "NodeNext"`, the extension is required.
+
+A common pattern: write `.js` in imports even from `.ts` source —
+the compiler doesn't rewrite, Node resolves to `.ts` at runtime via
+native TypeScript or via the bundled output at `.js`.
+
+```ts
+// foo.ts
+export const foo = 1;
+
+// bar.ts
+import { foo } from './foo.js';   // resolves to foo.ts at runtime / dist/foo.js after build
+```
+
+The `.js` extension matches what TypeScript would emit if compiled.
+
+## Tooling that broke and got fixed
+
+Most popular Node tools now work natively in ESM:
+
+- **TypeScript native** — strip types runs ESM (or CJS).
+- **Vitest / Jest** — both support ESM.
+- **node:test** — ESM-first.
+- **Vite / esbuild / rollup** — ESM-native bundlers.
+- **`ts-jest` / `ts-node`** — increasingly obsolete given native TS.
+
+If you hit a tool that doesn't support ESM, it's a 2022 artifact;
+look for a maintained alternative.
+
+## Module caching
+
+ESM modules are cached by URL. CJS by resolved path. Different
+caches. A module imported via both `require` and `import` is
+loaded twice.
+
+```js
+const a = require('./foo.cjs');
+const b = await import('./foo.cjs');
+a === b.default;   // depends on the file's exports — often true, but be careful
+```
+
+For app code, you usually don't mix. Stick to one style per file.
+
+## Common pitfalls
+
+### Forgetting `.js` extension
+
+```js
+import { foo } from './foo';   // works in TS, fails at runtime
+import { foo } from './foo.js'; // works always
+```
+
+Native Node ESM is strict. Always extension.
+
+### `module.exports = ...` in ESM by mistake
+
+```js
+// In a .js file with "type": "module"
+module.exports = { foo };    // ReferenceError: module is not defined
+```
+
+ESM has no `module`. Use `export`. Conversely, CJS files (`.cjs` or
+in a package without `"type": "module"`) can't use `import`/`export`.
+
+### `import.meta.url` vs `__filename`
+
+```js
+import.meta.url;          // 'file:///path/to/foo.js'  (URL)
+fileURLToPath(import.meta.url);   // '/path/to/foo.js'   (path)
+```
+
+`import.meta.url` is a URL string. Path operations need the
+conversion. `import.meta.dirname` skips the dance (Node 20.11+).
+
+### Importing a CJS module that doesn't define named exports
+
+```js
+import { foo } from 'old-cjs-lib';   // SyntaxError
+```
+
+If Node can't statically determine the exports, you must:
+
+```js
+import lib from 'old-cjs-lib';
+const { foo } = lib;
+```
+
+Modern Node analyzes most CJS correctly; the failure mode shrinks
+each release.
+
+### `package.json` `exports` mistakes
+
+```json
+{
+  "exports": {
+    ".": "./index.js"
+  }
+}
+```
+
+This blocks deep imports — `my-lib/utils` won't resolve. Either
+expose all entries:
+
+```json
+{
+  "exports": {
+    ".": "./index.js",
+    "./utils": "./utils.js"
+  }
+}
+```
+
+Or use `./*` for everything:
+
+```json
+{
+  "exports": {
+    ".": "./index.js",
+    "./*": "./*.js"
+  }
+}
+```
+
+The first form is safer (explicit public API); the second gives
+consumers free rein.
+
+### Loading `.json` without import attribute
+
+```js
+import config from './config.json';   // Node: SyntaxError without attribute
+import config from './config.json' with { type: 'json' };   // works
+```
+
+The attribute is required in standard ESM. Bundlers ignore it; Node
+requires it.
+
+## Migrating CJS to ESM
+
+For a CJS codebase moving to ESM:
+
+1. Add `"type": "module"` to `package.json`.
+2. Rename any files that are still CJS-only to `.cjs`.
+3. Replace `require` with `import` in `.js` files.
+4. Replace `module.exports` with `export default` or named
+   `export`s.
+5. Replace `__dirname` / `__filename` with `import.meta.dirname` /
+   `import.meta.filename`.
+6. Add `.js` extensions to relative imports.
+7. Add `with { type: 'json' }` to JSON imports.
+
+A medium-sized codebase migrates in an afternoon. Bigger ones (3000+
+files) take days; do it incrementally per package.
+
+## The mental model
+
+In 2026, ESM is **the default**. CJS exists for legacy compatibility.
+Most app code is ESM; most libraries publish ESM (with CJS for
+backward compat).
+
+The interop is largely solved:
+
+- ESM imports CJS: works for static analyzable, otherwise default
+  + destructure.
+- CJS requires ESM: works in Node 22+ without TLA, else
+  `import()`.
+- Both: same module loaded twice — usually fine, occasionally
+  surprising.
+
+Use ESM. Use `.js` extensions. Use native TS where it works
+(`--experimental-strip-types`). Pair with modern Node (22+) and the
+interop goes away.

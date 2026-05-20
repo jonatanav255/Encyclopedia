@@ -1,0 +1,261 @@
+export const level = 'staff';
+
+# HTTP timeouts, Slowloris, and request smuggling
+
+The HTTP layer has a small family of attacks that exploit timing,
+parser disagreement, or header ambiguity. Node has built-in defenses
+that you have to configure correctly. Misconfiguration is how
+production services get DoS'd or accidentally route attacker requests
+to the wrong endpoint.
+
+## Slowloris
+
+The attack: open many TCP connections to your server, send headers
+slowly (one byte every few seconds). Each connection ties up a Node
+worker / file descriptor without ever finishing the request. With
+enough connections, the server runs out of resources to serve real
+traffic.
+
+The defense is two timeouts:
+
+### `headersTimeout` (default 60s)
+
+Maximum time to read the request **headers** in full. Slowloris on
+headers fails when this fires.
+
+```js
+server.headersTimeout = 60_000;   // 60s — Node default
+```
+
+For most APIs, 10–30s is plenty. Browsers send headers in one or two
+packets; only attackers drag it out.
+
+### `requestTimeout` (default 5 min)
+
+Maximum time from connection accept to **end of request body**.
+Defends against:
+
+- Slowloris-on-body: send headers fast, body slowly.
+- Stuck clients that opened the connection and walked away.
+- Endpoints expected to receive small bodies — bound the time.
+
+```js
+server.requestTimeout = 30_000;   // 30s — adjust per service
+```
+
+For an upload-heavy endpoint, this can be much higher (and the
+upload route should set higher per-socket timeouts). For typical
+JSON APIs, 30s is generous.
+
+### `keepAliveTimeout` (default 5s)
+
+Doesn't defend against Slowloris directly, but interacts. After a
+response, Node holds the TCP connection idle for `keepAliveTimeout`
+expecting the next request. Set this carefully w.r.t. your proxy —
+see **HTTP server internals**.
+
+## HTTP request smuggling
+
+The attack: send a request with **ambiguous framing** so the
+front-end proxy and the back-end Node parse it differently. The
+attacker injects a second request that the back-end picks up as part
+of someone else's connection — getting routed past auth, hitting
+internal endpoints, or poisoning the response cache.
+
+The classic forms:
+
+### CL.TE
+
+`Content-Length` and `Transfer-Encoding` both present:
+
+```
+POST / HTTP/1.1
+Content-Length: 13
+Transfer-Encoding: chunked
+
+0
+
+SMUGGLED
+```
+
+- Proxy honors `Content-Length: 13` — reads 13 bytes (including
+  `SMUGGLED`).
+- Node honors `Transfer-Encoding: chunked` — reads `0\r\n\r\n`
+  (terminator) and stops, leaving `SMUGGLED` in the socket buffer.
+- Next request the proxy forwards on the same keep-alive socket gets
+  `SMUGGLED` prepended.
+
+The attacker just smuggled an arbitrary request through the proxy's
+auth, parsed by the backend as a fresh request.
+
+### TE.CL
+
+Same idea, reversed: proxy honors `Transfer-Encoding`, backend
+honors `Content-Length`.
+
+### TE.TE
+
+Both honor `Transfer-Encoding` but the proxy gets confused by a
+malformed variant:
+
+```
+Transfer-Encoding: chunked
+Transfer-Encoding: x
+
+(body)
+```
+
+The duplicate, second header parsed differently by the proxy gets
+the attacker the same desync.
+
+### What Node does
+
+Node's HTTP parser is **strict** about TE/CL conflicts:
+
+- If both `Content-Length` and `Transfer-Encoding: chunked` are
+  present, Node prefers `Transfer-Encoding` (RFC compliant) and
+  drops the connection if the framing is otherwise ambiguous.
+- Node rejects duplicate `Transfer-Encoding` headers, malformed
+  chunk lines, and bad framing.
+
+But the defense depends on **both** Node and your proxy agreeing.
+The full mitigation:
+
+1. **Keep Node patched.** Most smuggling CVEs were parser bugs.
+2. **Use HTTP/2 between proxy and Node** if your stack supports it.
+   HTTP/2 framing is unambiguous — no smuggling.
+3. **Configure your proxy** (nginx, HAProxy, Envoy) to reject
+   ambiguous requests upstream of Node. Most modern proxies do this
+   by default; older configs may not.
+4. **Disable keep-alive between proxy and Node** if you can't update
+   either. Drastic — adds latency — but eliminates the cross-request
+   contamination vector.
+
+## What else Node's HTTP server defends against
+
+- **Oversized headers**: `maxHeaderSize` (default 16 KB) and
+  `--max-http-header-size`. Returns 431.
+- **Header floods**: `maxHeadersCount` (default 2000). Rejects if
+  exceeded.
+- **Bad chunked encoding**: strict parser; closes connection on
+  garbage.
+- **Embedded `\r\n` in headers**: rejected (CRLF injection).
+- **Invalid HTTP version strings**: rejected.
+
+Most of this is the parser's job, not yours. You configure timeouts
+and limits; Node enforces protocol correctness.
+
+## Recommended production settings
+
+```js
+import { createServer } from 'node:http';
+
+const server = createServer(app);
+
+// Slowloris defense
+server.headersTimeout = 10_000;          // 10s — generous for legit clients
+server.requestTimeout = 30_000;          // 30s — for typical JSON
+server.keepAliveTimeout = 65_000;        // Must exceed LB idle (ALB: 60s)
+
+// Resource limits
+server.maxHeadersCount = 100;
+server.maxRequestsPerSocket = 1000;      // Force socket rotation
+// maxHeaderSize: 16384 is fine; lower if you want stricter
+
+server.listen(PORT);
+```
+
+For upload-heavy endpoints, raise `requestTimeout` on the route
+rather than globally — or route uploads through a separate process /
+proxy buffer.
+
+## Detection
+
+Monitor for:
+
+- **Connections held without bytes**: a slow-attack indicator.
+- **High socket count without traffic**: backpressure from
+  Slowloris.
+- **Sudden 400/431 spikes**: ambiguous requests being rejected (or
+  a real client problem).
+- **Sudden 408 (Request Timeout) spikes**: clients failing to
+  finish before your `requestTimeout`. Could be legit (mobile
+  network), could be attack.
+
+A WAF / Cloudflare-style edge filters most of this before it reaches
+you. If you're directly exposed, monitor and tune.
+
+## What about HTTP/2?
+
+HTTP/2 eliminates smuggling because:
+
+- One **framing format** for all messages (no CL vs TE choice).
+- Each request is a **stream** with explicit ID and length.
+- Multiple requests multiplex without sharing byte ranges.
+
+Slowloris on HTTP/2 isn't impossible — clients can still send
+incomplete headers — but the protocol has built-in per-stream and
+per-connection limits (`SETTINGS_MAX_CONCURRENT_STREAMS`).
+
+If your proxy supports H2 to Node, you get smuggling protection for
+free. Otherwise, the H1 defenses above are what you have.
+
+## Common pitfalls
+
+### Setting timeouts and not testing
+
+Tools like `slowhttptest` or `slowloris.py` simulate the attack
+against your dev instance. Run them. If your server doesn't
+gracefully shed slow connections within a minute, your timeouts are
+wrong.
+
+### Trusting `Content-Length` blindly
+
+```js
+const len = +req.headers['content-length'];
+const body = await readBody(req, len);
+```
+
+Don't trust the header. Use a stream reader with a maximum byte cap
+(`getRawBody({ limit: '1mb' })`). Smuggled requests can lie about
+length.
+
+### Allowing `Transfer-Encoding` for non-chunked
+
+The only legitimate `Transfer-Encoding` value is `chunked` in
+HTTP/1.1. Anything else (`gzip`, `identity`) is parser bait — most
+modern Node versions reject these, but if you have any custom
+parsing, be paranoid.
+
+### Forgetting that your proxy is part of the surface
+
+The smuggling attack relies on **disagreement** between proxy and
+Node. Even a perfectly configured Node is vulnerable if the proxy
+parses sloppily. Keep both updated.
+
+### Disabling keep-alive everywhere as overkill
+
+Some teams turn off keep-alive to "eliminate smuggling." It works,
+but kills performance — every request pays TCP+TLS handshake. Reach
+for this only as a last resort.
+
+## The mental model
+
+The HTTP layer is **a state machine that can be tricked into reading
+the wrong bytes as the wrong message**. Two defenses:
+
+1. **Timeouts** for clients who refuse to finish — Slowloris.
+2. **Strict parsing + proxy alignment** for clients who frame
+   ambiguously — smuggling.
+
+Node does most of the parsing correctly. Your job is to:
+
+- Set the four timeouts (`headersTimeout`, `requestTimeout`,
+  `keepAliveTimeout`, with `keepAliveTimeout` > proxy idle).
+- Keep Node and proxy patched.
+- Use HTTP/2 between them if possible.
+- Monitor for the symptoms.
+
+This is a small enough surface that "done once, mostly forgotten" is
+the right state — but missing any of these can turn into a serious
+incident.

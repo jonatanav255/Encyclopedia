@@ -1,0 +1,457 @@
+export const level = 'senior';
+
+# Graceful shutdown (deep)
+
+A "graceful shutdown" is the difference between **dropping in-flight
+requests with errors** and **letting them finish naturally** before
+the process exits. Done badly: customers see 502s during every
+deploy. Done well: deploys are invisible to users.
+
+This is a longer treatment than the basic shutdown topic — covering
+the lesser-known details: keep-alive draining, WebSocket draining,
+in-flight job tracking, and what Node 18.2's `closeIdleConnections`
+finally fixed.
+
+## The phases
+
+```
+SIGTERM
+  ↓
+1. Fail readiness probe        — LB stops sending new traffic
+  ↓ (wait for LB to notice — ~5-10s)
+2. Stop accepting new requests — server.close()
+  ↓
+3. Close idle keep-alive conns — server.closeIdleConnections()
+  ↓
+4. Wait for in-flight to drain — bounded timeout
+  ↓
+5. Force-close stragglers      — server.closeAllConnections()
+  ↓
+6. Close downstream resources  — DB pool, Redis, queues
+  ↓
+7. Process exits
+```
+
+Six steps. Most "graceful shutdown" code skips at least three of
+them.
+
+## Why pre-18.2 was broken
+
+Before Node 18.2, calling `server.close()` waited for **all
+in-flight connections** to close — including idle keep-alive
+connections that the client was keeping open hoping for the next
+request.
+
+A client with `keep-alive` on a long-lived TCP socket → that socket
+stays open for `keepAliveTimeout` (default 5s). Multiply across
+hundreds of clients → `server.close()` blocks for seconds.
+
+Worse: if the orchestrator's `terminationGracePeriodSeconds` was
+30s, the process got SIGKILL before clean shutdown finished.
+
+Node 18.2 added `closeIdleConnections()` and `closeAllConnections()`
+to fix this. Now you can:
+
+- Stop new accepts (`server.close()`).
+- Force-close *idle* connections immediately (no new requests come
+  on them anyway).
+- Let *active* connections drain naturally up to a deadline.
+- Force-close stragglers after the deadline.
+
+## A full implementation
+
+```js
+import http from 'node:http';
+
+const server = http.createServer(app);
+server.listen(PORT);
+
+let isShuttingDown = false;
+const inFlight = new Set();
+
+// Track in-flight requests
+app.use((req, res, next) => {
+  inFlight.add(res);
+  res.on('finish', () => inFlight.delete(res));
+  res.on('close', () => inFlight.delete(res));
+  next();
+});
+
+// Readiness probe
+app.get('/healthz/ready', (req, res) => {
+  if (isShuttingDown) return res.status(503).send('shutting down');
+  res.send('ok');
+});
+
+async function shutdown(signal) {
+  log.info({ signal }, 'shutdown initiated');
+  isShuttingDown = true;
+
+  // 1. Wait for LB to notice readiness failure
+  await new Promise(r => setTimeout(r, 5_000));
+
+  // 2. Stop accepting new HTTP connections
+  server.close((err) => {
+    if (err) log.error({ err }, 'server.close error');
+  });
+
+  // 3. Close idle keep-alive connections (Node 18.2+)
+  server.closeIdleConnections();
+
+  // 4. Wait for in-flight to finish, with timeout
+  const deadline = Date.now() + 25_000;
+  while (inFlight.size > 0 && Date.now() < deadline) {
+    log.info({ inFlight: inFlight.size }, 'waiting for in-flight to drain');
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // 5. Force-close stragglers
+  if (inFlight.size > 0) {
+    log.warn({ inFlight: inFlight.size }, 'force-closing connections');
+    server.closeAllConnections();
+  }
+
+  // 6. Close downstream resources
+  await Promise.all([
+    db.end(),
+    redis.quit(),
+    queue.close(),
+  ]);
+
+  log.info('shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Final safety net
+setTimeout(() => {
+  log.error('forced exit after timeout');
+  process.exit(1);
+}, 30_000).unref();
+```
+
+The key pieces:
+
+- **Readiness flips first.** Orchestrator (k8s) reads the probe;
+  LB stops sending new traffic.
+- **Wait 5 seconds.** Probe interval is typically 5–10s; gives the
+  LB time to notice.
+- **`server.close()` stops new accepts.** Doesn't kill existing.
+- **`closeIdleConnections()`** kills idle keep-alive immediately —
+  no point keeping them open.
+- **In-flight tracking** lets you know when actual work has
+  finished.
+- **`closeAllConnections()`** is the hammer for stuck requests.
+- **Downstream resources** close after the server, in order (so the
+  app can finish writing).
+- **Final `unref` timer** is the last resort.
+
+## Kubernetes interaction
+
+```yaml
+# deployment.yaml
+spec:
+  terminationGracePeriodSeconds: 60   # total time before SIGKILL
+
+  containers:
+    - name: app
+      readinessProbe:
+        httpGet:
+          path: /healthz/ready
+          port: 3000
+        periodSeconds: 5
+        failureThreshold: 1
+```
+
+Sequence:
+
+1. k8s sends SIGTERM to the pod.
+2. Your `/healthz/ready` returns 503.
+3. After 5s + threshold, k8s marks the pod NotReady.
+4. Service removes the pod from endpoints.
+5. Your shutdown drains in-flight.
+6. If shutdown finishes < 60s, k8s waits and reaps cleanly.
+7. If not, k8s sends SIGKILL at 60s.
+
+Tune `terminationGracePeriodSeconds` to your actual drain time +
+buffer. 60s is generous for typical APIs; long-running uploads need
+more.
+
+## Draining WebSockets
+
+WebSocket connections are long-lived. Standard graceful shutdown
+doesn't drain them — they hold connections indefinitely.
+
+```js
+import { WebSocketServer } from 'ws';
+
+const wss = new WebSocketServer({ server });
+
+async function drainWebSockets(timeoutMs = 10_000) {
+  // Send a "going away" notice
+  for (const ws of wss.clients) {
+    try {
+      ws.send(JSON.stringify({ type: 'server_shutdown', reconnect_in: 5 }));
+    } catch {}
+  }
+
+  // Wait briefly for clients to reconnect elsewhere
+  await new Promise(r => setTimeout(r, 2_000));
+
+  // Close with proper close frame (code 1001 = going away)
+  for (const ws of wss.clients) {
+    ws.close(1001, 'server shutting down');
+  }
+
+  // Wait for closes to complete
+  const deadline = Date.now() + timeoutMs;
+  while (wss.clients.size > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  // Hard close
+  for (const ws of wss.clients) ws.terminate();
+}
+```
+
+WebSocket close codes:
+
+- `1000` — normal closure (clean end).
+- `1001` — going away (server restart, page navigate).
+- `1006` — abnormal closure (no close frame).
+- `1011` — server error.
+
+Use `1001` for graceful shutdown. Clients can detect and reconnect
+to a fresh pod.
+
+## Draining SSE
+
+Server-Sent Events are similar:
+
+```js
+const sseConnections = new Set();
+
+app.get('/stream', (req, res) => {
+  // ...
+  sseConnections.add(res);
+  req.on('close', () => sseConnections.delete(res));
+});
+
+async function drainSSE() {
+  for (const res of sseConnections) {
+    try {
+      res.write('event: server_shutdown\ndata: reconnect\n\n');
+      res.end();
+    } catch {}
+  }
+  sseConnections.clear();
+}
+```
+
+The client's `EventSource` auto-reconnects to the next pod.
+
+## In-flight job tracking
+
+Some apps have **background jobs** that aren't HTTP requests but
+still need to finish:
+
+```js
+const activeJobs = new Set();
+
+async function runJob(job) {
+  activeJobs.add(job);
+  try {
+    return await job.execute();
+  } finally {
+    activeJobs.delete(job);
+  }
+}
+
+async function shutdown() {
+  // ... HTTP drain ...
+
+  // Wait for jobs
+  const deadline = Date.now() + 60_000;
+  while (activeJobs.size > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  if (activeJobs.size > 0) {
+    // Save state for resume; cancel remaining
+    for (const job of activeJobs) {
+      await job.checkpoint();
+      job.cancel();
+    }
+  }
+}
+```
+
+For job queues (BullMQ, etc.), the library has a `pause` / `close`
+method:
+
+```js
+await queue.pause();      // stop pulling new jobs
+await queue.close();       // wait for workers to finish current
+```
+
+## Connection draining with `keep-alive` timing
+
+```js
+server.keepAliveTimeout = 65_000;
+server.headersTimeout   = 66_000;
+```
+
+Coordinated with the LB idle timeout (covered in **HTTP server
+internals**). During shutdown, you want:
+
+- New requests blocked at the LB level (readiness probe).
+- Existing keep-alive sockets eventually go idle, get closed.
+- In-flight requests finish.
+
+`closeIdleConnections` makes this faster — don't wait for the 65s
+timeout to close idle.
+
+## What happens if you do nothing
+
+```js
+process.on('SIGTERM', () => process.exit(0));
+```
+
+Or no handler at all:
+
+- Default behavior: process exits on SIGTERM.
+- All TCP connections die abruptly.
+- In-flight requests get RST (client sees connection reset).
+- The LB hasn't been told you're going away → sends a few more
+  requests at the dying pod.
+- Customers see "Service Unavailable" or worse, half-completed
+  operations.
+
+For tiny services with no real users, this might be fine. For
+anything production, it's a deploy-time outage every 30 minutes.
+
+## Testing it
+
+Manual test:
+
+```bash
+# In one terminal
+node app.js
+
+# In another, start a slow request
+curl -m 60 http://localhost:3000/slow-endpoint
+
+# In a third, send SIGTERM
+kill -TERM <pid>
+```
+
+The curl should complete; the process should exit only after the
+curl finishes (or after the timeout).
+
+For CI / automated tests:
+
+```js
+// integration-test.js
+import { spawn } from 'node:child_process';
+
+const proc = spawn('node', ['app.js']);
+await wait(2000);
+
+const slow = fetch('http://localhost:3000/slow');
+await wait(500);
+proc.kill('SIGTERM');
+
+const res = await slow;
+expect(res.status).toBe(200);   // request completed despite SIGTERM
+```
+
+Validate the graceful-shutdown behavior on every CI run.
+
+## Common pitfalls
+
+### Not failing the readiness probe first
+
+The LB keeps sending traffic to a closed-down pod. New requests get
+errors. Always fail readiness first; wait for LB.
+
+### Not draining keep-alive
+
+Pre-18.2, `server.close()` waited for keep-alive timeouts. Slow.
+Post-18.2, use `closeIdleConnections()` to flush them.
+
+### Closing DB before HTTP
+
+```js
+await db.end();
+server.close();
+```
+
+In-flight requests trying to write to the DB error out. Close the
+server first, drain in-flight, then close DB.
+
+### No final timeout
+
+Forgetting to `setTimeout` + `process.exit(1)` as a hard limit.
+A stuck shutdown holds the process forever (until SIGKILL). Always
+have a hard cap.
+
+### Ignoring SIGINT
+
+```js
+process.on('SIGTERM', shutdown);
+// SIGINT (Ctrl-C) defaults to instant exit
+```
+
+Both should drain. Handle both.
+
+### Tracking only `res.on('finish')`
+
+```js
+res.on('finish', () => inFlight.delete(res));
+```
+
+`finish` fires when the response was fully sent. If the client
+disconnects mid-response, you also want to remove. Add
+`res.on('close', ...)` (fires for either).
+
+### Forgetting Express 5 changes
+
+Express 5 doesn't change graceful shutdown directly, but the
+underlying `http.Server` API is what you use. The patterns are
+Express-agnostic.
+
+### Sub-process shutdown
+
+If your app spawns child processes (workers, scripts), send them
+SIGTERM too:
+
+```js
+async function shutdown() {
+  for (const child of childProcesses) {
+    child.kill('SIGTERM');
+  }
+  // ... wait for children to exit ...
+}
+```
+
+Or use a process supervisor (PM2, systemd) that handles this.
+
+## The mental model
+
+Graceful shutdown is **stop new work, finish existing work, then
+exit**. The orchestrator gives you a finite window (typically 30–60s);
+your job is to make the most of it without dropping requests.
+
+Five rules:
+
+1. **Readiness flips first.** Other steps don't matter if the LB
+   keeps sending traffic.
+2. **`closeIdleConnections`** is essential post-Node 18.2.
+3. **Track in-flight** explicitly so you know when to give up.
+4. **WebSockets and SSE** need their own drain.
+5. **Hard timeout** as a safety net.
+
+For 2026 Node services, "graceful" should be the default. The cost
+is one well-tested shutdown handler. The reward is invisible deploys.

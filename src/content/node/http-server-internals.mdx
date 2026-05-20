@@ -1,0 +1,242 @@
+export const level = 'senior';
+
+# Node HTTP server internals
+
+The `http` module looks like a tidy "listen, get requests, send
+responses" API. Underneath are a half-dozen timeouts, a header parser,
+keep-alive socket reuse, and chunked-transfer state. Most production
+incidents in Express services trace back to one of these knobs being
+wrong.
+
+## The defaults that matter
+
+```js
+import { createServer } from 'node:http';
+
+const server = createServer(app);
+server.keepAliveTimeout = 65_000;    // ms — keep idle TCP open between requests
+server.headersTimeout  = 66_000;     // ms — read full headers in
+server.requestTimeout  = 30_000;     // ms — read full request body
+server.maxHeadersCount = 2000;       // count
+server.maxHeaderSize    = 16 * 1024; // bytes (also -–max-http-header-size)
+server.timeout          = 0;         // legacy "socket idle" — leave 0
+```
+
+These are server-level. Once tuned, every connection inherits them.
+
+## What each one stops
+
+### `requestTimeout` (default: 5 min in modern Node, 0 in old)
+
+Maximum time from connection accept to **end of request body**. If the
+client uploads slowly forever, this kills it. The defense against
+Slowloris, slow POST bodies, and "client keeps the socket alive
+without finishing the request."
+
+Old Node defaulted to 0 (no limit). Node 18+ defaults to 5 minutes.
+You probably want lower — 30–60s unless you serve uploads.
+
+### `headersTimeout` (default: 60s)
+
+Maximum time to read the request **headers**. Stops the classic
+"send one byte every 30 seconds" Slowloris attack at the header phase.
+
+Rule: `headersTimeout ≤ requestTimeout`. Node enforces this; if you
+set them inconsistently, behavior is undefined.
+
+### `keepAliveTimeout` (default: 5s)
+
+How long Node keeps an idle TCP connection open between requests on
+HTTP/1.1 keep-alive. Higher = more connection reuse, less TLS
+handshake overhead, but more idle file descriptors.
+
+### `maxHeaderSize` (default: 16 KB)
+
+Largest single header line *plus* total headers Node will parse.
+Exceeding it returns 431 (Request Header Fields Too Large). Bigger =
+more attack surface; smaller = breaks clients with fat cookies.
+
+## The proxy-coordination problem
+
+When you sit behind a load balancer (ALB, nginx, Cloudflare, Envoy),
+your `keepAliveTimeout` interacts with **the proxy's idle timeout**.
+
+The race:
+
+1. Proxy decides to reuse an idle connection to your Node.
+2. Node's `keepAliveTimeout` fires at the same moment and closes
+   the socket.
+3. Proxy writes the next request bytes into a closing socket.
+4. Client sees a 502 / "upstream connection reset."
+
+The fix: **Node's `keepAliveTimeout` must be strictly greater than
+the proxy's idle timeout**, plus enough jitter to win the race.
+
+```
+nginx default: 75s         → Node keepAliveTimeout = 80_000+
+ALB default:   60s         → Node keepAliveTimeout = 65_000+
+GCP LB default: 600s       → Node keepAliveTimeout = 605_000+
+```
+
+Pair with `headersTimeout` ≥ `keepAliveTimeout + a few seconds`
+because Node uses it as an idle ceiling.
+
+You'll see this misconfiguration as **intermittent 502s under
+normal load** that come and go without an obvious cause. It's almost
+always this.
+
+## How requests flow through `http.Server`
+
+```
+TCP accept
+  ↓
+'connection' event — socket attached
+  ↓
+HTTP parser reads bytes — buffered until headers complete
+  ↓
+'request' event — Express middleware starts
+  ↓
+parser hands body chunks to req (it's a Readable)
+  ↓
+handler writes res (a Writable backed by the same socket)
+  ↓
+parser knows the response ended; socket goes idle
+  ↓
+keep-alive: wait for next request, or close on timeout
+```
+
+Backpressure: if your handler stops reading `req`, Node stops reading
+from the socket. The client eventually fills its TCP send buffer and
+blocks. Don't ignore the body.
+
+## `req.socket` and `res.socket`
+
+Both point at the same underlying TCP socket. You can:
+
+- Read low-level info: `req.socket.remoteAddress`, `.encrypted`,
+  `.bytesRead`.
+- Destroy a misbehaving client: `req.socket.destroy()`.
+- Set a per-connection timeout: `req.socket.setTimeout(ms, cb)`.
+
+`req.socket.destroy()` is the hard hammer. Calls beyond cleanup belong
+on the response object (`res.end()`, `res.destroy()`).
+
+## Chunked transfer encoding
+
+When your handler doesn't set `Content-Length`, Node uses
+`Transfer-Encoding: chunked` to stream the body:
+
+```
+HTTP/1.1 200 OK
+Transfer-Encoding: chunked
+
+5
+hello
+6
+ world
+0
+```
+
+Each chunk is `<hex-length>\r\n<bytes>\r\n`, terminated by `0\r\n\r\n`.
+`res.write(chunk)` produces one chunk; `res.end()` writes the
+terminator.
+
+Why this matters:
+
+- For streaming responses (SSE, file downloads), chunked is
+  automatic.
+- For known-length responses (a 200-byte JSON object), Node sets
+  `Content-Length` and skips chunked — slightly more efficient.
+- Some misconfigured proxies buffer chunked responses before
+  forwarding, defeating streaming. Diagnose by checking proxy
+  buffering settings (nginx `proxy_buffering off` for streaming).
+
+## HTTP/2 (`node:http2`)
+
+Different module entirely. `http2.createSecureServer({ cert, key },
+handler)`. Multiplexes many requests over one TCP connection (no head-
+of-line blocking at the HTTP layer). Header compression with HPACK.
+Server push is deprecated and effectively dead.
+
+Most Node services don't run HTTP/2 directly — the proxy terminates
+HTTP/2 from the client and speaks HTTP/1.1 to Node. That's fine.
+HTTP/2 server-side mainly helps internal mesh calls; for browser-
+facing edges, the proxy handles it.
+
+## Disable header bytes you don't want
+
+```js
+server.removeHeader('X-Powered-By'); // doesn't work — that's a response thing
+app.disable('x-powered-by');         // in Express, removes the X-Powered-By header
+```
+
+Cuts a small information disclosure. Helmet does it by default.
+
+## Tuning checklist
+
+For a typical production API behind a proxy:
+
+```js
+const server = createServer(app);
+
+// Behind ALB (60s idle): make Node hold longer
+server.keepAliveTimeout = 65_000;
+server.headersTimeout   = 66_000;   // ≥ keepAliveTimeout
+
+// Bound request body time
+server.requestTimeout = 60_000;     // 1 minute max upload
+
+// Defend against weird clients
+server.maxHeadersCount = 100;
+server.maxRequestsPerSocket = 0;    // 0 = unlimited; set ~1000 if you want forced rotation
+
+// Per-socket idle timeout (rare; usually leave 0)
+server.timeout = 0;
+
+server.listen(PORT);
+```
+
+## Common pitfalls
+
+### `server.timeout` ≠ what you think
+
+`server.timeout` (the old "socket idle" knob) defaults to 0 in modern
+Node. It's **not** the request body timeout; that's `requestTimeout`.
+The naming is historical baggage. Use the specific ones.
+
+### `keepAliveTimeout` lower than proxy = 502s
+
+Covered above. The first thing to check when you see intermittent
+502s in an LB-fronted service.
+
+### Sticking with defaults behind no proxy
+
+If you run Node *directly* facing the internet (rare but happens),
+the defaults are reasonable. The dangerous case is behind a proxy
+with a different idle timeout — Node's defaults assume "no
+coordination needed."
+
+### Forgetting `maxRequestsPerSocket`
+
+A single client could keep one keep-alive connection alive forever,
+hogging a worker thread in some deployment shapes. Set this to a few
+hundred to a few thousand to force connection rotation periodically.
+
+### Per-route timeouts that override the server
+
+Express has no built-in per-route timeout. Libraries like
+`connect-timeout` set one but don't actually destroy the socket —
+they just call `next(err)`, which doesn't help if the handler is
+blocked. For hard timeouts, set them at the socket level
+(`req.socket.setTimeout(ms)`) or use a proxy timeout above Node.
+
+## The mental model
+
+The HTTP server is a state machine: accept → parse headers → parse
+body → run handler → write response → idle → repeat. Each phase has
+its own timeout. Each timeout exists for a specific failure mode
+(slow client, slow body, slow proxy, slow handler).
+
+Get the four timeouts (`headersTimeout`, `requestTimeout`,
+`keepAliveTimeout`, `server.timeout`) coordinated with your proxy and
+you've eliminated the bulk of "random 502" tickets.

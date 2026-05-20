@@ -1,0 +1,288 @@
+export const level = 'staff';
+
+# `diagnostics_channel`
+
+`diagnostics_channel` is Node's official mechanism for **passive
+instrumentation**. Modules publish events ("about to make an HTTP
+request," "DB query starting"); consumers subscribe. No monkey-
+patching, no wrapping.
+
+It's how OpenTelemetry, undici, pino, mongoose, and others integrate
+with each other without each one knowing the others exist.
+
+## The API
+
+```js
+import diagnostics_channel from 'node:diagnostics_channel';
+
+const ch = diagnostics_channel.channel('myapp:event');
+
+// Publisher
+ch.publish({ name: 'thing happened', timestamp: Date.now() });
+
+// Subscriber
+ch.subscribe((message) => {
+  console.log('received:', message);
+});
+```
+
+Channels are looked up by name. If no one's subscribed,
+`ch.publish(...)` is a near-zero-cost no-op (just a flag check).
+
+This "free if unobserved" property is what makes it suitable for hot
+paths.
+
+## Why this exists
+
+Before `diagnostics_channel`, instrumentation libraries did this:
+
+```js
+const originalRequest = http.request;
+http.request = function patched(...args) {
+  const span = startSpan('http_request');
+  const req = originalRequest.apply(this, args);
+  req.on('response', () => span.end());
+  return req;
+};
+```
+
+Monkey-patching the `http` module to intercept calls. Brittle, racy,
+breaks across Node versions, and clashes if two libraries patch the
+same thing.
+
+`diagnostics_channel` is the alternative: Node modules **publish at
+documented points**, libraries **subscribe**. No wrapping. No
+breakage.
+
+## What ships with channels in Node 22+
+
+The Node team has been adding channels across the platform:
+
+- **`http.client.request.start`** — outbound HTTP request begins.
+- **`http.client.response.finish`** — response received.
+- **`http.server.request.start`** — incoming request received.
+- **`http.server.response.finish`** — response sent.
+- **`net.client.socket`** — TCP connect.
+- **`undici:request:create`**, **`undici:request:headers`** — undici
+  events.
+
+Plus library-published channels for nearly everything:
+
+- **`process:exit`**, **`process:uncaughtException`**
+- **`mongoose`**, **`pg`**, **`redis`** — DB drivers publish query
+  events.
+- Custom channels you create.
+
+## Tracing channels
+
+For tracing the lifecycle of an operation (start → end), Node added
+**`TracingChannel`**:
+
+```js
+import diagnostics_channel from 'node:diagnostics_channel';
+
+const tc = diagnostics_channel.tracingChannel('myapp:db.query');
+
+// Publisher
+tc.tracePromise(async () => {
+  // do the query
+  return await db.query(sql);
+}, { sql });
+
+// Subscriber
+tc.subscribe({
+  start(ctx) { ctx.startTime = process.hrtime.bigint(); },
+  end(ctx) { /* called for both success and error */ },
+  asyncStart(ctx) { /* awaited part begins */ },
+  asyncEnd(ctx) { /* awaited part ends */ },
+  error(ctx) { /* on throw / rejection */ },
+});
+```
+
+`TracingChannel` fires named events at standard points. The
+subscriber gets a context object that carries data across the
+lifecycle.
+
+This is the API OTel uses to track async operation lifetimes
+correctly across `await`s.
+
+## Subscribing in practice
+
+```js
+import diagnostics_channel from 'node:diagnostics_channel';
+
+diagnostics_channel.subscribe('http.client.request.start', ({ request }) => {
+  // request is the http.ClientRequest
+  console.log(`outbound: ${request.method} ${request.path}`);
+});
+
+diagnostics_channel.subscribe('http.client.response.finish', ({ request, response }) => {
+  console.log(`got ${response.statusCode} for ${request.path}`);
+});
+```
+
+The shorthand `diagnostics_channel.subscribe(name, listener)` is
+equivalent to `diagnostics_channel.channel(name).subscribe(listener)`.
+
+## Use cases
+
+### Cross-cutting logging
+
+Log every DB query without wrapping the driver:
+
+```js
+diagnostics_channel.subscribe('pg.query', ({ text, values }) => {
+  log.debug({ sql: text }, 'db query');
+});
+```
+
+If `pg` ever publishes to this channel (newer versions do), you get
+universal query logging for free. The driver doesn't need to know
+about your logger.
+
+### Performance metrics
+
+```js
+const tc = diagnostics_channel.tracingChannel('http.client.request');
+
+tc.subscribe({
+  start(ctx) { ctx._t = process.hrtime.bigint(); },
+  end(ctx) {
+    const took = Number(process.hrtime.bigint() - ctx._t) / 1e6;
+    histogram.observe({ origin: ctx.request.host }, took);
+  },
+});
+```
+
+### Tracing context propagation
+
+OTel uses it to attach the current span to outbound HTTP calls so
+downstream services receive `traceparent`:
+
+```js
+diagnostics_channel.subscribe('http.client.request.start', ({ request }) => {
+  const span = trace.getActiveSpan();
+  if (span) {
+    request.setHeader('traceparent', formatTraceparent(span.spanContext()));
+  }
+});
+```
+
+Without monkey-patching `http.request`. Subscribe, set the header on
+the request object the user is about to send, done.
+
+## Defining your own channels
+
+```js
+// in your-lib.js
+import diagnostics_channel from 'node:diagnostics_channel';
+
+const ch = diagnostics_channel.channel('mylib:operation');
+
+export async function doWork(input) {
+  if (ch.hasSubscribers) {
+    ch.publish({ input, startedAt: Date.now() });
+  }
+  // ... do work
+}
+```
+
+`ch.hasSubscribers` lets you skip allocating the payload object when
+no one's listening. The publish itself is already cheap when there
+are no subscribers; the payload construction can be the expensive
+part.
+
+For full lifecycle events, define a `tracingChannel`:
+
+```js
+const tc = diagnostics_channel.tracingChannel('mylib:operation');
+
+export function doWork(input) {
+  return tc.tracePromise(async () => realDoWork(input), { input });
+}
+```
+
+Subscribers get start/end/error events with the context.
+
+## Compared to events
+
+EventEmitter is the wrong tool for cross-cutting instrumentation
+because:
+
+- Listeners are scoped to specific emitter instances.
+- Registering on the wrong emitter silently misses events.
+- Memory leaks if listeners aren't removed (`setMaxListeners`).
+
+`diagnostics_channel` is global by name and doesn't care about
+emitter instances.
+
+## Compared to ALS
+
+| | `AsyncLocalStorage` | `diagnostics_channel` |
+| --- | --- | --- |
+| Purpose | Carry data across async boundaries | Notify about events |
+| Direction | Function-to-function | Module-to-observer |
+| Cost when unused | ~free | ~free |
+| Typical use | Request context | Instrumentation |
+
+You'll use both. ALS for "what user is this request for"; channels for
+"a DB query just happened."
+
+## Common pitfalls
+
+### Subscribing to events that don't exist
+
+```js
+diagnostics_channel.subscribe('imaginary', () => {});  // works — but never fires
+```
+
+There's no compile-time check that a channel exists. If your handler
+never fires, double-check the channel name with the publisher's
+docs.
+
+### Publishing without checking
+
+```js
+ch.publish(buildExpensivePayload());  // builds payload even with no subscribers
+```
+
+For expensive payloads, gate behind `ch.hasSubscribers`. The publish
+itself is cheap; constructing the message can be the cost.
+
+### Forgetting unsubscribe in tests
+
+```js
+const unsub = diagnostics_channel.subscribe('foo', fn);
+// later
+unsub();   // explicit cleanup
+```
+
+`subscribe` returns an unsubscribe function. Tests that leak
+subscribers can have cross-test contamination.
+
+### Treating channels as a pub-sub system
+
+They're for diagnostics, not for app messaging. Synchronous, in-
+process, low-overhead. For real pub-sub, use Redis or a queue.
+
+## Compatibility
+
+`diagnostics_channel` has been stable since Node 16. `tracingChannel`
+is newer (Node 19+, stable in 22). Library ecosystem adoption is
+growing — undici, mongoose, mysql2, and more publish channels.
+
+OpenTelemetry's auto-instrumentation increasingly uses
+`diagnostics_channel` instead of monkey-patching. Same observability,
+better forward-compat.
+
+## The mental model
+
+`diagnostics_channel` is **pub-sub for "something happened in the
+Node runtime."** Modules publish at well-defined points; instrumentation
+libraries subscribe. No wrapping. No clashes. Free when unobserved.
+
+For app code, you mostly subscribe (to instrument existing modules)
+or publish (to expose your own lifecycle to observers). For library
+code you maintain, defining channels is the modern way to make your
+library observable without forcing users into your specific logger
+or tracing system.

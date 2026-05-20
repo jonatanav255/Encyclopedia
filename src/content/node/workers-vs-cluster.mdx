@@ -1,0 +1,331 @@
+export const level = 'senior';
+
+# `worker_threads` vs `cluster`
+
+Two ways to use more than one CPU in a Node app. They look similar
+but solve different problems.
+
+- **`cluster`**: spawn N **processes**. Share an HTTP listener.
+  Used to scale across cores for I/O-bound HTTP servers.
+- **`worker_threads`**: spawn N **threads** in one process. Share
+  memory via `SharedArrayBuffer`. Used for CPU-bound work that
+  would block the event loop.
+
+Pick based on the problem, not what looks cooler.
+
+## When to use `cluster`
+
+Classic use: scale a single Node HTTP server across CPUs.
+
+```js
+// app.js
+import cluster from 'node:cluster';
+import { cpus } from 'node:os';
+
+if (cluster.isPrimary) {
+  for (let i = 0; i < cpus().length; i++) cluster.fork();
+} else {
+  const app = require('./app');
+  app.listen(3000);
+}
+```
+
+The primary forks `N` workers; the OS load-balances incoming HTTP
+connections among them. Each worker is a separate Node process —
+own memory, own event loop.
+
+Pros:
+
+- Each worker can be restarted independently.
+- Process crash doesn't kill siblings.
+- Mature, stable, works since Node 0.x.
+
+Cons:
+
+- Each process has its own memory — N × the base footprint.
+- Shared state requires IPC (Redis, DB) or `node-cluster` IPC
+  messages.
+- No easy way to share connections, caches, or in-memory
+  state.
+
+In 2026 the cluster pattern is less common because:
+
+- **Containers** are the modern "process replication." Run 8
+  containers with 1 worker each, let Kubernetes schedule them.
+  Better isolation than `cluster`.
+- **Auto-scaling** is easier at the container level.
+- **Observability**: easier to scrape metrics from 8 containers
+  than 8 processes inside one container.
+
+If you're deploying on bare metal / a single VM, `cluster` is fine.
+If you're on Kubernetes / ECS / Cloud Run, it's usually wrong —
+let the orchestrator handle multi-process scaling.
+
+## When to use `worker_threads`
+
+CPU-bound work that would block the event loop:
+
+```js
+import { Worker } from 'node:worker_threads';
+
+const worker = new Worker('./worker.js');
+worker.on('message', (result) => console.log(result));
+worker.postMessage({ data });
+```
+
+```js
+// worker.js
+import { parentPort } from 'node:worker_threads';
+
+parentPort.on('message', ({ data }) => {
+  const result = heavyComputation(data);
+  parentPort.postMessage(result);
+});
+```
+
+Each worker has its own V8 isolate. They can run truly in parallel
+with the main thread.
+
+Cases where workers win:
+
+- **CPU-bound JS**: image processing without a native binding, PDF
+  generation, parsing huge CSV/JSON, ML inference, expensive
+  cryptography.
+- **Avoiding event-loop blocking**: even if you could split work
+  with `setImmediate`, a worker is cleaner.
+- **Shared memory via `SharedArrayBuffer`**: zero-copy data
+  passing for large blobs.
+
+Workers don't help for:
+
+- **I/O-bound work** (network, fs). The main event loop already
+  doesn't block on I/O.
+- **Trivial computations**. The cost of `postMessage`
+  (serialization) outweighs the work.
+- **Many short-lived tasks**. Use a pool (`piscina`) instead of
+  spawning per task.
+
+## Memory: shared vs not
+
+### `cluster` workers
+
+Each process has its own V8 heap, its own native heap. ~100MB
+baseline per process (lower for simple apps, higher for heavy
+dependencies).
+
+Sharing memory means IPC: send messages via `process.send`,
+receive via `process.on('message')`. Or use Redis / a shared file
+/ a DB.
+
+### `worker_threads`
+
+Each worker has its own V8 isolate but **can share memory via
+`SharedArrayBuffer`**:
+
+```js
+const buf = new SharedArrayBuffer(1024);
+const view = new Int32Array(buf);
+
+worker.postMessage({ shared: buf });
+
+// In worker:
+parentPort.on('message', ({ shared }) => {
+  const view = new Int32Array(shared);
+  Atomics.add(view, 0, 1);   // atomic increment
+});
+```
+
+`Atomics` provides race-safe operations. This is real multithreaded
+JavaScript. Powerful, easy to get subtly wrong (race conditions).
+
+For most workloads, you don't need shared memory. `postMessage` with
+structured clone is fine — it serializes deeply.
+
+For huge data (10MB+), use **transferable objects** to avoid the
+copy:
+
+```js
+const buf = new ArrayBuffer(10 * 1024 * 1024);   // 10 MB
+worker.postMessage({ buf }, [buf]);
+// `buf` is now detached on the main thread; usable on the worker
+```
+
+After transfer, the sender can't use the buffer. The receiver owns
+it.
+
+## Worker pools
+
+Spawning a worker per task is wasteful — startup is tens of ms. For
+recurring CPU-bound work, use a pool:
+
+```js
+import Piscina from 'piscina';
+
+const pool = new Piscina({ filename: './worker.js' });
+
+app.post('/render', async (req, res) => {
+  const png = await pool.run({ template: req.body.template });
+  res.type('image/png').send(png);
+});
+```
+
+`piscina` manages a pool of workers, queues tasks, handles retry on
+crash. Battle-tested. Don't roll your own unless you have specific
+needs.
+
+Pool size = `os.cpus().length` is a reasonable default for
+CPU-bound work. For mixed workloads (some CPU, some I/O), tune.
+
+## Sharing a TCP listener
+
+`cluster` lets workers share one listener:
+
+```js
+// Each worker listens on the same port
+http.createServer(app).listen(3000);
+```
+
+The OS round-robins TCP accepts to whichever worker is ready. Each
+worker handles a subset of requests; total throughput scales near-
+linearly with workers (up to NIC saturation).
+
+Workers (`worker_threads`) **don't share TCP listeners by default**.
+Each thread is in the same process; they can't independently `accept()`
+on the same port without coordination.
+
+You can simulate by having the main thread accept and dispatch via
+`MessagePort`, but at that point you're rebuilding `cluster` poorly.
+
+For "one process listens, many threads process," the pattern is:
+
+```js
+// main.js
+const server = http.createServer((req, res) => {
+  const work = serialize(req);
+  workerPool.run(work).then(result => res.json(result));
+});
+server.listen(3000);
+```
+
+Single listener, CPU-heavy work happens in worker pool. The main
+thread does only I/O. This is the modern shape — `cluster` rarely
+needed.
+
+## When do you actually need cluster in 2026?
+
+- **Legacy app**: already uses `cluster`, works, leave it.
+- **Bare metal deployment** without container orchestration:
+  `cluster` saturates a VM.
+- **Built-in graceful restart**: `cluster` supports rolling restart
+  of workers without dropping connections. Useful if you don't
+  have a load balancer in front.
+
+For most new code: deploy multiple containers; skip `cluster`.
+
+## When do you actually need worker_threads in 2026?
+
+- **CPU-bound endpoints** (image processing, encryption, parsing).
+- **Background tasks** that would block: `pool.run(...)` is cleaner
+  than `setImmediate` chains.
+- **Native add-on alternatives**: workers + pure JS sometimes beat
+  native FFI for portability.
+
+For most CRUD APIs: no workers needed. Event loop handles it.
+
+## Common pitfalls
+
+### Treating workers as cheap
+
+```js
+for (const item of items) {
+  const worker = new Worker('./w.js');
+  worker.postMessage(item);
+  // ...
+}
+```
+
+Each worker is ~30ms to spawn. For N items, you spawn N workers,
+all initialization overhead, plus you've blown the process resource
+limit.
+
+Use a pool. Always.
+
+### Forgetting structured clone overhead
+
+```js
+// Main thread
+worker.postMessage(hugeObjectGraph);   // deep clone — slow
+```
+
+`postMessage` does a **structured clone** (deep copy). For multi-MB
+data, this can take hundreds of ms.
+
+Either:
+
+- Transfer (`postMessage(data, [data])`) for `ArrayBuffer`.
+- Use `SharedArrayBuffer` for ongoing shared state.
+- Send smaller per-task payloads.
+
+### Workers can't access main-thread state
+
+```js
+// Main thread sets up a DB connection
+const db = await connectDB();
+
+// Workers can't use `db`
+```
+
+Each worker is a fresh isolate. They need their own connections,
+their own config loading, their own everything. Pass references via
+messages, not closures.
+
+### `cluster` and DB connections
+
+```js
+// Each worker opens its own DB pool
+const pool = new pg.Pool({ max: 10 });
+// 8 workers × 10 = 80 connections to Postgres
+```
+
+Per-worker pools multiply. Postgres `max_connections` is usually
+100–200. Easy to exhaust.
+
+Fix: lower per-worker pool size, or use a single pool via a
+connection pooler (PgBouncer).
+
+### `cluster` and sticky sessions
+
+If your app uses in-memory sessions (default `express-session`),
+`cluster` breaks them: a session stored in worker 1 is invisible to
+worker 2. Use a session store (Redis) before clustering.
+
+Same for any in-memory cache, rate limiter, or coordination
+mechanism.
+
+### Worker error handling
+
+```js
+worker.on('error', (err) => {});      // worker crash
+worker.on('exit', (code) => {});       // worker exit
+```
+
+Workers can crash. Listen for these events; restart the worker (or
+replay the work) on crash. Pool libraries (`piscina`) handle this.
+
+## The mental model
+
+`cluster` = many Node processes sharing a listener. Solves "use more
+than one CPU for HTTP serving." In 2026, usually replaced by
+container replicas.
+
+`worker_threads` = many V8 isolates in one process. Solves "do CPU
+work without blocking the event loop." Still relevant.
+
+A typical 2026 Node service:
+
+- One process (no `cluster`).
+- One `worker_threads` pool for the CPU-bound endpoint (if any).
+- Many container replicas, orchestrated by Kubernetes.
+
+That's the default. Reach for `cluster` only when you have a
+specific reason (single-VM deploys, in-process graceful restart).

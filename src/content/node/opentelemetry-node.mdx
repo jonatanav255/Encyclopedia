@@ -1,0 +1,339 @@
+export const level = 'senior';
+
+# OpenTelemetry in Node
+
+OpenTelemetry (OTel) is the industry-standard tool for emitting
+**traces, metrics, and logs** from applications, with vendor-neutral
+exporters. For Node services, it's now the default observability
+stack — Datadog, New Relic, Honeycomb, Grafana Tempo, Jaeger all
+ingest OTel.
+
+This page is about getting OTel running for an Express/Node service,
+the parts that matter, and the corners that bite.
+
+## The three signals
+
+- **Traces** — a tree of spans showing one operation across services.
+  "User logged in → auth service → DB query → response."
+- **Metrics** — numeric measurements over time. Request rate, error
+  count, latency histograms.
+- **Logs** — structured text with timestamp and context. OTel can
+  correlate logs to traces via `traceId` / `spanId`.
+
+You can adopt them independently; most teams start with traces.
+
+## The components
+
+```
+your-app
+  ↓ OTel SDK + instrumentation
+OTLP (gRPC or HTTP/protobuf)
+  ↓
+OTel Collector (optional but recommended)
+  ↓
+exporters → Jaeger / Tempo / Honeycomb / Datadog / ...
+```
+
+- **SDK** — `@opentelemetry/sdk-node`. Boots the trace, metric, log
+  pipelines.
+- **Instrumentations** — pre-built integrations for HTTP, Express,
+  pg, redis, etc. They subscribe to `diagnostics_channel` or
+  monkey-patch as needed.
+- **Exporters** — `@opentelemetry/exporter-trace-otlp-http` and
+  friends. Ship spans to a collector or backend.
+- **Collector** — a separate process. Receives OTLP, batches,
+  resamples, exports to N backends. Strongly recommended in
+  production.
+
+## A minimal Express setup
+
+```js
+// instrumentation.js (loaded BEFORE app.js)
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { Resource } from '@opentelemetry/resources';
+import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [SemanticResourceAttributes.SERVICE_NAME]: 'my-api',
+    [SemanticResourceAttributes.SERVICE_VERSION]: process.env.GIT_SHA,
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: 'http://collector:4318/v1/traces',
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+```bash
+node --import ./instrumentation.js src/app.js
+```
+
+The `--import` flag (Node 20+) loads the file before the app starts.
+This **must happen before** any HTTP / DB modules are imported,
+because instrumentations patch them.
+
+`getNodeAutoInstrumentations` wires up Express, HTTP client/server,
+fetch, pg, redis, mysql, mongodb, kafkajs, ioredis, gRPC, and more.
+For most apps you turn it on and get traces for free.
+
+## What you get out of the box
+
+Each incoming HTTP request becomes a parent span. Inside it, child
+spans for:
+
+- Express route matching and middleware.
+- Outbound HTTP calls.
+- DB queries (with sanitized SQL).
+- Redis operations.
+
+The whole tree is exported to your backend. In Tempo / Jaeger /
+Honeycomb you can click a slow request and see exactly where time
+went.
+
+## Context propagation
+
+OTel propagates trace context across service boundaries via headers.
+The standard is **W3C Trace Context**: `traceparent` and `tracestate`.
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+              ^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^ ^^
+              version trace-id                  parent-span-id   flags
+```
+
+When your Express service calls another service, OTel adds
+`traceparent` to the outbound request. The other service's OTel
+picks it up and creates spans as children of yours.
+
+The result: a unified trace across N services, even when teams use
+different languages.
+
+Older systems used B3 (Zipkin) and Jaeger formats; OTel can
+propagate those too. Configure with `OTEL_PROPAGATORS`.
+
+## Custom spans
+
+Auto-instrumentation covers the obvious. For your business logic,
+add manual spans:
+
+```js
+import { trace } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('my-app');
+
+async function processOrder(order) {
+  return tracer.startActiveSpan('processOrder', async (span) => {
+    span.setAttribute('order.id', order.id);
+    span.setAttribute('order.amount', order.amount);
+
+    try {
+      await chargeCard(order);
+      span.setStatus({ code: 1 });  // OK
+      return { ok: true };
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: 2, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+`startActiveSpan` makes the span the "active" one — any
+auto-instrumentation that fires inside (HTTP calls, DB queries) hangs
+off it automatically.
+
+## Sampling
+
+By default, OTel samples everything. In production you'll want to
+sample to control cost.
+
+Two common strategies:
+
+### Head sampling
+
+Decide at the start of a request: keep 10%, drop 90%.
+
+```js
+new NodeSDK({
+  // ...
+  sampler: new TraceIdRatioBasedSampler(0.1),
+});
+```
+
+Pro: simple, low overhead. Con: you can't see *that* particular slow
+request unless you got lucky.
+
+### Tail sampling
+
+Send all spans to the collector; the collector decides per trace —
+e.g., keep all errors, keep 10% of fast requests, keep 100% of
+slow ones.
+
+Done in the OTel Collector config, not in your app. The app's just
+"emit everything"; the collector smarts.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - { type: status_code, status_code: { status_codes: [ERROR] } }
+      - { type: latency, latency: { threshold_ms: 1000 } }
+      - { type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+```
+
+Tail sampling is better quality but needs the collector to buffer
+spans for `decision_wait`. Recommended for production.
+
+## Metrics
+
+Counters, gauges, histograms exported via OTLP.
+
+```js
+import { metrics } from '@opentelemetry/api';
+
+const meter = metrics.getMeter('my-app');
+const requestCount = meter.createCounter('http_requests_total');
+const requestLatency = meter.createHistogram('http_request_duration_seconds');
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    requestCount.add(1, { method: req.method, route: req.route?.path, status: res.statusCode });
+    requestLatency.record(seconds, { method: req.method });
+  });
+  next();
+});
+```
+
+For Prometheus scraping, use `@opentelemetry/exporter-prometheus`
+which exposes a `/metrics` endpoint. Or use OTLP → collector →
+Prometheus.
+
+## Logs and trace correlation
+
+```js
+import pino from 'pino';
+import { context, trace } from '@opentelemetry/api';
+
+const log = pino({
+  mixin() {
+    const span = trace.getActiveSpan();
+    if (!span) return {};
+    const ctx = span.spanContext();
+    return { traceId: ctx.traceId, spanId: ctx.spanId };
+  },
+});
+
+log.info('processing order');
+// Logs include traceId / spanId — jump from log to trace in your UI
+```
+
+Now every log line has the trace ID. Search by trace ID and find
+every log + every span for one request.
+
+## Common pitfalls
+
+### Importing app before SDK
+
+```js
+// WRONG order
+import './app.js';                    // already loaded http, pg, etc.
+import './instrumentation.js';        // tries to patch — too late
+```
+
+Auto-instrumentation patches modules at import time. Load
+instrumentation **first** via `--import` or `--require`. Otherwise
+nothing gets traced.
+
+### Forgetting `--import`
+
+Without `--import`, the instrumentation file runs after dependent
+modules are loaded. Same problem. Always start the app via:
+
+```bash
+node --import ./instrumentation.js src/index.js
+```
+
+Or with Node 18 (pre-`--import`):
+
+```bash
+node --require ./instrumentation.js src/index.js
+```
+
+### Sending too many spans
+
+Auto-instrumentation can produce hundreds of spans per request (one
+per middleware, one per query). Backend cost balloons. Either:
+
+- Sample at the head/tail.
+- Disable some instrumentations: `getNodeAutoInstrumentations({
+  '@opentelemetry/instrumentation-fs': { enabled: false } })` —
+  fs is especially noisy.
+- Aggregate redundant spans (e.g., merge per-middleware spans into a
+  "request" span).
+
+### Not setting service.name
+
+Every span needs a `service.name`. Without it, backends label
+everything "unknown_service" and dashboards are useless. Pass via
+`Resource` (as in the boot example) or env vars
+(`OTEL_SERVICE_NAME=my-api`).
+
+### Forgetting to propagate across queues
+
+If you enqueue a job onto Redis/SQS, the worker on the other side
+starts a new trace. To preserve the trace:
+
+```js
+// Producer
+const span = trace.getActiveSpan();
+const headers = {};
+propagation.inject(context.active(), headers);
+await queue.add({ ...payload, _traceHeaders: headers });
+
+// Consumer
+const ctx = propagation.extract(context.active(), job._traceHeaders);
+context.with(ctx, () => processJob(job));
+```
+
+Manual but explicit. Some libraries (BullMQ + OTel instrumentation)
+do this for you.
+
+## What to put in spans
+
+Useful attributes:
+
+- `http.method`, `http.route`, `http.status_code` (set by auto-instr).
+- Your domain IDs: `user.id`, `order.id`, `tenant.id`. Don't use PII;
+  hash if needed.
+- `error.message`, `error.stack` (set by `recordException`).
+- High-cardinality but useful: `cache.hit` (true/false), `db.rows`,
+  `queue.depth`.
+
+Avoid putting the full HTTP body or headers — too big, often PII.
+
+## The mental model
+
+OTel is **emit signals via SDK → collect via Collector → store in
+backend**. Auto-instrumentation handles the obvious; manual spans
+fill in business logic. Propagation carries context across services.
+Logs, metrics, traces correlate via shared IDs.
+
+The minimum useful setup is one file (`instrumentation.js`) loaded
+with `--import`, autoInstrumentations enabled, an OTLP exporter
+pointed at a collector. From there you incrementally add business
+spans, sampling rules, and dashboards.
+
+For 2026 Node services, this is the default. The cost of *not*
+adopting OTel is reinventing distributed tracing internally with worse
+tools.

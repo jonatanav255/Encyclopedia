@@ -1,0 +1,381 @@
+export const level = 'senior';
+
+# Backpressure and `highWaterMark`
+
+A stream that produces data faster than the consumer can handle it
+will, by default, buffer the excess in memory. With enough volume,
+that buffer crashes your process — OOM.
+
+**Backpressure** is the mechanism that tells the producer to slow
+down. Node streams have it built in; you just have to honor it.
+
+## The contract
+
+```js
+const ok = writable.write(chunk);
+
+if (!ok) {
+  await new Promise(r => writable.once('drain', r));
+}
+```
+
+`writable.write(chunk)` returns:
+
+- `true` — internal buffer below `highWaterMark`. Keep writing.
+- `false` — buffer is full. Wait for `'drain'` before writing more.
+
+This is the entire backpressure contract for writable streams.
+Ignoring `false` doesn't stop your writes — Node accepts them and
+buffers in memory until OOM. The contract is **advisory but
+essential**.
+
+## `highWaterMark`
+
+The "low water" mark of when to start producing backpressure:
+
+- Default for byte streams: **64 KB**.
+- Default for object mode: 16 objects.
+
+```js
+const writer = fs.createWriteStream('out.txt', { highWaterMark: 1024 * 1024 });
+// 1 MB buffer before backpressure kicks in
+```
+
+Higher = more memory, fewer pauses. Lower = less memory, more
+context switches.
+
+For typical use, the default is fine. Tune when:
+
+- You're writing many small chunks (raise it to batch more in
+  memory).
+- You're memory-constrained (lower it for tighter feedback).
+
+## The common pitfall
+
+```js
+// BAD — ignores write() return value
+async function copyFile(source, dest) {
+  const src = fs.createReadStream(source);
+  const dst = fs.createWriteStream(dest);
+
+  src.on('data', (chunk) => {
+    dst.write(chunk);    // returns false sometimes — we don't care
+  });
+  src.on('end', () => dst.end());
+}
+```
+
+For a 100MB file, this works. For a 10GB file or thousands of small
+files, the writable buffer balloons.
+
+The fix using `pause()` / `resume()`:
+
+```js
+src.on('data', (chunk) => {
+  if (!dst.write(chunk)) {
+    src.pause();
+    dst.once('drain', () => src.resume());
+  }
+});
+```
+
+Manual; error-prone; nobody writes streams this way anymore.
+
+## `pipe` and `pipeline`
+
+`.pipe()` (the old way):
+
+```js
+src.pipe(dst);   // automatic backpressure; broken error handling
+```
+
+`pipe` handles backpressure correctly. But on error in either stream,
+the other is left dangling. Resource leak.
+
+`stream.pipeline` (the modern way):
+
+```js
+import { pipeline } from 'node:stream/promises';
+
+await pipeline(src, dst);
+```
+
+Same backpressure. Plus:
+
+- Errors propagate (any stream errors → rejection).
+- All streams properly closed on error.
+- Returns a promise; awaitable.
+
+`pipeline` is what you use in 2026 code. `pipe` is legacy.
+
+For multi-stage:
+
+```js
+await pipeline(
+  src,
+  zlib.createGunzip(),
+  csv.parse(),
+  writeRows,
+);
+```
+
+Each stage applies backpressure to the previous. If `writeRows` is
+slow, `csv.parse` slows, then `gunzip` slows, then `src` reads less
+from the file. Memory stays bounded.
+
+## Async iteration: implicit backpressure
+
+```js
+for await (const chunk of src) {
+  await processChunk(chunk);   // backpressure happens naturally
+}
+```
+
+When you `await`, Node pauses reading from `src`. As soon as your
+await resolves, it asks for the next chunk. Backpressure for free.
+
+This is the idiomatic 2026 way for "consumer-side" stream processing.
+Reads as plain async code; backpressure is invisible.
+
+## Producing a stream with backpressure
+
+```js
+import { Readable } from 'node:stream';
+
+const stream = new Readable({
+  read(size) {
+    // called when consumer wants more; produce up to `size` bytes
+    const data = produceMoreData(size);
+    if (data === null) {
+      this.push(null);   // end the stream
+    } else {
+      const more = this.push(data);
+      if (!more) {
+        // consumer can't keep up; we should pause
+        // but `read` won't be called again until they want more
+      }
+    }
+  },
+});
+```
+
+`read` is **pull-based** — the consumer calls it when ready. `push`
+returns false when the internal buffer is over highWaterMark. You
+don't have to do anything — the next `read` will fire when the
+consumer drains.
+
+For "push-based" producers (you have data to push from elsewhere):
+
+```js
+const stream = new Readable({ read() {} });   // no-op read
+
+setInterval(() => {
+  const more = stream.push(generateChunk());
+  if (!more) {
+    // pause the producer — your interval, your source
+  }
+}, 100);
+```
+
+For "wrap an event emitter as a stream," check `more` from `push` and
+pause your source.
+
+## Object mode
+
+By default, streams handle Buffer/string chunks. **Object mode**
+streams pass arbitrary JS values:
+
+```js
+const obj = new Readable({
+  objectMode: true,
+  read() { this.push({ row: 1 }); this.push({ row: 2 }); this.push(null); },
+});
+```
+
+`highWaterMark` for object mode counts **objects**, not bytes.
+Default: 16.
+
+Object streams are useful for parsed-data pipelines (CSV rows, log
+entries) but each object takes memory proportional to its content.
+For huge objects, lower `highWaterMark`.
+
+## Web streams vs Node streams
+
+Node's WHATWG `ReadableStream` / `WritableStream` / `TransformStream`
+(in `node:stream/web`) have different mechanics:
+
+- They use `pull(controller)` instead of `read(size)`.
+- Backpressure is via `controller.desiredSize`.
+- They're awaitable via async iteration.
+
+Both stream worlds interoperate:
+
+```js
+import { Readable } from 'node:stream';
+
+const nodeStream = Readable.fromWeb(webStream);
+const webStream = Readable.toWeb(nodeStream);
+```
+
+Be careful: converting between them can silently buffer if the
+backpressure semantics don't align. For most code, use Node streams
+internally and convert only at API boundaries.
+
+## Diagnosis
+
+Symptoms of broken backpressure:
+
+- RSS climbs steadily during uploads / file processing.
+- `process.memoryUsage().heapUsed` stays flat (the buffer is in
+  off-heap memory).
+- Throughput is *slower* than naïve "read all, process all"
+  (because the kernel paged your buffer to disk).
+
+Reproduce with a slow consumer and a fast producer:
+
+```js
+const slow = new Writable({
+  write(chunk, enc, cb) {
+    setTimeout(cb, 100);   // slow on purpose
+  },
+});
+
+for (let i = 0; i < 1_000_000; i++) {
+  slow.write(Buffer.alloc(1024));   // huge buffer accumulates
+}
+```
+
+`process.memoryUsage().rss` will balloon. Adding `await` on `'drain'`
+fixes it.
+
+## Patterns that get this wrong
+
+### Streaming uploads to disk
+
+```js
+app.post('/upload', (req, res) => {
+  req.pipe(fs.createWriteStream('upload.bin'));   // OK — backpressure works
+});
+
+app.post('/upload', async (req, res) => {
+  const ws = fs.createWriteStream('upload.bin');
+  req.on('data', (chunk) => ws.write(chunk));     // BAD — buffer ballooning
+  req.on('end', () => ws.end());
+});
+```
+
+The first version uses `pipe` which honors backpressure. The second
+doesn't check `write`'s return; buffer balloons under fast uploads.
+
+`pipeline(req, ws)` is the modern form.
+
+### SSE / WebSocket streaming
+
+```js
+function streamEvents(res) {
+  setInterval(() => {
+    res.write(`data: ${JSON.stringify(getEvent())}\n\n`);   // backpressure ignored
+  }, 10);
+}
+```
+
+If the client is slow (mobile / throttled), `res.write` returns
+false; you keep writing; buffer fills.
+
+Fix:
+
+```js
+async function streamEvents(res) {
+  for await (const event of eventSource()) {
+    if (!res.write(`data: ${JSON.stringify(event)}\n\n`)) {
+      await new Promise(r => res.once('drain', r));
+    }
+  }
+}
+```
+
+### Compressing large data
+
+```js
+const compressed = await pipeline(
+  fs.createReadStream('huge.log'),
+  zlib.createGzip(),
+  fs.createWriteStream('huge.log.gz'),
+);
+```
+
+`zlib.gzip` (the non-stream version) buffers the entire output in
+memory — bad for huge inputs. The streaming form `createGzip` plus
+`pipeline` handles backpressure.
+
+For data smaller than 100MB, the non-stream API is convenient. Above
+that, stream.
+
+## Common pitfalls
+
+### Forgetting `pipeline` errors
+
+```js
+src.pipe(dst);
+src.on('error', () => {});    // dst still open!
+```
+
+With `pipe`, you must handle errors on every stream:
+
+```js
+src.on('error', (err) => dst.destroy(err));
+dst.on('error', (err) => src.destroy(err));
+```
+
+`pipeline` does this for you. Don't write `pipe` in new code.
+
+### Reading and ignoring
+
+```js
+src.on('data', () => {});  // empty handler — drains source
+```
+
+Attaching a `data` handler unpauses the stream and discards chunks.
+If your processing is async and slow, the `data` events arrive
+faster than you process — implicit buffer growth somewhere.
+
+Use `for await` or `pipeline`. Explicit `data` handlers are a smell.
+
+### Mixing flowing and paused modes
+
+```js
+src.on('data', handler);    // flowing
+src.pause();                 // pauses, but rewatching data resumes
+```
+
+The stream state is fragile when mixing event-based ('data') and
+pull-based ('readable') consumption. Pick one. `for await` is best
+because it's clearly pull-based.
+
+### Object-mode streams with huge objects
+
+```js
+const stream = new Readable({ objectMode: true });
+stream.push({ giantArray: new Array(1e6).fill('x') });
+```
+
+The default `highWaterMark` of 16 objects means 16 of these in
+memory. Lower it for large objects.
+
+## The mental model
+
+Backpressure is **the producer pausing when the consumer can't keep
+up**. Every Node stream supports it; you just have to:
+
+- Honor `write`'s return value (or use `pipeline` / async iteration).
+- Use `pipeline` over `pipe`.
+- For producers, return false from `push` and let the consumer
+  resume by pulling.
+
+The cost of not honoring backpressure is OOM under load. The cost of
+honoring it is ~5 lines of code — or zero, if you use `pipeline` and
+async iteration like modern Node code does.
+
+Streams are the unsung hero of Node. Used right, they handle
+gigabytes with megabytes of memory. Used wrong, they crash the
+process.

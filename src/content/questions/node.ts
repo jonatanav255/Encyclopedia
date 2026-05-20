@@ -106,5 +106,111 @@ export const bank: QuestionBank = {
       answer:
         '**Confirm it\'s a leak, not normal growth.** Plot `process.memoryUsage()` — if `heapUsed` rises steadily without leveling off, it\'s a leak. If `rss` rises but `heapUsed` is stable, it might be V8\'s heap fragmentation or off-heap (native modules, Buffer pool) — different problem.\n\n**Capture snapshots.** Add a SIGUSR2 handler that calls `v8.writeHeapSnapshot()`. In production, trigger it once early (baseline) and once when memory is high (loaded). Pull both files locally; load into Chrome DevTools.\n\n**Diff snapshots.** "Comparison" view shows what grew. The top retainers are usually:\n- Unbounded `Map` / `Set` (caches without eviction). Switch to `lru-cache`.\n- EventEmitter listeners. Set `setMaxListeners(...)`, audit `on()` without matching `off()`.\n- Timer or interval holding a closure with large captured state. `unref()` won\'t help; you need to clear them.\n- Promises that never settle (e.g., DB calls hanging). Each holds a closure and any awaiting callbacks.\n- Connection pools with leaked connections — driver-specific.\n\n**Confirm with logs/metrics.** Custom gauge for cache size, listener count, in-flight requests. If the gauge climbs alongside memory, you\'ve found it.\n\n**Reproduce in staging** with load. Heap snapshots in prod are necessary but reproducing helps you verify the fix.\n\n**Fix**: bound the cache, remove the listener, clear the timer, fail the promise. **Don\'t just bump `--max-old-space-size`** — that delays the symptom and risks OOM-kills under load spikes.\n\n**Long-term**: add a memory regression test; alert on rate-of-growth, not just absolute RSS.',
     },
+
+    // --- additions for new topics ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What replaces `nodemon` and `dotenv` in modern Node?',
+      answer:
+        '`node --watch` restarts on file changes; `node --env-file=.env` loads env vars before running. Combined with `--experimental-strip-types` (or just native TS in 23.6+), the modern dev script is `node --watch --env-file=.env src/index.ts`. No `nodemon`, no `dotenv`, no `tsx`/`ts-node`. Caveat: `--env-file` doesn\'t do variable expansion; `dotenv-expand` still has a niche.',
+    },
+    {
+      level: 'junior',
+      question: 'How do you run a `.ts` file directly with modern Node?',
+      answer:
+        '`node --experimental-strip-types src/index.ts` (Node 22.6+) or just `node src/index.ts` (23.6+ default for .ts). Node erases the type annotations and runs the JavaScript. **No type checking at runtime** — that\'s `tsc --noEmit`, which you still run in CI. Stripping doesn\'t handle `enum`, `namespace`, or parameter properties; for those use `--experimental-transform-types` or rewrite to literal-union types.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'What does `node:test` give you that justifies leaving Jest/Vitest?',
+      answer:
+        'Built-in, zero deps. Subtests via `t.test`, mocking via `mock.fn` / `mock.method` / `mock.timers`, snapshot testing, coverage via `--experimental-test-coverage`, watch via `--test --watch`, multiple reporters (spec/tap/junit), parallel files. Native ESM and TypeScript. For libraries and backend services where you don\'t need jsdom, it\'s the right default in 2026. Stick with Vitest for frontend (jsdom) or when you need a richer plugin ecosystem.',
+    },
+    {
+      level: 'mid',
+      question: 'What changed about `require(esm)` in Node 22+?',
+      answer:
+        'It works synchronously, unflagged in Node 23+, for ESM modules that don\'t use top-level `await`. Before, you had to use dynamic `import()` from CJS to load ESM. Now `const lib = require(\'./lib.mjs\')` just works — unless the ESM file does TLA, in which case `require` throws and you must use `await import(...)`.',
+    },
+    {
+      level: 'mid',
+      question: 'You write `fetch(url)` in a hot loop and DNS lookups are blocking other code. Why?',
+      answer:
+        'undici (which powers `fetch`) uses `dns.lookup` internally — which runs on the libuv thread pool. Default pool size is 4. A slow DNS server holds a pool thread for the full timeout, starving fs/crypto/zlib that also use the pool. Two fixes: (1) install `cacheable-lookup` and use it via `setGlobalDispatcher(new Agent({ connect: { lookup: cl.lookup } }))` to cache DNS responses. (2) Bump `UV_THREADPOOL_SIZE=16` (or higher) in your launch command. Together they eliminate DNS-induced pool exhaustion.',
+    },
+    {
+      level: 'mid',
+      question: 'When would you use Web streams vs Node streams in 2026?',
+      answer:
+        'Web streams (`ReadableStream`, etc.) at API boundaries — `fetch` response bodies, `CompressionStream`, anywhere you might run in the browser too. Node streams for internal pipelines — `fs.createReadStream`, transforms with the npm ecosystem. Bridge with `Readable.fromWeb` / `Readable.toWeb`. Both support `for await...of`, which is the modern consumer pattern regardless of source.',
+    },
+    {
+      level: 'mid',
+      question: 'You see RSS climb steadily while uploading large files. Diagnosis?',
+      answer:
+        'You\'re ignoring `write()`\'s return value (backpressure). The producer (the incoming request stream) writes faster than the consumer (disk, transform, response) accepts. Node accepts everything and buffers in memory. Fix: use `pipeline(src, dst)` from `node:stream/promises` (it honors backpressure and propagates errors), or honor `write`\'s `false` return by awaiting `\'drain\'`. Async iteration (`for await...of`) also handles backpressure automatically.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s `Promise.withResolvers()` for?',
+      answer:
+        'Externalizes a promise\'s `resolve` and `reject`: `const { promise, resolve, reject } = Promise.withResolvers()`. Replaces the closure dance `let resolve; const p = new Promise(r => resolve = r);`. Useful for bridging event emitters to promises, building deferred queues, custom async iterators. Stable in Node 22+, all modern browsers.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'Your service behind ALB gets intermittent 502s with no obvious cause. Where do you look?',
+      answer:
+        'Almost always Node\'s `keepAliveTimeout` is **less than or equal to** the ALB idle timeout (60s). When the ALB tries to reuse an idle connection at the same instant Node\'s keepAliveTimeout fires, the LB writes into a closing socket → 502. Fix: set `server.keepAliveTimeout = 65_000` and `server.headersTimeout = 66_000` (`headersTimeout` must exceed `keepAliveTimeout`). For other LBs, match to their idle timeout + a few seconds of jitter. This single config eliminates the bulk of "random 502" incidents.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s `AsyncLocalStorage` and what should you use it for?',
+      answer:
+        'Thread-local-like storage that propagates through async boundaries. Set it once at the entry of a request; read it anywhere in the async tree via `store.getStore()`. Used for request IDs, user IDs, trace contexts, tenant IDs — the "ambient" values you don\'t want to pass through every function signature. Near-zero overhead in modern Node. OpenTelemetry, pino, and most observability libraries use it under the hood.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s `diagnostics_channel` and why does it exist?',
+      answer:
+        'A passive pub-sub for instrumentation — modules publish at well-defined points ("http request started," "DB query starting"), libraries subscribe. No monkey-patching, no version-breakage. `ch.publish()` is near-free when no subscribers. The official replacement for "wrap `http.request` to intercept calls." OTel, undici, and many DB drivers now publish channels; subscribe to instrument without wrapping.',
+    },
+    {
+      level: 'senior',
+      question: 'How would you tune `UV_THREADPOOL_SIZE`?',
+      answer:
+        'Default is 4 — way too small for crypto-heavy or DNS-lookup-heavy workloads. Bump to `2 × CPU cores` as a starting point (`UV_THREADPOOL_SIZE=16` for an 8-core box). Set via launch flag, not from JS (must be read before libuv initializes). Watch for the symptom: event-loop lag low but request latency high — that\'s pool exhaustion. Common triggers: `bcrypt`/`argon2`, `dns.lookup`, `fs.readFile`, `zlib`. Higher pool sizes are cheap (~8MB stack per thread).',
+    },
+    {
+      level: 'senior',
+      question: 'Why use undici directly instead of global `fetch`?',
+      answer:
+        'You can configure pools per origin (different limits for stable vs flaky upstreams), use `request` instead of `fetch` for lower-overhead high-throughput calls, and use `RetryAgent` for built-in idempotent-method retries. `fetch` itself uses undici under the hood — but the default global dispatcher has no per-origin pool sizing, no DNS cache, no retry. For production HTTP clients at scale, configure a custom `Agent` with `pipelining: 1` and reasonable `connections` per origin via `setGlobalDispatcher`.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s the difference between `worker_threads` and `cluster` in 2026?',
+      answer:
+        '`worker_threads` = many V8 isolates in one process; share memory via `SharedArrayBuffer`; for CPU-bound JavaScript work that would block the event loop. `cluster` = many Node processes sharing an HTTP listener; for using multiple CPU cores for I/O serving. In 2026, `cluster` is mostly replaced by container replicas — let Kubernetes scale processes. `worker_threads` is still relevant for CPU-bound endpoints; pool them with `piscina` rather than spawning per task.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a hardened deployment for a Node service handling sensitive data.',
+      answer:
+        '**Install layer**: pnpm with `--frozen-lockfile --ignore-scripts` in CI; explicit `pnpm approve-builds` for packages needing postinstall. Pin pnpm via `packageManager` in package.json. Renovate or Dependabot with grouped minors auto-merge after CI; humans review majors.\n\n**Runtime layer**: `node --permission --allow-fs-read=./dist --allow-fs-read=./node_modules --allow-net --frozen-intrinsics --disable-proto=delete dist/index.js`. Combined: filesystem locked, no addons, no prototype pollution surface. ~1% overhead.\n\n**Network layer**: TLS 1.3 only, certificate pinning if calling specific services, egress firewall blocking everything but allowed destinations (defense against SSRF + data exfil).\n\n**Process layer**: dedicated IAM role per service with minimum permissions; secrets fetched at startup via Secrets Manager; rotated regularly with backward-compatible rotation windows.\n\n**Observability**: OpenTelemetry with auto-instrumentation; W3C traceparent propagation; pino structured logs with traceId/spanId correlation; metrics on event-loop lag, p99 latency, error budget burn rate.\n\n**Failure mode**: graceful shutdown with readiness probe + closeIdleConnections + bounded in-flight drain + final timeout. K8s `terminationGracePeriodSeconds` matched to drain time + buffer.\n\n**Supply chain monitoring**: Socket or similar passive monitoring of installed deps. Alerts on suspicious behavior (unexpected network calls, obfuscated code).',
+    },
+    {
+      level: 'staff',
+      question: 'How would you implement OpenTelemetry for an existing Express app without rewriting it?',
+      answer:
+        '**Auto-instrument first.** Install `@opentelemetry/sdk-node` and `@opentelemetry/auto-instrumentations-node`; create an `instrumentation.js` that boots the SDK with a service name and an OTLP exporter pointed at your collector. Run with `node --import ./instrumentation.js src/index.js` so instrumentation patches modules **before** they\'re used. You immediately get spans for HTTP server/client, Express routes, DB queries, Redis — no app changes.\n\n**Then propagation.** Auto-instr handles inbound `traceparent` and outbound HTTP. For queues (BullMQ, etc.), explicitly inject/extract via `propagation.inject(context.active(), headers)` at enqueue and `propagation.extract` at consumer.\n\n**Then sampling.** Default 100% in dev. In prod, tail-based sampling at the Collector — keep all errors, all slow requests (> p99), and 10% probabilistic. This needs a separate Collector process; worth running.\n\n**Then logs correlation.** Configure pino to inject `traceId`/`spanId` from the active span. Now every log line joins a trace.\n\n**Then custom spans.** For business operations (process order, charge payment), wrap with `tracer.startActiveSpan(...)`. Use `setAttribute` for IDs and outcomes; `recordException` on error.\n\n**Then dashboards.** Latency by route, error rate, dependency latency, throughput. Wire SLOs to burn-rate alerts.\n\nCost: 1-2 sprints if existing code is reasonable. Payoff: every "where is time going?" question becomes a trace lookup.',
+    },
   ],
 };

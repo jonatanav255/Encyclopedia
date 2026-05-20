@@ -1,0 +1,272 @@
+export const level = 'junior';
+
+# `node --watch` and `--env-file`
+
+Two Node flags that quietly replace a small ecosystem of tools.
+
+## `node --watch`
+
+Restarts the process when watched files change:
+
+```bash
+node --watch src/index.js
+```
+
+Same as the old `nodemon` pattern. Restarts on changes to:
+
+- The entry file.
+- Files imported from it (transitively).
+
+```bash
+node --watch --watch-path=src --watch-path=config src/index.js
+```
+
+`--watch-path` adds explicit watch directories. Useful if you import
+templates, config, or other non-JS files that should trigger restart.
+
+Exclude:
+
+```bash
+node --watch --watch-preserve-output src/index.js
+```
+
+`--watch-preserve-output` keeps the previous output visible across
+restarts (default clears the terminal). Helpful when debugging
+startup errors.
+
+For tests:
+
+```bash
+node --test --watch
+```
+
+Reruns affected tests on changes. Replaces `jest --watch`.
+
+For TypeScript (Node 22+):
+
+```bash
+node --watch --experimental-strip-types src/index.ts
+node --watch src/index.ts          # in 23.6+
+```
+
+Combines with native TypeScript — no nodemon, no tsx, no ts-node.
+
+## `node --env-file`
+
+Loads environment variables from a file before running:
+
+```bash
+node --env-file=.env src/index.js
+```
+
+`.env`:
+
+```
+DATABASE_URL=postgres://localhost/myapp
+PORT=3000
+NODE_ENV=development
+```
+
+Replaces:
+
+```js
+// import 'dotenv/config';   — no longer needed
+```
+
+For multi-env:
+
+```bash
+node --env-file=.env --env-file=.env.local src/index.js
+```
+
+Files load in order; later overrides earlier. Matching the
+`.env`/`.env.local` pattern Next.js / Remix use.
+
+### Caveats
+
+- **No variable expansion.** `.env` files with `BASE=foo BAR=$BASE/bar`
+  don't expand `$BASE`. `dotenv-expand` does; native `--env-file`
+  doesn't.
+- **No `quote` handling beyond basic.** Multi-line values via `"..."`
+  work; complex JSON values might not parse as you expect.
+- **Errors if file missing.** Add `--env-file-if-exists=.env` to make
+  it optional.
+
+For most cases the native version is enough. Edge cases keep
+`dotenv` relevant.
+
+## `--watch` + `--env-file`
+
+```bash
+node --watch --env-file=.env src/index.js
+```
+
+Combined: auto-restart with env loaded. The full "dev server" command.
+
+In `package.json`:
+
+```json
+{
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/index.js",
+    "start": "node --env-file=.env src/index.js",
+    "test": "node --test --watch"
+  }
+}
+```
+
+No nodemon, no dotenv, no tsx. The dev experience is `pnpm dev`.
+
+## What this replaces
+
+Tools that 2024 Node projects routinely installed:
+
+- **nodemon** → `--watch`.
+- **dotenv** → `--env-file`.
+- **tsx** / **ts-node** → `--experimental-strip-types` (Node 22+).
+- **nyc** → `--experimental-test-coverage`.
+- **jest** / **mocha** → `node:test`.
+
+For new projects, a "blank" Node 22+ project starts with effectively
+zero dev dependencies for these jobs. `pnpm install` adds your
+*actual* dependencies, not the surrounding tooling.
+
+## Behaviour details
+
+### `--watch` ignores `node_modules`
+
+By design. Changes to dependencies don't trigger restart. If you're
+developing a local package (linked via pnpm workspace), explicit
+`--watch-path=packages/dep/dist` is needed.
+
+### `--watch` doesn't watch every imported file by default
+
+It watches the entry plus its required-at-startup imports. Dynamic
+imports inside handlers aren't watched. Add `--watch-path` if
+needed.
+
+### Watching too broadly
+
+```bash
+node --watch --watch-path=. src/index.js
+```
+
+This watches the whole repo — including `node_modules`,
+`.git`, `dist`. Slow. Specific `--watch-path` flags are better.
+
+### Restart delay
+
+The watcher debounces (default ~100ms). Rapid saves trigger one
+restart. Mostly invisible.
+
+### Killing the process
+
+`Ctrl-C` kills the watcher and the watched process cleanly. Modern
+`--watch` propagates signals correctly.
+
+## Common pitfalls
+
+### `--env-file` after the script
+
+```bash
+node src/index.js --env-file=.env   # WRONG — passed to your script
+node --env-file=.env src/index.js   # right
+```
+
+Same pitfall as other Node flags. Flags before the script path.
+
+### Variable expansion expectations
+
+```
+.env:
+BASE=foo
+BAR=$BASE/bar
+```
+
+`process.env.BAR` is literally `$BASE/bar`, not `foo/bar`. If you
+need expansion, install `dotenv` and use it.
+
+### `.env` in git
+
+Should be in `.gitignore`. Commit `.env.example` listing variable
+names but no values.
+
+### `--watch` in production
+
+Don't. `--watch` is for dev. Production should run normally; let
+the orchestrator (Kubernetes, systemd, PM2) handle restarts.
+
+### Conflicts with PM2
+
+PM2's own watch mode is separate. If you use PM2 for production
+process management, don't combine `--watch` with it; PM2 handles
+restart.
+
+For dev, `node --watch` is enough.
+
+## Watch in tests
+
+```bash
+node --test --watch tests/
+```
+
+Reruns affected tests on save. Faster feedback than CI loops.
+Combined with `--test-only`:
+
+```js
+import { test } from 'node:test';
+
+test.only('focus on this', () => { ... });
+```
+
+```bash
+node --test --watch --test-only tests/
+```
+
+Iterate on one test, no other distractions.
+
+## `--watch-path` for non-JS files
+
+If your code reads templates, config, SQL files, etc., add them:
+
+```bash
+node --watch --watch-path=src --watch-path=templates --watch-path=migrations src/index.js
+```
+
+Without this, restarting on template edits requires manual reload.
+
+## `--inspect` and watch
+
+```bash
+node --watch --inspect src/index.js
+```
+
+Watch + inspector. Restart wires up a fresh inspector each time. Some
+debuggers handle this gracefully (Chrome DevTools); others lose
+state.
+
+For long debugging sessions, drop `--watch` while debugging.
+
+## The mental model
+
+`--watch` and `--env-file` are **first-party replacements for
+ubiquitous dev dependencies**. They're stable, fast, and require no
+configuration.
+
+For new Node projects in 2026, the default dev script is:
+
+```bash
+node --watch --env-file=.env --experimental-strip-types src/index.ts
+```
+
+Or in 23.6+:
+
+```bash
+node --watch --env-file=.env src/index.ts
+```
+
+No `nodemon`, no `dotenv`, no `tsx`, no `node_modules` for these
+jobs.
+
+The argument for keeping the equivalent npm packages is shrinking.
+For typical apps, they're no longer needed.

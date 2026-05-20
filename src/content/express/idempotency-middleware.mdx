@@ -1,0 +1,421 @@
+export const level = 'senior';
+
+# Idempotency middleware
+
+For any POST/PUT/PATCH/DELETE endpoint that creates resources or has
+side effects, the client may retry on network failure. Without
+idempotency support, retries can charge a card twice, create
+duplicate orders, or send the same email N times.
+
+The **`Idempotency-Key`** header (Stripe, IETF draft RFC 9437) is the
+industry-standard mechanism for letting the client say "if you saw
+this same key before, return the previous response instead of
+re-executing."
+
+## The protocol
+
+Client side:
+
+```http
+POST /charges HTTP/1.1
+Idempotency-Key: 87ad-f0f3-...
+Content-Type: application/json
+
+{"amount": 1000, "currency": "usd"}
+```
+
+The client generates a UUID (or similar) per *logical operation*.
+The same key on retry → same response. A new logical operation
+gets a new key.
+
+Server side:
+
+1. Look up the key in storage.
+2. **If found, return the stored response.** No re-execution.
+3. **If not found, mark "in progress," execute, store response.**
+4. **If two requests come in simultaneously with the same key,
+   one wins; the other gets 409 (or waits and returns the same
+   result).**
+
+## Minimal implementation
+
+```js
+import { createHash } from 'node:crypto';
+
+export function idempotencyMiddleware(redis) {
+  return async (req, res, next) => {
+    const key = req.headers['idempotency-key'];
+    if (!key) return next();    // no key → just process normally
+
+    if (!/^[a-zA-Z0-9_\-]{16,128}$/.test(key)) {
+      return res.status(400).json({ error: 'invalid idempotency key' });
+    }
+
+    // Hash the body to detect "same key, different body" (client bug)
+    const bodyHash = createHash('sha256')
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+
+    const storageKey = `idempotency:${req.user?.id ?? 'anon'}:${key}`;
+
+    // Atomic claim — set the key only if it doesn't exist.
+    // This is the single place we decide "first request wins."
+    const initial = JSON.stringify({ status: 'in_progress', bodyHash });
+    const claimed = await redis.set(storageKey, initial, 'EX', 24 * 3600, 'NX');
+
+    if (claimed === null) {
+      // Someone else has the key — read what's there.
+      const existing = await redis.get(storageKey);
+      const parsed = JSON.parse(existing);
+      if (parsed.bodyHash !== bodyHash) {
+        return res.status(422).json({
+          error: 'idempotency key reused with different request body',
+        });
+      }
+      if (parsed.status === 'in_progress') {
+        return res.status(409).json({ error: 'request in progress' });
+      }
+      // Completed — replay the stored response.
+      return res.status(parsed.statusCode).json(parsed.body);
+    }
+
+    // We won the claim — capture the response and persist.
+    const origJson = res.json.bind(res);
+    res.json = (body) => {
+      redis.set(storageKey, JSON.stringify({
+        status: 'completed',
+        bodyHash,
+        statusCode: res.statusCode,
+        body,
+      }), 'EX', 24 * 3600);
+      return origJson(body);
+    };
+
+    next();
+  };
+}
+```
+
+Per-route:
+
+```js
+app.post('/charges', idempotencyMiddleware(redis), chargeHandler);
+```
+
+## What "store the response" means
+
+The cached response should include:
+
+- **Status code** (200, 201, 400 — replay the same).
+- **Body** (the JSON payload).
+- **Body hash** (to detect key reuse with different inputs).
+- **(optional) Headers** — for things like `Location` on 201.
+
+When you replay, write the same status/body so the client can't tell
+whether it was a fresh execution or a replay.
+
+## TTL
+
+Idempotency keys should have a finite lifetime. Common: **24
+hours**. After that, the key expires and the same key could be
+reused for a different operation.
+
+For longer TTLs (a week), you're insuring against very delayed
+retries (long offline period). For shorter (1 hour), tighter; same
+risk if a slow background retry comes in.
+
+Stripe uses 24 hours. Most providers do.
+
+## Scope: per-user, per-endpoint, global?
+
+```
+idempotency:<user>:<key>
+```
+
+The right scope depends on threat model:
+
+- **Per-user**: User A's key doesn't collide with User B's. Most
+  common.
+- **Per-endpoint**: `/charges:user:key`. Allows users to reuse the
+  same key across different endpoints. Stripe does this implicitly
+  by including the operation in the key namespace.
+- **Global**: One key everywhere. Risky if two unrelated callers
+  accidentally pick the same UUID.
+
+Per-user + per-endpoint is the safest:
+
+```
+idempotency:POST:/charges:user-42:abc123
+```
+
+## In-progress requests
+
+```js
+if (parsed.status === 'in_progress') {
+  return res.status(409).json({ error: 'request in progress' });
+}
+```
+
+Two strategies:
+
+1. **Reject duplicates while in progress** (409). Client retries
+   after a delay.
+2. **Wait and return the same result.** Long-poll: the second
+   request blocks until the first completes, then returns the same
+   response.
+
+Strategy 1 is simpler and more common. Strategy 2 gives better
+client UX but adds complexity (waiters, timeouts, fairness).
+
+For most APIs, **409 in-progress** is fine — clients should retry
+with backoff.
+
+## Body validation
+
+```js
+if (parsed.bodyHash !== bodyHash) {
+  return res.status(422).json({
+    error: 'idempotency key reused with different request body',
+  });
+}
+```
+
+Same key, different body = client bug. Either:
+
+- The client retried with a different body (shouldn't happen).
+- Two unrelated operations accidentally got the same key.
+
+Either way, reject with 422. Don't replay the wrong response.
+
+## Failure semantics
+
+What if the request **fails mid-execution**?
+
+Option A — store the failure response:
+
+```js
+res.status(500).json({ error: 'internal' });
+// cache as completed with statusCode 500
+```
+
+The retry gets back the 500. Predictable.
+
+Option B — don't cache failures, let the client retry:
+
+```js
+if (res.statusCode >= 500) {
+  await redis.del(storageKey);   // free up the key
+}
+```
+
+The retry executes fresh.
+
+Stripe-style: cache *all* responses including 500s. The client
+shouldn't retry the same idempotency key on a 5xx; it should
+generate a new key. This is documented in the API contract.
+
+Option A is simpler and more deterministic.
+
+## Storage backends
+
+### Redis
+
+- Fast, atomic SET NX EX.
+- TTL built in.
+- Single-region; for multi-region, replicate.
+
+The default. ~95% of implementations.
+
+### Postgres
+
+```sql
+CREATE TABLE idempotency_keys (
+  user_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  body_hash TEXT,
+  status_code INT,
+  response JSONB,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, key)
+);
+
+-- Cleanup
+CREATE INDEX ON idempotency_keys (created_at);
+DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours';
+```
+
+Pros:
+
+- Transactional with your business writes.
+- Inspect via SQL.
+
+Cons:
+
+- Higher latency than Redis.
+- Cleanup needs a job.
+
+For services already heavily Postgres-dependent, this is OK.
+
+## Stripe-style API spec
+
+```http
+POST /v1/charges
+Idempotency-Key: <uuid>
+```
+
+Response includes (optionally) an indicator that the response was
+replayed:
+
+```http
+HTTP/1.1 200 OK
+Idempotency-Status: replayed
+```
+
+Or in the body:
+
+```json
+{
+  "id": "ch_123",
+  "idempotency_replayed": true
+}
+```
+
+This lets clients distinguish "the operation just happened" from
+"the operation happened earlier, you're getting the cached
+response." Mostly observational; clients usually don't care.
+
+## When you don't need idempotency
+
+- **Read-only endpoints** (GET, HEAD, OPTIONS) — already idempotent
+  semantically.
+- **Pure UPSERT operations** — naturally idempotent in the data
+  layer (PUT to a known resource ID).
+- **Endpoints where double-processing is harmless** (e.g.,
+  "mark user as read again" — same state).
+
+For everything else (POST that creates, charges, sends external
+side effects), idempotency is mandatory for production.
+
+## Combining with retries
+
+Server-side hardening pairs with client-side retry:
+
+```js
+// Client
+async function postCharge(body) {
+  const key = crypto.randomUUID();
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await fetch('/charges', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      if (i === 2) throw err;
+      await sleep(2 ** i * 1000);   // exponential backoff
+    }
+  }
+}
+```
+
+The retry uses the **same key**. Server returns the same response.
+
+If you generate a new key per attempt, retries become duplicate
+operations — which is exactly the bug idempotency keys solve.
+
+## Common pitfalls
+
+### Generating the key server-side
+
+```js
+// BAD — server generates the key
+app.post('/charges', (req, res) => {
+  const key = crypto.randomUUID();   // useless — different every request
+});
+```
+
+The key must come from the **client**, persist across the client's
+retries. Server-generated keys can't help.
+
+### Caching for too long
+
+```js
+EX: 86400 * 30   // 30 days
+```
+
+A month is far too long. Storage grows; the same client might reuse
+a key by accident.
+
+24 hours is the standard. Anything more than 7 days is suspicious.
+
+### Treating Idempotency-Key as auth
+
+```js
+if (idempotencyKey === knownUserKey) authenticate(user);   // NO
+```
+
+The key proves "this is a retry of a specific request from a
+client" — not "this is user X." Authentication is separate.
+
+### Ignoring concurrent requests with the same key
+
+```js
+const cached = await redis.get(key);
+if (cached) return replay(cached);
+// race window here — two requests both see "not cached"
+await process();
+await redis.set(key, response);
+```
+
+Two parallel requests with the same key both pass the check, both
+process, both write. Two charges.
+
+Use `SET NX` to claim the key atomically:
+
+```js
+const claimed = await redis.set(key, 'in_progress', 'NX', 'EX', 86400);
+if (!claimed) {
+  // someone else has it; check status
+  const status = await redis.get(key);
+  // ... wait or return 409
+}
+```
+
+### Forgetting to cache the response
+
+```js
+await process();
+res.json(result);
+// Never wrote to the idempotency store; next retry re-processes
+```
+
+Wrap `res.json` / `res.send` to persist before returning. The
+middleware example above shows this.
+
+### Validating only the key, not the body
+
+```js
+if (cached) replay();
+```
+
+Same key, different body → client bug. Replaying the *cached*
+response when the body changed is wrong. Use a body hash to detect.
+
+## The mental model
+
+Idempotency middleware is **a cache keyed by client-supplied
+identifier**. The first request executes; subsequent requests with
+the same key get the same response.
+
+The discipline:
+
+1. **Atomic claim** of the key (`SET NX`).
+2. **Capture and persist** the response after execution.
+3. **Replay** stored responses on retry.
+4. **Reject** key reuse with different body.
+5. **TTL** to bound storage.
+
+For 2026 Node + Express services, this middleware is standard for
+any side-effect endpoint. The cost is one Redis call per request;
+the saving is "we don't charge customers twice."

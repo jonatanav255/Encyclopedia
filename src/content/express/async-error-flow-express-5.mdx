@@ -1,0 +1,352 @@
+export const level = 'mid';
+
+# Async error flow in Express 5
+
+Express 5's headline feature: **rejected promises from handlers now
+forward to error middleware automatically.** The decade-long ritual
+of wrapping every async handler is over.
+
+```js
+// Express 5 — just throw or reject
+app.get('/users/:id', async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+  if (!user) throw new NotFoundError();
+  res.json(user);
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof NotFoundError) return res.sendStatus(404);
+  res.status(500).send('internal');
+});
+```
+
+The thrown `NotFoundError` becomes a rejected promise. Express awaits
+the handler, catches the rejection, and routes it to the
+4-argument error middleware. No `try/catch + next(err)`. No
+`express-async-handler`. No `express-async-errors` patch.
+
+## What changed
+
+Express 4's handler signature was `(req, res, next)`. The framework
+called it but didn't `await` the return value. If your async function
+threw, the rejection became an unhandled promise rejection — at best
+logged, at worst crashing the process. None of it reached your error
+middleware.
+
+The pre-Express-5 workaround:
+
+```js
+// The old wrap pattern
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get('/users/:id', asyncHandler(async (req, res) => {
+  // ...
+}));
+```
+
+Or via the `express-async-errors` patch that monkey-patched the
+Router to await handlers.
+
+Express 5 builds this into the framework. The wrapper is no longer
+needed.
+
+## What error middleware looks like
+
+```js
+app.use((err, req, res, next) => {
+  // 4 arguments — that's how Express identifies error middleware
+  log.error({ err, req: { method: req.method, url: req.url } }, 'request error');
+
+  if (err instanceof ValidationError) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (err instanceof NotFoundError) {
+    return res.status(404).send();
+  }
+  res.status(500).send('internal');
+});
+```
+
+The 4-arg signature is how Express distinguishes error middleware
+from regular middleware. The order matters: register error middleware
+**after** all routes.
+
+If you call `next(err)` (or throw) and no error middleware catches
+it, Express's default handler returns a 500 with a generic message.
+
+## What you can delete
+
+After upgrading to Express 5:
+
+```js
+// Delete this wrapper
+// const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Delete this dependency
+// import 'express-async-errors';
+
+// Routes are now plain:
+app.get('/users/:id', async (req, res) => {
+  // throws propagate to error middleware
+});
+```
+
+## When this doesn't help
+
+### After `res` is sent
+
+```js
+app.get('/stream', async (req, res) => {
+  res.write('chunk1');
+  await badThing();      // throws AFTER bytes sent
+});
+```
+
+Once you've called `res.write(...)`, the response has started.
+Express catches the error and forwards to middleware, but **you
+can't change the response anymore** — the headers and some bytes
+are out.
+
+The middleware can log, but can't send a 500 (the connection is
+mid-stream). Best you can do is `res.destroy()`:
+
+```js
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    // Can't send a new response. Kill the connection.
+    return res.destroy(err);
+  }
+  res.status(500).send('error');
+});
+```
+
+`res.destroy(err)` aborts the response and signals the client. The
+client sees a network error rather than a graceful 500.
+
+Always check `res.headersSent` in error middleware before writing.
+
+### Thrown from a non-handler
+
+```js
+app.use((req, res, next) => {
+  setImmediate(() => {
+    throw new Error('uncaught');   // NOT caught by error middleware
+  });
+});
+```
+
+Express's catch only covers the handler function and its return
+value. A throw from a deferred callback (`setImmediate`, `setTimeout`,
+event emitter, child process) escapes the framework.
+
+Handle these manually:
+
+```js
+setImmediate(() => {
+  try {
+    riskyThing();
+  } catch (err) {
+    next(err);    // explicit forward
+  }
+});
+```
+
+### Errors from inside `next()` calls
+
+Most middleware does the right thing. Some libraries call `next()`
+synchronously after an async operation, which makes Express think
+the middleware completed. Then if the async result throws inside the
+middleware's catch, it's too late — Express has moved on.
+
+In practice this is rare. Use library code from 2024+ where the
+ecosystem caught up to Express 5.
+
+## Synchronous errors
+
+Throws from synchronous handlers still work:
+
+```js
+app.get('/foo', (req, res) => {
+  throw new Error('boom');   // caught by error middleware
+});
+```
+
+Express has always caught synchronous throws. The change in 5 was
+**async** throws.
+
+## Async iteration
+
+A handler that's an async generator (e.g., streaming JSON):
+
+```js
+app.get('/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  for await (const row of streamRows()) {
+    if (!res.write(JSON.stringify(row) + '\n')) {
+      await new Promise(r => res.once('drain', r));
+    }
+  }
+  res.end();
+});
+```
+
+The for-await is awaited; rejections from the iterator propagate up
+to Express's catch. But once you've started writing, the
+"can't change response" rule applies — handle the error before
+calling `res.write` or `res.destroy()` after.
+
+## Per-router error middleware
+
+You can have error middleware on a sub-router:
+
+```js
+const usersRouter = Router();
+usersRouter.get('/:id', async (req, res) => { ... });
+usersRouter.use((err, req, res, next) => {
+  if (err instanceof UserSpecificError) return res.status(400).send();
+  next(err);    // pass to parent
+});
+
+app.use('/users', usersRouter);
+app.use(errorHandler);   // catches what users router didn't
+```
+
+The sub-router's error middleware fires first. If it doesn't handle
+the error (calls `next(err)`), the app-level error middleware gets
+it. Useful for module-specific error translation.
+
+## TypeScript signatures
+
+```ts
+import type { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
+
+const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+  // typed
+};
+
+app.use(errorHandler);
+```
+
+`ErrorRequestHandler` is the 4-arg type. Use it for clarity.
+
+## Common patterns
+
+### Centralized HTTP error class
+
+```js
+class HttpError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+app.get('/users/:id', async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+  if (!user) throw new HttpError(404, 'not_found', 'User not found');
+  res.json(user);
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ code: err.code, message: err.message });
+  }
+  log.error({ err }, 'unexpected error');
+  res.status(500).json({ code: 'internal', message: 'Internal error' });
+});
+```
+
+All handlers throw `HttpError(status, code, message)`. The middleware
+translates to a uniform JSON shape.
+
+### Wrap external errors
+
+```js
+try {
+  await stripe.charges.create(...);
+} catch (err) {
+  if (err.type === 'StripeCardError') {
+    throw new HttpError(402, 'payment_failed', err.message);
+  }
+  throw new HttpError(500, 'payment_error', 'Internal payment error');
+}
+```
+
+Convert third-party errors to your `HttpError` at the seam. The error
+middleware then handles one type uniformly.
+
+### Don't catch what you can't handle
+
+```js
+// Bad
+app.get('/users/:id', async (req, res) => {
+  try {
+    const user = await db.users.findById(req.params.id);
+    res.json(user);
+  } catch (err) {
+    res.status(500).send('failed');    // strips context, loses 404 vs 500
+  }
+});
+```
+
+The catch swallows the chance to differentiate. Without the catch,
+the error middleware sees the original error and can decide. Let
+errors propagate to the centralized handler.
+
+## Common pitfalls
+
+### Forgetting `res.headersSent` check
+
+After streaming, the error handler trying to write a 500 fails
+silently. Always check.
+
+### Old wrap still in the code
+
+Leaving `asyncHandler(fn)` calls in works (they're no-ops in Express
+5) but adds clutter. Delete them once tests pass.
+
+### Throwing non-Error values
+
+```js
+throw 'something';   // string, not Error
+```
+
+The middleware gets `'something'`, which has no stack, can't be
+`instanceof` anything. Always throw `Error` (or a subclass).
+
+### Async generator in a handler
+
+```js
+app.get('/stream', function* () { ... });   // a generator, not async generator
+```
+
+Sync generators don't return promises. Express awaits a promise, not
+a generator. Make it `async function*` and use `for await`.
+
+### Forgetting that error middleware needs 4 args
+
+```js
+app.use((err, req, res) => { ... });   // 3 args — treated as regular middleware
+```
+
+It must literally have 4 parameters. Express checks `fn.length === 4`.
+Drop one (`(err, req, res, _next)`) is fine — the param is unused but
+counts toward arity.
+
+## The mental model
+
+In Express 5, **handler errors flow to error middleware** automatically
+— whether sync or async. The framework awaits your handler; rejections
+propagate.
+
+Three things you still do manually:
+
+1. Handle errors from outside the handler's promise chain (timers,
+   event emitters, child processes).
+2. Check `res.headersSent` before writing in error middleware.
+3. Translate to a uniform error shape (HttpError + status code).
+
+The boilerplate of `try/catch + next(err)` everywhere is gone. The
+remaining discipline is about distinguishing error categories and
+shaping responses consistently.

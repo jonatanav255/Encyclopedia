@@ -1,0 +1,293 @@
+export const level = 'senior';
+
+# DNS in Node
+
+DNS in Node is two completely different APIs that look similar.
+Choose wrong and a hung DNS server takes down your service.
+
+## `dns.lookup` vs `dns.resolve`
+
+```js
+import dns from 'node:dns/promises';
+
+// API 1: lookup (uses OS resolver, via libuv pool)
+const addr1 = await dns.lookup('example.com');
+
+// API 2: resolve (uses c-ares, async, no pool)
+const addrs = await dns.resolve4('example.com');
+```
+
+They do superficially similar things — turn `example.com` into an IP.
+Under the hood they're entirely different.
+
+### `dns.lookup`
+
+- Calls the **OS resolver** (`getaddrinfo`).
+- Honors `/etc/hosts`, `nsswitch.conf`, NSS plugins.
+- Returns one IP (the OS picks, prefers IPv6/IPv4 per Happy Eyeballs).
+- Synchronous-OS-call → runs on the libuv thread pool.
+
+### `dns.resolve` / `dns.resolve4` / `dns.resolveCname` / etc.
+
+- Uses **c-ares** (a DNS library bundled with Node).
+- Bypasses `/etc/hosts`. Goes straight to configured DNS servers.
+- Returns all records (array of IPs, or specific record types).
+- Async, no thread pool.
+
+## Why this matters
+
+The bug: `fetch`, `http.request`, `net.connect`, and most "high-level"
+network APIs use `dns.lookup` internally. A slow DNS server holds
+a pool thread for the full timeout (5–30 seconds by default).
+
+With `UV_THREADPOOL_SIZE=4`, four slow DNS lookups exhaust the pool.
+Suddenly:
+
+- `fs.readFile` blocks (no pool threads available).
+- `bcrypt.compare` blocks.
+- `zlib.gunzip` blocks.
+- New `fetch` calls block.
+
+Everything that uses the pool stalls. A DNS outage becomes a total
+service outage.
+
+The defense:
+
+1. **DNS caching** (most important).
+2. **Bump `UV_THREADPOOL_SIZE`** to absorb spikes.
+3. **Use `dns.resolve`** for things that don't need `/etc/hosts`.
+
+## DNS caching with `cacheable-lookup`
+
+Node has **no built-in DNS caching**. Each `dns.lookup` call hits the
+OS resolver, which usually hits the network. There's no in-process
+cache.
+
+The standard fix:
+
+```js
+import CacheableLookup from 'cacheable-lookup';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+const cl = new CacheableLookup();
+
+setGlobalDispatcher(new Agent({
+  connect: { lookup: cl.lookup },
+}));
+```
+
+`cacheable-lookup` is a drop-in replacement for `dns.lookup` that
+caches responses by TTL. Reduces:
+
+- DNS server load.
+- Time for "cold" first request (subsequent requests reuse the
+  result).
+- Pool pressure (cached lookups don't touch the pool).
+
+This single change improves p99 latency for services calling
+external APIs by 50–200ms per request.
+
+## Happy Eyeballs
+
+When a hostname resolves to both IPv4 and IPv6 addresses, Node
+implements **Happy Eyeballs** (RFC 8305): try both, use whichever
+responds first. Prevents IPv6 misconfigurations from adding seconds
+to every request.
+
+`net.connect` and undici's connect handle this. Custom code using
+`net.createConnection` directly with a single IP doesn't.
+
+For most code, you don't touch this. If your service does explicit
+TCP connects, prefer `net.connect({ host, port })` (Happy Eyeballs)
+over `net.connect({ host: ipString, port })`.
+
+## `--dns-result-order`
+
+Controls the order of IPv4 vs IPv6 in lookup results:
+
+- `ipv4first` — IPv4 first (old default).
+- `ipv6first` — IPv6 first.
+- `verbatim` — whatever the OS resolver returned (Node 18+ default).
+
+```bash
+node --dns-result-order=ipv4first app.js
+```
+
+For services running in environments with broken IPv6, force `ipv4first`.
+
+## TTL and DNS rebinding
+
+DNS results have a TTL. The OS resolver respects it; `dns.lookup`
+honors what the OS says. `cacheable-lookup` honors the TTL from the
+DNS response.
+
+Implication: an attacker who controls a DNS record can use **DNS
+rebinding** — a record that points to a public IP for the initial
+fetch and a private IP (10.0.0.1, 169.254.169.254 metadata) for the
+second. The second lookup happens after TTL expires and your service
+silently follows.
+
+Defense:
+
+- **Cache aggressively** (longer TTL than the attacker's).
+- **Block private IP ranges** in the application layer (re-resolve
+  yourself or use a library).
+- **Use egress firewall** to block private destinations regardless
+  of DNS.
+
+For SSRF defense, application-layer IP checks are the only reliable
+mechanism — DNS resolution is mutable.
+
+## `resolver` for explicit control
+
+```js
+import { Resolver } from 'node:dns/promises';
+
+const resolver = new Resolver();
+resolver.setServers(['8.8.8.8', '1.1.1.1']);
+
+const records = await resolver.resolve4('example.com');
+```
+
+`Resolver` lets you pick the DNS servers, bypassing the OS resolver
+entirely. Useful for:
+
+- Health checks against a specific DNS server.
+- Internal services with custom DNS (Kubernetes CoreDNS, Consul).
+- Sandboxed environments where the OS resolver is broken.
+
+## Lookup hooks
+
+undici (and therefore `fetch`) accepts a custom `lookup` function:
+
+```js
+new Agent({
+  connect: {
+    lookup(host, opts, callback) {
+      // custom logic — log, override, fall back
+      cacheableLookup.lookup(host, opts, callback);
+    },
+  },
+});
+```
+
+Useful for:
+
+- Custom caching policies.
+- Routing logic ("for hosts matching X, use IP Y").
+- Logging / metrics on DNS resolution times.
+
+## Common pitfalls
+
+### Forgetting that fetch uses `dns.lookup`
+
+```js
+const res = await fetch('https://api.example.com');
+// ...uses dns.lookup → libuv pool → no cache
+```
+
+A flaky DNS = a flaky service. Always install a DNS cache for any
+service making outbound HTTP at scale.
+
+### Using `dns.resolve` and being surprised by `/etc/hosts`
+
+```js
+// /etc/hosts: 127.0.0.1 api.test
+const ip = await dns.resolve4('api.test');
+// fails — c-ares ignores /etc/hosts
+```
+
+`dns.resolve` skips local overrides. For dev environments using
+`/etc/hosts` or `docker-compose`'s embedded DNS, use `dns.lookup`.
+
+### Caching forever
+
+Setting `cacheable-lookup` with no TTL:
+
+```js
+new CacheableLookup({ maxTtl: Infinity });
+```
+
+Cache leaks; expired records persist; failovers (DNS pointed to a
+new IP) silently don't take effect.
+
+Honor the TTL from the response. The default is reasonable.
+
+### Not bumping the pool when DNS is slow
+
+If your service depends on a slow internal DNS server, and you've
+done everything else right, raise `UV_THREADPOOL_SIZE`:
+
+```bash
+UV_THREADPOOL_SIZE=32 node app.js
+```
+
+The DNS calls still go through the pool, but there's enough capacity
+to absorb spikes.
+
+### Using IPs to bypass DNS
+
+```js
+// "Optimization": skip DNS by hardcoding IP
+const res = await fetch('https://1.2.3.4/api');
+```
+
+Breaks:
+
+- TLS certificate verification (cert is for hostname, not IP).
+- DNS-based failover.
+- Load-balanced multi-IP records.
+
+Don't do this. If DNS is too slow, cache it; don't remove it.
+
+### Confusing `dns.lookup` errors
+
+```js
+try {
+  await dns.lookup('does-not-exist.example');
+} catch (err) {
+  err.code;     // 'ENOTFOUND' (not 'NXDOMAIN')
+}
+```
+
+`ENOTFOUND` from `dns.lookup` ≈ `NXDOMAIN`. `ESERVFAIL`,
+`ETIMEDOUT`, etc. for other failures. The c-ares-based `dns.resolve`
+returns different error codes (`NOTFOUND`, `SERVFAIL`).
+
+If you write retry logic, handle both sets.
+
+## Recommended setup
+
+For a production Node service in 2026 calling external APIs:
+
+```js
+import CacheableLookup from 'cacheable-lookup';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+const cl = new CacheableLookup({
+  maxTtl: 60,        // 1 minute
+  errorTtl: 5,       // cache failures briefly to avoid hammering
+});
+
+setGlobalDispatcher(new Agent({
+  connect: { lookup: cl.lookup },
+}));
+```
+
+Combined with `UV_THREADPOOL_SIZE=16+` in your launch config, that's
+the typical setup. Most services don't need more sophistication.
+
+## The mental model
+
+DNS in Node is **two APIs with different failure modes**.
+`dns.lookup` is the OS resolver on the libuv pool — convenient, slow,
+pool-blocking on failures. `dns.resolve` is c-ares — async, no pool,
+ignores `/etc/hosts`.
+
+For application code, you mostly use `fetch` / `http.request` / `net`,
+which use `dns.lookup` internally. Cache aggressively. Bump the pool
+size. Block private IPs in the app layer for SSRF defense.
+
+DNS is the most common "invisible" cause of latency spikes in
+production Node. Knowing the mechanics is what separates "the API got
+slow" tickets from "DNS got slow and our pool exhausted" insights.

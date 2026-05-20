@@ -1,0 +1,409 @@
+export const level = 'mid';
+
+# `node:test` — deep dive
+
+Node ships its own test runner: `node:test` plus `node --test`. It's
+stable, fast, has no dependencies, and covers most of what Jest /
+Vitest offer. For libraries and CLI tools especially, it's the right
+default in 2026.
+
+## The basics
+
+```js
+// math.test.js
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+test('adds numbers', () => {
+  assert.equal(1 + 1, 2);
+});
+```
+
+```bash
+node --test
+```
+
+Discovers `*.test.js`, `*.test.mjs`, and files in `test/` directories.
+Runs them in parallel (one file per worker by default).
+
+## `assert/strict`
+
+Use the strict variant. Strict means `assert.equal(0, false)` fails
+(no coercion), which is what you actually want.
+
+```js
+import assert from 'node:assert/strict';
+
+assert.equal(a, b);              // strict equality
+assert.deepEqual(obj, expected); // deep + strict
+assert.match(string, /pattern/);
+assert.throws(() => fn(), /msg/);
+await assert.rejects(asyncFn, /msg/);
+```
+
+The full API is on `assert` — `assert.fail`, `.ok`, `.strictEqual`,
+`.notEqual`, etc.
+
+## Subtests
+
+```js
+import { test } from 'node:test';
+
+test('user', async (t) => {
+  await t.test('starts inactive', () => {
+    const u = createUser();
+    assert.equal(u.active, false);
+  });
+
+  await t.test('can be activated', () => {
+    const u = createUser();
+    u.activate();
+    assert.equal(u.active, true);
+  });
+});
+```
+
+`t.test(...)` nests. Subtests are siblings within their parent,
+shown in TAP / dot output as `user > starts inactive`.
+
+`t.test` returns a promise — `await` it so the parent waits before
+moving on.
+
+## Concurrency
+
+Tests **inside a file** run sequentially by default. To run them in
+parallel:
+
+```js
+test('parallel batch', { concurrency: true }, async (t) => {
+  await Promise.all([
+    t.test('a', () => { ... }),
+    t.test('b', () => { ... }),
+  ]);
+});
+```
+
+Files run in parallel automatically. Control with
+`--test-concurrency=N` flag.
+
+## Hooks
+
+```js
+import { before, beforeEach, after, afterEach, test } from 'node:test';
+
+before(async () => { /* once before all tests in this file */ });
+after(async () => { /* once after all tests */ });
+
+beforeEach(() => { /* before each test */ });
+afterEach(() => { /* after each test */ });
+
+test('uses db', async () => {
+  // ...
+});
+```
+
+`before`/`after` run once; `beforeEach`/`afterEach` run per test.
+Hooks can be async; the runner waits for them.
+
+Inside a `test`, `t.before`/`t.beforeEach`/etc. are scoped to that
+test's subtests. Useful for sharing setup between related subtests.
+
+## Mocking
+
+`node:test/mock` ships built-in mocking:
+
+```js
+import { test, mock } from 'node:test';
+
+test('mocks a function', () => {
+  const log = mock.fn();
+  log('hello');
+  assert.equal(log.mock.callCount(), 1);
+  assert.deepEqual(log.mock.calls[0].arguments, ['hello']);
+});
+
+test('mocks a method', () => {
+  const obj = { greet: () => 'hi' };
+  mock.method(obj, 'greet', () => 'bye');
+  assert.equal(obj.greet(), 'bye');
+  mock.restoreAll();
+});
+```
+
+`mock.fn(impl?)` creates a spy. `mock.method(obj, key, impl?)` replaces
+a method (auto-restored after test if `t.mock` was used; with global
+`mock`, you call `mock.restoreAll()`).
+
+For timers:
+
+```js
+test('mocked timers', () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+
+  let n = 0;
+  setTimeout(() => n++, 1000);
+
+  mock.timers.tick(1000);
+  assert.equal(n, 1);
+
+  mock.timers.reset();
+});
+```
+
+`mock.timers.tick(ms)` advances time without waiting. Pairs with
+mocked `Date.now()` for deterministic tests of date-dependent code.
+
+## Snapshot testing
+
+Stable since Node 22:
+
+```js
+test('renders correctly', (t) => {
+  t.assert.snapshot({ user: 'jon', age: 30 });
+});
+```
+
+Run once to create a `.snapshot` file alongside. Subsequent runs
+compare against the saved snapshot. Update with
+`--test-update-snapshots`.
+
+Useful for deterministic outputs (rendered HTML, generated SQL,
+serialized JSON). Less useful for whole-DOM dumps — the same caveats
+as Jest snapshots apply.
+
+## Coverage
+
+```bash
+node --test --experimental-test-coverage
+```
+
+Outputs a coverage report at the end. Still behind the
+`--experimental-test-coverage` flag as of early 2026, though the
+API has been stable across recent releases.
+
+```bash
+node --test --experimental-test-coverage \
+  --test-coverage-include='src/**' \
+  --test-coverage-exclude='**/*.test.js'
+```
+
+For CI integration, the LCOV reporter:
+
+```bash
+node --test \
+  --experimental-test-coverage \
+  --test-reporter=lcov \
+  --test-reporter-destination=coverage/lcov.info
+```
+
+Then upload to Codecov / Coveralls.
+
+## Reporters
+
+```bash
+node --test --test-reporter=spec
+node --test --test-reporter=tap
+node --test --test-reporter=dot
+node --test --test-reporter=junit  --test-reporter-destination=results.xml
+```
+
+JUnit XML is the CI integration format (GitLab, Jenkins, GitHub
+Actions test summaries).
+
+## Watch mode
+
+```bash
+node --test --watch
+```
+
+Reruns affected tests on file changes. Replaces `nodemon`-style
+loops for tests.
+
+## Filtering
+
+```bash
+node --test --test-name-pattern='login'           # by test name
+node --test --test-only                            # only `test.only(...)` tests
+node --test --test-skip-pattern='slow'             # skip matching
+```
+
+Mark a test as `.only`:
+
+```js
+test.only('focus on this', () => { ... });
+```
+
+Then `node --test --test-only` runs just that one — handy for
+debugging.
+
+## TypeScript
+
+```bash
+node --test --experimental-strip-types 'src/**/*.test.ts'
+```
+
+Native TS in Node 22+ via `--experimental-strip-types`. No
+tsx / ts-node. See **Native TypeScript** for the full story.
+
+## Comparison with Jest / Vitest
+
+| | `node:test` | Jest | Vitest |
+| --- | --- | --- | --- |
+| Built-in | yes | no | no |
+| Speed | fast | slow | fast |
+| ESM | native | works (jest@28+) | native |
+| TypeScript | native (24+) | needs config | native |
+| Snapshot | yes | yes | yes |
+| Coverage | yes (24+) | yes | yes |
+| Watch | yes | yes | yes |
+| Mocking | minimal but solid | extensive | extensive |
+| Browser env | no | yes (jsdom) | yes |
+| Plugin ecosystem | small | huge | growing |
+
+**Pick `node:test`** for libraries, CLIs, backend services where you
+don't need DOM. Zero deps, fast, no config.
+
+**Pick Vitest** for frontend (jsdom) or when you need plugins / UI.
+
+**Jest** is fine if you already have it. New projects rarely pick it
+in 2026.
+
+## Common patterns
+
+### Testing an Express route
+
+```js
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import request from 'supertest';
+import { app } from './app.js';
+
+test('GET /health returns 200', async () => {
+  const res = await request(app).get('/health');
+  assert.equal(res.status, 200);
+});
+```
+
+Supertest still works with `node:test`.
+
+### Testing with a real DB
+
+```js
+import { test, before, after } from 'node:test';
+import { startContainer } from './test-db.js';
+
+let db;
+
+before(async () => { db = await startContainer(); });
+after(async () => { await db.stop(); });
+
+test('inserts and reads', async () => {
+  await db.query("INSERT INTO users (name) VALUES ('jon')");
+  const rows = await db.query('SELECT * FROM users');
+  assert.equal(rows.length, 1);
+});
+```
+
+testcontainers + node:test works cleanly. The hooks bracket the
+whole file.
+
+### Parameterized tests
+
+```js
+for (const [input, expected] of [
+  ['hello', 5],
+  ['', 0],
+  ['x', 1],
+]) {
+  test(`length of '${input}' is ${expected}`, () => {
+    assert.equal(input.length, expected);
+  });
+}
+```
+
+Plain JavaScript. No special `describe.each` API needed.
+
+## Common pitfalls
+
+### Forgetting `await` on subtests
+
+```js
+test('parent', (t) => {
+  t.test('child', () => { ... });   // returns a promise — forgot to await
+});
+// Parent finishes before child runs; child's failures might miss the report
+```
+
+Always `await t.test(...)`.
+
+### Synchronous assertions in async code
+
+```js
+test('async fails', async () => {
+  fetchSomething().then(data => assert.equal(data.x, 1));
+  // returns immediately — assertion runs after test "passed"
+});
+```
+
+Return or await the promise:
+
+```js
+await fetchSomething().then(data => assert.equal(data.x, 1));
+```
+
+Or use `await` directly:
+
+```js
+const data = await fetchSomething();
+assert.equal(data.x, 1);
+```
+
+### Module mocking
+
+`node:test` doesn't have `jest.mock()`. For module-level mocking, use
+the **module customization hooks** API (`register` and a hook
+module):
+
+```js
+import { register } from 'node:module';
+register('./test-hook.js', import.meta.url);
+```
+
+Complex. For simple needs, prefer dependency injection (pass the
+collaborator as an argument) over module mocking.
+
+### Running tests from non-default paths
+
+By default `--test` discovers `test/`, `tests/`, and `*.test.*`. For
+custom layouts pass paths explicitly:
+
+```bash
+node --test 'src/**/__tests__/*.js'
+```
+
+### Concurrency surprises
+
+Tests within a file are sequential. Tests across files are parallel.
+If your tests share state (a global DB, a fixed port), parallelism
+breaks them.
+
+Either: isolate (per-test DB, ephemeral ports), or set
+`--test-concurrency=1` and accept slower CI.
+
+## The mental model
+
+`node:test` is **the smallest competent runner that does the things
+99% of tests need**. Subtests, hooks, mocking, snapshots, coverage,
+watch, parallel files. No config file. No deps. Native ESM and TS.
+
+For libraries shipping in 2026, the default test setup is:
+
+```
+src/
+  foo.js
+  foo.test.js
+package.json scripts: "test": "node --test"
+```
+
+That's it. No `jest.config.js`, no `vitest.config.ts`. The dependencies
+column in your `package.json` thanks you.

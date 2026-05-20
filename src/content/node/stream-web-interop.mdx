@@ -1,0 +1,392 @@
+export const level = 'mid';
+
+# Node streams vs Web streams
+
+Node has **two stream APIs**:
+
+- **Node streams** (`node:stream`) — the original, around since
+  Node 0.10. `Readable`, `Writable`, `Duplex`, `Transform`.
+- **Web streams** (`node:stream/web`) — WHATWG standard, the same
+  API browsers ship. `ReadableStream`, `WritableStream`,
+  `TransformStream`.
+
+Both work. They have different semantics. You'll use both — Node
+streams internally, Web streams at API boundaries (notably `fetch`
+response bodies).
+
+## The two APIs
+
+### Node streams
+
+```js
+import { Readable } from 'node:stream';
+
+const stream = new Readable({
+  read() {
+    this.push('hello');
+    this.push(null);
+  },
+});
+
+stream.on('data', chunk => console.log(chunk));
+```
+
+Push-based. Event emitter. Backpressure via the boolean return of
+`write` / `push`.
+
+### Web streams
+
+```js
+const stream = new ReadableStream({
+  start(controller) {
+    controller.enqueue('hello');
+    controller.close();
+  },
+});
+
+for await (const chunk of stream) console.log(chunk);
+```
+
+Pull-based. Promise-based. Backpressure via `controller.desiredSize`.
+
+## Where Web streams show up in Node
+
+You can't avoid them. The platform APIs use them:
+
+```js
+// fetch response body — Web stream
+const res = await fetch(url);
+res.body;   // ReadableStream
+
+// Compression streams
+new CompressionStream('gzip');     // global, Web stream
+new DecompressionStream('gzip');
+
+// Blob.stream()
+new Blob(['hello']).stream();      // ReadableStream
+```
+
+If you `fetch` and want to stream the response, you're using Web
+streams.
+
+Inside Node-only code (reading a file, writing to S3 via SDK), Node
+streams are more common.
+
+## Converting between them
+
+```js
+import { Readable, Writable } from 'node:stream';
+
+// Node → Web
+const webRead = Readable.toWeb(nodeReadable);
+const webWrite = Writable.toWeb(nodeWritable);
+
+// Web → Node
+const nodeRead = Readable.fromWeb(webReadable);
+const nodeWrite = Writable.fromWeb(webWritable);
+```
+
+These conversions exist in `node:stream` and work in both directions.
+
+The standard pattern: receive a Web stream from `fetch`, pipe to a
+Node stream for processing or persistence:
+
+```js
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { createWriteStream } from 'node:fs';
+
+const res = await fetch(url);
+await pipeline(
+  Readable.fromWeb(res.body),
+  createWriteStream('out.bin'),
+);
+```
+
+`pipeline` from `stream/promises` handles errors and backpressure.
+
+## Backpressure mechanics differ
+
+### Node streams
+
+```js
+const ok = writable.write(chunk);
+if (!ok) await once(writable, 'drain');
+```
+
+`write()` returns false when buffer exceeds `highWaterMark`. Wait
+for `'drain'`.
+
+### Web streams
+
+```js
+const writer = writable.getWriter();
+await writer.write(chunk);   // awaits until consumer is ready
+```
+
+`writer.write(chunk)` returns a promise that resolves when the
+stream wants more data. `await` it for backpressure.
+
+The mental model is reversed:
+
+- Node: "send everything, watch the brakes."
+- Web: "ask permission before sending."
+
+## Async iteration: works on both
+
+```js
+for await (const chunk of nodeReadable) { ... }
+for await (const chunk of webReadable) { ... }
+```
+
+Both support `for await...of`. This is the easiest consumer-side
+pattern. Backpressure happens automatically as you `await` per
+iteration.
+
+## Pitfalls when converting
+
+### Backpressure can be lost
+
+```js
+const node = Readable.fromWeb(webStream);
+node.pipe(slowConsumer);   // Web stream's flow control might not perfectly map
+```
+
+In practice, the conversion is faithful. But edge cases — controllers
+firing rapidly, asymmetric high-water marks — can cause buffering at
+the boundary.
+
+For high-volume code, test the memory profile. If RSS climbs across
+the conversion, you've found backpressure asymmetry.
+
+### Errors don't always propagate
+
+```js
+const nodeStream = Readable.fromWeb(webStream);
+// If webStream errors, nodeStream emits 'error' — but listeners on webStream
+// don't fire after conversion.
+```
+
+Attach error handling to whichever object you actually pass around.
+`pipeline` (Node) and `pipeTo` (Web) both handle errors correctly
+for their respective worlds.
+
+### `cancel` vs `destroy`
+
+Web streams use `cancel()` to abort:
+
+```js
+await webReadable.cancel('reason');
+```
+
+Node streams use `destroy(err)`:
+
+```js
+nodeReadable.destroy(new Error('aborted'));
+```
+
+The conversion functions bridge these. Direct usage requires the
+right method.
+
+## When to use which
+
+**Use Web streams when:**
+
+- Working with `fetch` response/request bodies.
+- Cross-platform code (browser + Node + Bun + Deno).
+- Code you want to share between server and client.
+
+**Use Node streams when:**
+
+- File I/O via `fs.createReadStream` / `createWriteStream`.
+- Working with libraries that expect Node streams (most of the
+  npm ecosystem).
+- Backpressure-sensitive high-throughput pipelines (Node's
+  ecosystem has more battle-tested transforms).
+
+**Convert at boundaries:**
+
+- `fetch` response → `Readable.fromWeb` for further Node processing.
+- Outbound HTTP that needs a request body → Web stream because
+  `fetch` expects it.
+
+## TransformStream
+
+Both APIs have transforms.
+
+### Node
+
+```js
+import { Transform } from 'node:stream';
+
+const upper = new Transform({
+  transform(chunk, encoding, callback) {
+    callback(null, chunk.toString().toUpperCase());
+  },
+});
+```
+
+### Web
+
+```js
+const upper = new TransformStream({
+  transform(chunk, controller) {
+    controller.enqueue(chunk.toUpperCase());
+  },
+});
+```
+
+Same idea, different syntax. Web transforms compose with
+`pipeThrough`:
+
+```js
+const result = source.pipeThrough(upper).pipeThrough(compress);
+```
+
+Node transforms compose with `pipeline`:
+
+```js
+await pipeline(source, upper, compress, destination);
+```
+
+## TextEncoder / TextDecoder streams
+
+Web standard, available globally in Node:
+
+```js
+const decoder = new TextDecoderStream();
+const reader = res.body.pipeThrough(decoder).getReader();
+const { value, done } = await reader.read();
+// value is a string, not bytes
+```
+
+Decodes UTF-8 chunks correctly even when split across buffer
+boundaries. Important for streaming text where a multi-byte
+character might span two chunks.
+
+For NDJSON / line-delimited JSON:
+
+```js
+async function* lines(stream) {
+  const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    const split = buffer.split('\n');
+    buffer = split.pop();
+    for (const line of split) if (line.trim()) yield JSON.parse(line);
+  }
+  if (buffer.trim()) yield JSON.parse(buffer);
+}
+
+for await (const obj of lines(res.body)) console.log(obj);
+```
+
+This pattern is fairly common for streaming JSON APIs (OpenAI, etc.).
+
+## SSE streaming
+
+Server-Sent Events bodies are line-based:
+
+```js
+const res = await fetch('/events');
+const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+
+let buffer = '';
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += value;
+
+  let i;
+  while ((i = buffer.indexOf('\n\n')) !== -1) {
+    const event = buffer.slice(0, i);
+    buffer = buffer.slice(i + 2);
+    processEvent(event);
+  }
+}
+```
+
+The buffer holds partial events across reads. Web streams + a hand-
+rolled framer is the standard pattern.
+
+## Performance
+
+Web streams have a slightly higher per-chunk overhead than Node
+streams (promise machinery vs event emitters). For modest
+throughput, the difference is invisible. For multi-GB/sec
+internal pipelines, Node streams win.
+
+Don't pick based on speed unless you've measured. The right axis is
+"what does my API give me, what do I pass it to."
+
+## Common pitfalls
+
+### Mixing event-style and async-iterator-style
+
+```js
+stream.on('data', handler);     // flowing mode
+for await (const chunk of stream) { ... }   // also flowing — but conflicts
+```
+
+Pick one mode per consumer. Async iteration is the modern default.
+
+### Forgetting to `release` the reader
+
+```js
+const reader = webStream.getReader();
+const { value } = await reader.read();
+// If you exit without reader.releaseLock(), the stream is "locked"
+// and unusable elsewhere.
+```
+
+Use `reader.releaseLock()` if you stop reading manually. Or use
+`for await` which releases automatically when the loop ends.
+
+### Treating Web streams as Node EventEmitters
+
+```js
+webStream.on('data', ...);   // doesn't exist
+webStream.read();             // doesn't exist
+```
+
+The Web API is completely different. Convert with `Readable.fromWeb`
+if you need EventEmitter-style.
+
+### Double-pumping the body
+
+```js
+const res = await fetch(url);
+const text = await res.text();
+const json = await res.json();    // throws — body already consumed
+```
+
+`fetch` response bodies are single-consumption. Buffer once, parse
+to whatever you need:
+
+```js
+const text = await res.text();
+const json = JSON.parse(text);
+```
+
+Or `res.clone()` before consuming.
+
+## The mental model
+
+Web streams and Node streams are **two implementations of the same
+idea** with different ergonomics:
+
+- Web: promise-based, Web platform, browser-compatible.
+- Node: event-based, Node-native, ecosystem-mature.
+
+For 2026 Node code:
+
+- API boundary (fetch, Blob, Web Streams from external libs): Web.
+- Internal pipelines (fs, transforms, in-process): Node.
+- Bridge with `Readable.fromWeb` / `Readable.toWeb`.
+- Async iteration (`for await...of`) works on both.
+
+Knowing which you're holding is half the battle. The conversion is
+cheap; the confusion is expensive.

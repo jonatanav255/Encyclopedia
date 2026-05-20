@@ -1,0 +1,384 @@
+export const level = 'senior';
+
+# CSRF in 2026
+
+CSRF (Cross-Site Request Forgery) is the attack where a malicious
+site convinces the user's browser to make a state-changing request
+to your site while their session cookie auto-attaches. The classic:
+a hidden form on attacker.com that POSTs to bank.com/transfer.
+
+In 2026, **the defenses have shifted**. The classic CSRF token
+pattern is increasingly unnecessary because of:
+
+- **`SameSite=Lax`** cookies (default in modern browsers).
+- **`Sec-Fetch-Site` header** (sent by all modern browsers).
+- **`csurf` package is deprecated** (still on npm, unmaintained — don't install).
+
+This page is the modern playbook.
+
+## The threat model
+
+Without defenses:
+
+1. User is logged into `bank.com`; session cookie set.
+2. User visits `attacker.com`.
+3. Attacker's page has a hidden `<form action="bank.com/transfer">`
+   that auto-submits.
+4. Browser sends the request to `bank.com` **with the cookie
+   attached** because cookies attach by default.
+5. `bank.com` sees a valid session and processes the transfer.
+
+The attack works because browsers attach cookies cross-origin.
+
+## Defense 1: `SameSite=Lax` (modern default)
+
+```js
+app.use(session({
+  cookie: {
+    secure: true,
+    httpOnly: true,
+    sameSite: 'lax',
+  },
+}));
+```
+
+`SameSite=Lax` means: **don't attach this cookie on cross-site
+POST, PUT, DELETE, PATCH**. Cross-site GET still attaches (so links
+work).
+
+Modern Chrome, Firefox, Safari default to `SameSite=Lax` if you
+don't set it. So even if you forget, you're mostly protected for
+state-changing requests.
+
+For tighter security:
+
+```js
+sameSite: 'strict',
+```
+
+Cookies don't attach on **any** cross-site request. Even clicking a
+link from external sites. Breaks "external referrer logs in" flow;
+use sparingly.
+
+For embedding in iframes (cross-site contexts):
+
+```js
+sameSite: 'none',
+secure: true,
+```
+
+Required for cross-site cookies. Be sure you've audited for CSRF
+elsewhere.
+
+## Defense 2: `Sec-Fetch-Site`
+
+Modern browsers send `Sec-Fetch-Site` indicating where the request
+came from:
+
+```
+Sec-Fetch-Site: same-origin    ← from your domain
+Sec-Fetch-Site: same-site      ← from a subdomain
+Sec-Fetch-Site: cross-site     ← from a different domain
+Sec-Fetch-Site: none           ← user typed URL or bookmark
+```
+
+Reject state-changing cross-site requests:
+
+```js
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    return next();
+  }
+  const site = req.headers['sec-fetch-site'];
+  if (site === 'cross-site') {
+    return res.status(403).send('CSRF');
+  }
+  next();
+});
+```
+
+Almost free defense. Works for all major browsers since ~2020.
+
+Combined with `SameSite=Lax`, you get layered defense against most
+CSRF without per-request tokens.
+
+## Defense 3: Origin / Referer check
+
+Some older browsers don't send `Sec-Fetch-Site`. Fall back to
+`Origin`:
+
+```js
+const ALLOWED_ORIGINS = new Set([
+  'https://app.example.com',
+  'https://www.example.com',
+]);
+
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const origin = req.headers.origin;
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    return res.status(403).send('CSRF');
+  }
+  next();
+});
+```
+
+`Origin` is sent by browsers on cross-origin requests. If the value
+isn't on your allowlist, reject.
+
+For old browsers without `Origin`, `Referer` (yes, the misspelling)
+is a weaker fallback.
+
+## Defense 4: CSRF token (classic)
+
+Despite the above, some scenarios still want explicit tokens:
+
+- **API not under your control** (third-party integrations).
+- **Strict-mode environments** where layered defense is required.
+- **Compliance** (PCI, SOX) sometimes mandates it.
+
+The pattern: server issues a random token; client must echo it on
+state-changing requests.
+
+### Double-submit cookie
+
+```js
+// Set on login
+const csrfToken = crypto.randomBytes(32).toString('hex');
+res.cookie('csrf_token', csrfToken, { sameSite: 'lax', secure: true });
+
+// On state-changing request, require X-CSRF-Token header matching cookie
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const cookie = req.cookies?.csrf_token;
+  const header = req.headers['x-csrf-token'];
+  if (!cookie || cookie !== header) return res.status(403).send('CSRF');
+  next();
+});
+```
+
+The cookie is set on the same site; an attacker can't read it
+(cross-site cookie reads are blocked). The client reads the cookie
+via JS and adds it as a header on outgoing requests. An attacker
+can't forge the header because they can't read the cookie.
+
+### Synchronizer token
+
+The session-store-based version: token stored server-side, mapped to
+the session. Less common in 2026 (double-submit is simpler).
+
+## The csurf situation
+
+`csurf` was the standard Express CSRF library for years. It's been
+**deprecated and unmaintained** since 2022 (the original maintainer
+stepped away; no security patches since). The package is still on
+npm but you shouldn't install it. Use one of:
+
+- **`@dr.pogodin/csurf`** — community fork, maintained.
+- **`csurf-csrf`** — another fork.
+- **`tiny-csrf`** — minimal.
+- **Hand-rolled middleware** — for the simple double-submit pattern.
+
+For new projects in 2026, hand-rolled is usually fine. The
+classic CSRF token approach is rarely needed given SameSite + Sec-Fetch-Site
+defenses.
+
+## API authentication tokens
+
+If your API uses **Bearer tokens** (Authorization header), CSRF is
+not a concern. Browsers don't auto-attach Authorization headers;
+the client explicitly adds them. An attacker site can't read
+your token from localStorage / sessionStorage cross-origin.
+
+So:
+
+```
+Browser → Server using session cookies → CSRF risk
+Browser → Server using Authorization: Bearer → No CSRF risk
+```
+
+JWT in localStorage isn't subject to CSRF; it has its own XSS
+exposure risk.
+
+## Test before trusting
+
+For any CSRF defense, **test it**:
+
+1. Set up a separate domain.
+2. Build a malicious HTML page with a hidden form auto-submitting
+   to your prod-like endpoint.
+3. Log in to the prod-like endpoint in the same browser.
+4. Visit the attacker page. See if the request succeeds.
+
+A request that should succeed (same-origin POST) should work. A
+cross-origin POST should be rejected.
+
+## CORS is not a CSRF defense
+
+A common confusion. CORS controls **what JavaScript can read from a
+cross-origin response**. CSRF is about **whether the request
+succeeded at all**.
+
+A cross-origin POST from attacker.com still **fires** at your
+server. CORS only blocks the response from being read by JS. If
+your endpoint did damage on the way through (charged a card, deleted
+data), CORS didn't prevent it.
+
+**CORS is for protecting your API surface; SameSite + CSRF tokens
+are for protecting state changes.**
+
+## Form submissions vs fetch
+
+```html
+<form action="/transfer" method="POST">
+```
+
+Browsers submit forms cross-origin with cookies (subject to
+SameSite). No preflight.
+
+```js
+fetch('/transfer', { method: 'POST', credentials: 'include' });
+```
+
+`fetch` with `credentials: 'include'` and a non-simple content type
+(JSON) triggers a CORS preflight. Your server gets an OPTIONS
+request first. If your CORS policy denies the origin, the browser
+blocks the request entirely.
+
+So:
+
+- **Form CSRF**: SameSite-Lax blocks most. Sec-Fetch-Site catches
+  more.
+- **JSON-fetch CSRF**: CORS preflight blocks unauthorized origins
+  before the request fires.
+
+For modern APIs that only accept `Content-Type: application/json`,
+CSRF is largely mitigated by the preflight requirement.
+
+## Putting it together
+
+A modern Express setup with reasonable CSRF defense:
+
+```js
+import session from 'express-session';
+import cors from 'cors';
+
+// 1. Strict cookies
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  cookie: {
+    secure: true,
+    httpOnly: true,
+    sameSite: 'lax',     // default-ish; explicit is good
+    maxAge: 30 * 24 * 3600 * 1000,
+  },
+}));
+
+// 2. CORS allowlist
+app.use(cors({
+  origin: ['https://app.example.com', 'https://www.example.com'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+}));
+
+// 3. Sec-Fetch-Site check for state-changing
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const site = req.headers['sec-fetch-site'];
+  if (site && site === 'cross-site') return res.status(403).send('CSRF');
+  next();
+});
+
+// 4. Optional: double-submit cookie for paranoid endpoints
+const sensitiveCsrf = (req, res, next) => {
+  const cookie = req.cookies?.csrf_token;
+  const header = req.headers['x-csrf-token'];
+  if (!cookie || cookie !== header) return res.status(403).send('CSRF');
+  next();
+};
+
+app.post('/transfer', sensitiveCsrf, async (req, res) => {
+  // ...
+});
+```
+
+Layered defense: SameSite, CORS, Sec-Fetch-Site, double-submit on
+sensitive endpoints. Multiple things have to fail for CSRF to
+succeed.
+
+## Common pitfalls
+
+### Forgetting to use SameSite
+
+```js
+cookie: { secure: true, httpOnly: true }
+// SameSite not set → browser default
+```
+
+The browser default is `Lax` now. But older browsers might not be.
+Explicit is safer.
+
+### `SameSite=None` without `Secure`
+
+```js
+cookie: { sameSite: 'none' }
+// Modern browsers reject
+```
+
+`SameSite=None` requires `Secure: true`. Browsers silently drop the
+cookie otherwise.
+
+### Trusting Origin without allowlisting
+
+```js
+if (req.headers.origin) next();
+// Any origin "validates"
+```
+
+Allowlist explicit origins. Empty `Origin` (legitimate same-origin
+GETs sometimes have no Origin) is its own case.
+
+### Long-lived CSRF tokens
+
+```js
+res.cookie('csrf_token', token);   // no expiration
+```
+
+CSRF tokens should rotate. Set a max-age, refresh on every login.
+Otherwise a leaked token (e.g., from logs) is permanent.
+
+### Per-form tokens
+
+The synchronizer pattern uses one token per session, not per form.
+Per-form is overkill; per-session is standard.
+
+### Disabling CSRF "for development"
+
+```js
+if (process.env.NODE_ENV !== 'production') skipCsrf();
+```
+
+Tempting; risky. A dev token leaked to a real laptop is permanent.
+Use a real local origin (`localhost:3000`) and consistent rules.
+
+## The mental model
+
+In 2026, CSRF defense is **layered, mostly automatic**:
+
+1. **SameSite=Lax cookies** — most attacks blocked.
+2. **Sec-Fetch-Site check** — second layer, free.
+3. **CORS preflight** — blocks unauthorized JSON-fetch attacks.
+4. **CSRF token** — only for endpoints with strict requirements
+   (financial, compliance).
+
+The csurf-required, token-everywhere model is gone. Modern Express
+relies on the browser's protections plus a thin server check.
+
+For most apps, the right setup is:
+
+```
+SameSite=Lax + CORS allowlist + Sec-Fetch-Site check
+```
+
+Three lines of middleware. The big-name attacks of 2010–2018 don't
+work on this stack.

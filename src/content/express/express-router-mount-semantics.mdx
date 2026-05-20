@@ -1,0 +1,390 @@
+export const level = 'senior';
+
+# Router mount semantics
+
+Express's mounting model (`app.use('/api', router)`) is mostly
+intuitive — but the details around `req.url` vs `req.baseUrl` vs
+`req.originalUrl`, param inheritance, and error middleware scoping
+catch even experienced developers.
+
+## The basics
+
+```js
+const apiRouter = Router();
+apiRouter.get('/users', (req, res) => res.json({}));
+
+app.use('/api', apiRouter);
+```
+
+A request to `/api/users`:
+
+- Matched by Express's app routing as `/api/*`.
+- Passed to `apiRouter` with `req.url` rewritten to `/users` (the
+  remainder after mount).
+- `apiRouter.get('/users', ...)` matches the rewritten path.
+
+## URL properties
+
+Inside the mounted router, three URL properties:
+
+```js
+apiRouter.get('/users/:id', (req, res) => {
+  req.originalUrl;   // '/api/users/42'
+  req.baseUrl;        // '/api'
+  req.url;            // '/users/42'
+  req.path;           // '/users/42'
+});
+```
+
+- **`req.originalUrl`** — the URL the client sent. Doesn't change
+  as you traverse mounted routers.
+- **`req.baseUrl`** — the mount path concatenated up to here.
+- **`req.url`** — the URL relative to the current router.
+- **`req.path`** — `req.url` with the query string stripped.
+
+Use `req.originalUrl` for logging (client perspective). Use
+`req.url`/`req.path` for routing logic inside the router.
+
+## Nested routers
+
+```js
+const v1Router = Router();
+v1Router.use('/users', usersRouter);
+
+app.use('/api/v1', v1Router);
+```
+
+A request to `/api/v1/users/42`:
+
+- `apiRouter.use('/api/v1', v1Router)` matches → `req.url` becomes
+  `/users/42`, `req.baseUrl` becomes `/api/v1`.
+- `v1Router.use('/users', usersRouter)` matches → `req.url` becomes
+  `/42`, `req.baseUrl` becomes `/api/v1/users`.
+- `usersRouter.get('/:id', ...)` matches → `req.params.id === '42'`.
+
+`baseUrl` accumulates as you descend; `url` shrinks.
+
+## Param inheritance
+
+By default, sub-routers **don't** see parent route params:
+
+```js
+app.get('/tenants/:tenantId/users/:userId', handler);
+// req.params.tenantId and req.params.userId both available
+
+const userRouter = Router();
+userRouter.get('/:userId', (req, res) => {
+  req.params.userId;     // available
+  req.params.tenantId;   // undefined
+});
+app.use('/tenants/:tenantId/users', userRouter);
+```
+
+Sub-router doesn't inherit `tenantId` from the parent path. To fix,
+create the router with `mergeParams: true`:
+
+```js
+const userRouter = Router({ mergeParams: true });
+userRouter.get('/:userId', (req, res) => {
+  req.params.tenantId;   // now available
+  req.params.userId;     // available
+});
+```
+
+Use `mergeParams` when sub-routers need to see params from their
+mount path. Standard for multi-tenant apps.
+
+## Error middleware scoping
+
+```js
+const apiRouter = Router();
+
+apiRouter.get('/users/:id', async (req, res) => {
+  throw new Error('boom');
+});
+
+// Error middleware on the sub-router
+apiRouter.use((err, req, res, next) => {
+  log.error({ err }, 'api error');
+  if (err.name === 'ValidationError') return res.status(400).json(...);
+  next(err);   // pass to parent
+});
+
+app.use('/api', apiRouter);
+
+// App-level error middleware
+app.use((err, req, res, next) => {
+  log.error({ err }, 'unhandled');
+  res.status(500).send('internal');
+});
+```
+
+The sub-router's error middleware fires first. If it handles the
+error (sends a response), the app-level middleware doesn't run. If
+it calls `next(err)`, the app-level middleware gets it.
+
+This is useful for **module-specific error translation**:
+
+- The `api` router translates ValidationError → 400.
+- The `auth` router translates Unauthorized → 401.
+- The app fallback translates anything unhandled → 500.
+
+### Important: error middleware is scoped to its router stack
+
+```js
+const apiRouter = Router();
+apiRouter.use((err, req, res, next) => { /* catches api errors */ });
+
+const adminRouter = Router();
+adminRouter.use((err, req, res, next) => { /* catches admin errors */ });
+
+app.use('/api', apiRouter);
+app.use('/admin', adminRouter);
+
+// Error from /api can't reach the admin router's error middleware
+// Errors from outside any router stack reach only app-level
+```
+
+Each error middleware catches errors **from within its router's
+middleware stack**. App-level error middleware is the catch-all.
+
+Always have an app-level error middleware as the final layer.
+
+## Settings inheritance
+
+Some settings on the app inherit to sub-apps:
+
+```js
+app.set('trust proxy', 1);
+app.set('view engine', 'ejs');
+
+const subApp = express();
+subApp.set('view engine', 'pug');   // overrides
+
+app.use('/sub', subApp);
+```
+
+Sub-apps inherit `trust proxy` (and a few others) by default. Set
+explicitly if you need different values per sub-app.
+
+For `Router` instances (not full sub-apps), there's no parallel
+settings system — they share the parent app's settings.
+
+## `app.use` vs `router.use`
+
+```js
+app.use(middleware);              // for all requests
+app.use('/path', middleware);      // for paths under /path
+app.use('/api', router);           // mount a router
+
+router.use(middleware);            // for all requests in this router
+router.use('/path', middleware);   // for paths under /path within this router
+```
+
+Same semantics; just whether the scope is "the whole app" or "this
+router."
+
+## Order matters
+
+```js
+const router = Router();
+
+router.use(authMiddleware);
+router.get('/me', handler);          // requires auth
+
+const publicRouter = Router();
+publicRouter.get('/login', loginHandler);   // no auth
+
+app.use('/api', router);
+app.use('/api', publicRouter);
+```
+
+The first router checks auth for any `/api/*` request that matches a
+route inside it. `/api/login` doesn't match anything in the first
+router (no `/login` route), so it falls through to the second.
+
+But: if you reverse the order, `/api/me` hits the public router
+first; no auth applied.
+
+Routers and middleware are processed in registration order. Be
+deliberate.
+
+## Mount with a regex
+
+```js
+app.use(/\/api\/v[0-9]+/, router);
+```
+
+Regex mounts work. Inside the router, `req.baseUrl` is the matched
+prefix (`/api/v1`, `/api/v2`).
+
+Useful for versioned APIs without per-version routers.
+
+## Mount with multiple paths
+
+```js
+app.use(['/api', '/api/v1'], router);
+```
+
+The router responds to both `/api` and `/api/v1`. `req.baseUrl`
+reflects whichever matched.
+
+## Sub-app vs Router
+
+```js
+const subApp = express();
+app.use('/sub', subApp);
+```
+
+Vs.
+
+```js
+const router = Router();
+app.use('/router', router);
+```
+
+Sub-apps have their own settings (`subApp.set`), view engines, etc.
+Routers don't — they inherit from the parent.
+
+Use a Router for grouping routes. Use a sub-app for fully isolated
+config (rare).
+
+## `app.use` without a path
+
+```js
+app.use(middleware);
+```
+
+Without a path, the middleware runs for every request. Common for:
+
+- Logging.
+- Auth (sets `req.user` if present).
+- Body parsing.
+
+`app.use('/path', middleware)` runs only for paths starting with
+`/path`.
+
+## Static middleware mounting
+
+```js
+app.use('/static', express.static('public'));
+```
+
+Mounted at `/static`. `req.url` inside `serve-static` is the
+remainder (e.g., `/logo.png` for `/static/logo.png`). Same model as
+routers.
+
+## Common pitfalls
+
+### Forgetting `mergeParams`
+
+```js
+app.use('/tenants/:tenantId', tenantRouter);
+
+tenantRouter.get('/users', (req, res) => {
+  req.params.tenantId;   // undefined!
+});
+```
+
+Add `Router({ mergeParams: true })`. Without it, parent params
+don't propagate.
+
+### Confusing `req.url` and `req.originalUrl`
+
+```js
+app.use('/api', (req, res, next) => {
+  log.info({ url: req.url });   // logs /users/42 for /api/users/42 — confusing
+  next();
+});
+```
+
+For logs, use `req.originalUrl` (what the client sent). For
+internal routing logic, `req.url`/`req.path` (current scope).
+
+### Error middleware order
+
+```js
+app.use(apiRouter);
+app.use((err, req, res, next) => {});   // unique 4-arg signature
+app.use(adminRouter);
+```
+
+Error middleware should come **after** all regular middleware /
+routes. Once errors flow through, putting more routes after the
+error handler means those routes can't be reached for errors.
+
+For sub-routers, error middleware comes after the router's own
+routes.
+
+### Param mounting with `/`
+
+```js
+app.use('/api/', router);
+app.get('/api/users', handler);
+// User hits /api/users — which matches?
+```
+
+Depending on Express version, trailing slashes in mount paths can
+have weird matches. Drop the trailing slash on mount paths.
+
+### Mounting at `/` and capturing everything
+
+```js
+app.use('/', someRouter);
+app.use('/api', apiRouter);
+```
+
+`app.use('/', someRouter)` matches everything. If `someRouter` has
+a catch-all, the `apiRouter` never runs. Be explicit about
+ordering.
+
+### `app.use` running before `app.get`
+
+```js
+app.use((req, res) => {
+  res.send('catch all');
+});
+app.get('/users', (req, res) => {});
+```
+
+The middleware (no path) responds to everything, including
+`/users`. The `app.get` never runs. Middleware order again.
+
+## The mental model
+
+Mounting is **rewriting the URL** at each boundary. The original URL
+is preserved in `req.originalUrl`; the prefix consumed is in
+`req.baseUrl`; the remainder is `req.url`.
+
+Sub-routers and middleware run in registration order. Error
+middleware is scoped to its router's stack but bubbles up via
+`next(err)` to parent stacks.
+
+For a typical app:
+
+```js
+// app.js
+const app = express();
+app.set('trust proxy', 1);
+
+// 1. Cross-cutting middleware
+app.use(logger);
+app.use(express.json());
+
+// 2. Mount routers
+app.use('/api', apiRouter);
+app.use('/auth', authRouter);
+
+// 3. Static / SPA fallback
+app.use(express.static('dist'));
+app.get('/*splat', spaFallback);
+
+// 4. Catch-all 404
+app.use((req, res) => res.status(404).json({ error: 'not found' }));
+
+// 5. Error handler (always last)
+app.use((err, req, res, next) => { ... });
+```
+
+Five layers. Each router can have its own internal structure with
+the same pattern. The mount semantics are consistent throughout.

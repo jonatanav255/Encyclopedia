@@ -1,0 +1,355 @@
+export const level = 'senior';
+
+# `trust proxy` — the deep dive
+
+Every Express service behind a load balancer needs `app.set('trust
+proxy', ...)`. Get it wrong and:
+
+- `req.ip` is the proxy's IP, not the client's. Rate limiting
+  applies collectively → easy bypass.
+- `req.secure` and `req.protocol` are wrong → secure cookies don't
+  attach, redirect loops happen.
+- Your audit logs say "all traffic came from 10.0.0.1."
+
+But get it **too loose** and you trust attacker-controlled headers
+→ rate-limit bypass, IP spoofing, audit corruption.
+
+## What it does
+
+When `trust proxy` is set, Express consumes `X-Forwarded-*` headers
+to figure out the real client IP and protocol:
+
+- `X-Forwarded-For: client-ip, proxy1-ip, proxy2-ip`
+- `X-Forwarded-Proto: https` (or `http`)
+- `X-Forwarded-Host: example.com`
+
+`req.ip` becomes the first untrusted entry in `X-Forwarded-For`.
+`req.protocol`, `req.hostname`, and `req.secure` derive from the
+forwarded values.
+
+Without `trust proxy`, Express uses the direct socket info — which
+is the proxy, not the client.
+
+## The values it accepts
+
+### `true` (or `'all'`) — trust every hop
+
+```js
+app.set('trust proxy', true);
+```
+
+Trusts the entire `X-Forwarded-For` chain. **Dangerous behind anything
+that isn't a single-hop LB you fully control.** An attacker can spoof
+headers and Express believes them.
+
+Don't use unless you know exactly what's between client and Node.
+
+### `false` (default) — trust nothing
+
+```js
+app.set('trust proxy', false);
+```
+
+Use socket info only. `req.ip` is the immediate peer. Correct when
+Node is directly exposed (rare) or when you don't trust any proxy.
+
+### A hop count (integer)
+
+```js
+app.set('trust proxy', 1);   // trust 1 proxy in front
+app.set('trust proxy', 2);   // trust 2 proxies
+```
+
+Express skips the last N entries in `X-Forwarded-For` and uses the
+N+1th from the right as `req.ip`. The "skip" is what trusts those
+hops.
+
+`1` is right for: behind a single ALB / nginx / Cloudflare in front
+of Node.
+
+`2` is right for: behind Cloudflare → ALB → Node, or any chain you
+fully own.
+
+This is the safest setting for typical deployments. It's a
+**numerical promise**: "exactly this many hops in front of me are
+mine."
+
+### Subnet / IP list (string or array)
+
+```js
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+app.set('trust proxy', '10.0.0.0/8');
+app.set('trust proxy', ['10.0.0.0/8', '192.168.0.0/16']);
+```
+
+Trusts a specific set of IPs as proxies. `loopback`, `linklocal`,
+`uniquelocal` are aliases for RFC 1918 / loopback ranges.
+
+Use when:
+
+- Your proxy IPs are stable and known.
+- You're paranoid about hop count drift.
+
+Express's logic: walk `X-Forwarded-For` from right to left, skipping
+entries while they match the trusted list. The first non-matching
+entry is `req.ip`.
+
+### A function
+
+```js
+app.set('trust proxy', (addr, hop) => addr === '10.0.0.1');
+```
+
+Custom logic. Useful for dynamically-assigned proxies (autoscaling
+LBs, Cloudflare's published IP list refreshed periodically). The
+function returns true if the proxy at the given hop should be
+trusted.
+
+## What changes when it's set
+
+After `app.set('trust proxy', N)`:
+
+```js
+req.ip                  // client IP (skips trusted hops)
+req.ips                 // [hop1, hop2, ...] — the chain
+req.protocol            // 'https' if X-Forwarded-Proto: https
+req.hostname            // X-Forwarded-Host if present, else Host
+req.secure              // shortcut: req.protocol === 'https'
+```
+
+And middleware that uses these (rate limiters, cookies with `secure:
+true`, etc.) get correct values.
+
+## The classic bug
+
+Behind a single LB, `trust proxy` *off*:
+
+```js
+// app.js — no trust proxy
+app.use(rateLimit({ windowMs: 60_000, max: 100 }));
+```
+
+Every request from any client to your service has `req.ip ===
+'<proxy IP>'`. The rate limiter sees one "client" — itself — and
+everyone shares the same budget. Limit applies collectively. An
+attacker can dispatch unlimited requests because they look like
+everyone else.
+
+The fix:
+
+```js
+app.set('trust proxy', 1);
+app.use(rateLimit({ windowMs: 60_000, max: 100 }));
+```
+
+Now `req.ip` is the real client. Per-client limits actually limit.
+
+## The classic *other* bug
+
+`trust proxy: true` behind a multi-hop chain with unknown sources:
+
+```js
+// app.js — trust everything
+app.set('trust proxy', true);
+```
+
+An attacker sends:
+
+```
+GET / HTTP/1.1
+X-Forwarded-For: 8.8.8.8, 10.0.0.1
+```
+
+Express trusts the chain entirely; `req.ip` is now `8.8.8.8` (the
+spoofed value). The attacker controls audit logs, rate-limit keys,
+and IP-based ACLs.
+
+This is one of the most exploited misconfigurations in production
+Express services. **Never `trust proxy: true`** unless you can name
+every byte that enters the connection.
+
+## Cloudflare specifics
+
+Cloudflare also sets the real client IP in `CF-Connecting-IP` in
+addition to `X-Forwarded-For`. `req.ip` is a getter — you can't
+assign to it. Two options:
+
+1. **Use `trust proxy` with Cloudflare's published IP range** so
+   Express trusts CF's `X-Forwarded-For` chain. `req.ip` is then
+   correct via the standard mechanism.
+2. **Read the custom header directly** in middleware that needs it,
+   without trying to overwrite `req.ip`:
+
+```js
+app.use((req, _res, next) => {
+  req.clientIp = req.headers['cf-connecting-ip'] ?? req.ip;
+  next();
+});
+
+// Configure rate-limit etc. with keyGenerator: (req) => req.clientIp
+```
+
+Cloudflare also sets `X-Forwarded-Proto`, which `trust proxy`
+honors. For most CF setups, option 1 (trust + CF IP allowlist) is
+the cleanest.
+
+## ALB specifics
+
+AWS ALB sets standard `X-Forwarded-*` headers. `trust proxy: 1` is
+the correct setting if Node is directly behind ALB.
+
+ALB also sets `X-Amzn-Trace-Id` — not for IP, but for trace
+correlation. Propagate it.
+
+## nginx specifics
+
+You configure nginx to set headers:
+
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Host $host;
+```
+
+`$proxy_add_x_forwarded_for` appends to the existing chain — good
+for "many hops." If you set `X-Forwarded-For $remote_addr`, you
+replace the chain — fine for single-hop behind nginx.
+
+On the Node side, `trust proxy: 1` (one hop, nginx). With more
+hops, count or list.
+
+## Verifying
+
+Add a debug endpoint:
+
+```js
+app.get('/_debug/ip', (req, res) => {
+  res.json({
+    ip: req.ip,
+    ips: req.ips,
+    protocol: req.protocol,
+    secure: req.secure,
+    'x-forwarded-for': req.headers['x-forwarded-for'],
+    'x-forwarded-proto': req.headers['x-forwarded-proto'],
+  });
+});
+```
+
+Hit it from outside (curl from your laptop):
+
+```bash
+curl https://your-api.example.com/_debug/ip
+{
+  "ip": "<your-public-ip>",
+  "protocol": "https",
+  "secure": true,
+  "x-forwarded-for": "<your-public-ip>"
+}
+```
+
+If `ip` is your public IP and `protocol` is `https`, `trust proxy`
+is set correctly. If `ip` is `10.x.x.x` and `protocol` is `http`,
+you've got it wrong.
+
+(Remove this endpoint after verification — it's an info leak.)
+
+## Rate limiting interactions
+
+```js
+import rateLimit from 'express-rate-limit';
+
+app.set('trust proxy', 1);    // MUST be set first
+
+app.use(rateLimit({
+  windowMs: 60_000,
+  max: 100,
+  keyGenerator: (req) => req.ip,   // default
+  validate: { trustProxy: true },  // assert trust proxy is configured
+}));
+```
+
+`express-rate-limit` v7 added `validate.trustProxy` which throws if
+you haven't set `trust proxy`. Worth enabling.
+
+For more sophistication, key by `req.ip` plus user ID:
+
+```js
+keyGenerator: (req) => `${req.ip}:${req.user?.id ?? 'anon'}`
+```
+
+Authenticated users get their own bucket; anonymous traffic shares
+per-IP.
+
+## Session cookies and `secure: true`
+
+```js
+app.use(session({
+  cookie: { secure: true, sameSite: 'lax' },
+}));
+```
+
+`secure: true` means "only send this cookie over HTTPS." With
+`trust proxy` off, `req.protocol` is `'http'` (because the proxy
+talks plain HTTP to Node), so Express thinks the request is
+insecure → cookie never sets.
+
+With `trust proxy: 1`, `req.protocol` honors `X-Forwarded-Proto:
+https`, and the cookie sets correctly.
+
+This is why "my login works but the session cookie never persists in
+production" is almost always `trust proxy`.
+
+## Common pitfalls
+
+### Defaulting to `true` "just in case"
+
+The most dangerous setting. Always pick the narrowest correct value.
+
+### Inconsistent hop count across environments
+
+Dev: direct Node, `trust proxy: 0`.
+Staging: behind nginx, `trust proxy: 1`.
+Prod: Cloudflare → ALB → Node, `trust proxy: 2`.
+
+Config drift here causes audit log corruption in one env and not the
+other. Pin the value per env explicitly.
+
+### Setting `trust proxy` after middleware
+
+```js
+app.use(rateLimit(...));   // sees old req.ip
+app.set('trust proxy', 1); // too late for already-mounted middleware
+```
+
+Express docs note that some middleware reads `trust proxy` at
+request time, but some captures it at mount. Set `trust proxy`
+before any middleware that uses `req.ip`.
+
+### Forgetting the `validate` check in rate-limit
+
+Without `validate.trustProxy: true`, the rate limiter silently
+under-works behind a proxy. Easy to miss until the first attack.
+
+### Trusting Cloudflare without checking origin
+
+Cloudflare hides your real IP. But if attackers can reach your
+origin directly (e.g., via the IP), they can send arbitrary
+`CF-Connecting-IP`. Restrict origin firewall to Cloudflare's IP
+range to make the trust valid.
+
+## The mental model
+
+`trust proxy` answers: **how many hops in front of Node do I own and
+trust?**
+
+- 0: nobody. Direct exposure.
+- N: exactly N specific, controlled hops.
+- IP list: these specific proxies, no matter how many hops.
+- `true`: anyone in the chain (almost never correct).
+
+The cost of wrong-narrow: features break, sessions don't persist.
+The cost of wrong-wide: spoofing attacks succeed.
+
+Set it deliberately. Verify with a debug endpoint. Pin per
+environment.

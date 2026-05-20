@@ -1,0 +1,296 @@
+export const level = 'senior';
+
+# HTTP client: undici and the global `fetch`
+
+Modern Node's global `fetch` is built on **undici** — the HTTP/1.1
+client the Node team maintains. Understanding undici's dispatcher
+model is how you actually scale outbound HTTP from a Node service.
+
+The legacy `http.Agent` from `node:http` still exists, but it's slow,
+allocates more, and lacks pipelining and per-origin pool control.
+For new code, use undici directly (or `fetch`, which uses it).
+
+## The dispatcher model
+
+undici splits HTTP clients into three layers:
+
+- **`Client`** — talks to **one origin** (one host:port). One TCP/TLS
+  connection at a time.
+- **`Pool`** — talks to **one origin**, multiple connections.
+  `connections: N` parallel sockets.
+- **`Agent`** — talks to **many origins**, internally creates `Pool`s
+  per origin. The thing you'd usually use globally.
+
+```js
+import { Agent, setGlobalDispatcher, request } from 'undici';
+
+const agent = new Agent({
+  connections: 128,           // max sockets per origin
+  pipelining: 1,              // requests in flight per socket (1 = no pipelining)
+  keepAliveTimeout: 10_000,
+  keepAliveMaxTimeout: 60_000,
+});
+
+setGlobalDispatcher(agent);
+
+// Now global fetch uses this agent
+const res = await fetch('https://api.example.com/users');
+```
+
+`setGlobalDispatcher` makes `fetch`, `request`, etc. use your agent.
+You can also pass `dispatcher` per call.
+
+## Pipelining: keep it 1
+
+```js
+new Agent({ pipelining: 1 })   // default
+```
+
+Pipelining > 1 means "send the next request before the previous
+response arrives, on the same socket." It sounds great until one slow
+response head-of-line-blocks every request behind it. Almost every
+real HTTP/1.1 setup is faster with `pipelining: 1` and more
+connections.
+
+This is one of those defaults that looks like a typo and isn't.
+
+## Sizing connection pools
+
+For each upstream origin, ask:
+
+1. **Latency** of a typical request: 50 ms? 500 ms?
+2. **Target RPS** to this origin.
+3. **Headroom** for spikes.
+
+`connections = RPS × latency_seconds × headroom`.
+
+100 RPS × 0.1 s × 2 = 20 connections per process. With 4 processes
+that's 80 connections — well below typical server limits.
+
+Too few connections → requests queue → latency tail. Too many → file
+descriptors and upstream connection limits.
+
+Watch undici's internal stats (`agent.stats` per pool) to see queue
+depth under load.
+
+## `request` vs `fetch`
+
+```js
+import { request } from 'undici';
+
+const { statusCode, headers, body } = await request('https://api.example.com');
+const json = await body.json();
+```
+
+`request` is undici's lower-level API. Compared to `fetch`:
+
+- **No body buffering** by default — you stream from `body`.
+- **Fewer allocations** in the hot path.
+- **No `Response` wrapper** — slightly less ergonomic, less overhead.
+
+For high-throughput backend → backend calls (10k+ req/sec to one
+origin), prefer `request`. For everything else, `fetch` is fine and
+matches the platform API.
+
+## Per-origin agents
+
+A common pattern: one strict agent for a flaky upstream, one liberal
+for a stable one.
+
+```js
+import { Pool } from 'undici';
+
+const stripe = new Pool('https://api.stripe.com', {
+  connections: 10,
+  keepAliveTimeout: 30_000,
+});
+
+const internal = new Pool('http://users-svc.internal', {
+  connections: 100,
+  bodyTimeout: 5_000,
+});
+
+await stripe.request({ path: '/v1/charges', method: 'POST', body: '...' });
+```
+
+`Pool` is one-origin. Bind to URL once, reuse forever. Don't create
+a new `Pool` per request — that defeats keep-alive.
+
+## Timeouts
+
+```js
+const res = await fetch(url, {
+  signal: AbortSignal.timeout(5_000),    // total request timeout
+});
+```
+
+For finer control with `undici.request`:
+
+```js
+const { body } = await request(url, {
+  headersTimeout: 2_000,     // wait this long for response headers
+  bodyTimeout: 10_000,        // wait this long between body chunks
+});
+```
+
+Always set timeouts. Without them, a hung upstream consumes a
+connection from your pool indefinitely.
+
+## Connecting to HTTPS
+
+undici handles TLS via Node's `tls` module. By default it uses Node's
+CA bundle. To override:
+
+```js
+new Agent({
+  connect: {
+    rejectUnauthorized: false,   // dev only — skip cert verification
+    ca: customCaBundle,
+    keepAlive: true,
+  },
+});
+```
+
+For dev/test environments with self-signed certs, scope
+`rejectUnauthorized: false` carefully. Never in production.
+
+## Retries
+
+undici has a built-in `RetryAgent`:
+
+```js
+import { Agent, RetryAgent } from 'undici';
+
+const dispatcher = new RetryAgent(new Agent(), {
+  maxRetries: 3,
+  minTimeout: 100,
+  maxTimeout: 1000,
+  timeoutFactor: 2,
+  retryAfter: true,
+  methods: ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'],
+});
+
+setGlobalDispatcher(dispatcher);
+```
+
+Only idempotent methods are retried by default. The retry honors
+`Retry-After` headers.
+
+For more nuanced retry (circuit breaker, hedging), reach for
+`cockatiel` or `opossum` and wrap your fetch calls.
+
+## Streaming responses
+
+```js
+const res = await fetch(url);
+for await (const chunk of res.body) {
+  // chunk is Uint8Array
+}
+```
+
+`res.body` is a `ReadableStream` (WHATWG). Async iteration is the
+straightforward path.
+
+For large downloads, stream-to-disk:
+
+```js
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { createWriteStream } from 'node:fs';
+
+const res = await fetch(url);
+await pipeline(Readable.fromWeb(res.body), createWriteStream('out.bin'));
+```
+
+`Readable.fromWeb` bridges WHATWG → Node streams. Pipeline handles
+errors and cleanup.
+
+## Connecting to HTTP/2
+
+undici 7+ supports HTTP/2 via `allowH2: true`:
+
+```js
+new Agent({ allowH2: true });
+```
+
+Most of the time the proxy in front of Node does HTTP/2 termination
+to the browser and HTTP/1.1 to internal services. H2 between Node and
+internal services pays off only for high-fan-out workloads
+(multiplexing helps when you have many concurrent requests to the
+same origin).
+
+## Common pitfalls
+
+### Reusing default agent across origins
+
+The global agent shares limits across all origins. If one origin
+gets slow, requests to other origins might starve. Per-origin `Pool`s
+fix this.
+
+### Not catching `AbortError`
+
+```js
+try {
+  await fetch(url, { signal: AbortSignal.timeout(5000) });
+} catch (err) {
+  if (err.name === 'AbortError') {
+    // timed out
+  }
+}
+```
+
+Treat aborts as a category of error in your wrapper. Distinguish
+"timeout" from "network failure."
+
+### Buffering `res.body` for big payloads
+
+`await res.text()` buffers the entire body in memory. For multi-MB
+JSON, parse via stream:
+
+```js
+import { parser } from 'stream-json';
+import { pick } from 'stream-json/filters/Pick';
+
+await pipeline(
+  Readable.fromWeb(res.body),
+  parser(),
+  pick({ filter: 'items.*' }),
+  yourSink,
+);
+```
+
+For most APIs the response is small and `.json()` is fine. The check
+is "could this ever be more than ~10MB?"
+
+### DNS not cached
+
+Node doesn't cache DNS by default. undici will resolve every hostname
+every connection. For hot upstreams, add `cacheable-lookup`:
+
+```js
+import CacheableLookup from 'cacheable-lookup';
+import { Agent } from 'undici';
+
+const cl = new CacheableLookup();
+new Agent({ connect: { lookup: cl.lookup } });
+```
+
+Cuts ~10–50 ms off the first request after connection establishment.
+
+### Treating undici as a one-liner
+
+undici has 50+ knobs. The minimal config above (connections, timeouts,
+per-origin pools, retry-when-idempotent) covers 95% of production
+needs. The rest is for specific cases.
+
+## The mental model
+
+undici is **request → pool → connections → TLS → socket**. You shape
+behavior at the pool layer (size, keep-alive, pipelining), the
+request layer (timeouts, signals, headers), and the agent layer (per-
+origin segmentation).
+
+For most apps, one `Agent` with per-origin `Pool`s, sane timeouts,
+`pipelining: 1`, and `RetryAgent` wrapped around it is the complete
+production setup. `fetch` is the user-facing API; undici is what
+makes it fast.

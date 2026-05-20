@@ -1,0 +1,340 @@
+export const level = 'mid';
+
+# Composing AbortSignals
+
+Modern `AbortSignal` has a handful of factories that let you build
+cancellation logic without manual race conditions or timer juggling.
+
+The three you'll actually use:
+
+- `AbortSignal.timeout(ms)` — a signal that aborts after `ms`.
+- `AbortSignal.any([signals])` — a signal that aborts when any input
+  signal aborts.
+- `AbortSignal.abort(reason)` — an already-aborted signal.
+
+Plus `AbortController` for ones you trigger manually.
+
+## `AbortSignal.timeout(ms)`
+
+```js
+const signal = AbortSignal.timeout(5000);
+
+const res = await fetch(url, { signal });
+// throws AbortError after 5s
+```
+
+Replaces:
+
+```js
+// Old way
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 5000);
+try {
+  await fetch(url, { signal: controller.signal });
+} finally {
+  clearTimeout(timer);
+}
+```
+
+`AbortSignal.timeout` is one line; the old way was five. The signal
+auto-cleans on completion (no timer leak).
+
+Use everywhere you need a per-call timeout: `fetch`, `setTimeout`,
+DB queries (if they accept signals), custom code.
+
+## `AbortSignal.any([signals])`
+
+```js
+const signal = AbortSignal.any([
+  AbortSignal.timeout(5000),
+  userCancelSignal,
+]);
+
+await fetch(url, { signal });
+// Aborts at 5s OR if user cancels
+```
+
+`any` aborts as soon as ANY input signal aborts. No more manual race
+between user-cancel and timeout.
+
+The aborted reason is the reason of whichever fired first.
+
+## `AbortSignal.abort(reason)`
+
+```js
+const signal = AbortSignal.abort('immediate');
+
+await fetch(url, { signal });   // throws synchronously
+```
+
+A pre-aborted signal. Useful for:
+
+- Testing "what happens if I pass an already-aborted signal."
+- Marking a code path as "should not even start."
+
+## `AbortController` for manual control
+
+```js
+const ac = new AbortController();
+
+setTimeout(() => ac.abort('user clicked cancel'), 10_000);
+
+await fetch(url, { signal: ac.signal });
+```
+
+`AbortController` is the original API. You hold the controller; pass
+`.signal` around. Anyone can call `ac.abort(reason)` to trigger
+cancellation.
+
+For events:
+
+```js
+button.addEventListener('click', () => ac.abort());
+```
+
+Combine controller with timeout via `any`:
+
+```js
+const userAc = new AbortController();
+button.addEventListener('click', () => userAc.abort());
+
+const signal = AbortSignal.any([
+  AbortSignal.timeout(30_000),
+  userAc.signal,
+]);
+
+await longOperation({ signal });
+```
+
+User can cancel; timeout fires at 30s; whichever happens first wins.
+
+## Where AbortSignal is accepted
+
+The API surface is broad in modern Node:
+
+- `fetch(url, { signal })`
+- `setTimeout(fn, ms, { signal })`
+- `setInterval(fn, ms, { signal })`
+- `setImmediate(fn, { signal })`
+- `events.once(emitter, name, { signal })`
+- `events.on(emitter, name, { signal })`
+- `stream.pipeline(streams, { signal })` (via options)
+- `node:test`: `t.test(name, { signal }, ...)`
+- Most Node `fs/promises` calls (`readFile`, `writeFile`).
+
+If a Node API accepts options, check if it takes a signal.
+
+## Honoring AbortSignal in your code
+
+If you write async code that should be cancellable:
+
+```js
+async function doWork({ signal } = {}) {
+  signal?.throwIfAborted();   // throws if already aborted
+
+  for (const item of items) {
+    signal?.throwIfAborted();
+    await processItem(item);
+  }
+}
+```
+
+`signal.throwIfAborted()` throws `AbortError` if the signal has
+fired. Stable in Node 18+.
+
+For listening on the event:
+
+```js
+signal.addEventListener('abort', () => {
+  cleanup();
+}, { once: true });
+```
+
+Useful for releasing resources (close DB connection, kill child
+process) when work is cancelled.
+
+For propagating into a sub-operation:
+
+```js
+async function outer({ signal }) {
+  await inner({ signal });   // pass along
+}
+```
+
+The signal threads through your async stack.
+
+## Propagating into work that has its own cancellation
+
+```js
+async function dbQuery(sql, { signal } = {}) {
+  const conn = await pool.acquire();
+  signal?.addEventListener('abort', () => conn.cancelQuery(), { once: true });
+
+  try {
+    return await conn.query(sql);
+  } finally {
+    pool.release(conn);
+  }
+}
+```
+
+Bridge the AbortSignal to the underlying API's cancellation
+(`conn.cancelQuery()`). Use `{ once: true }` to avoid leaking
+listeners.
+
+## `signal.reason`
+
+After abort, the signal carries a reason:
+
+```js
+const ac = new AbortController();
+ac.abort('user clicked cancel');
+
+ac.signal.reason;   // 'user clicked cancel'
+```
+
+`AbortError` thrown by `signal.throwIfAborted()` has `err.cause`
+set to the reason. Useful for distinguishing timeout vs user vs
+other.
+
+```js
+try {
+  await fetch(url, { signal: AbortSignal.timeout(5000) });
+} catch (err) {
+  if (err.name === 'AbortError') {
+    if (err.cause === 'timeout') log.warn('timed out');
+  }
+}
+```
+
+Convention: pass an Error or a string as the reason. `AbortSignal.timeout`
+uses a `DOMException('TimeoutError')` by convention.
+
+## In Express handlers
+
+```js
+app.get('/long-op', async (req, res) => {
+  const ac = new AbortController();
+  req.on('close', () => ac.abort());
+
+  try {
+    const result = await someWork({ signal: ac.signal });
+    res.json(result);
+  } catch (err) {
+    if (err.name === 'AbortError') return;   // client disconnected; nothing to send
+    throw err;
+  }
+}
+```
+
+If the client disconnects mid-request, abort downstream work. Saves
+CPU on doomed requests. Important for slow endpoints or expensive
+DB queries.
+
+A common pattern: a middleware that exposes `req.signal`:
+
+```js
+app.use((req, res, next) => {
+  const ac = new AbortController();
+  req.on('close', () => ac.abort('client disconnect'));
+  req.signal = ac.signal;
+  next();
+});
+
+// Then in any handler:
+app.get('/data', async (req, res) => {
+  const data = await fetchData({ signal: req.signal });
+  res.json(data);
+});
+```
+
+Express doesn't attach `req.signal` automatically (that's a Fastify/Hono
+pattern). The middleware above gives you the same behavior in Express.
+
+## Common pitfalls
+
+### Forgetting to pass the signal down
+
+```js
+async function outer({ signal }) {
+  await fetch(url);          // forgot signal
+  await fetch(otherUrl);     // forgot signal
+}
+```
+
+Cancellation doesn't propagate to nested calls. Plumb it through.
+
+### Listening on `abort` and never cleaning
+
+```js
+signal.addEventListener('abort', cleanup);
+// signal might be long-lived; cleanup might not be needed later
+```
+
+Use `{ once: true }` so the listener removes itself on fire. For
+signals that might never abort, this prevents leaks.
+
+### Catching `AbortError` and re-throwing
+
+```js
+try {
+  await fetch(url, { signal });
+} catch (err) {
+  if (err.name === 'AbortError') {
+    // Just exit silently
+    return;
+  }
+  throw err;
+}
+```
+
+Right pattern for "ignore aborts." Don't `throw err` for aborts —
+they're usually expected.
+
+### Using a single AbortController for multiple operations
+
+```js
+const ac = new AbortController();
+await fetch(a, { signal: ac.signal });
+await fetch(b, { signal: ac.signal });
+// If a's signal fires for any reason, both should abort? Yes — that's the design.
+```
+
+This is fine if "abort all" semantics are what you want. For
+independent abortion, separate controllers.
+
+### `AbortSignal.timeout` and Node version
+
+`AbortSignal.timeout` requires Node 17+. Available everywhere modern
+but not in old LTS (16). Check your minimum.
+
+### Timing of `signal.throwIfAborted`
+
+```js
+async function f({ signal }) {
+  signal?.throwIfAborted();
+  const data = await loadSlowly();  // can't be aborted mid-flight
+  return data;
+}
+```
+
+`throwIfAborted` only catches abort *at the point of the call*. For
+true cancellation mid-async, you need to pass the signal down to
+`loadSlowly` (and it has to honor it).
+
+## The mental model
+
+AbortSignal is **the platform-wide cancellation primitive**. Built
+once, used everywhere — fetch, timers, fs, events, custom async
+code.
+
+Three patterns cover 90% of usage:
+
+1. **Per-call timeout**: `AbortSignal.timeout(ms)`.
+2. **Compose user + timeout**: `AbortSignal.any([userSig, timeoutSig])`.
+3. **Propagate**: thread `signal` through every async function.
+
+For 2026 Node code, every async function that does I/O or could be
+long-running should accept an optional `signal` and honor it. It's
+the difference between "code that responds to cancellation" and
+"code that wastes resources on doomed work."

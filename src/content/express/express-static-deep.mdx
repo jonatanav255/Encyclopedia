@@ -1,0 +1,421 @@
+export const level = 'mid';
+
+# `express.static` (deep)
+
+`express.static` serves files from disk. Simple in basic use; full of
+non-obvious options for production. Most apps use a fraction of what
+it can do.
+
+## The basics
+
+```js
+import express from 'express';
+
+app.use(express.static('public'));
+```
+
+Files in `./public/` are served at the URL paths matching their names.
+`./public/logo.png` → `/logo.png`. `./public/css/main.css` →
+`/css/main.css`.
+
+For a mount path:
+
+```js
+app.use('/assets', express.static('public'));
+```
+
+`./public/logo.png` → `/assets/logo.png`.
+
+## Cache headers
+
+```js
+app.use(express.static('public', {
+  maxAge: '1y',       // 1 year — for fingerprinted assets
+  immutable: true,    // additional Cache-Control: immutable
+  etag: true,
+  lastModified: true,
+}));
+```
+
+Sets `Cache-Control: public, max-age=31536000, immutable`. The
+client (and any intermediate CDN) caches the file aggressively.
+
+`immutable` is the key for **hashed filenames** — the file at
+`/assets/app.abc123.js` never changes (a new build gets a new hash).
+Tells caches "no need to revalidate; just serve."
+
+Per-file overrides:
+
+```js
+app.use(express.static('public', {
+  setHeaders(res, path) {
+    if (path.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-cache');   // HTML revalidates
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  },
+}));
+```
+
+HTML files revalidate; everything else caches for a year. Standard
+pattern for SPAs.
+
+## ETag and Last-Modified
+
+By default, `express.static` sets both. Conditional requests get
+304 Not Modified automatically. Bandwidth saved.
+
+For strong ETags (byte-perfect validation), this works correctly
+for static files — they don't change without a deploy.
+
+## `index.html` and directory paths
+
+```js
+app.use(express.static('public', {
+  index: 'index.html',     // default; serves index.html for /
+}));
+```
+
+Request `/`: serves `public/index.html`. Request `/about/`: serves
+`public/about/index.html` if it exists.
+
+`index: false` disables this. Useful when you want explicit handling
+of root paths.
+
+## SPA fallback
+
+For single-page apps:
+
+```js
+app.use(express.static('dist', {
+  maxAge: '1y',
+  immutable: true,
+}));
+
+// Catch all other routes — SPA handles them
+app.get('/*splat', (req, res) => {
+  res.sendFile('dist/index.html', { root: process.cwd() });
+});
+```
+
+`express.static` serves assets and `index.html` for explicit paths.
+The fallback serves `index.html` for everything else (`/users/42`,
+`/dashboard`).
+
+Don't cache the SPA fallback `index.html` aggressively:
+
+```js
+res.sendFile('dist/index.html', {
+  root: process.cwd(),
+  maxAge: 0,    // always revalidate
+});
+```
+
+If `index.html` is cached aggressively and you deploy a new asset
+hash, browsers continue requesting the old hash → 404s.
+
+## Dotfiles
+
+```js
+app.use(express.static('public', {
+  dotfiles: 'ignore',   // default — 404 for .files
+  // dotfiles: 'deny',  // 403 for .files
+  // dotfiles: 'allow', // serve .files
+}));
+```
+
+`.git/`, `.env`, `.npmrc` shouldn't be served. Default is `ignore`
+(404), which is fine for most cases. `deny` is slightly more
+explicit (403).
+
+`allow` is rarely correct — it's how teams accidentally serve
+`.env` to the world.
+
+## `fallthrough`
+
+```js
+app.use(express.static('public', { fallthrough: false }));
+```
+
+By default, if a file isn't found, the middleware calls `next()` —
+control passes to the next route. With `fallthrough: false`, the
+middleware ends the request with a 404 (or whatever appropriate
+status).
+
+Useful when you know `express.static` is the **last** middleware in
+the chain. Avoids unnecessary route processing for missing assets.
+
+## Range requests
+
+Range requests work automatically:
+
+```http
+GET /video.mp4 HTTP/1.1
+Range: bytes=1000-2000
+```
+
+Server responds with `206 Partial Content` + the requested range.
+HTML5 `<video>` uses this to scrub and buffer efficiently.
+
+No code from you. `express.static` handles it.
+
+## Acceptable encodings
+
+```js
+app.use(express.static('public', {
+  extensions: ['html', 'htm'],
+}));
+```
+
+`extensions` tells `express.static` to try common extensions if the
+URL doesn't include one. Request `/about` → tries `/about.html` and
+`/about.htm`.
+
+For pre-compressed files:
+
+```js
+app.use(express.static('public'));
+// no built-in support for serving pre-compressed (.gz, .br)
+```
+
+Express's `static` middleware doesn't auto-serve `file.gz` for
+gzip-accepting clients. For that, use `compression` (compresses on
+the fly) or serve pre-compressed via nginx / Cloudflare.
+
+## Symlinks
+
+`express.static` follows symlinks by default. If you have user-
+uploadable content, this is a security risk — a malicious symlink
+could escape the static root.
+
+```js
+// Use a strict file resolver
+app.use('/uploads', express.static('uploads', {
+  // No native option; you need a wrapper
+}));
+
+// Better:
+app.get('/uploads/:filename', async (req, res) => {
+  const filename = path.basename(req.params.filename);   // strip path components
+  const fullPath = path.resolve('uploads', filename);
+  if (!fullPath.startsWith(path.resolve('uploads') + path.sep)) {
+    return res.sendStatus(403);
+  }
+  res.sendFile(fullPath);
+});
+```
+
+For user uploads, **don't serve via `express.static`**. Custom
+handler with explicit validation.
+
+## `serve-static` options summary
+
+`express.static` is a thin wrapper around `serve-static`. Full
+options:
+
+```js
+{
+  acceptRanges: true,
+  cacheControl: true,
+  dotfiles: 'ignore',
+  etag: true,
+  extensions: false,
+  fallthrough: true,
+  immutable: false,
+  index: 'index.html',
+  lastModified: true,
+  maxAge: 0,
+  redirect: true,
+  setHeaders: undefined,
+}
+```
+
+Default `maxAge: 0` → no caching. **Always set this for production
+assets.**
+
+## Pre-built bundles
+
+For modern SPAs:
+
+```
+public/
+  index.html
+  assets/
+    app.abc123.js
+    app.def456.css
+    logo.789ghi.png
+```
+
+The build tool (Vite, Webpack) hashes filenames. The `index.html`
+references them by exact hash. New build → new hash → new file.
+Cache-bust by hash.
+
+```js
+app.use('/assets', express.static('public/assets', {
+  maxAge: '1y',
+  immutable: true,
+}));
+
+app.use(express.static('public', {
+  index: false,        // explicit handling below
+}));
+
+app.get('/*splat', (req, res) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile('public/index.html', { root: process.cwd() });
+});
+```
+
+`/assets/*` → cached forever (hashed names).
+`/` and anything else → `index.html`, no cache (so deploys
+reflect immediately).
+
+## Behind a CDN
+
+For production at scale, serve static files via CDN (Cloudflare,
+Fastly, CloudFront):
+
+- CDN does TLS termination, geographic distribution.
+- Node serves the origin for cache misses + dynamic.
+- Set `Cache-Control` on `express.static` responses; CDN respects
+  it.
+
+For pure-static sites, **don't go through Node at all**. Push
+`public/` to S3 + CloudFront, or use Vercel / Netlify. Node is for
+dynamic work.
+
+## CSP and inline content
+
+When serving HTML, you might want to set per-file CSP:
+
+```js
+app.use(express.static('public', {
+  setHeaders(res, filepath) {
+    if (filepath.endsWith('.html')) {
+      res.setHeader('Content-Security-Policy',
+        "default-src 'self'; script-src 'self' 'nonce-...'");
+    }
+  },
+}));
+```
+
+For per-request CSP (nonces, etc.), a static middleware can't help
+— write a custom handler that injects the nonce.
+
+## Common pitfalls
+
+### Not caching `assets/*`
+
+```js
+app.use(express.static('public'));   // maxAge: 0 default
+```
+
+Every page load re-fetches every asset. Set `maxAge` for hashed
+assets.
+
+### Caching `index.html`
+
+```js
+app.use(express.static('public', { maxAge: '1y', immutable: true }));
+```
+
+If `index.html` is in `public/`, it gets cached forever. New
+deploys don't take effect. Either exclude index.html or serve it
+with its own handler.
+
+### Forgetting `immutable`
+
+```js
+maxAge: '1y'
+// → Cache-Control: public, max-age=31536000
+```
+
+vs.
+
+```js
+maxAge: '1y',
+immutable: true
+// → Cache-Control: public, max-age=31536000, immutable
+```
+
+`immutable` is a hint to browsers: don't even revalidate if the
+user hits refresh. Without it, browsers sometimes revalidate
+anyway. With hashed assets, `immutable` is correct.
+
+### Serving user uploads via static
+
+```js
+app.use('/uploads', express.static('uploads'));   // SECURITY
+```
+
+User uploads can include `.html` with malicious script, `.svg` with
+embedded JS, files that look like images but execute. Either:
+
+- Serve via custom handler with strict `Content-Type` set.
+- Serve from a different (cookie-less) domain so XSS via uploaded
+  HTML can't access main-domain cookies.
+- Use object storage (S3 with presigned URLs).
+
+### Path traversal
+
+```js
+app.get('/file/:name', (req, res) => {
+  res.sendFile(path.join('files', req.params.name));   // BAD
+});
+```
+
+`req.params.name = '../etc/passwd'` reads outside the directory.
+
+`express.static` blocks this (`serve-static` validates paths).
+`res.sendFile` with raw user input doesn't. Always:
+
+```js
+const safe = path.basename(req.params.name);
+const fullPath = path.resolve('files', safe);
+if (!fullPath.startsWith(path.resolve('files') + path.sep)) {
+  return res.sendStatus(403);
+}
+```
+
+### Forgetting `Vary: Accept-Encoding`
+
+If you compress via `compression()`, it adds `Vary: Accept-Encoding`
+automatically. If you serve pre-compressed via nginx, set it
+manually.
+
+### Static middleware before `express.json`
+
+```js
+app.use(express.json());
+app.use(express.static('public'));
+```
+
+`express.json()` reads the body of every request — including GETs
+to static assets. Wasteful. Order static first:
+
+```js
+app.use(express.static('public'));
+app.use(express.json());
+```
+
+## The mental model
+
+`express.static` is **HTTP for files**:
+
+- ETags + Last-Modified for conditional requests.
+- Range support for video and large files.
+- Cache-Control via `maxAge` / `immutable`.
+- 404 fallthrough or block based on `fallthrough`.
+
+For SPAs:
+
+- `/assets/*` → hashed, immutable, year-long cache.
+- `/index.html` (and SPA fallback) → no cache, always revalidate.
+
+For user uploads: **don't use `express.static`**. Custom handler
+with content-type enforcement and path validation.
+
+For production at scale: put a CDN in front, let Node serve only
+origin cache misses + dynamic. `express.static` is for "low traffic"
+or behind the CDN.

@@ -1,0 +1,447 @@
+export const level = 'senior';
+
+# CSP and the Reporting API
+
+Content Security Policy (CSP) is a browser-enforced allowlist
+telling the browser **which sources can execute scripts, load
+images, connect to APIs, etc.** It's the strongest defense against
+XSS — a malicious script injected into your page can't run if its
+source isn't in the policy.
+
+This page is about deploying CSP in 2026, including nonces,
+`strict-dynamic`, the Reporting API, and a sensible report-only
+rollout.
+
+## A minimal CSP
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+```
+
+Reads as:
+
+- `default-src 'self'` — by default, only load from same origin.
+- `script-src 'self'` — only same-origin scripts.
+- `object-src 'none'` — no `<object>`, `<embed>`, `<applet>`.
+- `base-uri 'self'` — restrict `<base href>`.
+- `frame-ancestors 'none'` — refuse to be iframed.
+
+`'self'` means same origin (scheme + host + port). `'none'` means
+nothing matches.
+
+This locks down basic XSS. An injected `<script src="evil.com/x.js">`
+is blocked because `evil.com` isn't in `script-src`.
+
+## Nonces
+
+Inline scripts (`<script>...</script>`) are blocked by `script-src
+'self'`. If you need them, **don't** use `'unsafe-inline'` (defeats
+CSP). Use a **nonce** instead:
+
+```js
+import { randomBytes } from 'node:crypto';
+
+app.use((req, res, next) => {
+  res.locals.nonce = randomBytes(16).toString('base64');
+  next();
+});
+
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy',
+    `script-src 'self' 'nonce-${res.locals.nonce}'; object-src 'none'`);
+  next();
+});
+```
+
+In your template:
+
+```html
+<script nonce="<%= nonce %>">
+  // inline JS, allowed because of matching nonce
+</script>
+```
+
+The nonce is per-request, random, in the header. An attacker
+injecting `<script>` doesn't know the nonce, so their script doesn't
+execute.
+
+## `strict-dynamic`
+
+```
+Content-Security-Policy: script-src 'nonce-abc123' 'strict-dynamic'
+```
+
+`'strict-dynamic'` says: scripts loaded by trusted (nonced) scripts
+are also trusted, transitively. Useful for modern JS bundlers that
+load chunks dynamically.
+
+With `strict-dynamic`, you only need to nonce the entry script; the
+chunks it loads are auto-trusted.
+
+Combine:
+
+```
+script-src 'nonce-abc123' 'strict-dynamic' 'unsafe-inline' https:
+```
+
+The `'unsafe-inline'` and `https:` are **ignored** when
+`strict-dynamic` is present (browsers know to honor the stricter
+rule). They're fallbacks for old browsers that don't understand
+`strict-dynamic`.
+
+This is the modern recommended `script-src`.
+
+## Directives
+
+Common directives:
+
+- `default-src` — fallback for anything not specified.
+- `script-src` — scripts.
+- `style-src` — CSS.
+- `img-src` — images.
+- `font-src` — fonts.
+- `connect-src` — fetch, XHR, WebSocket, EventSource.
+- `media-src` — audio/video.
+- `frame-src` — iframes.
+- `frame-ancestors` — who can iframe you (replaces `X-Frame-Options`).
+- `form-action` — what forms can submit to.
+- `base-uri` — `<base>` tag values.
+- `object-src` — `<object>`, `<embed>`.
+- `report-uri` (deprecated) / `report-to` — where to send violation reports.
+- `upgrade-insecure-requests` — auto-upgrade HTTP to HTTPS.
+
+## A 2026-typical CSP
+
+```js
+app.use((req, res, next) => {
+  res.locals.nonce = randomBytes(16).toString('base64');
+  next();
+});
+
+app.use((req, res, next) => {
+  const nonce = res.locals.nonce;
+  res.setHeader('Content-Security-Policy', [
+    `default-src 'self'`,
+    `script-src 'nonce-${nonce}' 'strict-dynamic' https:`,
+    `style-src 'self' 'nonce-${nonce}'`,
+    `img-src 'self' data: https:`,
+    `font-src 'self'`,
+    `connect-src 'self' wss: https://api.example.com`,
+    `frame-ancestors 'none'`,
+    `form-action 'self'`,
+    `base-uri 'self'`,
+    `object-src 'none'`,
+    `upgrade-insecure-requests`,
+    `report-to default`,
+  ].join('; '));
+  next();
+});
+```
+
+Plus the Reporting API header for violation reports (next section).
+
+## Report-Only mode
+
+Deploying CSP all-at-once usually breaks the app. Roll out via
+**Report-Only**:
+
+```js
+res.setHeader('Content-Security-Policy-Report-Only', policy);
+```
+
+The browser **enforces nothing** but **sends violation reports** to
+your endpoint. You can see what would have been blocked, fix the
+real issues, then switch to enforcing.
+
+Standard rollout:
+
+1. Deploy `Content-Security-Policy-Report-Only` with target policy.
+2. Watch violation reports for a week.
+3. Fix legitimate violations (inline styles, third-party scripts).
+4. Switch to `Content-Security-Policy` (enforcing).
+5. Keep `report-to` so you see ongoing violations.
+
+## The Reporting API
+
+The modern way to receive violation reports:
+
+```js
+app.use((req, res, next) => {
+  res.setHeader('Reporting-Endpoints', 'default="/api/csp-reports"');
+  // CSP header includes: report-to default
+  next();
+});
+
+app.post('/api/csp-reports',
+  express.json({ type: 'application/reports+json' }),
+  (req, res) => {
+    for (const report of req.body) {
+      if (report.type === 'csp-violation') {
+        log.warn({
+          report: report.body,
+          age: report.age,
+        }, 'csp violation');
+      }
+    }
+    res.sendStatus(204);
+  }
+);
+```
+
+The browser batches violations and POSTs them to the endpoint. Each
+report includes the URL, the directive that fired, the blocked
+source, and a `documentURL`.
+
+The legacy `report-uri` directive is similar but uses a different
+content type (`application/csp-report`) and isn't batched. Use
+`report-to` + Reporting-Endpoints for new deployments.
+
+## What violations tell you
+
+Common violation reports during rollout:
+
+- **Third-party scripts** (analytics, ads, A/B testing) — add to
+  `script-src`.
+- **Inline `style="..."` attributes** — block by `style-src` unless
+  you add `'unsafe-inline'` (defeats the purpose) or nonce them.
+  Modern CSS-in-JS supports nonces.
+- **`eval()` somewhere** — block. Refactor or add `'unsafe-eval'`
+  (defeats purpose).
+- **Browser extensions** — extensions inject scripts; you'll see
+  reports. Most are noise; some legitimate user concern.
+
+## CSP and CSS-in-JS
+
+```js
+// Emotion / styled-components inject inline <style>
+<style>{`.css-abc { color: red }`}</style>
+```
+
+Without `'unsafe-inline'` or a nonce in `style-src`, these blocks
+get blocked.
+
+Modern libraries support nonces:
+
+```js
+import { CacheProvider } from '@emotion/react';
+import createCache from '@emotion/cache';
+
+const cache = createCache({ key: 'app', nonce: window.__nonce });
+```
+
+The server injects `<meta name="csp-nonce" content="...">` and the
+library picks it up. Some build-time CSS solutions (CSS Modules,
+Tailwind compiled to static CSS) avoid this entirely by emitting
+external `.css` files.
+
+## CSP and inline event handlers
+
+```html
+<button onclick="doSomething()">   <!-- blocked by strict CSP -->
+```
+
+`onclick="..."` attributes are inline scripts. Use event listeners
+in JS:
+
+```html
+<button id="my-btn">...</button>
+<script nonce="...">
+  document.getElementById('my-btn').addEventListener('click', doSomething);
+</script>
+```
+
+Modern frameworks (React, Vue, Svelte) compile to JS-attached
+handlers automatically, so this is a non-issue.
+
+## CSP and `eval()`
+
+`eval()`, `new Function(...)`, and string-arg `setTimeout(...)` are
+blocked. If you need them, add `'unsafe-eval'` — but you've lost
+much of the protection.
+
+Better: refactor. Most uses of `eval()` are unnecessary; legitimate
+ones (JIT compilers, evaluating user code) usually run in a
+sandboxed iframe or Web Worker with their own policy.
+
+For Vue / Vite SSR development with HMR, you might need
+`'unsafe-eval'` in dev — set per environment.
+
+## `Cross-Origin-*` headers
+
+CSP works with sibling headers:
+
+- `X-Content-Type-Options: nosniff` — don't MIME-sniff.
+- `X-Frame-Options: DENY` — legacy frame-ancestors.
+- `Cross-Origin-Resource-Policy: same-origin` — restrict who can
+  embed.
+- `Cross-Origin-Opener-Policy: same-origin` — isolate browsing
+  contexts.
+- `Cross-Origin-Embedder-Policy: require-corp` — for SharedArrayBuffer.
+- `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+
+Helmet sets sensible defaults for these:
+
+```js
+import helmet from 'helmet';
+
+app.use(helmet());
+// app.use(helmet.contentSecurityPolicy({ directives: ... }));
+```
+
+For CSP, helmet's default is strict; override with your policy.
+
+## Testing CSP
+
+```bash
+curl -I https://your-site.example.com
+```
+
+Read the `Content-Security-Policy` header. Paste into the **Google
+CSP Evaluator** for analysis.
+
+In the browser, open DevTools → Network → look for the
+`Content-Security-Policy` header in the response, and the **Console**
+for any CSP errors.
+
+Manual XSS attempt:
+
+```html
+<script>alert('xss')</script>
+```
+
+If your CSP works, the alert doesn't fire; the console logs the
+violation.
+
+## CSP for SPAs
+
+Single-page apps have a slightly different CSP shape:
+
+- `script-src` includes the SPA's domain and any CDN.
+- `connect-src` includes API origins.
+- `img-src` often includes `data:` for inline images.
+- `style-src` often needs nonces or hashes.
+
+```
+default-src 'self';
+script-src 'self' 'nonce-abc123' 'strict-dynamic';
+style-src 'self' 'nonce-abc123';
+img-src 'self' data: https://cdn.example.com;
+connect-src 'self' https://api.example.com wss://realtime.example.com;
+frame-ancestors 'none';
+```
+
+## CSP for Express + EJS / Pug
+
+```js
+app.set('view engine', 'pug');
+
+app.use((req, res, next) => {
+  res.locals.nonce = randomBytes(16).toString('base64');
+  next();
+});
+
+app.get('/', (req, res) => {
+  res.setHeader('Content-Security-Policy', `script-src 'nonce-${res.locals.nonce}'`);
+  res.render('index', { nonce: res.locals.nonce });
+});
+```
+
+In `index.pug`:
+
+```pug
+script(nonce=nonce)
+  | console.log('inline JS with nonce');
+```
+
+## Common pitfalls
+
+### Using `'unsafe-inline'` "to make it work"
+
+```
+script-src 'self' 'unsafe-inline'
+```
+
+Now inline scripts run unrestricted. An XSS injection works.
+CSP is defeated.
+
+The right path: nonce or hash inline scripts, refactor to external,
+use `strict-dynamic` with bundled JS.
+
+### Missing `report-to` during rollout
+
+Deploying CSP without reports = you can't see what broke. Set up
+the endpoint first, deploy in report-only, then enforce.
+
+### CSP-Report-Only AND CSP
+
+```http
+Content-Security-Policy: ...
+Content-Security-Policy-Report-Only: ...
+```
+
+Both can be sent. The first enforces; the second just reports. Use
+both to test stricter policies before tightening the enforced one.
+
+### `frame-ancestors 'none'` and login pages
+
+If you embed your login page in a popup iframe (some OAuth flows),
+`frame-ancestors 'none'` blocks it. Whitelist the allowed parent:
+
+```
+frame-ancestors 'self' https://trusted.example.com
+```
+
+### CSP and `iframe sandbox`
+
+```html
+<iframe sandbox src="..."></iframe>
+```
+
+Sandboxed iframes have their own CSP boundary. The parent's CSP
+doesn't apply inside. Set CSP on the iframe's response if you control
+it.
+
+### Browser DevTools CSP errors
+
+A flood of "Refused to execute inline script" errors during dev =
+your dev build has inline scripts the prod build doesn't. Either
+allow them in dev, or fix the build.
+
+### CSP violations from extensions
+
+Browser extensions inject scripts. Many are blocked by CSP and
+report. Filter these out at your reporting endpoint (look for
+`chrome-extension://`, `moz-extension://` source URLs).
+
+## The mental model
+
+CSP is **an allowlist of legitimate sources, enforced by the browser**.
+A strict CSP turns XSS from "execute arbitrary JS" to "useless
+text in the DOM."
+
+The deploy pattern:
+
+1. **Report-only first.** Don't break the site.
+2. **Watch reports** for a week. Fix legitimate violations.
+3. **Switch to enforcing.** Keep reports flowing.
+4. **Tighten over time.** Remove `unsafe-inline`, add `strict-dynamic`.
+
+The right policy for a modern web app in 2026:
+
+```
+default-src 'self';
+script-src 'nonce-X' 'strict-dynamic';
+style-src 'self' 'nonce-X';
+img-src 'self' data: https:;
+connect-src 'self' https://api.example.com;
+frame-ancestors 'none';
+form-action 'self';
+base-uri 'self';
+object-src 'none';
+upgrade-insecure-requests;
+report-to default;
+```
+
+CSP isn't a silver bullet — it doesn't replace input validation,
+output encoding, or auth. But it's the strongest XSS defense the
+platform gives you. Deploy it.

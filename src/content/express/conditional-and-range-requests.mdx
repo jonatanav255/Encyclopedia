@@ -1,0 +1,447 @@
+export const level = 'senior';
+
+# Conditional and Range requests
+
+Two HTTP features that turn naive endpoints into efficient ones:
+
+- **Conditional requests** (`ETag`, `If-None-Match`,
+  `If-Modified-Since`, `Last-Modified`) — return 304 Not Modified
+  when the client already has the current version.
+- **Range requests** (`Range`, `Content-Range`, `Accept-Ranges`) —
+  return only the requested byte range, enabling video scrubbing,
+  download resumption, parallel downloads.
+
+Together they save bandwidth and improve user experience for any
+resource the client might re-request.
+
+## ETags
+
+An **ETag** (Entity Tag) is an opaque identifier for the current
+version of a resource. The server sends one; the client sends it
+back on the next request asking "still the same?"
+
+```http
+HTTP/1.1 200 OK
+ETag: "abc123"
+
+(body)
+```
+
+Next request:
+
+```http
+GET /resource HTTP/1.1
+If-None-Match: "abc123"
+```
+
+If the resource is still version `"abc123"`:
+
+```http
+HTTP/1.1 304 Not Modified
+ETag: "abc123"
+
+(no body)
+```
+
+The body isn't sent. The client uses its cached copy. Bandwidth
+saved.
+
+If it changed:
+
+```http
+HTTP/1.1 200 OK
+ETag: "def456"
+
+(new body)
+```
+
+## Strong vs weak ETags
+
+```
+ETag: "abc123"        ← strong
+ETag: W/"abc123"      ← weak
+```
+
+**Strong** means byte-for-byte identical. Any change — even a
+whitespace tweak — invalidates it.
+
+**Weak** means "semantically equivalent." Two responses with the
+same data but different compression, or different content
+negotiation, can share a weak ETag.
+
+Default Express ETag is **weak** for `res.send()` responses (a
+hash of the body). For static files, `serve-static` uses a strong
+ETag derived from inode + size + mtime.
+
+Use cases:
+
+- **Strong**: precise validation (range requests use strong ETags
+  by spec).
+- **Weak**: cacheable representations that might vary slightly
+  (e.g., compressed vs uncompressed, gzip vs brotli).
+
+## Express ETag
+
+Express enables ETag for `res.send` / `res.json` by default:
+
+```js
+app.set('etag', 'weak');   // default
+app.set('etag', 'strong');
+app.set('etag', false);    // disable
+app.set('etag', (body, encoding) => myEtag(body));   // custom
+```
+
+It works automatically: send a response, Express adds the ETag, the
+next request with `If-None-Match` gets 304 if matched.
+
+### Custom ETag (e.g., from database)
+
+```js
+app.get('/articles/:id', async (req, res) => {
+  const article = await db.articles.findById(req.params.id);
+  const etag = `"${article.updatedAt.getTime()}-${article.id}"`;
+  res.setHeader('ETag', etag);
+
+  if (req.headers['if-none-match'] === etag) {
+    return res.status(304).end();
+  }
+
+  res.json(article);
+});
+```
+
+Using `updatedAt` + `id` as the ETag means the client revalidates
+only when the article changes. Cheap on the server (a quick DB
+lookup), cheap for the client (304 + cached body).
+
+For collections (lists), hash the latest `updatedAt` of any item
+plus the count, or use a per-collection version counter.
+
+## `Last-Modified` / `If-Modified-Since`
+
+The older, time-based alternative:
+
+```http
+HTTP/1.1 200 OK
+Last-Modified: Mon, 20 May 2026 12:00:00 GMT
+
+(body)
+```
+
+```http
+GET /resource HTTP/1.1
+If-Modified-Since: Mon, 20 May 2026 12:00:00 GMT
+```
+
+Server compares. If unchanged, 304. Easier when you already track
+modification time; less precise than ETag (one-second resolution).
+
+ETags are preferred. Last-Modified can be a fallback or used in
+combination.
+
+## Range requests
+
+A client says "give me bytes 1000 through 2000":
+
+```http
+GET /video.mp4 HTTP/1.1
+Range: bytes=1000-2000
+```
+
+Server responds with **206 Partial Content**:
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 1000-2000/8675309
+Content-Length: 1001
+Accept-Ranges: bytes
+
+(bytes 1000 through 2000)
+```
+
+Key headers:
+
+- `Content-Range: bytes <start>-<end>/<total>` — which slice +
+  total size.
+- `Content-Length: 1001` — size of *this slice*, not the whole.
+- `206` status, not `200`.
+
+For "I can do ranges," advertise:
+
+```http
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+```
+
+Clients (video players, downloaders) look for this header to know
+they can resume / scrub.
+
+## Range edge cases
+
+### Out of bounds
+
+```http
+Range: bytes=99999-100000
+```
+
+For a 1000-byte file, this is invalid. Respond:
+
+```http
+HTTP/1.1 416 Range Not Satisfiable
+Content-Range: bytes */1000
+```
+
+`*/<total>` is the special form indicating "no valid range, but here's
+the total size."
+
+### Suffix range
+
+```http
+Range: bytes=-500
+```
+
+"The last 500 bytes." Server returns bytes from `total - 500` to
+`total - 1`.
+
+### Open range
+
+```http
+Range: bytes=1000-
+```
+
+"Everything from 1000 onward." Server returns bytes 1000 to
+`total - 1`.
+
+### Multiple ranges
+
+```http
+Range: bytes=0-499, 1000-1499
+```
+
+The client wants two slices. Server can respond with:
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Type: multipart/byteranges; boundary=THIS_STRING
+
+--THIS_STRING
+Content-Type: <type>
+Content-Range: bytes 0-499/8675309
+
+(bytes 0-499)
+--THIS_STRING
+Content-Type: <type>
+Content-Range: bytes 1000-1499/8675309
+
+(bytes 1000-1499)
+--THIS_STRING--
+```
+
+Most servers don't bother with multipart. `express.static` returns
+the first range only or 416 for multi-range. For real multi-range
+support, write a custom handler.
+
+## Range support in `express.static`
+
+```js
+app.use(express.static('public'));
+```
+
+`express.static` (via `serve-static`) automatically handles range
+requests for files. ETag, Last-Modified, Range, conditional requests
+— all handled. You don't write code.
+
+For custom file serving, use `res.sendFile` which has the same
+support:
+
+```js
+app.get('/download/:id', async (req, res) => {
+  const file = await getFilePath(req.params.id);
+  res.sendFile(file);
+});
+```
+
+For dynamic content (DB-backed, generated, etc.), you implement
+ranges yourself.
+
+## Implementing ranges manually
+
+```js
+import { stat, createReadStream } from 'node:fs';
+import { promisify } from 'node:util';
+
+const fstat = promisify(stat);
+
+app.get('/download/:id', async (req, res) => {
+  const path = await getFilePath(req.params.id);
+  const { size } = await fstat(path);
+  const range = req.headers.range;
+
+  if (!range) {
+    res.setHeader('Content-Length', size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    return createReadStream(path).pipe(res);
+  }
+
+  // Parse "bytes=start-end"
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (!match) return res.sendStatus(416);
+
+  let start = match[1] ? +match[1] : 0;
+  let end = match[2] ? +match[2] : size - 1;
+
+  if (!match[1]) {
+    // suffix range: bytes=-N
+    start = size - end;
+    end = size - 1;
+  }
+
+  if (start >= size || end >= size || start > end) {
+    res.setHeader('Content-Range', `bytes */${size}`);
+    return res.sendStatus(416);
+  }
+
+  res.status(206);
+  res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+  res.setHeader('Content-Length', end - start + 1);
+  res.setHeader('Accept-Ranges', 'bytes');
+  createReadStream(path, { start, end }).pipe(res);
+});
+```
+
+For most apps, `express.static` covers this. The manual form is for
+custom storage backends (S3, GCS — though both support ranges
+themselves) or dynamically-generated content (video chunks, etc.).
+
+## When you need each
+
+### Conditional requests
+
+- **Any API** that serves data clients might cache: `/users/:id`,
+  `/articles/:slug`. Bandwidth savings + faster perceived loads.
+- **Mobile apps** with offline caches: clients re-validate stale
+  caches without re-downloading.
+- **CDN-cached content**: the CDN itself uses ETag to revalidate
+  with origin.
+
+### Range requests
+
+- **Video / audio streaming**: HTML5 `<video>` uses ranges to scrub
+  + buffer.
+- **Large file downloads**: clients can resume after disconnect.
+- **PDF viewers**: jump to page N without downloading earlier pages.
+- **Parallel downloaders** (some download managers split into
+  ranges).
+
+For typical JSON APIs, you mostly need conditional. For media /
+downloads, both.
+
+## Common pitfalls
+
+### Weak ETag for compressed responses
+
+```http
+Content-Encoding: gzip
+ETag: "abc123"        ← strong is misleading
+```
+
+Gzip compression varies (level, library). A strong ETag should
+match exactly; compressed bodies might differ between requests. Use
+weak (`W/"abc123"`) for compressed content. `compression()`
+middleware handles this correctly.
+
+### Comparing ETag with string equality
+
+```js
+if (req.headers['if-none-match'] === etag) ...
+```
+
+Mostly fine, but `If-None-Match` can be a list:
+
+```http
+If-None-Match: "abc123", "def456", "ghi789"
+```
+
+Or `*` (any). Handle these cases for full correctness. `fresh()` (the
+npm module Express uses) does it for you.
+
+### ETag for dynamic content with side effects
+
+```js
+app.get('/api/news', (req, res) => {
+  const news = generateNews();   // expensive computation every time
+  // ETag computed AFTER generation — no work saved
+});
+```
+
+The ETag check happens after Express builds the response. If
+generating the response is expensive, an upstream cache (CDN, Redis)
+saves more than ETag.
+
+For "is this still the same?" upfront, set the ETag in your data
+layer (e.g., a database row's `updatedAt`) and compare *before*
+expensive work:
+
+```js
+app.get('/api/news', async (req, res) => {
+  const meta = await db.query('SELECT updated_at FROM news_meta');
+  const etag = `"${meta.updatedAt.getTime()}"`;
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  // only generate if changed
+  const news = generateNews();
+  res.setHeader('ETag', etag);
+  res.json(news);
+});
+```
+
+### Range without `Accept-Ranges`
+
+Browsers don't try ranges unless `Accept-Ranges: bytes` was
+advertised in a previous response. If you support ranges but don't
+advertise, players might re-download the whole file when they
+should be scrubbing.
+
+### Multi-range madness
+
+Multipart byteranges responses are tricky. Most servers fall back to
+"return the union" or "return 416." Unless you specifically need
+them, don't implement; nobody (other than some specialized clients)
+uses them.
+
+### `If-Modified-Since` and ETag together
+
+Both can be sent. Per spec: ETag check wins if it's present. Don't
+confuse them — either honor both correctly or accept the slight
+inefficiency of ETag-only.
+
+### Caching while logged in
+
+ETag responses on personalized endpoints (`/me`, `/dashboard`) must
+include `Cache-Control: private` and use a per-user ETag (include
+user ID in the hash). Otherwise a shared cache serves user A's
+content to user B.
+
+```http
+Cache-Control: private, must-revalidate
+ETag: "<user-id-hash>"
+```
+
+## The mental model
+
+Conditional requests are **"do I need to download this again?"** —
+the client sends what it has, server replies "no, you're good" (304)
+or "here's new" (200).
+
+Range requests are **"give me just part of this"** — useful for
+large or media files where streaming partial data is the point.
+
+For 2026 Express apps:
+
+- ETag for read-heavy APIs — saves bandwidth, faster perceived
+  loads.
+- Range via `express.static` for static files — free.
+- Manual range only for custom dynamic content (rare).
+
+Both are standard HTTP features that have been around for decades.
+Modern frameworks make them mostly automatic. Knowing how to tune
+them is what makes you not the bottleneck.

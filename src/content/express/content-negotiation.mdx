@@ -1,0 +1,336 @@
+export const level = 'mid';
+
+# Content negotiation
+
+Content negotiation lets a single URL serve different
+representations based on what the client wants — JSON vs HTML, English
+vs French, gzipped vs not. The client expresses preferences via
+`Accept-*` headers; the server picks the best match.
+
+For most APIs that only serve JSON, you barely think about it. The
+moment you serve both API + HTML, or multiple languages, or
+compressed + uncompressed, the mechanics matter.
+
+## `Accept` and `res.format`
+
+```js
+app.get('/users/:id', async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+
+  res.format({
+    'application/json': () => res.json(user),
+    'text/html':        () => res.render('user', { user }),
+    'text/plain':       () => res.send(`${user.name}\n${user.email}`),
+    default:            () => res.status(406).send('Not Acceptable'),
+  });
+});
+```
+
+The client sends `Accept: text/html` or `Accept: application/json`.
+`res.format` picks the matching handler. The `default` runs if no
+declared type matches.
+
+For browsers, the default `Accept` header is often:
+
+```
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+```
+
+The `q=` values weight preferences. HTML preferred; XML acceptable;
+anything as a fallback.
+
+`res.format` parses this and matches highest-priority available.
+
+## `req.accepts`
+
+```js
+const type = req.accepts(['json', 'html', 'text']);
+// type === 'json' or 'html' or 'text' or false
+```
+
+Returns the highest-priority acceptable type that's in the list, or
+`false` if none matches. Useful when you want different logic per
+type without `res.format`'s callback structure.
+
+```js
+const type = req.accepts(['html', 'json']);
+if (type === 'html') return res.render(...);
+if (type === 'json') return res.json(...);
+res.sendStatus(406);
+```
+
+## `Vary` header
+
+When you serve different content based on a request header, **you
+must tell caches** which header to vary on:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Vary: Accept
+
+{"id": 1, "name": "jon"}
+```
+
+Without `Vary: Accept`:
+
+1. Browser A requests with `Accept: application/json`.
+2. Server responds JSON; CDN caches.
+3. Browser B requests with `Accept: text/html`.
+4. CDN returns the cached JSON to Browser B.
+5. Browser B is confused.
+
+`Vary: Accept` tells the CDN: "cache separately per Accept header."
+
+`res.format` doesn't automatically set `Vary` (as of Express 5).
+Add it yourself:
+
+```js
+res.vary('Accept');
+res.format({ ... });
+```
+
+## `Accept-Language`
+
+```http
+Accept-Language: en-US,en;q=0.9,es;q=0.8
+```
+
+User prefers US English, then any English, then Spanish.
+
+```js
+const lang = req.acceptsLanguages(['en', 'es', 'fr']);
+// lang === 'en' if user prefers English
+res.vary('Accept-Language');
+res.json({ message: i18n[lang].greeting });
+```
+
+For real i18n, use a library (`i18next`, `lingui`, `react-intl`).
+The negotiation logic is part of routing; the translation is part of
+rendering.
+
+## `Accept-Encoding` and compression
+
+```http
+Accept-Encoding: gzip, deflate, br
+```
+
+The client accepts gzip, deflate, or brotli compression. The
+`compression` middleware handles this automatically:
+
+```js
+import compression from 'compression';
+
+app.use(compression());
+```
+
+Set `Vary: Accept-Encoding` so caches store one per encoding. The
+middleware does this for you.
+
+For SSE / streaming responses, **disable compression**:
+
+```js
+app.use((req, res, next) => {
+  if (req.url.startsWith('/stream/')) return next();
+  return compression()(req, res, next);
+});
+```
+
+Compression buffers, defeating streaming.
+
+## `Accept-Charset`
+
+Mostly obsolete in 2026 — UTF-8 is everywhere. You'll rarely see
+`Accept-Charset` from real clients.
+
+If you do, the same pattern: `req.acceptsCharsets(['utf-8',
+'iso-8859-1'])`.
+
+## The `q=` weight
+
+```
+Accept: application/json;q=0.9, text/html;q=1.0
+```
+
+Q-values run 0 (not acceptable) to 1 (preferred). 0.9 means "lower
+preference than HTML."
+
+Default if omitted: 1.0.
+
+Two same q-values? First declared wins.
+
+This matters when you check what to serve: pick highest q. `res.format`
+and `req.accepts` handle this.
+
+## `Content-Type` (response)
+
+The server tells the client what was actually returned:
+
+```js
+res.type('application/json');
+res.type('json');          // shortcut — same as above
+res.type('html');
+res.type('xml');
+res.json(obj);             // sets Content-Type: application/json automatically
+```
+
+If your `res.format` handlers don't set `Content-Type`, set it:
+
+```js
+res.format({
+  'application/json': () => {
+    res.type('application/json');
+    res.send(JSON.stringify(user));
+  },
+});
+```
+
+Browsers and APIs both care.
+
+## API versioning via Accept
+
+```
+Accept: application/vnd.example.v2+json
+```
+
+A custom MIME type identifies an API version. The server matches:
+
+```js
+res.format({
+  'application/vnd.example.v1+json': () => res.json(v1Format(user)),
+  'application/vnd.example.v2+json': () => res.json(v2Format(user)),
+  default: () => res.json(v1Format(user)),   // backwards compat
+});
+```
+
+The advantage over URL-based versioning (`/v1/users`): same URL,
+different representations. The disadvantage: harder to test
+(browser URL bars don't easily set custom Accept headers).
+
+Most APIs prefer URL versioning for the ergonomics. Accept-versioning
+is a legitimate but less common choice.
+
+## CORS and content negotiation
+
+```http
+Access-Control-Expose-Headers: Content-Type, Vary
+```
+
+Browsers don't expose all response headers to JS unless allowed.
+Expose `Content-Type` if your client code reads it. Expose `Vary`
+if it matters for client caching.
+
+## Putting it together — a multi-format endpoint
+
+```js
+app.get('/users/:id', async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+  if (!user) return res.sendStatus(404);
+
+  res.vary('Accept');
+
+  res.format({
+    'application/json': () => res.json(user),
+
+    'text/html': () => res.render('user', { user }),
+
+    'text/csv': () => {
+      res.type('text/csv');
+      res.send(`name,email\n${user.name},${user.email}`);
+    },
+
+    default: () => res.sendStatus(406),
+  });
+});
+```
+
+JSON for API clients; HTML for browsers; CSV for the curl-and-pipe
+crowd. Same URL.
+
+In practice, most APIs just serve JSON and use a separate frontend
+that consumes the API. Multi-format on one URL is more common for
+data download endpoints (export as CSV / JSON / XLSX).
+
+## `406 Not Acceptable`
+
+When the client's Accept doesn't match what you can produce:
+
+```http
+HTTP/1.1 406 Not Acceptable
+Content-Type: text/plain
+
+Accept these: application/json, text/html
+```
+
+Per spec, the body should list available representations. In
+practice, a short message is fine.
+
+Express's `res.format` sets 406 via the `default` handler if you
+provide one (or 406 if you don't).
+
+## Common pitfalls
+
+### Forgetting `Vary`
+
+Most common bug. Symptoms: CDN serves the wrong content to half
+your users. Fix: `res.vary('Accept')` (and any other negotiated
+header).
+
+### `res.format` with overlapping types
+
+```js
+res.format({
+  'application/json': () => res.json(a),
+  'application/*':    () => res.json(b),
+});
+```
+
+If the client sends `Accept: application/json`, both match. Express
+picks the most specific (`application/json`). Less specific patterns
+are fallbacks.
+
+### Forgetting that browsers don't always send what you expect
+
+```
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+```
+
+Real-world browser Accept headers are messy. `res.format` and
+`req.accepts` handle the parsing.
+
+### Compression buffering streamed responses
+
+`compression()` buffers. For SSE, file downloads, anything streamed,
+either disable compression or use streaming compression options.
+
+### Content negotiation in API design
+
+If you only serve JSON, don't bother with `res.format`. It adds
+complexity for no benefit. `res.json` is enough.
+
+Content negotiation matters when:
+
+- You serve both API + web pages.
+- You serve data in multiple formats (JSON, CSV, XML).
+- You support multiple API versions via Accept.
+- You serve compressed and uncompressed.
+
+For everything else: `res.json(obj)` and move on.
+
+## The mental model
+
+Content negotiation is **a polite protocol**: client says "I prefer
+these, in this order"; server picks the best match it can produce.
+Caches respect the `Vary` header to store separate copies per
+negotiation axis.
+
+For Express:
+
+- `res.format({ type: fn })` — picks the handler.
+- `req.accepts([...])` — direct query for "what should I serve?".
+- `res.vary('Accept')` — tell caches about it.
+- `compression()` — handles `Accept-Encoding` automatically.
+
+Most APIs only need this for compression and don't think about it.
+Multi-format endpoints need every part. Either way, the mechanics
+are straightforward once you've seen them.

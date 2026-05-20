@@ -1,0 +1,301 @@
+export const level = 'mid';
+
+# Native TypeScript in Node
+
+As of Node 22.6+, you can run `.ts` files **directly** with Node — no
+`ts-node`, no `tsx`, no build step. Two flags do most of it:
+
+- `--experimental-strip-types` (Node 22.6+, default for `.ts` files
+  in 23.6+, stable in 25+) — **erase the type annotations**, run
+  the rest as JavaScript.
+- `--experimental-transform-types` — also transform syntax that
+  requires more than stripping: enums, namespaces, parameter
+  properties, legacy decorators.
+
+```bash
+node --experimental-strip-types src/index.ts
+node src/index.ts                    # in 23.6+, just works
+```
+
+That's it for most apps. No tsconfig needed at runtime; the
+TypeScript compiler is only for type-checking in CI / your editor.
+
+## What "strip types" means
+
+Strip-types looks at the source, removes:
+
+- Type annotations on declarations (`: string`, `: User`).
+- Type-only imports (`import type { Foo } from ...`).
+- Interface declarations (which produce no runtime code anyway).
+- Type assertions (`as X`, `<X>`).
+
+What's left is plain JavaScript. The runtime doesn't *transform*
+anything — just whitespaces over the type bits.
+
+```ts
+function add(a: number, b: number): number {
+  return a + b;
+}
+
+const x: string = 'hi';
+```
+
+becomes:
+
+```js
+function add(a        , b        )         {
+  return a + b;
+}
+
+const x         = 'hi';
+```
+
+(Actually a different representation, but conceptually that.) The
+source map points back to the original `.ts`.
+
+## What strip-types does NOT do
+
+Some TypeScript features need actual code generation, not just
+removal:
+
+- **Enums** — `enum Color { Red, Green }` compiles to a runtime
+  object.
+- **Namespaces** — `namespace Foo { ... }` compiles to an IIFE.
+- **Parameter properties** — `constructor(public name: string)`
+  needs `this.name = name` injected.
+- **Legacy decorators** — the `experimentalDecorators` form, which
+  predates Stage 3 decorators.
+
+For these you need `--experimental-transform-types`. Or, better,
+**avoid them**. Modern TypeScript style increasingly prefers:
+
+- Literal-union types over enums (`type Color = 'red' | 'green'`).
+- Modules over namespaces.
+- Explicit `this.name = name;` over parameter properties.
+- Stage 3 decorators (when they ship in V8) over legacy.
+
+Avoiding these features = strip-only TS, which is faster (no
+transformation step).
+
+## No type checking at runtime
+
+```bash
+node src/index.ts   # runs even if types are broken
+```
+
+Node strips types; it doesn't check them. If you write:
+
+```ts
+const x: number = 'not a number';   // type error
+```
+
+…Node happily runs it. The type checker would complain, but Node
+doesn't run the type checker.
+
+**The discipline:**
+
+- `node --test` runs tests with stripped types.
+- `tsc --noEmit` checks types in CI.
+
+Two separate commands, two separate roles. Don't conflate them.
+
+## Module resolution
+
+Node's TS support uses `--experimental-strip-types` plus its standard
+module resolution. Imports work as in any Node ESM:
+
+```ts
+import { fetchUser } from './users.js';
+```
+
+Note the `.js` extension — even though the source file is
+`users.ts`. Node resolves to `users.ts`, strips types, runs. The
+extension matches what TypeScript would emit if you compiled it.
+
+Some teams prefer `.ts` extensions in imports too — that's the
+**`--experimental-import-from-ts` model** (newer flag). The committee
+hasn't fully settled which wins; both work.
+
+## tsconfig
+
+Native Node TS doesn't read `tsconfig.json` at runtime. The compiler
+does (for `tsc --noEmit`).
+
+A typical setup:
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true        // we don't emit; Node strips
+  }
+}
+```
+
+`noEmit` and `isolatedModules` are key — they tell the compiler "you
+exist for type checking, not for output."
+
+## Performance vs ts-node / tsx
+
+Strip-types is fast because it doesn't do real parsing-with-AST. It
+uses the Swc-based stripping in libnode (or in the embedded
+TypeScript parser, depending on version). No transform pipeline.
+
+For a typical service, `node --import ts-node/esm app.ts` adds
+hundreds of ms of startup. `node app.ts` with native stripping adds
+~10ms. The difference matters for tooling, scripts, and tests.
+
+## When you still need `tsx` / `ts-node`
+
+A few cases:
+
+- **Decorators (legacy `experimentalDecorators`)** — strip-types
+  can't handle them; tsc + tsx still do.
+- **Path aliases** in tsconfig that need runtime resolution. Some
+  projects use `paths` and tsx handles it; Node strip-types doesn't
+  resolve them.
+- **`compilerOptions.target`** lower than what Node natively runs.
+  Strip-types doesn't downlevel; it leaves modern syntax. If you
+  need ES5 output, you still need a real compiler.
+
+For 95% of new code, strip-types is enough.
+
+## Watch mode
+
+```bash
+node --watch --experimental-strip-types src/index.ts
+```
+
+Or just:
+
+```bash
+node --watch src/index.ts
+```
+
+`--watch` restarts on file changes. Combined with native TS, it
+replaces `nodemon + ts-node` as a startup loop.
+
+For tests:
+
+```bash
+node --test --watch
+```
+
+## The bigger picture
+
+The traditional Node + TS stack:
+
+```
+tsc / esbuild / swc / tsx
+  ↓
+generated JS in ./dist
+  ↓
+node ./dist/index.js
+```
+
+Two stages. The build step adds 1–10 seconds. CI has to rebuild
+before testing. Tools fight each other on extensions and module
+resolution.
+
+Native TS collapses this:
+
+```
+node src/index.ts
+```
+
+One stage. The same source file runs in dev, test, and prod.
+Build step *only* for: production bundle optimization (esbuild for
+size), library publishing (you ship JS + .d.ts), or cross-compilation.
+
+For services running on Node directly (not bundled), the build step
+is gone. Big win.
+
+## Common pitfalls
+
+### Forgetting `.js` in imports
+
+```ts
+import { foo } from './foo';        // works in tsx; fails in Node native TS
+import { foo } from './foo.js';     // correct
+```
+
+Native TS follows Node's ESM resolution exactly. Always `.js`.
+
+### Running un-typechecked code in production
+
+Native TS *runs* TS but doesn't *check* it. CI must run `tsc --noEmit`
+as a separate step. Skipping the type check ships type errors.
+
+Common CI shape:
+
+```yaml
+- run: pnpm tsc --noEmit
+- run: pnpm node --test
+- run: pnpm build      # if shipping a bundle
+```
+
+### `tsconfig.json` differences
+
+Strip-types ignores some `tsconfig.json` settings — `target`,
+`emit`-related stuff, jsx. For things the compiler cares about (type
+checking), it reads tsconfig normally.
+
+Pin a tsconfig that's compatible with native:
+
+- `module: "NodeNext"`.
+- `moduleResolution: "NodeNext"`.
+- `verbatimModuleSyntax: true` — forces explicit type imports,
+  required for strip-types.
+
+### Using enums or namespaces "just to see"
+
+If you write `enum`, strip-types refuses. You need
+`--experimental-transform-types` or to rewrite the code. Easiest path
+is to avoid enums entirely.
+
+```ts
+// bad
+enum Role { Admin, User }
+
+// good
+type Role = 'admin' | 'user';
+const Role = { Admin: 'admin', User: 'user' } as const;
+```
+
+## What this means for tooling
+
+Several established tools become optional:
+
+- `ts-node` — replaced by native.
+- `tsx` — replaced by native for most cases.
+- `nodemon` — replaced by `node --watch`.
+- `dotenv` — replaced by `node --env-file=.env`.
+- `nyc` (coverage) — replaced by `node --test --experimental-test-coverage`.
+
+You can still use them. But a "blank" Node 24 project starts simpler
+than ever — `node` and `pnpm` cover most things.
+
+## The mental model
+
+Native TS in Node = **strip the annotations, run the rest as
+JavaScript**. Fast, no config, no build step. Type checking is a
+separate concern handled by `tsc --noEmit`.
+
+For new projects in 2026, this is the default. Skip the build
+pipeline for development. Bundle for production only if you need it
+(size, single-file deploy, edge runtime). Type-check in CI as a
+discrete step.
+
+For libraries you publish, you still build to `dist/` (consumers
+shouldn't run your TS source). For services, the source *is* the
+artifact.

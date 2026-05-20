@@ -208,5 +208,97 @@ export const bank: QuestionBank = {
       answer:
         '**Step 1: surface the implicit boundaries.** Map current files to "modules" (auth, billing, users, search, etc.). One module = one cohesive concern. Don\'t reorganize yet — just label.\n\n**Step 2: introduce a routes-only router per module.** `src/modules/users/router.ts` exports an Express Router. The main app mounts each: `app.use("/users", usersRouter)`. Move the relevant route handlers without changing behavior.\n\n**Step 3: extract the service layer.** For each module, route handlers become thin (parse + validate, call service, return). The service is plain TypeScript — no `req`/`res`. Tests at this layer don\'t need Express.\n\n**Step 4: enforce module boundaries.** Each module exports a public API (`index.ts`). Cross-module imports must go through it. ESLint can enforce: `eslint-plugin-import` with custom rules. Reveals hidden coupling.\n\n**Step 5: own data.** Each module owns its tables. Cross-module data access goes through the module\'s service, not raw SQL. This is the hardest step — touches the DB schema and existing queries.\n\n**Step 6 (optional): extract.** Only once boundaries are clean and proven through code review and ESLint, consider extracting a module to its own service. This is the modular-monolith → microservices transition; it should be a deliberate, justified choice (separate scaling needs, separate team ownership), not a default.\n\n**Throughout**: run all existing tests. Add new tests at the service layer as you extract. The migration is incremental — each step ships independently; no big-bang rewrite.\n\n**Common pitfalls**: trying to extract microservices before modular boundaries are clean (you ship the spaghetti to N services). Modularizing without writing tests (no safety net). Doing it during a feature freeze (correlates with team frustration; do incremental refactor alongside features).',
     },
+
+    // --- additions for new topics ---
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why must `Idempotency-Key` come from the client, not the server?',
+      answer:
+        'The whole point is for the client to **identify retries of the same logical operation**. If the server generates the key, it\'s different per request → all retries look like new operations → idempotency disabled. The client generates a UUID per logical call and reuses it on retry (typically with exponential backoff). Server stores `{ key → response }` for ~24 hours and replays the same response on key reuse.',
+    },
+    {
+      level: 'mid',
+      question: 'What does `res.format` do and when do you need `Vary: Accept`?',
+      answer:
+        '`res.format({ "application/json": fn, "text/html": fn })` picks a handler based on the request\'s `Accept` header — same URL, different representation. **Critical**: set `res.vary("Accept")` so intermediate caches (CDN, browser) store separate copies per Accept value. Without `Vary`, a CDN can serve cached JSON to a browser expecting HTML.',
+    },
+    {
+      level: 'mid',
+      question: 'Why disable compression for SSE routes?',
+      answer:
+        '`compression()` buffers data before emitting compressed chunks — defeating streaming. SSE clients see events arriving in clumps seconds after the server sent them. Either skip compression for `/stream/*` routes via the middleware\'s `filter` option, or wrap conditionally: `if (req.url.startsWith("/stream")) next(); else compression()(req, res, next);`. Same applies to file downloads where streaming matters.',
+    },
+    {
+      level: 'mid',
+      question: 'In Express 5, you can delete `express-async-errors`. Why?',
+      answer:
+        'Express 5 awaits returned promises from handlers and forwards rejections to error middleware automatically. The `asyncHandler(fn)` wrapper pattern and the `express-async-errors` patch are no longer needed. Just `async (req, res) => { throw new Error(...) }` works. One caveat: if you\'ve already written response bytes (`res.write`), errors can\'t change status — check `res.headersSent` in your error handler.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s the right `Cache-Control` for static assets vs `index.html` in a SPA?',
+      answer:
+        '**Hashed assets** (`app.abc123.js`): `Cache-Control: public, max-age=31536000, immutable` — cache forever; the hash changes when the file does. Use `express.static("dist", { maxAge: "1y", immutable: true })`.\n\n**`index.html` and SPA fallback**: `Cache-Control: no-cache, no-store, must-revalidate`. If index.html is cached and you deploy a new asset hash, the browser keeps requesting the old hash → 404. Serve index.html via a separate handler with `maxAge: 0`.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'You\'re receiving Stripe webhooks. Walk through the verification.',
+      answer:
+        '1. **Use `express.raw({ type: "*/*" })`** on this route, NOT `express.json()` — the signature is over raw bytes; JSON parsing reformats them.\n\n2. **Parse `Stripe-Signature`**: `t=<timestamp>,v1=<hex>`.\n\n3. **Timestamp check**: reject if `|now - t|` > 300 seconds (replay defense).\n\n4. **Recompute HMAC** over `\`${t}.${rawBody}\`` with the webhook secret using SHA-256.\n\n5. **Length-check** the expected vs received buffers before `crypto.timingSafeEqual` — it throws on length mismatch.\n\n6. **`timingSafeEqual`**, not `===`. Constant-time defeats timing attacks.\n\n7. Only after verification, `JSON.parse` the body.\n\n8. **Queue for async processing**; respond 200 within a few seconds. Use idempotency on `event.id` so retries don\'t double-process.',
+    },
+    {
+      level: 'senior',
+      question: 'What does `app.set("trust proxy", true)` do, and why is it dangerous?',
+      answer:
+        '`trust proxy: true` makes Express trust **every entry** in `X-Forwarded-For` / `X-Forwarded-Proto`. Behind a multi-hop chain you don\'t fully control, an attacker can send `X-Forwarded-For: <spoofed-ip>` and `req.ip` reports the spoofed value — bypassing IP-based rate limits, corrupting audit logs.\n\nUse the **narrowest correct value**: `trust proxy: 1` for "behind exactly one proxy I own" (typical ALB), `trust proxy: 2` for "Cloudflare → ALB → Node," or a specific IP/CIDR list. Verify with a debug endpoint that echoes `req.ip` from outside.',
+    },
+    {
+      level: 'senior',
+      question: 'When would you choose SSE over WebSockets?',
+      answer:
+        'When the data flow is **server → client only** (notifications, AI streaming, live feeds, progress bars). SSE is plain HTTP — auto-reconnect via `EventSource`, works through every CDN and proxy, simpler to operate. WebSockets give you bidirectional + binary, at the cost of upgrade negotiation, custom proxy support, manual reconnect. For 2026, SSE is the default for one-way push; WebSockets when the client also frequently sends messages (chat, multiplayer).',
+    },
+    {
+      level: 'senior',
+      question: 'Walk through Express 5\'s `path-to-regexp` v8 breakages.',
+      answer:
+        'Three big changes: (1) Bare `*` wildcards are gone — use **named** wildcards: `/files/*splat` (`req.params.splat`). (2) Optional segments use **braces**: `/users{/:id}` (matches `/users` or `/users/42`), not `/users/:id?`. (3) Reserved chars (`(`, `)`, `[`, `]`, `?`, `+`, `!`, `{`, `}`) need escaping (`\\\\(...)`).\n\nThe silent breakage isn\'t 404s — it\'s routes that **throw at registration time** with cryptic messages like "Missing parameter name." Caught on first test run after upgrade. Playbook: grep route strings for `*`, `?`, and parens; rewrite each.',
+    },
+    {
+      level: 'senior',
+      question: 'How do you propagate AbortSignal from an Express request to downstream work?',
+      answer:
+        'Express doesn\'t attach `req.signal` automatically (that\'s a Fastify/Hono pattern). Add a middleware: `const ac = new AbortController(); req.on("close", () => ac.abort()); req.signal = ac.signal;`. Then handlers pass `req.signal` to `fetch`, DB queries, anything that accepts a signal. When the client disconnects, the signal fires and downstream work aborts — saving CPU and DB load on doomed requests. Compose timeouts: `AbortSignal.any([req.signal, AbortSignal.timeout(10_000)])`.',
+    },
+    {
+      level: 'senior',
+      question: 'A mounted sub-router\'s handler reads `req.params.tenantId` and gets undefined. Why?',
+      answer:
+        '`req.params` is scoped to the router that matched the route. A sub-router created with default `Router()` doesn\'t see params from its parent\'s mount path. Fix: `Router({ mergeParams: true })`. Now `app.use("/tenants/:tenantId", tenantRouter)` propagates `tenantId` into the sub-router\'s `req.params`. Standard pattern for multi-tenant routing.',
+    },
+    {
+      level: 'senior',
+      question: 'How do you deploy CSP without breaking the site?',
+      answer:
+        '**Report-only first.** Set `Content-Security-Policy-Report-Only: <target-policy>` plus `Reporting-Endpoints`. Browsers send violation reports without enforcing. Watch reports for a week; fix legitimate violations: nonce inline scripts (modern CSS-in-JS supports this), move inline event handlers to `addEventListener`, add legitimate third-party origins to `script-src`. Once reports are clean, switch to `Content-Security-Policy` (enforcing). Use `strict-dynamic` + per-request nonces for modern bundlers; avoid `unsafe-inline`/`unsafe-eval`.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a graceful shutdown for an Express service on Kubernetes with WebSocket connections.',
+      answer:
+        '**1. Readiness probe flips on SIGTERM** → 503. Wait 5-10s for k8s to remove the pod from the Service\'s endpoints.\n\n**2. Notify WebSocket clients** via a `server_shutdown` event so they reconnect to another pod. Wait ~2s.\n\n**3. Close WebSockets with code 1001 (going away).** Hard `terminate()` after 10s for stragglers.\n\n**4. Stop accepting HTTP**: `server.close()`. **Close idle keep-alive** with `server.closeIdleConnections()` (Node 18.2+).\n\n**5. Drain in-flight HTTP** via a tracked `Set<res>`. Wait up to 25s.\n\n**6. Force-close stragglers**: `server.closeAllConnections()`.\n\n**7. Close downstream**: DB pool, Redis, queues — in that order, server first so handlers can write final responses.\n\n**8. Hard timeout**: `setTimeout(() => process.exit(1), 60_000).unref()` as last resort.\n\nK8s side: `terminationGracePeriodSeconds` matched to drain time + buffer (60s typical). Readiness `periodSeconds: 5, failureThreshold: 1` so the LB notices fast. Customers see zero disruption during normal deploys.',
+    },
+    {
+      level: 'staff',
+      question: 'Compare Express, Fastify, and Hono as a tech-lead picking for a new service.',
+      answer:
+        '**Throughput is rarely the answer.** A typical request spends < 5% of its time in framework code; DB and downstream calls dominate.\n\n**Express**: ubiquitous, every tutorial assumes it, LLMs generate solid code for it. Express 5 fixed the async-error pain. Massive middleware ecosystem. Pick for teams with Node history, fast onboarding, no exotic requirements.\n\n**Fastify**: JSON schema-based validation + serialization — schema is the contract. Faster output serialization (avoids JSON.stringify reflection). Plugin model with encapsulation. Pick for greenfield teams who want validation-as-architecture.\n\n**Hono**: multi-runtime — same code on Node, Bun, Deno, Cloudflare Workers, Vercel Edge. TypeScript-first with template-literal-typed route params. Tiny core. Pick for edge deployments or full TS-derived routing types.\n\n**Honorable mentions**: tRPC layers type-safe RPC on top of any. NestJS for enterprise structure (DI, decorators, modules) — heavier but standardizes large codebases.\n\n**Honest call**: existing Express → upgrade to v5, stay. Greenfield → Fastify is a defensible default. Need edge → Hono. Pick once, optimize the codebase under it.',
+    },
   ],
 };

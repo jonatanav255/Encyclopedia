@@ -1,0 +1,247 @@
+export const level = 'staff';
+
+# libuv thread pool
+
+Node's "single-threaded event loop" actually has a **thread pool**
+underneath, provided by libuv. A handful of OS threads handle
+blocking operations — filesystem, DNS, crypto, compression —
+on behalf of your JavaScript code.
+
+The default pool size is **4 threads**. That's the magic number
+behind many production performance mysteries.
+
+## What uses the thread pool
+
+- **Filesystem operations**: `fs.readFile`, `fs.writeFile`, `fs.stat`,
+  etc. — and all their sync counterparts when they exist.
+- **DNS lookups via `dns.lookup`** (uses libuv → thread pool).
+- **Crypto** that's CPU-bound: `crypto.pbkdf2`, `crypto.scrypt`,
+  `bcrypt` (via native binding), `argon2`, hashing large data.
+- **`zlib`**: compression / decompression.
+
+What **doesn't** use the thread pool:
+
+- **`net` / TCP**: epoll/kqueue/IOCP directly — no thread pool.
+- **`http` / HTTPS server**: built on `net`, no thread pool.
+- **`dns.resolve`**: uses c-ares, async, no thread pool.
+
+This split is the key: I/O-bound network workloads barely touch the
+pool. Filesystem-heavy or crypto-heavy workloads live on it.
+
+## The bug everyone hits
+
+```js
+app.post('/login', async (req, res) => {
+  const ok = await bcrypt.compare(password, user.hash);   // pool thread
+  // ...
+});
+```
+
+`bcrypt.compare` takes ~200-300ms on a default cost factor 12. It
+runs on a thread pool thread. With pool size 4:
+
+- 4 concurrent login attempts use all 4 threads.
+- Login 5 waits in the pool queue.
+- During the wait, **other endpoints that need the pool**
+  (file reads, DNS, gzip) also wait.
+
+Symptom: login latency is fine until concurrency hits ~5; then it
+balloons. *And* unrelated endpoints get slow at the same time.
+
+## The fix
+
+```bash
+UV_THREADPOOL_SIZE=16 node app.js
+```
+
+Or in code (before any other module loads):
+
+```js
+process.env.UV_THREADPOOL_SIZE = '16';
+```
+
+(Setting it from JS *might* be too late; safer in the launch
+command.)
+
+The pool size can be 1 to 1024. A rule of thumb: **pool size =
+number of CPU cores × 2 to 4** for crypto-heavy workloads.
+
+`UV_THREADPOOL_SIZE` is one of the most important Node tuning knobs.
+Most teams never touch it.
+
+## Diagnosing pool exhaustion
+
+The symptom: event-loop lag is *low* (loop is idle) but request
+latency is high. The loop has nothing to do; it's waiting on the
+pool.
+
+Use `perf_hooks.monitorEventLoopDelay` for the loop side. For pool
+saturation, you'd track `libuv:eio` work queue depth — but that's
+not directly exposed. Indirect signals:
+
+- Login / crypto endpoint latency p99 > 1s under load.
+- `fs.readFile` calls hanging.
+- `dns.lookup` slow.
+- All happen *together* under load.
+
+If you see these correlated, pool exhaustion is the likely culprit.
+
+## DNS specifically
+
+`dns.lookup(hostname, callback)` is the most-used DNS API. It calls
+`getaddrinfo` (a synchronous OS call) on a pool thread. A slow DNS
+server holds a pool thread for the full timeout (often 5–30s).
+
+The result: one slow DNS server can hold up to 4 of your pool
+threads. Add a few `fs.readFile` calls and a `bcrypt.hash`, and the
+pool is gone.
+
+Mitigations:
+
+- Use `dns.resolve` (c-ares, async, no pool). API: `dns.resolve4`,
+  `dns.resolve6`, etc. Slightly different semantics; resolves
+  records but doesn't honor `/etc/hosts`.
+- Cache DNS with `cacheable-lookup`.
+- Bump `UV_THREADPOOL_SIZE`.
+
+Modern undici defaults to using c-ares-style DNS, sidestepping the
+pool. If you're using global `fetch`, this is mostly handled.
+
+## Crypto specifically
+
+The CPU-bound crypto operations: `pbkdf2`, `scrypt`, `argon2`,
+`bcrypt`. They take meaningful time (≥100ms) and tie up a pool
+thread for the duration.
+
+For login services, the math is brutal:
+
+- Cost factor 12 bcrypt: ~250ms per hash.
+- Pool size 4.
+- Max ~16 logins/sec before queueing.
+
+For higher concurrency:
+
+- Bump `UV_THREADPOOL_SIZE`. Easy.
+- Move to a worker pool with `piscina`. Workers don't share the
+  libuv pool.
+- Use a lower cost factor (be aware of security trade-off).
+- Pre-compute hashes for static credentials (irrelevant for user
+  passwords).
+
+## Worker threads vs thread pool
+
+The libuv thread pool is **not** the same as `worker_threads`. They're
+separate concepts:
+
+| | libuv pool | worker_threads |
+| --- | --- | --- |
+| Where | inside one Node process | separate V8 isolates |
+| Runs | C++ work (fs, dns, crypto, zlib) | JavaScript |
+| Size | `UV_THREADPOOL_SIZE` | you spawn them |
+| Sharing | implicit (all async fs uses it) | explicit (`postMessage`) |
+
+For CPU-bound JS, use `worker_threads`. For blocking C-level work
+(fs, dns, crypto, zlib), tune the libuv pool.
+
+## What's safe to run on the pool
+
+Everything Node's built-in async APIs do is pool-safe. The thing to
+worry about is **how many concurrent pool calls you have**.
+
+A handler that does:
+
+1. `fs.readFile` on a config.
+2. `bcrypt.compare` on a password.
+3. `zlib.gunzip` on a payload.
+
+…uses 3 pool threads sequentially. If 4 concurrent requests do the
+same, that's 12 thread-slots-needed over the request lifetime
+against a 4-thread pool. Latency builds.
+
+## Numbers to know
+
+```
+Default pool size:         4
+Container with 2 CPUs:     pool size stays 4 (libuv doesn't auto-scale)
+Container with 16 CPUs:    pool size stays 4 — almost always wrong
+```
+
+Yes — even on a 32-core box, libuv defaults to 4. You almost always
+want to bump.
+
+For pure HTTP + Postgres workloads (no fs, no crypto, no DNS-lookup
+spam), 4 is fine. Anything else, raise it.
+
+## Common pitfalls
+
+### Setting it too late
+
+```js
+// app.js
+import { readFile } from 'node:fs/promises';   // libuv pool initialized HERE
+process.env.UV_THREADPOOL_SIZE = '16';          // too late
+```
+
+`UV_THREADPOOL_SIZE` is read **once**, when libuv initializes — which
+happens before your first line of JS runs. Set it via the launch
+command or in a wrapper script.
+
+The exception: setting before any built-in module loads works. But
+the safest pattern is the launch flag.
+
+### Tuning it without measuring
+
+Bumping to 1024 doesn't help if your workload doesn't use the pool.
+Each thread costs memory (~8MB stack on Linux) and OS overhead.
+
+Profile first. If you don't have fs/dns/crypto/zlib pressure, leave
+it at 4.
+
+### Confusing pool size with CPU count
+
+The pool is for **blocking I/O** within libuv. It's bounded by
+context-switching overhead, not CPUs. A 64-thread pool on a 4-core
+box is fine if those threads are mostly waiting for the disk.
+
+### Forgetting `bcrypt` vs `bcryptjs`
+
+`bcrypt` (native) uses the pool. `bcryptjs` (pure JS) runs on the
+main thread and blocks the event loop *directly*. `bcryptjs` is
+strictly worse for servers. Always use `bcrypt` or `argon2`.
+
+### Logging that hits disk a lot
+
+Heavy `console.log` (which is sync on Linux for TTYs but async for
+pipes) plus `pino` to a file uses the pool. For high-throughput
+services, log via `pino-transport` to a separate worker thread, or
+use a transport that writes async.
+
+## Monitoring
+
+There's no first-class metric for "pool depth," but indirect:
+
+- p99 latency of crypto / fs endpoints.
+- Difference between event-loop lag (low) and request latency
+  (high).
+- `--prof` and look for time spent in `uv_run` waiting for work.
+
+For now, instrument your hot fs/crypto code paths with latency
+metrics and watch.
+
+## The mental model
+
+The libuv thread pool is **a hidden 4-thread queue** behind every
+async fs, dns.lookup, crypto, and zlib call. It's sized for
+"reasonable defaults from 2010" and almost always wrong for production
+backends in 2026.
+
+Tune `UV_THREADPOOL_SIZE` for any service doing:
+
+- Authentication with password hashing.
+- File reads / writes per request.
+- Image / data processing (decompression).
+- Reverse-DNS or hostname lookups.
+
+The right size is empirical — start with `2 × CPU cores`, observe,
+adjust. The cost of underestimating is "everything slow under load"
+ticket that takes months to track down.

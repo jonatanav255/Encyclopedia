@@ -1,0 +1,289 @@
+export const level = 'mid';
+
+# `node:sqlite`
+
+Node ships a built-in SQLite client. Stable in Node 22 LTS+. Removes
+the `better-sqlite3` / `sqlite3` dependency for many use cases — CLI
+tools, edge functions, tests, embedded queues, local dev caches.
+
+```js
+import { DatabaseSync } from 'node:sqlite';
+
+const db = new DatabaseSync('./app.db');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);
+`);
+
+const insert = db.prepare('INSERT INTO users (name) VALUES (?)');
+insert.run('jon');
+
+const select = db.prepare('SELECT * FROM users WHERE id = ?');
+const user = select.get(1);
+console.log(user);    // { id: 1, name: 'jon' }
+```
+
+That's the entire API surface for basic CRUD.
+
+## Why it's useful
+
+- **Zero deps**. No `npm install`. Important for distroless or edge
+  runtimes.
+- **Single-file persistence**. `./app.db` is the whole database.
+  Copy, move, version-control if small.
+- **No network**. Connection is a file descriptor; no port
+  contention; no Docker / docker-compose to start.
+- **Fast**. WAL mode + memory caching makes it perform competitively
+  with PG for single-process workloads.
+
+It's also synchronous, which is the headline trade-off.
+
+## Synchronous = both feature and gotcha
+
+```js
+const user = db.prepare('SELECT * FROM users WHERE id = ?').get(1);
+```
+
+This call **blocks** until SQLite returns. There's no `await`. Pros:
+
+- Simpler code. `try/catch` works. No promise chains.
+- Better performance for single-statement queries (no event loop
+  hop).
+
+Cons:
+
+- **Blocks the event loop.** A slow query stalls all other requests.
+  For a request handler, this is a problem.
+
+For sync-blocking SQLite in a Node service:
+
+- **OK**: fast queries (sub-millisecond, indexed lookups). The
+  block is shorter than an HTTP write latency.
+- **Bad**: full-table scans, complex joins, write contention. These
+  could block for seconds.
+
+Run heavy queries on a worker thread:
+
+```js
+import { Worker } from 'node:worker_threads';
+
+const worker = new Worker('./sqlite-worker.js');
+worker.postMessage({ type: 'query', sql, params });
+worker.on('message', (result) => ...);
+```
+
+The worker has its own event loop. Sync DB calls there don't block
+the main thread.
+
+## API
+
+```js
+import { DatabaseSync } from 'node:sqlite';
+
+const db = new DatabaseSync(filename, options);
+```
+
+Options:
+
+- `readOnly: false`
+- `enableForeignKeyConstraints: true`
+- `enableDoubleQuotedStringLiterals: false` (recommended)
+- `open: true` (open immediately)
+
+Methods:
+
+```js
+db.exec(sql);                    // multi-statement SQL, no params
+const stmt = db.prepare(sql);    // prepared statement
+stmt.run(params);                // returns { changes, lastInsertRowid }
+stmt.get(params);                // first row or undefined
+stmt.all(params);                // all rows as array
+stmt.iterate(params);            // returns an iterator
+db.close();
+```
+
+Parameters bind positionally (`?`) or by name (`:name`, `@name`,
+`$name`):
+
+```js
+db.prepare('SELECT * FROM users WHERE id = ? AND active = ?').get(42, 1);
+db.prepare('SELECT * FROM users WHERE name = :name').get({ name: 'jon' });
+```
+
+## Transactions
+
+```js
+const tx = db.transaction((users) => {
+  const stmt = db.prepare('INSERT INTO users (name) VALUES (?)');
+  for (const u of users) stmt.run(u);
+});
+
+tx([{ name: 'a' }, { name: 'b' }, { name: 'c' }]);
+// All three inserts are atomic. Rollback on throw.
+```
+
+`db.transaction(fn)` returns a wrapper that BEGINs, runs `fn`, and
+COMMITs (or ROLLBACK on throw). The same API as `better-sqlite3`.
+
+For nested transactions, use savepoints (SQLite's mechanism for
+nested aborts within a single transaction).
+
+## WAL mode
+
+```js
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA synchronous = NORMAL');
+```
+
+WAL (Write-Ahead Logging) mode:
+
+- **Concurrent reads + one writer.** Multiple processes can read while
+  one writes.
+- **Faster writes.** Less fsync overhead.
+- **Larger working set.** WAL file grows; checkpoints flush it.
+
+For most use cases, turn it on at startup. WAL is the difference
+between SQLite being a "single-user toy" and a "real production DB for
+concurrent-read workloads."
+
+`synchronous = NORMAL` trades slight durability for speed. The OS
+ensures writes hit disk before the next transaction; a power loss
+might lose the last second of writes but won't corrupt the DB.
+`synchronous = FULL` is paranoid; `OFF` is reckless.
+
+## When `node:sqlite` is enough
+
+- **CLI tools** with local state.
+- **Build tools** caching artifacts.
+- **Edge functions** with read-mostly data shipped alongside code.
+- **Tests** — bring up SQLite in-memory (`':memory:'`) for fast,
+  isolated test data.
+- **Embedded job queues** for a single-process server.
+- **Local caches** for read-through patterns.
+
+The breakpoint is **concurrent writes from multiple processes**. SQLite
+serializes writes via file locking; a high-write multi-process
+workload bottlenecks. Postgres or a real DB wins.
+
+## When `better-sqlite3` is still better
+
+`better-sqlite3` is a long-standing native binding. It:
+
+- Sometimes faster (smaller overhead per call).
+- Has more API features (custom functions, hooks, blob streaming
+  API).
+- Mature ecosystem of extensions (full-text search via FTS5 helpers).
+
+`node:sqlite` is catching up. For new code in 2026, prefer
+`node:sqlite` unless you specifically need a feature it lacks.
+Migrating later is cheap — both APIs are similar.
+
+## Comparison with Postgres / MySQL
+
+| | SQLite | Postgres |
+| --- | --- | --- |
+| Concurrency | one writer, many readers | many writers |
+| Setup | file | server + client |
+| Network | none | TCP |
+| Replication | manual (copy file) | streaming, logical |
+| Types | dynamic (TEXT/INTEGER/REAL/BLOB) | strict |
+| Indexes | B-tree, FTS, R-tree | B-tree, GIN, GiST, BRIN |
+| Concurrent writes | serialized | row-locked |
+| Tools | sqlite3 CLI | psql, pgAdmin |
+
+SQLite for embedded / local / single-process. Postgres for production
+backends. Don't try to make SQLite a Postgres replacement; it isn't.
+
+## Common pitfalls
+
+### Sync DB in request handlers
+
+```js
+app.get('/users/:id', (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  res.json(user);
+});
+```
+
+For fast queries on an indexed primary key, this is fine. For slow
+queries or write-heavy endpoints, it blocks the event loop.
+
+Test under load. If event-loop lag spikes, move DB calls to a worker.
+
+### Forgetting WAL mode
+
+Without `PRAGMA journal_mode = WAL`, the default is `DELETE` mode —
+no concurrent readers during writes. Reads block, writes block.
+Turn on WAL at startup.
+
+### Not closing the DB
+
+```js
+const db = new DatabaseSync('./app.db');
+// process exits without db.close()
+```
+
+SQLite is generally fine with this — the OS closes the file. But the
+WAL file isn't checkpointed; you can leave a `-wal` file lingering.
+Add a SIGTERM handler that calls `db.close()`.
+
+### Storing large blobs
+
+SQLite handles blobs up to ~1GB per column, but reading/writing them
+blocks. For media or large attachments, write to disk or object
+storage and store paths in SQLite.
+
+### Treating SQLite as concurrent-write OLAP
+
+```js
+// 10 worker processes all hammering INSERT on the same DB
+```
+
+Workers serialize on the file lock. Throughput collapses. Use a real
+DB or change the pattern (single-writer process + queue).
+
+### Sync calls on the main thread for production HTTP
+
+Production rule: **either everything blocks (read-mostly, sub-ms
+queries) or push to a worker.** Don't mix sync DB with high
+concurrency.
+
+## Migrations
+
+`node:sqlite` doesn't have a migration system. Roll your own or use
+a library:
+
+```js
+const { user_version: version } = db.prepare('PRAGMA user_version').get();
+if (version === 0) {
+  db.exec(`CREATE TABLE users (...); PRAGMA user_version = 1;`);
+}
+if (version <= 1) {
+  db.exec(`ALTER TABLE users ADD COLUMN created_at TEXT; PRAGMA user_version = 2;`);
+}
+```
+
+`PRAGMA user_version` returns a row like `{ user_version: 0 }`, not
+a raw number — destructure to get the integer.
+
+`user_version` is SQLite's built-in schema version pragma. Walk
+through versions on startup.
+
+For more, `kysely`, `drizzle`, and `umzug` all support SQLite.
+
+## The mental model
+
+`node:sqlite` is **a real database in a file, sync, no deps**. It's
+the right choice for:
+
+- Single-process tools, scripts, tests, edge.
+- Read-mostly local caches.
+- Anywhere "install a DB server" is too much overhead.
+
+It's not a Postgres replacement for production backends. The sync API
+is its superpower in scripts (no async boilerplate) and its trap in
+servers (event loop blocking).
+
+For 2026 Node tooling, replacing `better-sqlite3` with `node:sqlite`
+is usually a one-import-rename change. Worth doing for the dep
+reduction.

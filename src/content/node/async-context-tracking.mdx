@@ -1,0 +1,323 @@
+export const level = 'senior';
+
+# AsyncLocalStorage and request-scoped context
+
+`AsyncLocalStorage` (ALS) is Node's primitive for "thread-local storage
+without threads." A value stored inside an async call chain is
+reachable by any function in that chain — without passing it through
+every function signature.
+
+It's how you carry request IDs, user IDs, tenant IDs, trace contexts
+through deep stacks of middleware, service calls, and database
+queries without polluting every function.
+
+## The basics
+
+```js
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const store = new AsyncLocalStorage();
+
+app.use((req, res, next) => {
+  store.run({ requestId: crypto.randomUUID(), userId: req.user?.id }, () => {
+    next();
+  });
+});
+
+// Anywhere downstream
+function logQuery(sql) {
+  const ctx = store.getStore();
+  console.log({ requestId: ctx?.requestId, sql });
+}
+```
+
+`store.run(value, fn)` calls `fn` with `value` available via
+`store.getStore()` for the entire async tree rooted at that call —
+across `await`, `setTimeout`, promise chains, event emitters
+(mostly), everything.
+
+## Why it exists
+
+The wrong solution is "pass `req` to every function":
+
+```js
+async function getUser(req, id) { ... }
+async function getUserPosts(req, id) { ... }
+async function logQuery(req, sql) { ... }
+```
+
+This pollutes every function signature with `req` just so logging or
+tracing can grab the request ID. ALS removes that need.
+
+The other wrong solution is a module-level mutable variable
+(`currentRequestId`), which breaks the moment two requests overlap.
+
+ALS gives each request its own implicit context, scoped to its async
+tree.
+
+## Patterns
+
+### Request-scoped context for Express
+
+```js
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+export const ctx = new AsyncLocalStorage();
+
+export function ctxMiddleware(req, res, next) {
+  ctx.run({
+    requestId: req.headers['x-request-id'] ?? crypto.randomUUID(),
+    userId: undefined,            // set by auth middleware
+    startedAt: process.hrtime.bigint(),
+  }, () => next());
+}
+```
+
+```js
+// In an auth middleware later:
+function authMiddleware(req, res, next) {
+  const store = ctx.getStore();
+  if (store) store.userId = req.user?.id;
+  next();
+}
+
+// In a logger anywhere:
+function log(level, msg, extra = {}) {
+  const store = ctx.getStore() ?? {};
+  pino.child({ requestId: store.requestId, userId: store.userId })[level](msg, extra);
+}
+```
+
+The middleware sets the store once; any code reachable from the
+request can read or update it without prop drilling.
+
+### Tracing context
+
+OpenTelemetry's Node SDK uses ALS under the hood to track the
+"current span." When you instrument a function, OTel calls
+`store.getStore()` to find the active span and attach DB queries /
+HTTP calls as child spans.
+
+You don't usually touch ALS directly with OTel — the SDK manages it.
+But knowing it's there explains why instrumentation "just works"
+across async boundaries.
+
+### Multi-tenant data isolation
+
+```js
+const tenant = new AsyncLocalStorage();
+
+app.use((req, res, next) => {
+  tenant.run({ id: req.tenant.id }, () => next());
+});
+
+function db() {
+  const t = tenant.getStore();
+  return basePool.connect({ schema: t.id });
+}
+```
+
+Every database call respects the current tenant without passing
+`tenantId` through every function.
+
+## How it survives `await`
+
+```js
+await fetch(...);                 // ALS context still here
+await new Promise(r => setTimeout(r, 1000));  // still here
+emitter.emit('foo');              // still here (in most cases)
+process.nextTick(() => ...);      // still here
+setImmediate(() => ...);          // still here
+```
+
+Node's async primitives are instrumented to propagate ALS context
+across yields. The propagation is at the Node level, not the
+language level — so this works without you doing anything.
+
+## Where it breaks (or used to)
+
+### Old EventEmitter listeners
+
+Listeners registered *before* `als.run(...)` may not see the right
+context. Modern Node (16+) handles this for most built-ins, but
+custom emitters can lose context if you cache callbacks across
+contexts.
+
+`asyncResource.bind(fn)` patches a callback so it captures the current
+context at bind time and restores it when called:
+
+```js
+import { AsyncResource } from 'node:async_hooks';
+
+const bound = AsyncResource.bind(() => {
+  const c = store.getStore();
+  console.log(c?.requestId);
+});
+```
+
+Useful when you queue a callback into a long-lived emitter or a
+worker pool.
+
+### Streams and pipes
+
+Reading from a stream pulls data without re-entering the original
+async chain. ALS context is preserved for the *handler* but might be
+lost in `'data'` listeners attached outside `als.run`.
+
+Same fix: `AsyncResource.bind` the listener.
+
+### Worker threads
+
+ALS doesn't cross worker thread boundaries. A worker has its own
+event loop, its own ALS instances. Send context explicitly via
+`postMessage` if you need it on the other side.
+
+## Performance
+
+The early implementations of ALS (via `async_hooks.createHook`) had
+non-trivial overhead — every async operation took an extra hop.
+
+Modern Node uses a fast path that's effectively free for the common
+case. Pino's [docs](https://getpino.io) and benchmarks show ALS-based
+context adding < 1% overhead in realistic loads.
+
+There's no longer a performance reason to avoid ALS for request
+context. The old advice "avoid async_hooks for performance" is
+outdated.
+
+## `enterWith` vs `run`
+
+`store.enterWith(value)` sets the current store without nesting — it
+mutates the active context for the current async chain. Useful when
+you want to set context once at the start of a handler and not pay
+for an extra closure indentation:
+
+```js
+function ctxMiddleware(req, res, next) {
+  ctx.enterWith({ requestId: '...' });
+  next();
+}
+```
+
+`run(value, fn)` is the safer default — context is scoped to `fn`
+and reverts automatically. `enterWith` persists for the rest of the
+current async chain; if you set it in middleware, it sticks through
+the handler.
+
+Most code is fine with `run`; reach for `enterWith` only when nesting
+is awkward.
+
+## `async_hooks.createHook` is effectively deprecated
+
+The old API:
+
+```js
+import { createHook } from 'node:async_hooks';
+
+createHook({
+  init(asyncId, type, triggerAsyncId) { ... },
+  before(asyncId) { ... },
+  after(asyncId) { ... },
+  destroy(asyncId) { ... },
+}).enable();
+```
+
+Don't use this for application code. It was the predecessor to ALS
+and has significant performance overhead. Reach for it only when
+building tools (instrumentation libraries, profilers).
+
+For "tell me which async ops are happening," use
+`diagnostics_channel` instead — see **Diagnostics channel**.
+
+## Real-world setup
+
+A typical Node service's context boot:
+
+```js
+// context.js
+import { AsyncLocalStorage } from 'node:async_hooks';
+export const ctx = new AsyncLocalStorage();
+
+// app.js
+import { ctx } from './context.js';
+
+app.use((req, res, next) => {
+  ctx.run({
+    requestId: req.headers['x-request-id'] ?? crypto.randomUUID(),
+    userId: undefined,
+    spanId: undefined,
+  }, () => next());
+});
+
+// logger.js
+import pino from 'pino';
+import { ctx } from './context.js';
+
+const base = pino();
+export const log = new Proxy(base, {
+  get(target, prop) {
+    if (typeof target[prop] !== 'function') return target[prop];
+    return (...args) => {
+      const c = ctx.getStore() ?? {};
+      return target.child(c)[prop](...args);
+    };
+  },
+});
+```
+
+Now `log.info('hi')` automatically includes the request ID. No
+prop drilling, no globals, no hacks.
+
+## Common pitfalls
+
+### Setting context outside `run`
+
+```js
+store.getStore().userId = 42;     // crash if no store
+```
+
+Always check: `const s = store.getStore(); if (s) s.userId = 42;`.
+Or wrap defensively with a helper.
+
+### Forgetting that `run` is the entry point
+
+Context exists only inside an active `run`. If your code doesn't
+enter a `run` (e.g., in a CLI script or a background tick), there's
+no store.
+
+For "always-on" context, wrap the entire process:
+
+```js
+store.run({}, () => bootApp());
+```
+
+### Cross-process boundaries
+
+ALS doesn't survive `worker_threads`, `child_process`, or `cluster`
+workers. Send context explicitly. For HTTP outbound, propagate via
+`traceparent` headers (W3C trace context) — see **OpenTelemetry
+Node**.
+
+### Mutating shared default stores
+
+```js
+const initial = { count: 0 };
+store.run(initial, () => { store.getStore().count++; });
+```
+
+If you reuse `initial` across calls, you'll mutate it across requests.
+Always pass a fresh object to `run`.
+
+## The mental model
+
+ALS is **a per-async-chain dictionary**. Set it once at the entry of
+a chain (HTTP request, queue job, scheduled tick); read it anywhere
+inside that chain. Survives async boundaries automatically.
+
+The thing it solves: ambient values that span deep call stacks
+without polluting function signatures. The thing it doesn't solve:
+inter-process or inter-realm context — for that, propagate explicitly.
+
+For Node services in 2026, ALS is the default tool. OTel, pino, and
+most observability libraries use it. Use it directly when you need
+custom request-scoped state.

@@ -1,0 +1,379 @@
+export const level = 'senior';
+
+# Express 5 routing corner cases
+
+Express 5 ships `path-to-regexp` v8, which is **stricter** than the
+v0.x parser shipped with Express 4. Most route patterns work
+unchanged; a few syntaxes have moved or disappeared. This page is the
+migration cookbook.
+
+## The big changes
+
+1. **No bare `*` for unnamed wildcards.** You must name them.
+2. **Optional segments use `{...}` braces.**
+3. **Regex routes must be explicit `RegExp` objects.**
+4. **Some characters now require escaping.**
+
+The silent breakage isn't 404s — it's **routes that throw at
+registration time** with cryptic errors like `Missing parameter
+name`.
+
+## Wildcards: from `*` to `*name`
+
+### Old (Express 4)
+
+```js
+app.get('/files/*', (req, res) => {
+  const path = req.params[0];   // implicit numbered param
+});
+```
+
+### New (Express 5)
+
+```js
+app.get('/files/*splat', (req, res) => {
+  const path = req.params.splat;   // named
+});
+```
+
+You name the wildcard. The name appears in `req.params`. Pick
+anything: `splat`, `rest`, `path`, `wildcard`.
+
+For typed access: with TypeScript and an `interface RequestParams`,
+the named form is far better than `req.params[0]` (which has no
+type).
+
+## Optional segments: braces
+
+### Old
+
+```js
+app.get('/users/:id?', (req, res) => {
+  // req.params.id might be undefined
+});
+```
+
+### New
+
+```js
+app.get('/users{/:id}', (req, res) => {
+  // The {/:id} block is optional as a unit
+});
+```
+
+The `{...}` makes the inside optional. The leading `/` is included
+in the group so `/users` matches as well as `/users/42`.
+
+A common pattern:
+
+```js
+app.get('/posts/:postId{/comments/:commentId}', (req, res) => {
+  // matches /posts/1 OR /posts/1/comments/5
+});
+```
+
+Multiple optional pairs:
+
+```js
+app.get('/api{/:version}{/:resource}', handler);
+```
+
+Each `{...}` is independently optional.
+
+## Regex routes
+
+### Old
+
+```js
+app.get(/^\/api\/(v\d+)/, handler);
+```
+
+### New
+
+```js
+app.get(/^\/api\/(v\d+)/, handler);
+```
+
+This still works — `RegExp` objects are passed through.
+
+What broke: **regex syntax inside path strings** (like
+`(?:foo|bar)`). You can't mix path string and regex anymore. Either
+the whole pattern is a string with the new syntax, or it's a real
+regex.
+
+## Reserved characters
+
+Some characters now have specific meanings and must be escaped:
+
+- `(` `)` — grouping
+- `[` `]` — character class
+- `?` — optional quantifier
+- `+` — one-or-more quantifier
+- `!` — negation
+- `{` `}` — optional segment
+
+To match these literally in a path:
+
+```js
+app.get('/file\\(name\\)', handler);   // matches /file(name)
+```
+
+Escape with `\\` in JavaScript strings (one backslash + one for the
+escape character).
+
+## Common migration patterns
+
+### Catch-all route
+
+```js
+// Old
+app.get('*', handler);
+
+// New
+app.get('/*splat', handler);
+// or
+app.get('{*splat}', handler);   // matches anything including empty
+```
+
+For "fallback for SPAs":
+
+```js
+app.get('/*splat', (req, res) => {
+  res.sendFile('index.html');
+});
+```
+
+### Optional trailing slash
+
+```js
+// Old (sometimes worked)
+app.get('/api/users/?', handler);
+
+// New (explicit)
+app.get('/api/users{/}', handler);
+```
+
+### Multi-level path with optional last segment
+
+```js
+// Old
+app.get('/blog/:year/:month?/:day?', handler);
+
+// New
+app.get('/blog/:year{/:month}{/:day}', handler);
+```
+
+### Versioned API
+
+```js
+// Old
+app.use('/api/:version(v\\d+)', router);   // regex constraint in path
+
+// New — split into two
+const versionedRouter = Router({ mergeParams: true });
+app.use('/api/:version', (req, res, next) => {
+  if (!/^v\d+$/.test(req.params.version)) return res.sendStatus(404);
+  next();
+}, versionedRouter);
+```
+
+Or use regex routes:
+
+```js
+app.use(/^\/api\/(v\d+)/, versionedRouter);
+// req.params[0] holds the version
+```
+
+The first form is cleaner if you can spare the param-check
+middleware.
+
+## Repeated params
+
+### Old
+
+```js
+app.get('/items/:id+', handler);
+// req.params.id was an array of repeated path segments
+```
+
+### New
+
+```js
+app.get('/items/*ids', handler);
+// req.params.ids is the joined string
+```
+
+If you actually want an array, split it yourself:
+
+```js
+const segments = req.params.ids.split('/');
+```
+
+The "params as array" feature was niche; few real apps used it.
+
+## Where this bites
+
+### Routes throw at startup
+
+```js
+app.get('/users/?', handler);   // Express 5: Missing parameter name
+```
+
+The error happens at `app.get(...)` time, not at first request.
+Tests catch it; deploys do too. The fix is to translate the pattern.
+
+### Catch-alls match more than expected
+
+```js
+app.get('*splat', handler);     // matches '' too
+app.get('/*splat', handler);    // matches everything starting with '/'
+```
+
+The first is "match anything"; the second is "match everything under
+root." For SPAs the second is usually right.
+
+### `req.params[0]` is no longer populated
+
+Anything that read `req.params[0]` (the implicit unnamed wildcard
+capture) needs to use the new named param.
+
+### Sub-router mounts with regex
+
+```js
+app.use(/\/foo/, router);   // regex mount — still works
+app.use('/foo?', router);   // string with ? — now means "optional"
+```
+
+The string form changed meaning. If you wanted "match /foo or /fooo"
+you need a regex now.
+
+## Mount paths
+
+Mount paths (`app.use('/api', router)`) didn't change much. They
+still strip the prefix; `req.originalUrl` keeps the full URL,
+`req.baseUrl` is the mount prefix, `req.url` is the post-mount
+remainder.
+
+```js
+app.use('/api', router);
+
+// GET /api/users/42 →
+//   req.originalUrl = '/api/users/42'
+//   req.baseUrl     = '/api'
+//   req.url         = '/users/42'
+```
+
+For named params in the mount itself:
+
+```js
+app.use('/tenant/:tenantId', tenantRouter);
+```
+
+`tenantId` is available in `tenantRouter`'s handlers via
+`req.params.tenantId` *if* the router was created with
+`Router({ mergeParams: true })`. Otherwise sub-routers don't see
+parent params.
+
+## Param middleware
+
+```js
+app.param('id', (req, res, next, id) => {
+  // validate / load id
+  if (!/^\d+$/.test(id)) return res.sendStatus(404);
+  req.id = +id;
+  next();
+});
+
+app.get('/users/:id', handler);   // req.id is set
+```
+
+`app.param` predates Express 5 and works unchanged. Useful for
+shared validation of common path params.
+
+## The migration playbook
+
+For an existing Express 4 codebase:
+
+1. **Run tests after upgrading.** Routes that throw at registration
+   show up immediately.
+2. **Grep for `'*'` in route strings.** Replace with named
+   wildcards.
+3. **Grep for `':...?'`.** Replace with `{/...}` form.
+4. **Grep for `req.params[0]`.** Migrate to named params.
+5. **Test with paths that include `(`, `)`, `[`, `]`** if you have
+   any.
+
+Most apps survive the migration in an afternoon. The bigger Express
+5 wins (async error forwarding, null-prototype params) are worth it.
+
+## Performance
+
+`path-to-regexp` v8 is faster and produces tighter regexes. Route
+matching is rarely a bottleneck in any app (the database is). Don't
+optimize routes for speed; design for clarity.
+
+## Common pitfalls
+
+### Confusing wildcard with optional
+
+```js
+// "splat" matches any path
+app.get('/files/*splat', ...);
+
+// "splat" is optional path
+app.get('/files{/*splat}', ...);
+```
+
+The second matches both `/files` and `/files/anything`. The first
+requires at least something after `/files/`.
+
+### Forgetting the `/` inside braces
+
+```js
+app.get('/users{:id}', handler);    // matches /users:id literally? probably broken
+app.get('/users{/:id}', handler);   // matches /users or /users/42
+```
+
+The leading `/` inside the optional block is important.
+
+### Trying to use look-arounds
+
+```js
+app.get('/:id(?!admin)', handler);   // doesn't work
+```
+
+`path-to-regexp` doesn't support negative lookahead. Use a regex
+route or a validation middleware.
+
+### Mounting with the wrong slash
+
+```js
+app.use('/api/', router);
+app.get('/users', handler);
+
+// router gets /api/ stripped → request URL inside is /users
+// works, but the trailing slash in the mount can cause weird matches
+```
+
+Don't put trailing slashes on mount paths.
+
+### Order still matters
+
+```js
+app.get('/users/me', handler1);
+app.get('/users/:id', handler2);
+```
+
+`/users/me` must come before `/users/:id` — otherwise the param
+route catches `me` first and `handler1` never runs. This rule didn't
+change in Express 5.
+
+## The mental model
+
+`path-to-regexp` v8 is **stricter, named, and consistent**. The Express
+4 idioms that felt magical (unnamed `*`, optional `?`) became explicit
+(`*splat`, `{...}`).
+
+Once you internalize the new syntax (named wildcards, `{...}` for
+optionals, escape parens), routes read more clearly. The migration
+is a one-time tax with permanent legibility gains.

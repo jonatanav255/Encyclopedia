@@ -1,0 +1,414 @@
+export const level = 'senior';
+
+# Server-Sent Events
+
+SSE is a one-way streaming protocol from server to browser over
+plain HTTP. The browser opens a long-lived connection; the server
+pushes events as they happen. Built-in `EventSource` API in every
+browser. No special framing protocol like WebSocket.
+
+For "server pushes updates to browser" — notifications, live feed,
+progress bars, AI streaming responses — SSE is often the right
+choice over WebSockets.
+
+## The protocol
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+
+data: hello
+
+data: another message
+
+event: ping
+data: heartbeat
+
+id: 42
+event: update
+data: {"x":1}
+
+```
+
+Each event is one or more lines, separated from the next event by a
+blank line. Fields: `data`, `event` (name), `id`, `retry`.
+
+The browser side:
+
+```js
+const es = new EventSource('/stream');
+es.onmessage = (e) => console.log(e.data);
+es.addEventListener('update', (e) => console.log(JSON.parse(e.data)));
+es.onerror = (e) => console.log('reconnecting...');
+```
+
+`EventSource` auto-reconnects on disconnect. Sends `Last-Event-ID`
+header on reconnect so the server can resume.
+
+## SSE in Express
+
+```js
+app.get('/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');   // nginx: don't buffer
+  res.flushHeaders();
+
+  const send = (data, event) => {
+    if (event) res.write(`event: ${event}\n`);
+    res.write(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
+  };
+
+  // Send initial state
+  send({ status: 'connected' });
+
+  // Heartbeat every 15s to defeat proxy idle timeouts
+  const heartbeat = setInterval(() => res.write(':\n\n'), 15_000);
+
+  // Send updates as events come in
+  const onUpdate = (data) => send(data, 'update');
+  eventBus.on('update', onUpdate);
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    eventBus.off('update', onUpdate);
+  });
+});
+```
+
+Key points:
+
+- `Content-Type: text/event-stream` — mandatory.
+- `flushHeaders()` — send headers immediately (don't wait for the
+  first `write()`).
+- Comments (`:`) — heartbeats to defeat proxy timeouts.
+- `req.on('close', ...)` — clean up listeners when client
+  disconnects.
+
+## Why SSE over WebSockets
+
+| | SSE | WebSocket |
+| --- | --- | --- |
+| Direction | server → client | bidirectional |
+| Protocol | HTTP | upgraded from HTTP |
+| Reconnect | auto, with `Last-Event-ID` | manual |
+| Backpressure | TCP-level | manual |
+| Compression | gzip via HTTP | per-frame (deflate-frame) |
+| Proxy support | "just" HTTP — most proxies work | many proxies block |
+| Browser support | universal | universal |
+| Server library | none needed | ws / socket.io |
+
+SSE wins when:
+
+- Only server-to-client (notifications, feeds, AI streaming).
+- You want auto-reconnect for free.
+- You're behind HTTP proxies that don't support WS.
+- You want simpler infra.
+
+WebSocket wins when:
+
+- Client also sends frequent messages (chat).
+- Bidirectional latency matters.
+- You need binary frames.
+
+For server-push without client uploads, **SSE is the simpler
+default**.
+
+## The HTTP/1.1 connection limit
+
+Browsers cap connections to a single origin (typically 6 per host
+in HTTP/1.1). If you have multiple SSE streams (e.g., one per tab),
+this exhausts the limit and breaks other requests.
+
+Mitigations:
+
+- **HTTP/2** at the edge (Cloudflare, nginx). H2 multiplexes; no
+  6-connection limit. Most modern setups have this.
+- **Shared SSE** via `BroadcastChannel` + `SharedWorker` — one SSE
+  connection feeds all tabs.
+
+Since 2020+, every modern stack runs HTTP/2 to the browser, so this
+problem mostly went away.
+
+## `Last-Event-ID` and replay
+
+The server can include `id: <token>` in events; the browser sends
+`Last-Event-ID: <token>` on reconnect.
+
+```js
+app.get('/stream', (req, res) => {
+  const lastId = req.headers['last-event-id'];
+  // Replay events newer than lastId
+  // ...
+});
+```
+
+Useful for delivery guarantees. Combine with a Redis stream / event
+log: persist events with monotonic IDs, replay missed ones on
+reconnect.
+
+For "at-least-once delivery," the client also tracks
+`Last-Event-ID` and the server stores a buffer. For "exactly-once,"
+client and server coordinate at the application layer.
+
+## `retry` field
+
+```js
+res.write('retry: 3000\n');
+```
+
+Tells the browser to wait 3000 ms before reconnecting. Default is
+~3 seconds. Useful to throttle reconnects under load or back off
+during outages.
+
+## Heartbeats
+
+Idle proxies (nginx default 60s, ALB default 60s) close connections
+they think are dead. Heartbeats keep the connection alive:
+
+```js
+setInterval(() => res.write(':\n\n'), 15_000);
+```
+
+`:` starts a comment line in SSE. The client ignores it; the proxy
+sees activity.
+
+Pick an interval shorter than the proxy's idle timeout (15–30s
+typical).
+
+## Compression OFF
+
+```js
+res.setHeader('Content-Encoding', 'identity');
+// Or just don't enable compression for this route
+```
+
+`compression()` middleware buffers data for compression efficiency
+— defeating streaming. Either:
+
+- Disable compression for SSE routes.
+- Use `compression` with `filter: (req, res) => res.getHeader('Content-Type') !== 'text/event-stream'`.
+
+Some clients send `Accept-Encoding: gzip` and the middleware happily
+gzips your stream — buffering until the buffer is large enough to
+emit. Symptoms: events delayed by 1+ second. Disable for streams.
+
+## Express middleware order
+
+```js
+// Bad — compression runs first, buffers your stream
+app.use(compression());
+app.get('/stream', sseHandler);
+
+// Good — exclude /stream from compression
+app.use((req, res, next) => {
+  if (req.url.startsWith('/stream')) return next();
+  return compression()(req, res, next);
+});
+app.get('/stream', sseHandler);
+```
+
+Or use the filter option in `compression()`.
+
+Same logic for any "buffering" middleware (response transformers,
+some loggers).
+
+## Backpressure
+
+`res.write()` returns `false` when the buffer fills:
+
+```js
+function send(data, event) {
+  if (event) res.write(`event: ${event}\n`);
+  const ok = res.write(`data: ${JSON.stringify(data)}\n\n`);
+  return ok;
+}
+```
+
+If `ok === false`, wait for `'drain'`:
+
+```js
+async function sendBackpressured(data, event) {
+  if (!send(data, event)) {
+    await new Promise(r => res.once('drain', r));
+  }
+}
+```
+
+For high-volume streams to slow clients, this matters. For
+typical "notification" streams (few events per minute), it doesn't.
+
+## AI streaming (OpenAI-style)
+
+Most LLM APIs use SSE for streaming responses. As a producer:
+
+```js
+app.post('/chat', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+
+  const stream = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    messages: req.body.messages,
+    stream: true,
+  });
+
+  for await (const chunk of stream) {
+    const text = chunk.choices[0]?.delta?.content;
+    if (text) res.write(`data: ${JSON.stringify({ text })}\n\n`);
+  }
+
+  res.write('data: [DONE]\n\n');
+  res.end();
+});
+```
+
+As a consumer (in a browser via `EventSource`):
+
+```js
+const es = new EventSource('/chat');
+es.onmessage = (e) => {
+  if (e.data === '[DONE]') { es.close(); return; }
+  const { text } = JSON.parse(e.data);
+  appendToOutput(text);
+};
+```
+
+The `[DONE]` sentinel is a common convention. SSE has no
+"end-of-stream" event; either send a sentinel or close the
+connection from the server.
+
+## Authentication
+
+`EventSource` **doesn't support custom headers**. Authentication
+goes via cookies or query parameters:
+
+```js
+const es = new EventSource('/stream?token=...');
+```
+
+For "real" auth, cookies are safer (HttpOnly), but you need
+`withCredentials`:
+
+```js
+const es = new EventSource('/stream', { withCredentials: true });
+```
+
+And the server must send `Access-Control-Allow-Credentials: true`
+plus a specific origin (not `*`).
+
+For Bearer tokens, fetch's streaming API (`fetch` + `getReader()`)
+replaces `EventSource` with full header control:
+
+```js
+const res = await fetch('/stream', {
+  headers: { Authorization: `Bearer ${token}` },
+});
+const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+// parse SSE manually
+```
+
+Most chat / LLM clients now use this pattern instead of `EventSource`
+for the same reason.
+
+## Common pitfalls
+
+### Forgetting to set headers immediately
+
+```js
+res.write('first event');   // headers go out with this — too late to set them
+```
+
+Call `res.flushHeaders()` (or set headers + `res.writeHead`) before
+the first write. Otherwise the response starts before you've
+configured it.
+
+### Not handling client disconnect
+
+```js
+app.get('/stream', (req, res) => {
+  setInterval(() => res.write('data: ping\n\n'), 1000);
+  // Connects, runs forever, even after client closes
+});
+```
+
+Memory leak per connection. Always:
+
+```js
+req.on('close', () => clearInterval(...));
+```
+
+### Compression middleware buffering
+
+The #1 SSE bug. Symptoms: events arrive in chunks, not real-time.
+Cause: `compression()` is buffering. Fix above.
+
+### Trying to use `res.json()`
+
+```js
+res.json({ status: 'ok' });   // ends the response — no streaming
+```
+
+`res.json` and `res.send` end the response. Use only `res.write()`
+for SSE, `res.end()` to close at the end.
+
+### Forgetting double newline
+
+```js
+res.write('data: hello\n');   // BAD — missing newline; event not delivered
+res.write('data: hello\n\n'); // good
+```
+
+The trailing blank line is the event separator. Without it, the
+event never dispatches.
+
+### Multi-line `data`
+
+```js
+res.write(`data: line1\ndata: line2\n\n`);
+```
+
+Two `data:` lines → concatenated with `\n` on the client side:
+`e.data === 'line1\nline2'`. Or send JSON to keep it one line.
+
+### Server scaling
+
+```js
+// On one server: in-memory eventBus
+eventBus.emit('update', data);
+
+// Server 2 won't see this
+```
+
+For horizontal scaling, route events through Redis pub/sub, NATS, or
+similar. SSE handlers subscribe to the broker; emit goes through the
+broker.
+
+## The mental model
+
+SSE is **one-way HTTP streaming with auto-reconnect**. The browser
+opens a long-lived GET, the server writes events, the browser
+parses them.
+
+For most "server pushes to client" needs in 2026, SSE is the right
+choice over WebSockets:
+
+- Standard HTTP — works through proxies, CDNs, CORS.
+- `EventSource` is built into every browser.
+- Auto-reconnect with `Last-Event-ID`.
+- Simpler server code than WebSockets.
+
+The discipline:
+
+1. Right headers (`text/event-stream`, no-cache, no-transform).
+2. Heartbeats to defeat idle timeouts.
+3. No compression on the route.
+4. Clean up on client disconnect.
+
+Five lines of overhead per stream, and you've got a robust real-time
+channel without the WebSocket infra.

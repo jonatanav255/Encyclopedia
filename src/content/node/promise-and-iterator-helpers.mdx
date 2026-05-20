@@ -1,0 +1,318 @@
+export const level = 'mid';
+
+# Modern Promise and Iterator helpers
+
+Recent JavaScript added a handful of small additions that simplify
+patterns previously needing a helper library or a few lines of glue.
+Three to know:
+
+- `Promise.withResolvers()` — externalize a promise's `resolve`/`reject`.
+- `Array.fromAsync()` — collect an async iterable into an array.
+- Iterator helpers (`map`, `filter`, `take`, `reduce`) — lazy
+  iteration on any iterator.
+
+All are stable in Node 22+ (some in 20+).
+
+## `Promise.withResolvers()`
+
+Pre-2024 pattern: create a promise where you control resolve/reject
+from outside.
+
+```js
+// Old: manual
+let resolve, reject;
+const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+
+emitter.once('done', resolve);
+emitter.once('error', reject);
+```
+
+```js
+// New
+const { promise, resolve, reject } = Promise.withResolvers();
+
+emitter.once('done', resolve);
+emitter.once('error', reject);
+```
+
+Cleaner. No closure dance. The promise constructor takes a callback
+because it needs to capture the resolvers atomically;
+`withResolvers` does the same and returns them as an object.
+
+Use cases:
+
+- Bridging event-emitter-style APIs to promises.
+- Building a queue / deferred-task pattern.
+- Implementing your own async iterator.
+
+### Building a deferred queue
+
+```js
+function createQueue() {
+  const queue = [];
+  const waiters = [];
+
+  return {
+    push(item) {
+      if (waiters.length) waiters.shift().resolve(item);
+      else queue.push(item);
+    },
+    async pop() {
+      if (queue.length) return queue.shift();
+      const { promise, resolve } = Promise.withResolvers();
+      waiters.push({ resolve });
+      return promise;
+    },
+  };
+}
+```
+
+`pop` returns immediately if data is available; otherwise awaits.
+Classic queue, six lines.
+
+## `Array.fromAsync()`
+
+Materialize an async iterable into an array. Like
+`Array.from(iter)` but awaits.
+
+```js
+async function* range(n) {
+  for (let i = 0; i < n; i++) yield i;
+}
+
+const arr = await Array.fromAsync(range(5));
+// [0, 1, 2, 3, 4]
+```
+
+With a mapping function:
+
+```js
+const doubled = await Array.fromAsync(range(5), x => x * 2);
+// [0, 2, 4, 6, 8]
+```
+
+Useful for:
+
+- Tests where you assert against the full output.
+- Converting a paginated async iterator to one array.
+- Quick scripts where streaming isn't needed.
+
+For huge iterables, **don't** — you defeat the laziness. Stick with
+`for await...of`.
+
+## Iterator helpers (`map`, `filter`, `take`, etc.)
+
+In Node 22+, **iterators** (including those from `[Symbol.iterator]`,
+generators, and `Array.values()`) have lazy method chains:
+
+```js
+const result = users.values()
+  .filter(u => u.active)
+  .map(u => u.name)
+  .take(10)
+  .toArray();
+```
+
+Lazy: nothing happens until `toArray` (or another terminal). Process
+exactly 10 items max, in one pass.
+
+Compared to array `.filter().map().slice(0, 10)`: arrays materialize
+intermediate arrays at each step. Iterator helpers don't.
+
+### Available methods
+
+- `.map(fn)`
+- `.filter(fn)`
+- `.take(n)`
+- `.drop(n)`
+- `.flatMap(fn)`
+- `.reduce(fn, initial)`
+- `.toArray()`
+- `.forEach(fn)`
+- `.some(fn)`
+- `.every(fn)`
+- `.find(fn)`
+
+For async iterators, the **`Iterator.prototype.*Async`** methods (or
+similar) ship in Node 22+. Check current docs — the spec settled in
+2024.
+
+### Why this is great
+
+Half of lodash's iteration helpers are now built in. Without a
+dependency:
+
+```js
+// lodash
+_.chain(users).filter('active').map('name').take(10).value();
+
+// native
+users.values().filter(u => u.active).map(u => u.name).take(10).toArray();
+```
+
+Same lazy semantics. Smaller bundle, no install.
+
+### Async iterator helpers (Stage 3, not yet stable)
+
+The proposal adds the same `.map/.filter/.take/.toArray` chain to
+**async** iterators:
+
+```js
+const result = await fetchPages()
+  .filter(page => page.items.length > 0)
+  .flatMap(page => page.items)
+  .take(100)
+  .toArray();
+```
+
+As of early 2026 these helpers are still at TC39 Stage 3 and not
+shipped in stable Node — use `for await (const x of iter)` + `break`
+instead, or libraries like `iterator-helpers-polyfill`.
+
+## `Iterator.from(iterable)`
+
+For "use helpers on something that isn't already an iterator":
+
+```js
+const result = Iterator.from(new Set([1, 2, 3]))
+  .filter(x => x > 1)
+  .toArray();
+```
+
+`Iterator.from` wraps any iterable. Useful for `Map`, `Set`,
+`Headers`, and custom iterables.
+
+## Real-world examples
+
+### Read a file line by line, find the first match
+
+```js
+import { open } from 'node:fs/promises';
+
+const file = await open('huge.log');
+try {
+  for await (const line of file.readLines()) {
+    if (line.includes('ERROR')) {
+      console.log(line);
+      break;
+    }
+  }
+} finally {
+  await file.close();
+}
+```
+
+`file.readLines()` returns an async iterable. Iterating with
+`for await` lazily reads — `break` stops after the first match
+without reading the whole file. (Async iterator helpers with
+`.find` are not yet stable in Node as of 2026; use `for await`.)
+
+### Take the first 5 results from a paginated API
+
+```js
+async function* fetchPages(url) {
+  while (url) {
+    const res = await fetch(url).then(r => r.json());
+    for (const item of res.items) yield item;
+    url = res.nextPage;
+  }
+}
+
+const first5 = [];
+for await (const item of fetchPages('/api/feed')) {
+  first5.push(item);
+  if (first5.length >= 5) break;
+}
+```
+
+`Array.fromAsync` would collect the whole iterable, which defeats
+the laziness here — the `for await` + `break` pattern stays right
+until async iterator helpers (`.take`) ship stably in Node.
+
+## Common pitfalls
+
+### Treating helpers as eager
+
+```js
+arr.values().map(expensive).toArray();
+```
+
+Lazy still means "evaluated once at terminal." If `expensive` has
+side effects, they happen during `.toArray()`. If you want eager
+evaluation, just use `arr.map(...)` directly.
+
+### Forgetting `.toArray()`
+
+```js
+const result = arr.values().filter(...);
+console.log(result);   // logs an iterator, not the values
+```
+
+The intermediate is an iterator object. Terminal method
+(`.toArray()`, `.forEach`, etc.) is required.
+
+### Mixing sync iterator with async chain
+
+```js
+arr.values()
+  .map(async (x) => await fetch(x))   // returns a promise; map doesn't await
+  .toArray();
+// → array of promises, not awaited values
+```
+
+Use `Promise.all` to await:
+
+```js
+await Promise.all(arr.values().map(async x => fetch(x)).toArray());
+```
+
+Or with bounded concurrency, use a library like `p-map`:
+
+```js
+import pMap from 'p-map';
+const results = await pMap(arr, async x => fetch(x), { concurrency: 5 });
+```
+
+Async iterator helpers (lazy `.map`/`.filter` etc. on async
+iterators) are at TC39 Stage 3 in 2026 and not yet shipped in stable
+Node — check support before relying on them.
+
+### `withResolvers` and unhandled rejections
+
+```js
+const { promise, reject } = Promise.withResolvers();
+// ...never call reject or resolve
+// process exits with unhandled rejection
+```
+
+If the promise is never settled, it sits unresolved. If something
+awaits it, the await hangs. If nothing awaits, no problem. But if
+you forget to reject on error, you've created a silent leak.
+
+## Compatibility
+
+- `Promise.withResolvers` — Node 22+, all modern browsers.
+- `Array.fromAsync` — Node 22+, all modern browsers.
+- Iterator helpers — Node 22.0+ (basic), Node 24+ (more complete).
+  Browsers vary; check caniuse.
+- Async iterator helpers — Node 22+, browsers landing in 2025.
+
+If you support older runtimes, polyfill via `core-js` or just keep
+the manual versions.
+
+## The mental model
+
+Native JavaScript is **gradually absorbing the iteration patterns
+that needed lodash**. Iterator helpers + `Promise.withResolvers` +
+`Array.fromAsync` cover most of the day-to-day "I need a small
+helper" cases.
+
+For 2026 Node code, prefer these natives over their library
+equivalents:
+
+- `arr.values().filter().map().toArray()` over `_.chain(arr).filter().map().value()`.
+- `Promise.withResolvers()` over the manual closure pattern.
+- `Array.fromAsync(asyncIter)` over an ad-hoc collector loop.
+
+Smaller bundle, less to learn, no compatibility worries inside Node.
+The native versions are the default; lodash is the legacy.
