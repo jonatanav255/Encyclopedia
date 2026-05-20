@@ -1,0 +1,167 @@
+# Event loop
+
+JavaScript runs on **one thread**. Everything you write — function calls,
+promise callbacks, setTimeout handlers — happens on that single thread.
+The event loop is the scheduler that decides what to run next.
+
+## The three things that matter
+
+1. The **call stack** — what's running right now. Synchronous code lives here.
+2. The **microtask queue** — promise callbacks (`.then`, `.catch`,
+   `.finally`) and `queueMicrotask(...)`. Drained completely before any
+   macrotask.
+3. The **macrotask queue** — `setTimeout`, `setInterval`, I/O callbacks.
+   One per loop iteration.
+
+## The rule
+
+After every synchronous block finishes — meaning the call stack is empty —
+the event loop:
+
+1. **Drains the entire microtask queue**, running each callback in order
+   (and any new microtasks they schedule, until empty).
+2. Takes **exactly one** macrotask and runs it.
+3. Repeats.
+
+That's it. The whole "weird ordering" you see with promises and timers
+falls out of this rule.
+
+<EventLoop />
+
+Pick a scenario and click **Run**. Watch the call stack process each line,
+the queues fill up, and the actual console output appear in the order
+JavaScript would print it.
+
+## The classic gotcha
+
+```js
+console.log('A');
+setTimeout(() => console.log('B'), 0);
+Promise.resolve().then(() => console.log('C'));
+console.log('D');
+```
+
+Output: **A, D, C, B**. Why?
+
+- `console.log('A')` and `console.log('D')` are synchronous — they run
+  immediately on the call stack.
+- `setTimeout(..., 0)` schedules `console.log('B')` as a **macrotask**.
+- `Promise.resolve().then(...)` schedules `console.log('C')` as a
+  **microtask**.
+
+When the synchronous code finishes, the event loop drains microtasks
+first → "C". Then it pulls one macrotask → "B".
+
+## await is a microtask in disguise
+
+```js
+async function run() {
+  console.log('1');
+  await null;        // pauses; queues the resume as a microtask
+  console.log('3');  // runs after the current sync block + any microtasks before it
+}
+run();
+console.log('2');
+```
+
+Output: **1, 2, 3**. The `await` suspends `run()` and queues the
+"continue after `await`" code as a microtask. The synchronous code below
+finishes, microtasks drain, "3" prints.
+
+## Why this matters in practice
+
+<Cheatsheet
+  columns={['Symptom', 'Probable cause']}
+  rows={[
+    ['Promise chains run before setTimeout(0)', 'Microtasks drain fully before any macrotask.'],
+    ['await inside a loop is way slower than expected', 'Each await is a microtask hop. Use Promise.all to parallelize.'],
+    ['UI freezes for a moment despite "async" code', 'Sync work inside an async function still blocks the thread.'],
+    ['queueMicrotask + setTimeout(0) — micro runs first', 'Same rule: micro queue drains before any macro.'],
+    ['process.nextTick (Node) runs before promise microtasks', 'Node has an even higher-priority queue: nextTick > promise micro > timer macro.'],
+  ]}
+/>
+
+## What blocks the loop
+
+A tight synchronous loop, a giant JSON.parse, a sync crypto call — any
+of these keep the call stack busy and **prevent the event loop from
+servicing microtasks and macrotasks**. The page freezes; timers fire
+late; promises stack up. The fix is always the same: yield. Break the
+work into chunks (`setTimeout(..., 0)` between chunks), or move it to a
+worker thread.
+
+<Callout variant="warn">
+"Async" doesn't mean "off the main thread." `async`/`await` only changes
+**when** code runs on the same thread. CPU-bound work blocks the loop
+regardless of how many `async` keywords you sprinkle on it.
+</Callout>
+
+## Questions
+
+<QA level="junior" question="Why is JavaScript called single-threaded?">
+The language specifies a single execution thread for your code. Only one
+function runs at a time; everything else waits in the queues. The runtime
+(browser, Node) may use multiple OS threads internally for I/O, but your
+JavaScript code never runs in parallel with itself.
+</QA>
+
+<QA level="junior" question="What's the difference between a microtask and a macrotask?">
+Microtasks (promise callbacks, `queueMicrotask`) run **between** any two
+macrotasks, and the entire microtask queue is drained before the next
+macrotask runs. Macrotasks (`setTimeout`, `setInterval`, I/O callbacks)
+run one at a time, one per loop iteration. The split exists so promise
+chains feel synchronous from a single tick's perspective.
+</QA>
+
+<QA level="mid" question="Why does setTimeout(fn, 0) not run immediately?">
+Because it's a macrotask. The current sync code must finish, then all
+microtasks must drain, then the loop pulls one macrotask. "Zero
+milliseconds" is a **minimum** delay, not a guarantee. In practice the
+HTML spec clamps nested setTimeout(0) to 4ms after a few iterations.
+</QA>
+
+<QA level="mid" question="What's the output and why? `Promise.resolve().then(() => console.log('a')); console.log('b');`">
+**b, a.** The `console.log('b')` is synchronous and runs immediately. The
+`.then` callback is a microtask, queued to run once the synchronous code
+completes. Even though the promise is already resolved, the callback
+never runs synchronously — `.then` is always async.
+</QA>
+
+<QA level="senior" question="A request handler does `await` in a loop over 1000 items. Why might this be slow, and how would you fix it?">
+Each `await` pauses the function and queues its continuation as a
+microtask. With 1000 items, that's 1000 microtask hops — and if each
+iteration also makes a network call, the calls run **sequentially**, not
+in parallel. End-to-end latency becomes 1000 × per-call latency.
+
+Fix: parallelize. `await Promise.all(items.map(handle))` kicks off all
+1000 in parallel and awaits them together. For bounded parallelism, use
+something like `p-limit` to run, say, 20 at a time. The microtask hops
+become negligible; the bottleneck moves to the downstream service.
+</QA>
+
+<QA level="staff" question="How would you detect and remediate event-loop lag in a production Node service?">
+**Detect:** `perf_hooks.monitorEventLoopDelay()` gives you a histogram of
+lag samples. Export p50/p99 to your metrics system. Anything past ~10ms
+p99 means the loop is being blocked long enough to affect user-facing
+latency.
+
+**Diagnose:** when lag spikes, capture a CPU profile (`node --prof` or
+`@nearform/clinic`). Look for big stacks rooted in sync APIs:
+`crypto.pbkdf2Sync`, `JSON.parse` on huge payloads, regex with
+catastrophic backtracking, synchronous logging, file system reads.
+
+**Remediate, in order of cost:**
+
+1. Replace sync APIs with async (`crypto.pbkdf2`, streaming JSON parsers).
+2. Cap payload sizes (`express.json({ limit: '100kb' })`) so one bad
+   request can't dominate the loop.
+3. Move CPU-bound work to a worker thread (`worker_threads`).
+4. For truly expensive operations, queue them on a separate service so
+   the request thread stays responsive.
+5. Add backpressure — if event-loop lag exceeds a threshold, start
+   returning 503s for new requests so the loop can catch up. Better to
+   shed load than collapse.
+
+The cultural piece: make event-loop lag a first-class SLO so the team
+treats sync APIs as suspect by default.
+</QA>

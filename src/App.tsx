@@ -16,6 +16,7 @@ import { Cheatsheet } from './components/mdx/Cheatsheet';
 import { Term } from './components/mdx/Term';
 import { MiddlewarePipeline } from './components/demos/MiddlewarePipeline';
 import { RouteMatcher } from './components/demos/RouteMatcher';
+import { EventLoop } from './components/demos/EventLoop';
 
 const mdxComponents = {
   Callout,
@@ -30,6 +31,7 @@ const mdxComponents = {
   Term,
   MiddlewarePipeline,
   RouteMatcher,
+  EventLoop,
 };
 
 export default function App() {
