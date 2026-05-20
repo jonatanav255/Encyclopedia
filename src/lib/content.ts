@@ -3,12 +3,19 @@ import type { ComponentType } from 'react';
 type MdxModule = { default: ComponentType };
 
 const modules = import.meta.glob<MdxModule>('../content/**/*.mdx');
+// `as: 'raw'` is the Vite-documented way to get file contents as strings,
+// and it bypasses the MDX plugin's transform.
+const rawSources = import.meta.glob('../content/**/*.mdx', {
+  as: 'raw',
+  eager: true,
+}) as Record<string, string>;
 
 export type ContentEntry = {
   slug: string;
   topic: string;
   name: string;
   title: string;
+  raw: string;
   load: () => Promise<MdxModule>;
 };
 
@@ -28,11 +35,12 @@ export const entries: ContentEntry[] = Object.entries(modules)
       topic,
       name,
       title: titleCase(name),
+      raw: rawSources[path] ?? '',
       load,
     } satisfies ContentEntry;
   })
   .filter((e): e is ContentEntry => e !== null)
-  .sort((a, b) => a.slug.localeCompare(b.slug));
+  .sort((a, b) => a.title.localeCompare(b.title));
 
 export type TopicGroup = {
   topic: string;
@@ -48,8 +56,8 @@ export const groups: TopicGroup[] = (() => {
     map.set(e.topic, list);
   }
   return Array.from(map.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([topic, list]) => ({ topic, title: titleCase(topic), entries: list }));
+    .map(([topic, list]) => ({ topic, title: titleCase(topic), entries: list }))
+    .sort((a, b) => a.title.localeCompare(b.title));
 })();
 
 export function findBySlug(slug: string): ContentEntry | undefined {

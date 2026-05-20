@@ -4,7 +4,13 @@ import { Header } from './Header';
 import { Sidebar } from './Sidebar';
 import { attachCopyButtons } from '../../lib/copyButtons';
 
-export function Layout({ children }: { children: ReactNode }) {
+export function Layout({
+  children,
+  onOpenSearch,
+}: {
+  children: ReactNode;
+  onOpenSearch?: () => void;
+}) {
   const location = useLocation();
   const contentRef = useRef<HTMLDivElement | null>(null);
 
@@ -19,7 +25,7 @@ export function Layout({ children }: { children: ReactNode }) {
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header />
+      <Header onOpenSearch={onOpenSearch} />
       <div className="flex flex-1 min-h-0">
         <Sidebar />
         <main className="flex-1 overflow-y-auto">

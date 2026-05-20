@@ -1,8 +1,10 @@
+import { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { MDXProvider } from '@mdx-js/react';
 import { Layout } from './components/layout/Layout';
 import { Home } from './pages/Home';
 import { TopicPage } from './pages/TopicPage';
+import { SearchModal } from './components/search/SearchModal';
 import { Callout } from './components/mdx/Callout';
 import { QA } from './components/mdx/QA';
 import { Compare } from './components/mdx/Compare';
@@ -29,15 +31,29 @@ const mdxComponents = {
 };
 
 export default function App() {
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setSearchOpen((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   return (
     <MDXProvider components={mdxComponents}>
       <BrowserRouter>
-        <Layout>
+        <Layout onOpenSearch={() => setSearchOpen(true)}>
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/:topic/:name" element={<TopicPage />} />
           </Routes>
         </Layout>
+        <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} />
       </BrowserRouter>
     </MDXProvider>
   );
