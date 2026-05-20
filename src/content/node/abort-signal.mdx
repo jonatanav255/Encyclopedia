@@ -1,0 +1,213 @@
+export const level = 'mid';
+
+# AbortSignal
+
+`AbortController` and `AbortSignal` are the platform-standard way to
+cancel async work. They've been in browsers for years; Node 16+
+adopted them throughout the standard library — `fetch`, timers,
+streams, child processes, even `setTimeout` promises. Learning the
+pattern once buys you cancellation everywhere.
+
+## The shape
+
+```js
+const ac = new AbortController();
+const signal = ac.signal;
+
+doSomething(signal);
+
+setTimeout(() => ac.abort(), 5000);   // cancel after 5s
+```
+
+`AbortController` is the *handle* — you call `.abort()` on it.
+`AbortSignal` is the *listener* — you pass it to APIs that support
+cancellation. Once aborted, a signal stays aborted.
+
+## With `fetch`
+
+```js
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), 5000);
+
+try {
+  const res = await fetch(url, { signal: ac.signal });
+  // ...
+} catch (err) {
+  if (err.name === 'AbortError') {
+    console.log('request timed out');
+  } else throw err;
+} finally {
+  clearTimeout(t);
+}
+```
+
+Or the shortcut for "abort after N":
+
+```js
+await fetch(url, { signal: AbortSignal.timeout(5000) });
+```
+
+## With `setTimeout` (promise form)
+
+```js
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 1000);
+
+try {
+  await sleep(5000, undefined, { signal: ac.signal });
+  console.log('slept 5s');
+} catch (err) {
+  if (err.name === 'AbortError') console.log('aborted early');
+}
+```
+
+Sleep cancels at 1s with an `AbortError`. Same pattern for
+`setImmediate(...)` and `setInterval(...)` from `node:timers/promises`.
+
+## With streams
+
+```js
+import { pipeline } from 'node:stream/promises';
+
+const ac = new AbortController();
+
+await pipeline(source, dest, { signal: ac.signal });
+```
+
+Aborting closes the pipeline early. The streams clean up.
+
+## With child processes
+
+```js
+import { spawn } from 'node:child_process';
+
+const ac = new AbortController();
+const child = spawn('long-task', [], { signal: ac.signal });
+
+setTimeout(() => ac.abort(), 10_000);   // kills the child after 10s
+```
+
+Abort sends `SIGTERM`. For finer control, you'd `child.kill('SIGTERM')`
+yourself.
+
+## Combining signals
+
+`AbortSignal.any([sigA, sigB])` (Node 20+) is aborted if any input
+signal is. Useful when you want "stop on any of these":
+
+```js
+const combined = AbortSignal.any([
+  AbortSignal.timeout(5000),     // 5s timeout
+  req.signal,                     // client disconnected
+]);
+
+await fetch(upstream, { signal: combined });
+```
+
+If the client gives up, the upstream call is cancelled. Without this,
+you'd waste work after a disconnect.
+
+## Express integration
+
+Express handlers in modern Node attach `req.signal` and `res.signal`:
+
+```js
+app.get('/proxy', async (req, res) => {
+  // If the client disconnects, req.signal is aborted.
+  const upstream = await fetch('https://slow-service', { signal: req.signal });
+  res.json(await upstream.json());
+});
+```
+
+Without `signal`, your handler keeps churning after the client gave
+up. Wasted work, sometimes lots of it.
+
+## Listening to abort manually
+
+```js
+function expensiveOp(signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new Error('aborted'));
+
+    const handler = () => {
+      cleanup();
+      reject(new Error('aborted'));
+    };
+    signal.addEventListener('abort', handler, { once: true });
+
+    doWork().then((result) => {
+      signal.removeEventListener('abort', handler);
+      resolve(result);
+    });
+  });
+}
+```
+
+Two important details:
+
+1. **Check `signal.aborted` first** — the signal might already be
+   aborted by the time you check.
+2. **`{ once: true }`** auto-removes the listener after fire. Saves
+   you a `removeEventListener` call.
+
+## `AbortError`
+
+By convention, cancellation produces an error with `name === 'AbortError'`.
+Don't conflate it with other errors:
+
+```js
+try { await fn(signal); }
+catch (err) {
+  if (err.name === 'AbortError') {
+    // expected — caller cancelled us
+    return;
+  }
+  // some other error — log/propagate
+  throw err;
+}
+```
+
+Cancellation isn't a failure; treat it differently. Don't 5xx the
+client when they themselves gave up.
+
+## The pattern in custom code
+
+If you write a function that takes a signal and does async work,
+treat the signal as part of the contract:
+
+```js
+async function processItems(items, { signal } = {}) {
+  for (const item of items) {
+    signal?.throwIfAborted();        // throws if aborted (Node 17+)
+    await processItem(item);
+  }
+}
+```
+
+`signal.throwIfAborted()` is the shorthand for "check and throw."
+Now your function is cancellable like every standard library API.
+
+## What it doesn't do
+
+- **Synchronous code keeps running** — there's no preemption.
+  `signal.aborted` is only checked at await points. A long sync loop
+  inside your function isn't interrupted by `abort()`.
+- **Resources you've already allocated aren't reclaimed** — you write
+  cleanup logic. Aborting `fetch` releases the connection; aborting
+  your custom function only does what your custom function does.
+
+## Why bother
+
+Without cancellation primitives, you can't:
+
+- Implement client-disconnect handling.
+- Bound how long downstream calls take.
+- Cleanly tear down work during graceful shutdown.
+
+These are real production problems. `AbortSignal` is the standard
+answer. Use it on every external call (fetch, DB, child process)
+and propagate it through your own functions. Once you're in the
+habit, every request becomes inherently cancellable, which means
+the system stays responsive under stress.

@@ -1,0 +1,184 @@
+export const level = 'mid';
+
+# Content Negotiation
+
+The same URL can return different representations of the same
+resource — JSON for an API client, HTML for a browser, XML for a
+legacy integration. Content negotiation is how the client says
+"I'd like this in JSON, please" and how the server picks. Express
+gives you helpers; the underlying HTTP machinery is straightforward
+once you've seen it once.
+
+## The relevant headers
+
+| Header | Set by | Meaning |
+| --- | --- | --- |
+| `Accept` | Client | Acceptable media types (`application/json`) |
+| `Accept-Language` | Client | Preferred languages (`en-US, en;q=0.9`) |
+| `Accept-Encoding` | Client | Supported compressions (`gzip, br`) |
+| `Accept-Charset` | Client | Acceptable charsets (rare now — UTF-8 won) |
+| `Content-Type` | Both | Type of *this* body (`application/json`) |
+| `Content-Language` | Server | Language of this response |
+| `Content-Encoding` | Server | How this body is encoded (`gzip`) |
+| `Vary` | Server | Which request headers the response depended on |
+
+The `Accept-*` headers are the client's preferences. The `Content-*`
+headers describe the actual response.
+
+## Quality values
+
+Each `Accept-*` entry can have a `q=` weight:
+
+```
+Accept: application/json, text/html;q=0.9, */*;q=0.5
+```
+
+Means: "I prefer JSON. HTML is okay. Anything else is a last
+resort." `q` ranges 0.0 to 1.0; missing means 1.0.
+
+The server walks the list, finds the highest-q type it can serve,
+and uses that. The wildcard `*/*` matches anything.
+
+## Negotiation in Express
+
+`req.accepts()` does the math for you:
+
+```js
+app.get('/users/:id', (req, res) => {
+  const user = getUser(req.params.id);
+
+  res.format({
+    'application/json': () => res.json(user),
+    'text/html':        () => res.render('user', { user }),
+    'text/csv':         () => res.send(toCSV(user)),
+    default:            () => res.status(406).send('Not Acceptable'),
+  });
+});
+```
+
+`res.format` picks the handler matching the best `Accept` value.
+A 406 fallback handles "the client wants something we don't support."
+
+The simpler form:
+
+```js
+const accepts = req.accepts(['json', 'html', 'csv']);
+// → 'json' | 'html' | 'csv' | false
+```
+
+You decide what to do based on the result. `false` means none of
+your options were acceptable to the client.
+
+## The `Vary` header
+
+When a response depends on a request header, you must say so:
+
+```js
+res.set('Vary', 'Accept');
+res.json(data);
+```
+
+`Vary: Accept` tells caches "this response depended on the `Accept`
+header." If a different client sends a different `Accept`, the cache
+should fetch a fresh copy rather than serving the cached one.
+
+Without `Vary`, a shared cache might serve your JSON response to a
+client that wanted HTML. Painful.
+
+Multiple headers:
+
+```
+Vary: Accept, Accept-Encoding, Accept-Language
+```
+
+`Vary: *` means "this response is uncachable." Rarely what you want.
+
+## Content negotiation for languages
+
+```js
+const lang = req.acceptsLanguages(['en', 'es', 'fr']);
+res.set('Content-Language', lang);
+res.set('Vary', 'Accept-Language');
+res.json(translate(data, lang));
+```
+
+For i18n, this lets the same URL serve different languages based on
+the user's browser settings. Many apps prefer to put the language in
+the URL (`/en/users/42`) — it's easier to share and link, and you
+sidestep `Vary` headaches.
+
+## Content-Encoding (compression)
+
+```
+Request:  Accept-Encoding: gzip, br
+Response: Content-Encoding: gzip
+```
+
+The server compresses the body with one of the algorithms the
+client accepts. Express's `compression` middleware handles this
+automatically — see **Compression**.
+
+This is one place `Vary: Accept-Encoding` is automatic. The
+middleware sets it.
+
+## When negotiation doesn't fit
+
+Two common cases where negotiation is the *wrong* tool:
+
+### Different resources, different URLs
+
+If `/users.json` and `/users.csv` are really different endpoints
+(different access control, different caching strategies), make them
+different routes. URL-based content selection is simpler than
+header-based.
+
+```js
+app.get('/users.json', sendJson);
+app.get('/users.csv', sendCsv);
+```
+
+This also makes the URL shareable — `/users.csv` is unambiguous;
+`/users` requires headers to interpret.
+
+### Versioning
+
+Don't use `Accept` for API versioning unless you have a strong
+reason. Most APIs put the version in the URL (`/v1/users`) or in a
+custom header (`X-Api-Version`) because it's clearer in logs, easier
+to route, and easier to deprecate. See **API Versioning**.
+
+## The 406 status
+
+If the client's `Accept` excludes everything you can serve, the
+right response is `406 Not Acceptable`. In practice, most APIs
+return their default format anyway (JSON), reasoning that the client
+is probably a buggy SDK and getting *something* is better than
+nothing.
+
+Pick a policy and stick to it. Both are defensible.
+
+## Common client behavior
+
+- **Browsers**: `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`.
+  They want HTML.
+- **`fetch` in JS**: `Accept: */*` by default. They want anything.
+- **`curl`**: `Accept: */*`. Same.
+- **SDKs**: usually `Accept: application/json` explicitly.
+
+When debugging "the browser shows HTML but my SDK gets a 406," check
+what each is actually sending in `Accept`.
+
+## In practice
+
+For most APIs you'll only negotiate on one axis (format), and
+usually only JSON. The use cases for richer negotiation:
+
+- Sites that serve both HTML and JSON from the same URL (REST
+  conventions, server-rendered apps with JSON fallback).
+- APIs supporting multiple output formats (CSV/Excel for reports
+  alongside JSON for app clients).
+- Multilingual public pages (browser `Accept-Language` for the first
+  hit, sticky preference after).
+
+For everything else, simpler designs (URL-based selection, separate
+endpoints) compose better with caching, logging, and CDN rules.

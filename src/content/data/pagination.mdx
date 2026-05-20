@@ -1,0 +1,230 @@
+export const level = 'mid';
+
+# Pagination
+
+Returning all 100,000 rows is bad: slow, memory-heavy, and useless
+to the client. Pagination chunks results. The simple way (offset)
+works for small data and breaks at scale. The right way (cursor)
+takes a little more thought.
+
+## Offset pagination — the simple, broken default
+
+```sql
+SELECT * FROM users ORDER BY created_at DESC LIMIT 20 OFFSET 40;
+```
+
+Show page 3 (rows 41–60). The API:
+
+```
+GET /users?page=3&limit=20
+```
+
+Works. Easy to implement. Easy to add page numbers in a UI.
+
+### The problem
+
+`OFFSET 1000` means the database walks past 1000 rows before
+returning anything. `OFFSET 100000` makes the query slow even
+though the result is small.
+
+Worse: if rows are being inserted while users paginate, they see
+duplicates and skipped items. Insert one row, refresh page 1, and
+the last item of page 1 is now the first item of page 2.
+
+### When offset is OK
+
+- Small total result sets (a few hundred rows max).
+- Internal admin tools where occasional skip/dup is fine.
+- "Page numbers" are a hard UX requirement.
+
+For everything else, use cursor pagination.
+
+## Cursor pagination
+
+Instead of skipping N rows, ask "give me rows after this one":
+
+```
+GET /users?after=eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMSJ9&limit=20
+```
+
+The `after` cursor encodes the position. Server decodes it,
+filters past that point:
+
+```sql
+SELECT * FROM users
+WHERE (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT 21;
+```
+
+No `OFFSET`. The database uses the index to seek directly to the
+position. Constant-time regardless of how deep you've paged.
+
+### The cursor
+
+Encode just enough to identify "next." For sorting by
+`created_at DESC, id DESC`, the cursor is `(created_at, id)` of the
+last item from the previous page:
+
+```js
+const cursor = Buffer.from(JSON.stringify({
+  createdAt: lastItem.createdAt.toISOString(),
+  id: lastItem.id,
+})).toString('base64url');
+```
+
+Base64url is URL-safe; opaque to clients.
+
+### The query needs a tiebreaker
+
+Sorting only by `created_at` won't disambiguate rows with the same
+timestamp. The cursor needs a second column (the primary key works)
+to give a unique ordering:
+
+```sql
+ORDER BY created_at DESC, id DESC
+```
+
+Without the tiebreaker, two rows at the same timestamp can swap
+positions on different queries → users see duplicates or skips.
+
+### Fetching N+1
+
+Request `LIMIT 21` for a `limit=20` page. If you got back 21 rows,
+you know there's a next page. Return 20 to the user; use the 21st
+as a marker:
+
+```js
+const rows = await db.query('... LIMIT $1', [limit + 1]);
+const hasMore = rows.length > limit;
+const items = rows.slice(0, limit);
+const nextCursor = hasMore ? makeCursor(items[items.length - 1]) : null;
+```
+
+This avoids a separate `COUNT(*)` (which is expensive for large
+tables) just to determine `hasNext`.
+
+## Keyset pagination
+
+A subset of cursor pagination where the cursor is just the
+sort-key values (no encoding):
+
+```
+GET /events?after_created_at=2026-01-01T00:00:00Z&after_id=42&limit=20
+```
+
+Same query, just exposed differently. Easier to debug, more verbose
+URLs.
+
+## Response shape
+
+```json
+{
+  "items": [...],
+  "next_cursor": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMSJ9",
+  "has_more": true
+}
+```
+
+The client doesn't need to construct the next URL — it just
+includes the cursor in the next request.
+
+Some APIs use Link headers (`Link: <...>; rel="next"`). RFC 5988.
+Common in GitHub's API. Either works.
+
+## What about total count?
+
+`COUNT(*)` on a big table is expensive. Some options:
+
+- **Don't show total**. Just "next/prev." Many APIs don't expose
+  total intentionally. UX is fine if the user mostly wants the
+  first 100 items.
+- **Approximate count**. Postgres has `pg_class.reltuples` for an
+  estimate; close enough for "about 12,000 users."
+- **Cached count**. Compute once, refresh occasionally.
+
+A precise total is rarely worth the cost on large tables.
+
+## Sort by anything
+
+Cursor pagination works for any column, as long as you include a
+tiebreaker:
+
+- Sort by score (search results) → `(score, id)`.
+- Sort by name → `(name, id)`.
+- Sort by updated_at → `(updated_at, id)`.
+
+The cursor encodes whatever's needed for unambiguous "next" lookup.
+
+## Reverse direction
+
+For "previous page":
+
+```sql
+SELECT * FROM users
+WHERE (created_at, id) > ($1, $2)
+ORDER BY created_at ASC, id ASC
+LIMIT $3;
+```
+
+Then reverse the result client-side. The opposite of cursor
+fetching is a near-mirror query.
+
+## Avoiding `OFFSET` even when paginating sometimes
+
+A common middle-ground: use cursor for "next" navigation but
+support `offset` for jumping to specific pages in an admin UI. The
+admin operations don't hit the same scale.
+
+## In Express
+
+```js
+app.get('/users', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 20), 100);
+  const after = req.query.after ? decodeCursor(req.query.after) : null;
+
+  const where = after
+    ? 'WHERE (u.created_at, u.id) < ($1, $2)'
+    : '';
+  const params = after ? [after.createdAt, after.id, limit + 1] : [limit + 1];
+
+  const { rows } = await pool.query(`
+    SELECT * FROM users u
+    ${where}
+    ORDER BY u.created_at DESC, u.id DESC
+    LIMIT $${params.length}
+  `, params);
+
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const nextCursor = hasMore
+    ? encodeCursor({ createdAt: items[items.length - 1].created_at, id: items[items.length - 1].id })
+    : null;
+
+  res.json({ items, next_cursor: nextCursor, has_more: hasMore });
+});
+```
+
+Cap `limit` server-side (`Math.min(..., 100)`). Otherwise a client
+can request `?limit=10000000` and force you to load everything.
+
+## What about GraphQL?
+
+GraphQL has the Relay cursor connection spec — `edges`, `node`,
+`cursor`, `pageInfo`. It's the same idea formalized. Most GraphQL
+libraries support it.
+
+## Common bugs
+
+- **No tiebreaker** → duplicates/skips at boundaries.
+- **OFFSET pagination at scale** → page 1000 takes 5 seconds.
+- **No upper bound on `limit`** → a malicious client requests 1M
+  items.
+- **Exposing internal cursor format** → clients build URLs by
+  string concatenation, break when you change the format.
+- **`COUNT(*)` on every request** → unnecessary load on big tables.
+
+## When in doubt
+
+Cursor pagination. Always. Even when the table is small today.
+Tables grow.

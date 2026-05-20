@@ -1,0 +1,175 @@
+export const level = 'mid';
+
+# Buffers
+
+A `Buffer` is Node's representation of raw binary data — a fixed-size
+chunk of memory outside the V8 heap. Every byte that enters or leaves
+Node (files, sockets, TCP, TLS) is a buffer until something decodes it
+into a string or parses it into a structure.
+
+## What a Buffer is
+
+```js
+const buf = Buffer.from('hello', 'utf8');
+console.log(buf);                  // <Buffer 68 65 6c 6c 6f>
+console.log(buf.length);           // 5
+console.log(buf.toString('hex'));  // "68656c6c6f"
+console.log(buf.toString('utf8')); // "hello"
+console.log(buf[0]);               // 104  (byte value, not char)
+```
+
+Internally a `Buffer` is a `Uint8Array` subclass, so all the typed-array
+methods work. The difference is just that `Buffer` has Node-specific
+extras (`toString('hex')`, `Buffer.concat`, allocation helpers) and
+historically lives in off-heap memory.
+
+## Creating buffers
+
+```js
+Buffer.alloc(10);                  // zero-filled, 10 bytes
+Buffer.allocUnsafe(10);            // uninitialized — may contain old memory
+Buffer.from('hello');               // from string
+Buffer.from([0x68, 0x65, 0x6c]);    // from byte array
+Buffer.from(otherBuffer);           // copy
+```
+
+**Never use `Buffer.allocUnsafe` for buffers you'll expose to user
+code.** The memory isn't zeroed — it may contain bytes from previous
+allocations, including secrets. Use `Buffer.alloc` unless you're
+about to fully overwrite it.
+
+The older `new Buffer(...)` constructor is **deprecated** and gone in
+modern Node — same memory-leak risks as `allocUnsafe`. Always use the
+`Buffer.from`/`alloc` factory methods.
+
+## Encodings
+
+`Buffer` converts to/from strings via an encoding:
+
+- **`utf8`** (default) — variable-width Unicode.
+- **`utf16le`** — UTF-16 little-endian.
+- **`latin1`** — one byte per char, no Unicode.
+- **`ascii`** — like latin1 but strips high bit.
+- **`hex`** — two hex chars per byte.
+- **`base64`** / **`base64url`** — Base64.
+
+```js
+Buffer.from('hello').toString('base64');   // "aGVsbG8="
+Buffer.from('aGVsbG8=', 'base64').toString();  // "hello"
+```
+
+This is how you handle binary in JSON: base64-encode it.
+
+## Slicing without copying
+
+`buf.subarray(start, end)` returns a view into the same memory:
+
+```js
+const buf = Buffer.from('hello world');
+const slice = buf.subarray(6);
+console.log(slice.toString());  // "world"
+slice[0] = 0x57;                // 'W'
+console.log(buf.toString());     // "hello World"
+```
+
+The slice shares memory with the original. Cheap. If you need a
+separate copy, use `Buffer.copyBytesFrom(slice)` or
+`Buffer.from(slice)`.
+
+The older `buf.slice(start, end)` is now an alias for `subarray` (it
+used to be the only way; the name `subarray` matches typed arrays).
+
+## Concatenation
+
+```js
+const combined = Buffer.concat([a, b, c]);
+const sized = Buffer.concat([a, b], 100);   // truncate/pad to 100 bytes
+```
+
+Allocates a new buffer and copies. Avoid in loops — accumulate into
+one large pre-allocated buffer, or collect chunks and `concat` once
+at the end.
+
+## Reading multi-byte numbers
+
+```js
+const buf = Buffer.alloc(8);
+buf.writeUInt32BE(0xdeadbeef, 0);
+buf.writeFloatLE(3.14, 4);
+
+buf.readUInt32BE(0);    // 3735928559
+buf.readFloatLE(4);     // 3.140000104904175
+```
+
+`*BE` is big-endian (network byte order), `*LE` is little-endian
+(x86/ARM native). Available for `Int8/16/32`, `UInt8/16/32`,
+`BigInt64`, `Float`, `Double`. This is how you parse binary protocols
+(WebSocket frames, TCP, file formats).
+
+## Buffers + streams
+
+Stream chunks are buffers in binary mode. The classic accumulation
+pattern when you actually need the whole thing:
+
+```js
+const chunks = [];
+for await (const chunk of stream) chunks.push(chunk);
+const body = Buffer.concat(chunks);
+```
+
+For huge inputs, this is the anti-pattern — that's what streams exist
+to avoid. Use it only when the body is bounded and you genuinely need
+the whole thing (parsing JSON, decoding an image header).
+
+## Buffer vs string memory cost
+
+A 1MB UTF-8 file:
+
+- As a `string` in V8: 2MB (UTF-16 internally).
+- As a `Buffer`: 1MB.
+
+For raw bytes, buffers are cheaper. For text you'll do string
+operations on, decode once into a string. Don't repeatedly
+`toString()` the same buffer in a loop — it allocates each time.
+
+## TextEncoder / TextDecoder
+
+The platform-standard way to encode/decode:
+
+```js
+const enc = new TextEncoder();
+const dec = new TextDecoder('utf-8');
+
+const bytes = enc.encode('hello');  // Uint8Array, not Buffer
+const text = dec.decode(bytes);     // "hello"
+```
+
+These work in browsers too — useful for isomorphic code. The result
+is a `Uint8Array`, which Buffer is a subclass of, so you can pass it
+to Buffer methods.
+
+## Common bugs
+
+- **Mixing encodings**. `buf.toString()` defaults to UTF-8. If the
+  bytes aren't valid UTF-8, you get replacement characters and
+  data loss.
+- **Slicing without realizing it's a view**. Modifying the slice
+  modifies the source.
+- **Building huge buffers by `Buffer.concat` in a loop**. Accumulate
+  chunks in an array, concat once at the end.
+- **Trusting `buf.length` for character count**. It's the byte count.
+  `buf.toString().length` gives the character count (after UTF-8
+  decoding).
+
+## When you'll need them in Express
+
+- Reading raw request bodies (`express.raw()`).
+- Streaming uploads through transforms.
+- Generating signatures (`crypto.createHmac` returns a buffer).
+- Reading file headers (image dimensions, ZIP metadata).
+- Anything talking a binary protocol.
+
+For routine JSON-in / JSON-out APIs you'll rarely touch buffers
+directly. The framework handles the conversion. But the moment you
+implement webhooks (signature verification) or file uploads (magic
+bytes), you're back in buffer land.

@@ -1,0 +1,236 @@
+export const level = 'senior';
+
+# Memory & GC
+
+Node uses V8 — the same JavaScript engine as Chrome. Memory
+management is automatic (garbage collection), but the cost of GC
+shows up as latency spikes, OOM crashes, and the fun discovery that
+your "memory leak" is actually three big closures held alive by an
+event listener.
+
+## The heap
+
+Node's heap has a default maximum of about **2GB on 64-bit systems**
+(the exact number varies by Node version). When you go past it:
+
+```
+<--- Last few GCs --->
+... CPU stats ...
+<--- JS stacktrace --->
+FATAL ERROR: Ineffective mark-compacts near heap limit
+Allocation failed - JavaScript heap out of memory
+```
+
+The process dies. The orchestrator restarts you. Clients see errors.
+
+To raise the limit:
+
+```bash
+node --max-old-space-size=4096 server.js   # 4GB
+```
+
+This is a knob, not a fix. If you're hitting the limit, find out
+*why*. Either trim the working set or scale horizontally.
+
+## GC, briefly
+
+V8's GC is generational:
+
+- **Young generation** (small): new objects. Collected often,
+  cheaply. Live objects get promoted to old.
+- **Old generation** (big): objects that survived a young collection.
+  Collected less often, more expensively (mark-sweep, with
+  incremental marking and concurrent sweeping to reduce pause time).
+
+Most allocations die young — quick functions, temporary objects.
+Young GC is fast. Old-gen GC is where pauses come from.
+
+## What causes memory pressure
+
+1. **Caches that never evict.** A `Map` you put things into and
+   never delete. Top cause.
+2. **Closures holding references** the developer forgot about. A
+   callback registered on an emitter that's never removed.
+3. **Buffers held longer than needed.** Reading a 100MB file into a
+   string and keeping it.
+4. **Promises that never resolve.** They retain whatever they closed
+   over.
+5. **Connection objects.** Open sockets, file handles. Each one has
+   buffers.
+
+## Symptoms vs causes
+
+- **Steady memory growth over hours/days** — leak.
+- **Sudden spike, then OOM** — one bad request (oversized payload,
+  unbounded result set, etc.).
+- **High baseline but stable** — working set is just genuinely
+  large; might be fine.
+- **High GC time in CPU profile** — too much allocation/deallocation;
+  often a hot loop creating short-lived garbage.
+
+`v8.getHeapStatistics()` and `process.memoryUsage()` give you the
+numbers in code:
+
+```js
+const m = process.memoryUsage();
+// { rss, heapTotal, heapUsed, external, arrayBuffers }
+```
+
+- **`rss`** (resident set size): everything the process holds.
+- **`heapTotal`** / **`heapUsed`**: V8's JS heap.
+- **`external`**: C++ objects bound to JS (Buffers, native modules).
+- **`arrayBuffers`**: subset of external — `ArrayBuffer` data.
+
+A growing gap between `heapUsed` and `rss` often means external/native
+allocations.
+
+## Hunting a leak
+
+The reproducible workflow:
+
+1. **Capture a baseline heap snapshot** (Chrome DevTools → connect to
+   Node via `--inspect`, take snapshot).
+2. **Apply load** (`autocannon`, `wrk`, real traffic replay).
+3. **Take a second snapshot** at peak.
+4. **Diff them.** DevTools shows what's grown.
+5. **Look at the retainers** for top growers — what's keeping each
+   object alive?
+
+`heapdump` (npm package) or `v8.writeHeapSnapshot()` (built-in,
+Node 11+) can dump on signal:
+
+```js
+import v8 from 'node:v8';
+
+process.on('SIGUSR2', () => {
+  const path = `/tmp/heap-${Date.now()}.heapsnapshot`;
+  v8.writeHeapSnapshot(path);
+  console.log('snapshot written to', path);
+});
+```
+
+Send `kill -USR2 <pid>`, load it into DevTools, browse.
+
+## Common leak patterns
+
+### Listener pile-up
+
+```js
+function setup() {
+  emitter.on('data', handler);   // ← never removed
+}
+setInterval(setup, 100);
+```
+
+Each `setup` adds a listener. After an hour, thousands. `emitter`
+holds them all (and whatever they close over). Fix: remove listeners
+in cleanup, or use `once`.
+
+### Cache without bounds
+
+```js
+const cache = new Map();
+app.get('/users/:id', async (req, res) => {
+  if (!cache.has(req.params.id)) {
+    cache.set(req.params.id, await db.users.findById(req.params.id));
+  }
+  res.json(cache.get(req.params.id));
+});
+```
+
+Every distinct ID grows the cache. After enough distinct requests,
+OOM. Use a bounded LRU (`lru-cache`):
+
+```js
+import { LRUCache } from 'lru-cache';
+const cache = new LRUCache({ max: 1000, ttl: 60_000 });
+```
+
+Bounded by count + TTL. Won't grow forever.
+
+### Timers holding references
+
+```js
+function startCleanup(obj) {
+  setInterval(() => obj.tidy(), 1000);   // holds obj forever
+}
+```
+
+`setInterval` keeps the callback alive, which keeps `obj` alive.
+Even when nobody else references `obj`, it can't be collected.
+Either `clearInterval` when done, or use `.unref()` so the timer
+doesn't prevent process exit.
+
+### Promise that never settles
+
+```js
+const longPromise = new Promise((resolve) => {
+  // forgot to call resolve
+});
+
+await Promise.race([longPromise, otherWork]);
+```
+
+`longPromise` lives forever, retaining everything it captured. Subtle.
+Always have a path to settle.
+
+## `WeakMap` and `WeakRef`
+
+When you want to associate data with an object without preventing
+its collection:
+
+```js
+const meta = new WeakMap();
+meta.set(someObject, { extra: 'info' });
+
+// When `someObject` is no longer referenced elsewhere, both it
+// and its meta entry are eligible for collection.
+```
+
+Use `WeakMap` for "decoration" — extra data attached to externally-
+owned objects. Use `WeakRef` for caches where you want a value to be
+collectible (rare; reach for it last).
+
+## GC pauses and tail latency
+
+A long GC pause delays every request running through the event loop.
+For latency-sensitive services this matters.
+
+Mitigations:
+
+- **Reduce allocation rate.** Reuse objects in hot paths
+  (object pooling for high-churn types like buffers).
+- **Avoid massive single allocations.** Streaming a file is gentler
+  on GC than reading it all at once.
+- **Tune the heap** — `--max-old-space-size` larger means less
+  frequent old-gen GC but longer pauses when it does happen. Not a
+  one-knob fix; profile.
+- **Worker threads** for CPU+memory-heavy work — separate heap,
+  separate GC.
+
+For most apps, default GC behavior is fine. Tuning is a last resort.
+
+## When to scale up vs out
+
+You're at 80% memory steady. Two options:
+
+1. **Up**: bigger box, bigger `--max-old-space-size`. Simple, but
+   one process is still bound by GC and event-loop limits.
+2. **Out**: more replicas. Each is smaller, total capacity scales
+   linearly until the database (or other shared resource) becomes
+   the bottleneck.
+
+Default to "out." Up is the lazier short-term fix.
+
+## Quick wins
+
+- Set `NODE_OPTIONS=--max-old-space-size=4096` in container env to
+  give yourself room.
+- Use `lru-cache` for anything cache-like.
+- Stream large payloads.
+- Cap request body sizes (`express.json({ limit: '100kb' })`).
+- Track `process.memoryUsage()` as a metric in observability.
+
+Memory is one of the easier production issues to get ahead of — the
+graph either trends up over time (leak) or it doesn't. Stable is the
+goal.

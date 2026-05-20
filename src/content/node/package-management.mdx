@@ -1,0 +1,193 @@
+export const level = 'mid';
+
+# Package Management
+
+`node_modules` is one of the biggest folders on your hard drive for a
+reason — JavaScript leans hard on small packages. The art is in
+choosing dependencies carefully, locking versions deterministically,
+and noticing when one of them tries to mine bitcoin in your CI.
+
+## Why pnpm
+
+The recommended package manager for this project — and for new Node
+work generally. Reasons:
+
+- **Content-addressable store.** Packages are stored once on disk and
+  hardlinked into projects. Disk space + install time win.
+- **Strict module resolution.** A package can only import what it
+  explicitly depends on. Catches phantom-dependency bugs at install,
+  not in prod.
+- **Faster** than npm and yarn by a significant margin.
+- **Lockfile is reliable**. `pnpm-lock.yaml` is deterministic across
+  machines and resolves disputes that npm has historically had.
+- **Better defense against supply-chain attacks** — isolated
+  `node_modules`, smaller blast radius.
+
+```bash
+pnpm install            # install from lockfile (or create one)
+pnpm add express        # add a dependency
+pnpm add -D vitest      # devDependency
+pnpm remove old-pkg
+pnpm exec eslint .
+pnpm dlx create-vite    # one-shot, doesn't install permanently
+```
+
+`npm` is fine for casual scripts. For real projects, pnpm.
+
+## SemVer in practice
+
+```json
+{
+  "dependencies": {
+    "express": "^4.18.2",     // ^ = compatible with 4.x.x, up to <5.0.0
+    "lodash": "~4.17.21",     // ~ = compatible with 4.17.x, up to <4.18.0
+    "exact": "1.2.3",         // exact version
+    "any-1": "1.x",
+    "any-major": "*"           // any version (avoid)
+  }
+}
+```
+
+- `^X.Y.Z` (default for `pnpm add`): allows minor + patch updates.
+- `~X.Y.Z`: allows patch updates only.
+- `X.Y.Z`: pinned.
+- `*` or omitted: any. Don't.
+
+For libraries you publish, use `^`. For applications, the lockfile is
+what actually matters — the manifest ranges are what `pnpm update`
+respects.
+
+## Lockfile discipline
+
+The lockfile (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`)
+records the **exact** versions and integrity hashes installed. Commit
+it. Always.
+
+- **CI**: install with `pnpm install --frozen-lockfile`. Fails if the
+  lockfile is out of sync with `package.json`. This is the right
+  behavior — silent lockfile drift in CI hides real changes.
+- **Local**: `pnpm install` updates the lockfile if `package.json`
+  changed. That's fine when adding deps. Don't `rm pnpm-lock.yaml` to
+  "fix" something — you've just thrown away every deliberate pin.
+
+## `dependencies` vs `devDependencies` vs `peerDependencies`
+
+- **`dependencies`** — needed at runtime. Ship with the package.
+- **`devDependencies`** — needed for development/build only.
+  TypeScript, vitest, eslint. Not installed by consumers of your
+  library.
+- **`peerDependencies`** — required but not provided. The classic
+  example: a React plugin lists React as a peer; you (the consumer)
+  bring React. Prevents two copies.
+- **`optionalDependencies`** — try to install, but don't fail if it
+  can't. Native modules with platform-specific builds.
+
+For an app (not a library): `dependencies` for prod code,
+`devDependencies` for build tooling. `peerDependencies` rarely
+relevant.
+
+## Auditing dependencies
+
+```bash
+pnpm audit                  # check for known vulnerabilities
+pnpm audit --fix            # update where the constraint allows
+pnpm outdated               # show what's behind
+pnpm why express            # who depends on this?
+```
+
+`pnpm why` is invaluable when you have a transitive dependency you
+didn't expect — it traces the chain back to a direct dep.
+
+## Supply-chain hygiene
+
+The npm registry has had real supply-chain attacks (Shai-Hulud worm,
+compromised popular packages). What helps:
+
+- **pnpm's strict isolation** — a malicious dep can't reach into
+  unrelated parts of your `node_modules`.
+- **Skip postinstall scripts** for packages you don't trust. pnpm
+  prompts the first time it sees one. Approve only known-good
+  packages.
+- **Pin your tooling** — committing `pnpm-lock.yaml` means a CI
+  pipeline yesterday and tomorrow installs the same code.
+- **Use `npm` only where required**. Different ecosystems have
+  different threat models; switching managers is a real defensive
+  measure.
+- **Watch popular-package alerts.** Tools like `socket.dev` flag
+  suspicious changes at install time.
+
+## Native modules
+
+Some packages compile C/C++ at install:
+
+- `bcrypt` (older versions; newer prefers prebuilt)
+- `sharp` (libvips bindings)
+- `better-sqlite3`
+
+You need a C++ toolchain (`gcc`, `python`) available, or use prebuilt
+binaries (`@mapbox/node-pre-gyp` etc.). In Docker, install
+`build-essential` (Debian/Ubuntu) or alpine equivalents.
+
+If install fails on these, check Node version + glibc compatibility +
+toolchain. The error messages from `node-gyp` are notoriously
+unhelpful; google the literal error string.
+
+## Reproducible installs
+
+Three things make `pnpm install` deterministic:
+
+1. **Same Node version** — some packages compile per-Node-version.
+   Use `nvm`/`fnm`/`asdf` to pin. Better: commit `.nvmrc` or
+   `package.json#engines`.
+2. **Same package manager version** — pnpm respects
+   `packageManager` in package.json:
+   ```json
+   { "packageManager": "pnpm@9.12.0" }
+   ```
+3. **Frozen lockfile** — `--frozen-lockfile` (CI) or
+   `--prefer-frozen-lockfile`.
+
+Get all three right and "works on my machine" goes away.
+
+## Common pitfalls
+
+- **`package.json` and lockfile drift.** Someone hand-edits
+  `package.json`, doesn't run install. CI breaks. Fix: install
+  immediately after editing.
+- **Range mismatch in monorepos.** Two packages depend on different
+  versions of the same lib; both get installed. Wastes space; can
+  cause subtle bugs. `pnpm dedupe` helps.
+- **`peerDependencies` warnings.** "X requires Y as peer" — usually
+  fine, but read the version range. Mismatches cause runtime bugs
+  (e.g., two React copies → invalid hook calls).
+- **Installing in production with dev deps.** `pnpm install --prod`
+  skips devDependencies. Use it in production Dockerfiles to shrink
+  the image.
+- **`postinstall` scripts in untrusted deps.** pnpm asks before
+  running them. Don't blindly approve.
+
+## Monorepos
+
+pnpm has first-class workspace support:
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - 'packages/*'
+  - 'apps/*'
+```
+
+Each subpackage gets its own `package.json`; pnpm symlinks them so
+local packages can import each other by name. Saves the explosion of
+copies that `npm install` would create.
+
+For projects with one app and shared libs, this is the path.
+
+## When the install is slow
+
+- First install (cold cache): slow. Expected.
+- Subsequent installs: fast (hardlinks). If they're slow, the store
+  is misconfigured or you're behind a slow registry. Set a closer
+  registry (`pnpm config set registry`).
+- CI: use `--frozen-lockfile` + caching of the pnpm store
+  (`~/.local/share/pnpm/store`). Most CI providers have a recipe.

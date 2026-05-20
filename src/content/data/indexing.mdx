@@ -1,0 +1,289 @@
+export const level = 'senior';
+
+# Indexing
+
+An index is a data structure that lets the database find rows
+matching a predicate without scanning the whole table. The right
+indexes are the difference between sub-millisecond queries and
+multi-second timeouts. The wrong indexes waste space and slow down
+writes. Knowing where to add them — and where not to — is one of the
+most important data skills.
+
+## What an index does
+
+A primary-key lookup on an unindexed column:
+
+```sql
+SELECT * FROM users WHERE email = 'jon@example.com';
+```
+
+Without an index: the database reads every row in the table,
+comparing email values. O(n).
+
+With a B-tree index on `email`: the database walks the index tree
+to find the row reference, then reads the row. O(log n).
+
+For a 1M row table, that's the difference between "1 second" and
+"1 millisecond."
+
+## B-tree — the default
+
+```sql
+CREATE INDEX users_email_idx ON users (email);
+```
+
+Sorted balanced tree of values. Supports `=`, `<`, `<=`, `>`, `>=`,
+`BETWEEN`, `IN`, range queries, sort by the indexed column. Most
+indexes you create are B-trees, and that's correct.
+
+## Composite indexes
+
+Index on multiple columns:
+
+```sql
+CREATE INDEX posts_author_created_idx ON posts (author_id, created_at);
+```
+
+This index helps queries that filter on:
+
+- `author_id` alone.
+- `author_id AND created_at`.
+
+It does **not** help with `created_at` alone — the index is sorted
+primarily by `author_id`. Think of a phone book sorted by last name
+then first name: useful for "find Smith" or "find Smith, John,"
+useless for "find anyone named John."
+
+Order matters. Put the most-filtered column first.
+
+## Covering indexes
+
+An index that contains all the columns the query needs:
+
+```sql
+CREATE INDEX users_email_name_idx ON users (email) INCLUDE (name);
+
+SELECT name FROM users WHERE email = 'jon@example.com';
+```
+
+The query never has to read the actual table row — the index has
+everything. Postgres calls this an **index-only scan**. Fastest
+possible read.
+
+`INCLUDE` (Postgres 11+) adds columns to the index without making
+them part of the sort key. The query plan can use the index without
+touching the heap.
+
+## Partial indexes
+
+Index only a subset of rows:
+
+```sql
+CREATE INDEX active_users_email_idx ON users (email) WHERE active = true;
+```
+
+Smaller index. Faster. Cheaper to maintain. Use when queries
+consistently filter to the same subset (e.g., active users,
+non-deleted records).
+
+## Expression indexes
+
+Index a function of the column:
+
+```sql
+CREATE INDEX users_lower_email_idx ON users (lower(email));
+
+SELECT * FROM users WHERE lower(email) = 'jon@example.com';
+```
+
+Now case-insensitive email lookups use the index. Required: the
+query must call the same function the index uses.
+
+For substring matching, `GIN` with `pg_trgm` is the move (below).
+
+## Unique indexes
+
+```sql
+CREATE UNIQUE INDEX users_email_uniq ON users (email);
+-- equivalent to:
+ALTER TABLE users ADD CONSTRAINT users_email_unique UNIQUE (email);
+```
+
+Acts as both a data integrity constraint AND an index for lookups.
+`INSERT` of a duplicate fails with error code `23505`.
+
+For email/username/handle columns, almost always what you want.
+
+## GIN indexes for JSONB, arrays, full-text
+
+```sql
+CREATE INDEX events_data_gin_idx ON events USING gin (data);
+
+-- Now this is fast:
+SELECT * FROM events WHERE data @> '{"user": 42}';
+```
+
+GIN (Generalized Inverted Index) is for "the value is one of many."
+Arrays, JSONB, full-text search vectors. Slower to build, slower to
+update, but indispensable for these data shapes.
+
+For text search:
+
+```sql
+CREATE INDEX docs_search_idx ON docs USING gin (to_tsvector('english', body));
+
+SELECT * FROM docs
+WHERE to_tsvector('english', body) @@ to_tsquery('english', 'redis & nodejs');
+```
+
+Postgres's full-text search is good enough for many use cases that
+people reach for Elasticsearch for.
+
+## Sort using an index
+
+```sql
+SELECT * FROM users ORDER BY created_at DESC LIMIT 20;
+```
+
+With `CREATE INDEX users_created_idx ON users (created_at DESC)`,
+the database reads the index in order and stops after 20 — no
+sorting needed.
+
+This is huge for "latest N" queries. The index does the sort for
+you.
+
+## What an index costs
+
+- **Disk space** — usually a fraction of the table, but for wide
+  tables with many indexes it adds up.
+- **Write speed** — every `INSERT`, `UPDATE`, `DELETE` updates every
+  relevant index. 5 indexes on a table → 5× the write overhead.
+- **VACUUM / maintenance overhead** — Postgres-specific bloat.
+
+Index everything you read frequently. Don't index rarely-used
+columns "just in case."
+
+## EXPLAIN your queries
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM users WHERE email = 'jon@example.com';
+```
+
+Returns the query plan. What you want to see:
+
+- **Index Scan** — using an index. Good.
+- **Index Only Scan** — using a covering index, no heap fetch.
+  Better.
+- **Bitmap Index Scan + Bitmap Heap Scan** — combining multiple
+  indexes. Often fine.
+- **Seq Scan** — reading the whole table. Bad on big tables, fine
+  on small ones.
+
+`Seq Scan` on a 100-row lookup table is fine. `Seq Scan` on a
+10M-row table behind a `WHERE` is a missing index.
+
+Also look at:
+
+- **Rows estimated vs actual**. Big disparity → statistics are stale
+  (run `ANALYZE`).
+- **Cost** — relative; lower is better.
+- **Actual time** — milliseconds. The truth.
+
+## Common indexing mistakes
+
+### Indexing the wrong order
+
+```sql
+-- Bad if most queries are by author_id alone:
+CREATE INDEX (created_at, author_id);
+
+-- Better:
+CREATE INDEX (author_id, created_at);
+```
+
+The first column dominates.
+
+### Indexing a column with low cardinality
+
+```sql
+CREATE INDEX users_active_idx ON users (active);   -- two values: t/f
+```
+
+If half the rows match, the index isn't selective enough — the
+database often picks a sequential scan instead. Indexes shine on
+high-cardinality columns (many distinct values).
+
+Partial index works here:
+
+```sql
+CREATE INDEX users_active_idx ON users (id) WHERE active = true;
+```
+
+Now you index *only* active users. Tight and fast.
+
+### Indexing every column
+
+Hoping one will hit. Doesn't work — each query uses one index (or a
+small handful via bitmap combination). Wasted space and write
+overhead.
+
+### Forgetting indexes on foreign keys
+
+```sql
+-- posts.author_id is a foreign key, but unindexed
+SELECT * FROM users u
+JOIN posts p ON p.author_id = u.id;
+```
+
+Joining is slow because `posts.author_id` lookup has no index. **Always
+index foreign keys** unless you have a specific reason not to.
+
+### Building indexes that block writes
+
+```sql
+CREATE INDEX foo_idx ON foo (col);            -- blocks writes
+CREATE INDEX CONCURRENTLY foo_idx ON foo (col); -- doesn't, but slower
+```
+
+For production tables, `CONCURRENTLY`. The non-concurrent form
+takes an exclusive lock for the duration of the build.
+
+## Removing unused indexes
+
+```sql
+SELECT * FROM pg_stat_user_indexes WHERE idx_scan = 0;
+```
+
+Indexes that have never been scanned since the last reset. Likely
+candidates for removal.
+
+Don't remove indexes without checking — a rarely-used index might
+be critical for one query that runs nightly. Look at the actual
+query patterns first.
+
+## Indexing isn't the only tool
+
+- **Materialized views** for expensive aggregates that don't need
+  to be real-time.
+- **Partitioning** for huge tables — split by date/range/hash so
+  queries only touch relevant partitions.
+- **Denormalization** — copy a frequently-joined value into the
+  table so you don't need the join.
+
+These are bigger interventions but sometimes the right answer when
+indexing isn't enough.
+
+## In practice
+
+When your query is slow:
+
+1. `EXPLAIN ANALYZE` it.
+2. Look for `Seq Scan` on a big table.
+3. Add the index (composite if you filter on multiple columns).
+4. Re-EXPLAIN to confirm the plan changed.
+5. Time it. Repeat as needed.
+
+Most slow queries are missing an index. Most slow apps have a few
+obvious missing indexes and a lot of suspect-but-correct ones.
+Profile, fix the obvious, move on.

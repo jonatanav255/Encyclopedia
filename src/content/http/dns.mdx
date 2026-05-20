@@ -1,0 +1,211 @@
+export const level = 'mid';
+
+# DNS
+
+DNS turns `api.example.com` into an IP address. Every outbound
+request from your Node service does this — sometimes invisibly,
+sometimes slowly, sometimes wrongly. Understanding how Node resolves
+names is the difference between "the API is slow today" and "Node is
+hitting the wrong region's API because its DNS cache went stale 4
+hours ago."
+
+## The lookup chain
+
+When you `fetch('https://api.example.com')`:
+
+1. Node calls the OS resolver (or libc directly, depending on
+   platform).
+2. The OS checks its cache. Hit? Return. Miss? Continue.
+3. The OS asks the configured DNS server (`/etc/resolv.conf` on
+   Unix, often a local resolver like `systemd-resolved`).
+4. The DNS server walks the hierarchy: root → `.com` → `example.com`
+   nameservers → answer.
+5. Each step caches, respecting TTL.
+
+The whole resolution can take anywhere from <1ms (cached locally) to
+hundreds of ms (uncached, distant resolvers).
+
+## Node's resolver
+
+Two ways Node resolves names:
+
+- **`dns.lookup`** (default in `node:net`, `node:http`, `fetch`).
+  Uses the OS resolver. Honors `/etc/hosts`, `nsswitch.conf`.
+  Synchronous-feeling — uses libuv threadpool.
+- **`dns.resolve`** family. Uses Node's own resolver, talking
+  directly to DNS servers. Skips `/etc/hosts`, ignores OS cache.
+
+For most apps, the OS resolver (default) is right. The Node resolver
+is for when you specifically want bypass-OS behavior.
+
+## DNS caching in Node
+
+Node 18+ ships with `dns.lookup` results being **not cached by
+default**. Every connection re-resolves. The OS cache (if any) is the
+only caching layer.
+
+If your OS doesn't cache DNS (some container setups don't), you
+hammer the DNS server. This shows up as DNS being unexpectedly slow
+or as random `EAI_AGAIN` errors under load.
+
+Fix: enable a global cache.
+
+```js
+import { setGlobalDispatcher, Agent } from 'undici';
+
+setGlobalDispatcher(new Agent({
+  connect: {
+    lookup: (hostname, options, cb) => {
+      // your custom lookup with caching
+    },
+  },
+}));
+```
+
+Or use a library like `cacheable-lookup`:
+
+```js
+import CacheableLookup from 'cacheable-lookup';
+const cacheable = new CacheableLookup();
+cacheable.install(globalThis[Symbol.for('undici.dispatcher')]);
+```
+
+For fetch in particular, this matters a lot if you make many requests
+to the same hostname.
+
+## TTL — the source of "stale DNS" pain
+
+A DNS record's TTL says how long resolvers should cache it. The
+record might say 300 seconds; the resolver might cache longer
+(implementation-dependent). Some load balancers behind a single
+hostname change their IPs frequently — if your cache is wrong about
+which IP is current, you connect to a dead one.
+
+This is why "restart the service" sometimes fixes mysterious network
+issues. The fresh resolution skips the bad cache.
+
+For long-lived processes (Node services), this is a real concern.
+Either:
+
+- Use short TTLs (operationally expensive, more lookups).
+- Re-resolve periodically (rebuild your connection pool).
+- Let your connection pool re-establish on error (handles most
+  cases).
+
+## IPv4 vs IPv6 (the dual-stack problem)
+
+A hostname can have both an A record (IPv4) and AAAA record (IPv6).
+The OS resolver returns whichever it prefers. Node's behavior has
+shifted over versions.
+
+If your network supports v6 but a service's v6 endpoint is broken,
+your connections fail mysteriously while v4 would work. Diagnosis:
+
+```bash
+dig api.example.com A
+dig api.example.com AAAA
+```
+
+If both exist, force one family:
+
+```js
+fetch(url, {
+  // undici-specific
+  dispatcher: new Agent({ connect: { family: 4 } }),
+});
+```
+
+Or set `NODE_OPTIONS=--dns-result-order=ipv4first`. The default
+order changed in Node 17 — predictable failures shifted with it.
+
+## Resolution under load
+
+Each `fetch` call to a new hostname triggers a resolution. The
+libuv threadpool (default 4 threads) handles them. Saturate it and
+your other I/O work slows down — including unrelated `fs` calls.
+
+Two mitigations:
+
+- Cache DNS results (as above).
+- Increase the threadpool: `UV_THREADPOOL_SIZE=64` (env). 64 is a
+  reasonable upper bound; more rarely helps.
+
+## DNS over HTTPS (DoH)
+
+Encrypted DNS, served over HTTPS to a resolver like Cloudflare
+(`1.1.1.1`) or Google (`8.8.8.8`). Protects DNS queries from
+in-network observers.
+
+Node doesn't speak DoH natively. Some clients (browsers, OS-level
+resolvers) do. For server-to-server DNS, your queries are likely
+plain UDP/TCP to whatever resolver `/etc/resolv.conf` lists.
+
+In production this rarely matters — internal DNS for cloud services
+is usually inside the trusted network. For client-to-anywhere, DoH
+matters more.
+
+## Common production issues
+
+### `getaddrinfo ENOTFOUND`
+
+Resolver couldn't find the hostname. Either:
+
+- The name doesn't exist (typo).
+- DNS server unreachable / misconfigured.
+- The container's `/etc/resolv.conf` is wrong.
+
+In containers, `resolv.conf` is usually injected by the runtime
+(Kubernetes pods inherit it from kubelet). If it's wrong, DNS
+breaks for everything.
+
+### `EAI_AGAIN`
+
+Temporary failure. Resolver overloaded or transiently unreachable.
+Retry with backoff; don't immediately fail.
+
+### Slow first connection, fast subsequent ones
+
+First call: cache miss, full DNS lookup + TCP + TLS handshake.
+Subsequent: cached. If you see 200ms+ for the first request and
+20ms for the rest, you're seeing DNS+handshake latency. Keep-alive
+and DNS caching collapse this.
+
+### Wrong region
+
+CDN or DNS-based geo routing returns the wrong region's endpoint.
+Hard to diagnose because everything *looks* right. The fix is
+usually to use the right hostname (most clouds offer region-pinned
+DNS names) or use the IP directly with SNI.
+
+## `/etc/hosts`
+
+Local overrides. `dns.lookup` respects it; `dns.resolve` does not.
+Useful for:
+
+- Pointing at staging via the prod hostname (testing without DNS
+  changes).
+- Local dev (`127.0.0.1 myapp.local`).
+
+In production, almost always empty besides `localhost`.
+
+## Service discovery vs DNS
+
+In Kubernetes, `myservice.default.svc.cluster.local` is DNS — but
+it's resolved by the cluster's CoreDNS, not the public internet.
+Same protocol, different resolver, much shorter TTLs.
+
+In service meshes (Istio, Linkerd), DNS routes through sidecars that
+may add their own resolution logic. Your code doesn't know — it
+still just `fetch`'s a hostname.
+
+## When to care
+
+- High traffic to the same upstream → cache DNS.
+- IPv6 connectivity issues → force IPv4 or fix v6.
+- Cert / hostname mismatches → check what's being resolved.
+- Mysterious "service is down" that resolves on restart → DNS cache
+  staleness.
+
+For most Express apps, DNS is invisible until it isn't. When it
+isn't, the symptoms can look like anything — slow APIs, random
+timeouts, connection refused. Knowing where to look saves hours.

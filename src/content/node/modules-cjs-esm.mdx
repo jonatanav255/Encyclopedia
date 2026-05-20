@@ -1,0 +1,209 @@
+export const level = 'mid';
+
+# Modules: CommonJS vs ESM
+
+Node has two module systems. CommonJS (`require`, `module.exports`) is
+the original; ESM (`import`, `export`) is the JavaScript standard.
+You'll encounter both, sometimes in the same project, and the
+interop story has sharp edges.
+
+## CommonJS (CJS)
+
+```js
+// math.cjs
+function add(a, b) { return a + b; }
+module.exports = { add };
+
+// app.cjs
+const { add } = require('./math.cjs');
+```
+
+- Synchronous (`require` blocks until the module loads).
+- Dynamic (you can `require` at any point in code).
+- `__dirname`, `__filename`, `require`, `module`, `exports` are
+  available as ambient variables.
+- Files with `.cjs` extension or in a package with `"type":
+  "commonjs"` (the default if unspecified).
+
+## ESM (modern)
+
+```js
+// math.js
+export function add(a, b) { return a + b; }
+
+// app.js
+import { add } from './math.js';
+```
+
+- Asynchronous loading internally — but `import` still feels
+  synchronous in source.
+- **Static** — imports are resolved before any code runs. You can't
+  conditionally `import` at the top level (use dynamic `import()` for
+  that).
+- No `__dirname` / `__filename`. Use `import.meta.url`,
+  `import.meta.dirname`, `import.meta.filename` (Node 20+).
+- Files with `.mjs` extension or in a package with `"type": "module"`.
+
+## Which to pick
+
+For new projects, **ESM**. The ecosystem has moved. TypeScript
+defaults to ESM output. Top-level `await` only works in ESM. Many
+modern packages (`chalk` v5+, `node-fetch`, the entire `@octokit`
+family in newer versions) are ESM-only.
+
+The reasons to still use CJS:
+
+- Legacy codebases.
+- Compat with a runtime that doesn't support ESM (older AWS Lambda
+  runtimes, some serverless platforms).
+- A specific dependency that's CJS-only (rare these days).
+
+## Interop, where the trouble lives
+
+### ESM importing CJS
+
+```js
+// works — default + named where possible
+import express from 'express';   // CJS default export
+import { Router } from 'express'; // named, often works via Node's heuristics
+```
+
+Node tries to statically analyze the CJS file and synthesize named
+exports. Sometimes it works, sometimes you get
+`SyntaxError: The requested module './foo.cjs' does not provide an
+export named 'bar'`. When that happens:
+
+```js
+import pkg from './foo.cjs';
+const { bar } = pkg;
+```
+
+You import the whole module and destructure at runtime.
+
+### CJS importing ESM
+
+```js
+// CJS file
+const { add } = require('./math.mjs');   // throws — sync require of ESM
+```
+
+`require` is synchronous, ESM loading is async — you can't do this
+synchronously. The escape hatch:
+
+```js
+async function main() {
+  const { add } = await import('./math.mjs');
+}
+```
+
+Dynamic `import()` works from CJS. The cost: it's async, so it changes
+your call site. As of Node 22+, **synchronous `require` of ESM** is
+supported under a flag (`--experimental-require-module`) — eventually
+this will land stable.
+
+## Default vs named exports
+
+```js
+// ESM
+export default function () {}   // default export
+export const foo = 1;           // named export
+
+// CJS
+module.exports = function () {};        // "default"
+module.exports.foo = 1;                  // also possible — mixed
+```
+
+CJS doesn't have the default/named distinction at the language level
+— `module.exports` is one value. Node's ESM interop pretends
+`module.exports` is the default export. If the CJS file did
+`module.exports = { add }`, the ESM importer sees `add` as a named
+export (heuristic). If the CJS file did `module.exports = function`,
+only the default is available.
+
+## File extensions
+
+ESM requires extensions in relative imports:
+
+```js
+import { add } from './math';     // ❌ Cannot find module
+import { add } from './math.js';  // ✅
+```
+
+This is intentional — it mirrors what browsers do. TypeScript
+projects often have to write `.js` in source even when the file is
+`.ts`, because that's what the runtime resolver sees. Modern TS
+(5.4+) with `module: "nodenext"` enforces this.
+
+## Top-level await
+
+Only works in ESM:
+
+```js
+// app.js (ESM)
+const config = await loadConfig();
+const app = createApp(config);
+await app.listen(3000);
+```
+
+Useful for one-time async setup at startup. In CJS the equivalent is
+`(async () => { ... })()` IIFE.
+
+## `__dirname` in ESM
+
+The CJS ambient `__dirname` doesn't exist. Three options:
+
+```js
+// Node 20+
+const here = import.meta.dirname;
+
+// Standard
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+const here = path.dirname(fileURLToPath(import.meta.url));
+
+// Convenient
+const here = new URL('.', import.meta.url).pathname;  // works on POSIX
+```
+
+`import.meta.dirname` is what you want going forward.
+
+## `package.json` controls everything
+
+```json
+{
+  "type": "module",            // or "commonjs"
+  "main": "./dist/index.cjs",  // entry for old loaders
+  "exports": {                  // modern: per-condition
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  }
+}
+```
+
+The `exports` field replaces `main` for modern resolvers. It lets a
+package ship both an ESM and CJS build of the same code, served to
+the right consumer automatically. If you publish packages, you'll
+need to know this.
+
+## Common pain points
+
+- **A library is ESM-only and your project is CJS** → migrate the
+  project to ESM, or pin to an older CJS version of the library, or
+  use dynamic `import()` (CJS) to load it.
+- **TypeScript "Cannot find module './foo'"** → add `.js` to the
+  import path (yes, even with TS).
+- **Jest / vitest config differences** → most modern test runners
+  prefer ESM. Old Jest configs needed `transformIgnorePatterns` to
+  transform ESM dependencies; vitest just works.
+- **`__dirname is not defined`** → you're in ESM. Use the patterns
+  above.
+
+## The forward direction
+
+The ecosystem trajectory is clear: ESM is the standard, CJS sticks
+around for legacy. Node is filling in the gaps (sync `require(esm)`,
+better interop). New code should be ESM; old code can stay CJS;
+mixed projects are common and tolerable with the right `package.json`
+and a willingness to occasionally use dynamic `import()`.

@@ -1,0 +1,266 @@
+export const level = 'senior';
+
+# OAuth2 & OIDC
+
+OAuth 2.0 is an **authorization** framework — "this app is allowed
+to do these things on this user's behalf." OpenID Connect (OIDC) is
+**authentication** built on top — "this app knows who this user
+is." When someone says "log in with Google," they mean OIDC.
+
+## Why this matters
+
+In any real app you'll integrate at least one OAuth flow:
+
+- **Social login** — Google, GitHub, Apple, Microsoft.
+- **Enterprise SSO** — Okta, Auth0, Azure AD.
+- **Third-party API access** — let the user grant your app access
+  to their Google Drive, GitHub repos, Stripe account.
+
+The protocol has multiple flows, each for different client types,
+each with subtle security properties. Knowing which one to use
+matters.
+
+## The actors
+
+- **Resource Owner** — the user.
+- **Client** — your app, the one wanting access.
+- **Authorization Server** — the OAuth provider (Google, Auth0).
+- **Resource Server** — the API that holds the user's data
+  (sometimes same as the authorization server, sometimes not).
+
+A "flow" describes how these actors exchange messages to end up
+with the client holding an access token.
+
+## Authorization Code flow + PKCE (the modern default)
+
+For web apps, mobile apps, SPAs — basically anything that's not a
+server-to-server integration. The flow:
+
+1. Client generates a random `code_verifier` and its SHA-256 hash
+   `code_challenge` (PKCE).
+2. Client redirects the user to the auth server:
+   ```
+   GET https://accounts.google.com/o/oauth2/v2/auth?
+     client_id=...&
+     redirect_uri=https://app.example.com/callback&
+     response_type=code&
+     scope=openid email profile&
+     state=<random>&
+     code_challenge=<sha256(verifier)>&
+     code_challenge_method=S256
+   ```
+3. User logs in to Google, consents.
+4. Google redirects back to your `redirect_uri` with `?code=...&state=...`.
+5. Client verifies `state` matches what it sent (CSRF protection).
+6. Client exchanges the code for tokens — server-side:
+   ```
+   POST https://oauth2.googleapis.com/token
+   client_id=...
+   client_secret=...
+   code=<the code>
+   code_verifier=<the original verifier>
+   grant_type=authorization_code
+   redirect_uri=...
+   ```
+7. Response contains `access_token` (and `id_token` for OIDC).
+
+**PKCE** (Proof Key for Code Exchange) protects against an attacker
+who intercepts the authorization code. Without the original
+verifier, they can't exchange it for a token.
+
+The `state` parameter is your CSRF protection — the auth server
+echoes it back; you check it matches before continuing.
+
+## OIDC adds identity
+
+OAuth alone gives you `access_token` (use this to call APIs). OIDC
+additionally provides `id_token` — a signed JWT containing the
+user's identity claims:
+
+```json
+{
+  "iss": "https://accounts.google.com",
+  "sub": "1234567890",
+  "email": "jon@example.com",
+  "email_verified": true,
+  "name": "Jon",
+  "iat": 1730000000,
+  "exp": 1730003600
+}
+```
+
+`sub` is the stable user identifier. `email` may change; `sub` won't.
+
+You verify the JWT's signature against the auth server's public
+keys (published at `<issuer>/.well-known/jwks.json`). After
+verification, the claims are trustworthy.
+
+## In Express
+
+Don't implement OAuth flows yourself. Use a library:
+
+- **`passport`** + strategy (`passport-google-oauth20`, etc.) —
+  mature, widely used.
+- **`openid-client`** — official OIDC reference implementation in
+  Node.
+- **Auth0 SDK**, **Clerk**, **Supabase Auth** — managed auth
+  providers that wrap all of this.
+
+```js
+import { Issuer, generators } from 'openid-client';
+
+const issuer = await Issuer.discover('https://accounts.google.com');
+const client = new issuer.Client({
+  client_id: process.env.GOOGLE_CLIENT_ID,
+  client_secret: process.env.GOOGLE_CLIENT_SECRET,
+  redirect_uris: ['https://app.example.com/callback'],
+  response_types: ['code'],
+});
+
+app.get('/login', (req, res) => {
+  const code_verifier = generators.codeVerifier();
+  const code_challenge = generators.codeChallenge(code_verifier);
+  const state = generators.state();
+  req.session.code_verifier = code_verifier;
+  req.session.state = state;
+  res.redirect(client.authorizationUrl({
+    scope: 'openid email profile',
+    code_challenge,
+    code_challenge_method: 'S256',
+    state,
+  }));
+});
+
+app.get('/callback', async (req, res) => {
+  const params = client.callbackParams(req);
+  const tokenSet = await client.callback(
+    'https://app.example.com/callback',
+    params,
+    { code_verifier: req.session.code_verifier, state: req.session.state },
+  );
+  const userinfo = await client.userinfo(tokenSet.access_token);
+  req.session.user = userinfo;
+  res.redirect('/');
+});
+```
+
+The library handles the JWT verification, JWKS fetching with
+caching, key rotation, and the PKCE state machine.
+
+## Refresh tokens
+
+`access_token`s are short-lived (usually 1 hour). `refresh_token`s
+are long-lived (days/weeks). When the access token expires, you
+exchange the refresh token for a new access token without user
+interaction.
+
+Store refresh tokens server-side, encrypted at rest. Never expose
+them to the client (they're long-lived and powerful).
+
+## Client Credentials flow
+
+For **server-to-server** with no user. Your service authenticates
+with the auth server using `client_id` + `client_secret`, gets an
+access token, calls another service.
+
+```js
+const tokenResponse = await fetch('https://auth.example.com/oauth/token', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: process.env.CLIENT_ID,
+    client_secret: process.env.CLIENT_SECRET,
+    scope: 'read:users',
+  }),
+});
+```
+
+No user involved. The access token represents the *service*, not a
+user.
+
+## Flows that are mostly deprecated
+
+- **Implicit flow** — used to return the token directly in the
+  URL fragment for SPAs. Vulnerable to token leakage. **Replaced
+  by Authorization Code + PKCE for SPAs.**
+- **Resource Owner Password Credentials** — your app collects the
+  user's password and exchanges it for a token. Terrible — defeats
+  the entire point of OAuth. **Don't use this.**
+
+If a library or guide recommends either, it's outdated.
+
+## Scopes
+
+A scope is a permission the client is asking for:
+
+- `openid` — get an `id_token`.
+- `profile` — name, picture.
+- `email` — email address.
+- `https://www.googleapis.com/auth/drive.readonly` — read Drive.
+
+Request the minimum scopes you actually need. Users see what you're
+asking for; over-requesting reduces consent rates and accumulates
+risk.
+
+## Common bugs
+
+### Skipping `state` check
+
+A CSRF attacker can complete the OAuth flow on their own account
+on your app, then make the victim's browser hit the callback. Without
+the state check, the victim ends up logged in to the attacker's
+account on your service. Then the attacker watches what they do.
+
+Always check `state`. Always.
+
+### Trusting `email` blindly
+
+`email_verified: false` in the JWT means the user hasn't verified
+their email at the provider. They might be claiming an email they
+don't own. Check `email_verified` if you're auto-creating accounts
+keyed by email.
+
+### Using `sub` from one provider as a global identifier
+
+`sub` is unique per provider. Two users with `sub: "12345"` at
+Google and GitHub are different people. Key your `users` table by
+`(provider, sub)`, not just `sub`.
+
+### Storing access tokens in localStorage
+
+XSS reads them. For SPAs, store access tokens in memory only; use
+HttpOnly cookies for the long-lived parts (refresh token, session).
+
+## When to use a managed provider
+
+For most apps building auth from scratch — Auth0, Clerk, Supabase
+Auth, Firebase Auth, Workos, etc. They handle:
+
+- Multiple OAuth providers.
+- Email/password + magic links.
+- MFA.
+- Password reset flows.
+- Email verification.
+- Session management.
+- Compliance attestations.
+
+Cost: dollars per active user. Versus the engineering cost of
+building it right + maintaining it forever. Almost always worth it.
+
+Build your own auth only if you have a hard reason — regulatory,
+infrastructure-control, or you're literally building an auth
+product.
+
+## In Express specifically
+
+If you're integrating "Sign in with Google" as one of several
+methods, use a library (`passport`, `openid-client`) and a
+session-backed flow.
+
+If you're building auth for an internal SaaS, look at managed
+providers first. The total cost of ownership is lower.
+
+Build the flow once, test it carefully (every step, every error
+path), then leave it alone. The OAuth security model is unforgiving
+of clever modifications.

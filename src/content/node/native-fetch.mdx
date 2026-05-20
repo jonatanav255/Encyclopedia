@@ -1,0 +1,211 @@
+export const level = 'mid';
+
+# Native fetch
+
+Node 18 shipped `fetch` as a global, matching the browser's
+WHATWG fetch API. Before that, you needed `node-fetch`, `axios`, or
+`got`. Now you don't — for most outbound HTTP, the built-in is enough.
+
+## The basics
+
+```js
+const res = await fetch('https://api.example.com/users');
+if (!res.ok) throw new Error(`HTTP ${res.status}`);
+const data = await res.json();
+```
+
+Three things to know up front:
+
+- **`fetch` does not throw on 4xx/5xx.** It only rejects on network
+  failures (DNS, connection refused, TLS, etc.). Check `res.ok` or
+  `res.status` yourself.
+- **The body must be consumed.** Use `.json()`, `.text()`,
+  `.arrayBuffer()`, `.blob()`, or `.body` (a `ReadableStream`).
+- **Each response body can only be consumed once.** Calling `.json()`
+  twice throws.
+
+## Sending a POST
+
+```js
+const res = await fetch('https://api.example.com/users', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  },
+  body: JSON.stringify({ name: 'Jon' }),
+});
+```
+
+The `body` accepts a string, `Buffer`, `Uint8Array`, `FormData`,
+`URLSearchParams`, `ReadableStream`, or `Blob`. `Content-Type` is
+inferred for `FormData` and `URLSearchParams`; you set it for JSON
+yourself.
+
+For form-style posts:
+
+```js
+const params = new URLSearchParams({ name: 'Jon', age: '30' });
+await fetch(url, { method: 'POST', body: params });
+// Content-Type: application/x-www-form-urlencoded (auto)
+```
+
+## Timeouts
+
+`fetch` has no built-in timeout. Use `AbortSignal.timeout`:
+
+```js
+const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+```
+
+Throws an `AbortError` after 5 seconds. For more control:
+
+```js
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), 5000);
+
+try {
+  const res = await fetch(url, { signal: ac.signal });
+} finally {
+  clearTimeout(t);
+}
+```
+
+**Set a timeout on every outbound call.** A hung request without a
+timeout holds resources forever. The browser's default isn't 5s,
+it's "until the user gives up." Node has no such fallback.
+
+## Streaming the response
+
+`res.body` is a `ReadableStream`. Iterate it like any stream:
+
+```js
+const res = await fetch('https://example.com/large.json');
+for await (const chunk of res.body) {
+  // chunk is a Uint8Array
+}
+```
+
+Useful for processing large responses without buffering. For
+gigabyte-scale downloads to a file, pipe to a writable stream:
+
+```js
+import { Writable } from 'node:stream';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+
+const res = await fetch(url);
+await pipeline(res.body, createWriteStream('out.bin'));
+```
+
+## Connection pooling and keep-alive
+
+Node's native fetch uses `undici` under the hood. By default it
+**doesn't** maintain a global keep-alive pool — each call may open a
+fresh TCP connection. For high-throughput callers, share an agent:
+
+```js
+import { Agent, setGlobalDispatcher } from 'undici';
+
+setGlobalDispatcher(new Agent({ keepAliveTimeout: 10_000, connections: 50 }));
+```
+
+Or per-request:
+
+```js
+const agent = new Agent({ connections: 10 });
+const res = await fetch(url, { dispatcher: agent });
+```
+
+Without keep-alive, you pay TCP+TLS handshake on every call. To the
+same host, that adds tens of ms per request — sometimes more than
+the request itself.
+
+## Retries and backoff
+
+Fetch doesn't retry. You wrap:
+
+```js
+async function fetchWithRetry(url, opts = {}, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, opts);
+      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      if (i === tries - 1) throw err;
+      await new Promise(r => setTimeout(r, 2 ** i * 200));  // exp backoff
+    }
+  }
+}
+```
+
+Don't retry on 4xx (you'll just get the same error). Do retry on
+5xx and network errors. Add jitter to backoff so coordinated retries
+don't pile up. See **Retries & Backoff**.
+
+## Authentication helpers
+
+For Bearer tokens, just set the header. For OAuth2 client credentials,
+basic auth, signed requests — wrap fetch in a function that adds
+the headers. Don't reach for `axios` just for headers; the wrapping
+is one helper function.
+
+```js
+const api = (path, init = {}) => fetch(`https://api.example.com${path}`, {
+  ...init,
+  headers: {
+    Accept: 'application/json',
+    Authorization: `Bearer ${getToken()}`,
+    ...init.headers,
+  },
+});
+
+await api('/users');
+await api('/users', { method: 'POST', body: JSON.stringify({}) });
+```
+
+## When you still want a library
+
+- **`undici`** — the same library Node's fetch uses, exposed
+  directly. Lower-level, better performance for heavy traffic, full
+  HTTP/2 support, mocking helpers.
+- **`got`** — convenient retries, hooks, pagination, JSON-by-default.
+  Production-grade for outbound HTTP.
+- **`axios`** — convenient interceptors, broad familiarity. Slightly
+  bigger, opinionated. Still fine in 2026.
+
+For new code, native fetch + thin wrapper covers 90% of cases. For
+the heavy 10% (hooks, mocking, complex retries), reach for `undici`
+or `got`.
+
+## Common mistakes
+
+- **Forgetting `res.ok` check.** A 500 doesn't throw; your code
+  parses error JSON as data.
+- **Not setting timeouts.** A hung connection ties up resources
+  indefinitely.
+- **Reading body twice.** Throws. Clone first if you need to: `res.clone().text()`.
+- **Concurrent fetch without pool sizing.** 10k parallel `fetch`
+  calls open 10k connections. Use a bounded concurrency helper
+  (`p-limit`).
+- **Trusting the response's `Content-Type` for safety.** A
+  malicious server can send anything. Validate the parsed body.
+
+## HTTP/2 and HTTP/3
+
+Native fetch supports HTTP/1.1 transparently. For HTTP/2, you'd use
+`node:http2` directly or `undici`. HTTP/3 (QUIC) isn't in the stdlib
+yet. For inbound traffic the proxy in front of Node handles modern
+protocols; for outbound, HTTP/1.1 is usually fine and the rare HTTP/2
+case is library-territory.
+
+## Outbound vs inbound
+
+Native fetch is for **outbound** requests from your Node service.
+Express handles **inbound**. They share no APIs — you can't
+"use fetch in a route." (Well, you can, but the request handler is
+the framework's job; you'd be reinventing it.)
+
+In Express handlers, you'll often use `fetch` to call other services
+(downstream APIs, third parties). That's the natural place.

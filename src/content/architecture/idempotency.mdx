@@ -1,0 +1,270 @@
+export const level = 'senior';
+
+# Idempotency
+
+A retry-safe operation. The client can call it twice and get the
+same result as calling it once. For network-flaky operations
+(payments, important state changes), idempotency is the difference
+between "automatic retries are safe" and "the user gets charged
+twice."
+
+## The math
+
+An operation `f` is idempotent if `f(f(x)) = f(x)`. In HTTP terms:
+calling the endpoint multiple times with the same input has the
+same effect as calling it once.
+
+| Method | Idempotent? |
+| --- | --- |
+| GET | Yes |
+| HEAD | Yes |
+| PUT | Yes |
+| DELETE | Yes |
+| POST | **No** |
+| PATCH | No (by spec; often is in practice) |
+| OPTIONS | Yes |
+
+PUT vs POST: PUT writes a specific value to a known location;
+calling it twice writes the same value. POST creates new resources;
+calling it twice creates two.
+
+## Why it matters
+
+Networks fail unpredictably. The client sent a request; did the
+server receive it? Did it process it? The client doesn't know.
+
+Without idempotency, the client has to guess:
+
+- **Don't retry**: lose work when the request did succeed but the
+  response was lost.
+- **Retry blindly**: process the same operation twice (duplicate
+  payment, double order).
+
+With idempotency, the client retries; the server detects the
+duplicate and returns the original result without re-executing.
+
+## Idempotency keys
+
+The standard pattern: client generates a unique key per logical
+operation, sends it as a header:
+
+```
+POST /payments
+Idempotency-Key: a3f8c2d1-4e6b-4a5d-9f1e-2c8b3d7e1f9a
+Content-Type: application/json
+
+{ "amount": 1000, "currency": "USD" }
+```
+
+Server:
+
+1. Look up the key in a store (Redis, DB).
+2. If present, return the stored response. **Don't process again.**
+3. If absent, process the request. Store the response keyed by the
+   key.
+
+```js
+async function withIdempotency(req, res, next) {
+  const key = req.get('Idempotency-Key');
+  if (!key) return next();
+
+  const cached = await redis.get(`idem:${key}`);
+  if (cached) {
+    const { status, body } = JSON.parse(cached);
+    return res.status(status).json(body);
+  }
+
+  // Run the handler, capture the response
+  const originalJson = res.json.bind(res);
+  res.json = function (body) {
+    redis.set(`idem:${key}`, JSON.stringify({ status: res.statusCode, body }), {
+      EX: 24 * 60 * 60,    // remember for 24 hours
+    });
+    return originalJson(body);
+  };
+  next();
+}
+```
+
+This is the spirit; production-grade versions handle concurrent
+requests with the same key, in-flight detection, etc.
+
+## What the key represents
+
+The key represents a *logical operation* the client wants to ensure
+happens at most once. The client generates a UUID per intent:
+
+- User clicks "Pay" → generate key K, send POST with K.
+- Network drops; client retries → same K, same request.
+- Server: "I've seen K, return what I returned last time."
+
+If the user clicks Pay *again* deliberately for a new payment, the
+client generates a new K. Different key = different operation =
+two payments.
+
+## What the server stores
+
+Per key, you need at least:
+
+- The response status.
+- The response body.
+- The time it was stored (for TTL-based eviction).
+
+Optional:
+
+- A hash of the request body — to detect "same key, different
+  body" misuse and reject it.
+
+Stripe's API does this: if you send the same idempotency key with a
+different request body, you get an error.
+
+## Idempotency vs deduplication
+
+Subtle distinction:
+
+- **Idempotency** guarantees the *operation* runs at most once.
+- **Deduplication** removes duplicate *records* after the fact.
+
+For atomic single-write operations, idempotency keys are the right
+mechanism. For batch processing or event-driven systems, you'll
+often dedupe instead — accept that the same event might arrive
+multiple times, and dedupe at the worker level.
+
+## Naturally idempotent designs
+
+You can often design the operation to be inherently idempotent
+without keys:
+
+### Use PUT for state updates
+
+```
+PUT /users/42/email
+{ "email": "new@example.com" }
+```
+
+Calling twice with the same body produces the same state. No key
+needed.
+
+### Pass the desired state, not the delta
+
+```
+# Idempotent: result is the new total
+PUT /carts/123/items/sku-7 { "quantity": 3 }
+
+# Not idempotent: result depends on history
+POST /carts/123/items/sku-7 { "increment": 1 }
+```
+
+The PUT version is naturally retry-safe.
+
+### Client-generated IDs
+
+```
+POST /orders
+{ "id": "ord_abc123", "amount": 1000 }
+```
+
+Server uses the client's `id`. On a duplicate, it returns the
+existing record without creating a new one. The `id` itself acts as
+an idempotency key.
+
+This works beautifully when it fits the data model.
+
+## Common bugs
+
+### Caching the in-flight response
+
+A duplicate request arrives **while** the original is still being
+processed. Naive cache check: not present yet. Both run. Two
+charges.
+
+The fix: take a lock keyed by the idempotency key. The second
+caller waits for the first to finish (or polls), then gets the
+cached result.
+
+```js
+async function withIdempotencyAndLock(req, res, next) {
+  const key = req.get('Idempotency-Key');
+  if (!key) return next();
+
+  // Check cache
+  const cached = await redis.get(`idem:${key}`);
+  if (cached) return res.status(cached.status).json(cached.body);
+
+  // Try to acquire lock
+  const got = await redis.set(`lock:${key}`, '1', { NX: true, PX: 60_000 });
+  if (!got) {
+    // Already in progress — wait briefly and re-check the cache
+    // ...
+    return res.status(409).json({ error: 'in_progress' });
+  }
+
+  // ... run handler, store result, release lock
+}
+```
+
+Production code is more involved. Stripe's docs on idempotency are
+worth reading.
+
+### Replaying after side effects
+
+The operation sent an email and charged a card. Server crashed
+before responding. Client retries; server has no memory of the
+original. Side effects happen twice.
+
+Fix: do side effects **transactionally**. Use the outbox pattern
+(see **Background Jobs**): write "I owe an email" as a database row
+inside the transaction; a separate worker sends the email
+idempotently.
+
+### Too short a TTL
+
+If the client retries after the key has been evicted from cache,
+you re-process. Stripe stores keys for 24 hours; that's reasonable
+for most cases. Don't store forever — that's unbounded storage
+growth.
+
+## Where to apply it
+
+- **Payments and money movement.** Always.
+- **Email/SMS sending.** Usually.
+- **Order creation.** Yes.
+- **External API calls** that have side effects.
+- **GET requests.** Inherently idempotent; no key needed.
+
+## In Express
+
+A middleware that handles idempotency for specific routes:
+
+```js
+app.post('/payments', requireIdempotencyKey, withIdempotency, async (req, res) => {
+  const payment = await createPayment(req.body);
+  res.status(201).json(payment);
+});
+```
+
+The middleware checks the key, looks up the cache, locks, and
+short-circuits if appropriate. The handler stays simple.
+
+Don't apply idempotency middleware blanket-style — many endpoints
+don't need it, and the overhead (Redis call per request) adds up.
+Apply it explicitly to write-side endpoints that need it.
+
+## Documentation matters
+
+If your API supports idempotency keys, document:
+
+- Which endpoints accept them (and which require them).
+- How long they're remembered.
+- What happens on key reuse with different bodies.
+- Recommended key format (UUIDv4 is conventional).
+
+Clients can only retry safely if they know it's supported.
+
+## A final thought
+
+Idempotency is one of those features that's invisible when it
+works and catastrophic when it doesn't. The first time you see "we
+sent two confirmation emails and charged the card twice for the
+same order," you'll understand. Build it in early for endpoints that
+need it. Retrofitting is harder than designing for it.

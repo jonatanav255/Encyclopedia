@@ -1,0 +1,247 @@
+export const level = 'mid';
+
+# OWASP Top 10
+
+The OWASP Top 10 is the security industry's standard list of the
+most common, impactful web vulnerabilities. Updated every few years.
+Every Express developer should be able to name them, recognize them
+in code, and explain the fix. This is the floor of "security
+literate."
+
+## A01: Broken Access Control
+
+The most common category. Users accessing resources they shouldn't:
+
+```js
+app.get('/orders/:id', requireAuth, async (req, res) => {
+  const order = await db.orders.findById(req.params.id);
+  res.json(order);                  // ← never checks if the order belongs to req.user
+});
+```
+
+Anyone logged in can read anyone's order. Fix:
+
+```js
+const order = await db.orders.findById(req.params.id);
+if (order.userId !== req.user.id) return res.sendStatus(403);
+res.json(order);
+```
+
+**IDOR** (Insecure Direct Object Reference) is the specific
+instance: incrementing IDs in URLs to access other users' data.
+Defenses: ownership checks on every protected resource, opaque IDs
+(UUIDs make guessing harder), and (importantly) automated tests for
+authorization.
+
+## A02: Cryptographic Failures
+
+Was "Sensitive Data Exposure." Examples:
+
+- Storing passwords as `MD5(password)` instead of bcrypt.
+- Sending sensitive data over HTTP.
+- Hardcoded keys in source code.
+- Using `Math.random()` for security purposes (it's not cryptographically random).
+- Custom-built crypto.
+
+Fixes:
+
+- **Password hashing**: `bcrypt`, `argon2`, `scrypt`. Never MD5,
+  SHA-1, or even SHA-256-alone.
+- **TLS everywhere.**
+- **Secrets in env vars or a secret manager**, never committed.
+- **`crypto.randomBytes(n)` / `crypto.randomUUID()`** for tokens.
+- **Standard libraries** (`jwt`, `aes-256-gcm` via `node:crypto`) —
+  never roll your own.
+
+## A03: Injection
+
+SQL injection, command injection, NoSQL injection, LDAP, SSTI, etc.
+All the same root cause: user input concatenated into code/query
+strings.
+
+```js
+// SQL injection
+db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
+
+// Command injection
+exec(`convert ${req.body.file} out.png`);
+```
+
+Fixes:
+
+- **Parameterized queries** for SQL (`$1` placeholders).
+- **`spawn` with argument arrays** for shell commands, never `exec`
+  with concatenation.
+- **Don't `eval`** user input (or anything else).
+- **Validate input schemas** at the boundary.
+
+See **SQL Injection** for the full SQL-specific treatment.
+
+## A04: Insecure Design
+
+Architectural failings. Not a specific bug but a category:
+
+- Missing threat modeling — no one thought about who might attack
+  this.
+- Trust assumptions that aren't justified ("this internal service
+  is trusted because it's internal" — until someone gets in).
+- Missing security requirements in feature design.
+
+Fix is process, not code: review designs for security, threat-model
+sensitive features, test with adversarial mindset.
+
+## A05: Security Misconfiguration
+
+Defaults left in place. Sample data still in production. Verbose
+error messages leaking internals.
+
+- Stack traces in 500 responses → use a generic error page in prod.
+- Default credentials on admin panels → change them, or remove the
+  panel.
+- Open S3 buckets, exposed `.git/` folders → restrict access.
+- Missing security headers → use `helmet`.
+- `X-Powered-By: Express` → `app.disable('x-powered-by')`.
+
+Defenses are largely about defaults: ship hardened, opt back into
+verbosity for development only.
+
+## A06: Vulnerable and Outdated Components
+
+Your `node_modules` has known CVEs. Always.
+
+- Run `pnpm audit` regularly.
+- Patch security issues promptly — they're public the moment they're
+  disclosed.
+- Pin dependencies in lockfiles. Update deliberately, not by
+  accident.
+- Watch for supply-chain attacks — see **Package Management**.
+
+## A07: Identification and Authentication Failures
+
+Auth done badly:
+
+- Weak password requirements ("123456" allowed).
+- No rate limiting on login → unlimited brute force.
+- Session IDs in URLs (leaked via Referer headers).
+- Sessions that don't rotate on login (session fixation).
+- Tokens that never expire.
+
+Fixes:
+
+- Rate-limit login per IP and per username.
+- Use modern hashing (bcrypt/argon2).
+- Rotate session IDs on auth state changes (`req.session.regenerate`).
+- Reasonable session expiry; revocation on password change.
+- MFA where appropriate.
+
+See **Auth Basics**.
+
+## A08: Software and Data Integrity Failures
+
+- Unsigned auto-updates → attacker replaces your binary.
+- Loading untrusted serialized data → prototype pollution, RCE.
+- Trusting third-party CI/CD outputs without verification.
+
+For Node specifically: postinstall scripts on untrusted packages,
+malicious typo-squatted packages on npm. pnpm's strict isolation
+plus careful approval of postinstall scripts helps a lot.
+
+## A09: Security Logging and Monitoring Failures
+
+Without logging:
+
+- You don't know you were attacked.
+- You can't reconstruct the attack after the fact.
+- You can't detect attacks in progress.
+
+What to log:
+
+- Auth events (success and failure).
+- Authorization failures (403s).
+- Admin actions.
+- Anything money- or PII-related.
+- Errors with full context.
+
+What NOT to log: passwords, tokens, full credit-card numbers, PII
+in clear text. See **Logging**.
+
+Monitor: alert on spikes in 401/403 (someone's probing), 5xx (your
+service is broken or under attack), or unusual patterns.
+
+## A10: Server-Side Request Forgery (SSRF)
+
+Your server fetches a URL the user provided. Attacker provides
+`http://169.254.169.254/...` (AWS metadata endpoint) → your server
+returns its own credentials.
+
+```js
+// Bad
+app.get('/preview', async (req, res) => {
+  const data = await fetch(req.query.url).then(r => r.text());
+  res.send(data);
+});
+```
+
+Fixes:
+
+- Whitelist allowed domains/protocols.
+- Block private IP ranges (RFC 1918, link-local).
+- Resolve hostname first, check the resolved IP, then fetch by IP.
+- Set egress firewall rules — your server shouldn't be able to reach
+  metadata endpoints anyway.
+
+See **SSRF** for the deeper treatment.
+
+## How to actually use this list
+
+Don't memorize. Internalize the pattern: untrusted input + powerful
+operations = trouble. Specifically, for every endpoint, ask:
+
+1. **Authentication**: is the user who they say they are?
+2. **Authorization**: are they allowed to do this specifically?
+3. **Input validation**: does the input match what we expect?
+4. **Output safety**: are we escaping properly?
+5. **Errors**: are we leaking information in error messages?
+6. **Logging**: would we know if this was attacked?
+
+For every dependency, ask:
+
+7. **Is it up to date?**
+8. **Is it from a trusted maintainer?**
+9. **What does it do at install time?**
+
+For every secret, ask:
+
+10. **Where does it live? Who can read it?**
+
+That mental checklist catches most of what the Top 10 lists. The
+list is the symptom — the discipline of asking these questions is
+the cure.
+
+## Tools
+
+- `npm audit` / `pnpm audit` — known CVEs in deps.
+- **Snyk**, **Dependabot**, **Renovate** — automated CVE scanning
+  and PRs.
+- **Helmet** — sets security headers.
+- **`express-rate-limit`** — rate limiting (with Redis backend in
+  prod).
+- **`zod`** — validation.
+- **`bcrypt`** / **`argon2`** — password hashing.
+- **Sentry**, **Datadog** — error tracking, monitoring.
+- **OWASP ZAP**, **Burp Suite** — active scanning.
+
+You won't use all of these all the time. You should know they exist
+when you need them.
+
+## In Express
+
+`helmet`, `cors`, validation, rate limiting, `bcrypt`, structured
+logging. None are exotic. None take long to add. Most are one line
+or one middleware.
+
+The single biggest security improvement most Express apps could
+make: actually wire up auth and authorization correctly on every
+endpoint, not just "the ones that obviously need it." Reviews catch
+this; tests catch this; security audits catch this. Habit catches
+it best.

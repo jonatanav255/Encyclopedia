@@ -1,0 +1,268 @@
+export const level = 'mid';
+
+# Redis Patterns
+
+Redis is a fast, in-memory key-value store. In a typical Express
+stack it's the "everything that doesn't belong in Postgres" tool:
+cache, session store, rate-limiting backend, pub/sub bus, job queue,
+distributed lock. Knowing the patterns saves you from reinventing
+them.
+
+## Basic operations
+
+```js
+import { createClient } from 'redis';
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+await redis.set('key', 'value');
+await redis.get('key');                          // "value"
+await redis.set('key', 'value', { EX: 60 });     // expire in 60s
+await redis.del('key');
+await redis.exists('key');                       // 1 or 0
+```
+
+Operations are mostly atomic at the per-key level. Single-key
+commands either succeed completely or don't happen.
+
+## Caching
+
+The classic use case:
+
+```js
+async function getUser(id) {
+  const cached = await redis.get(`user:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  const user = await db.users.findById(id);
+  await redis.set(`user:${id}`, JSON.stringify(user), { EX: 300 });
+  return user;
+}
+```
+
+Cache-aside pattern: check cache; on miss, fetch and populate.
+TTL prevents stale data accumulating forever.
+
+Key naming convention: `<entity>:<id>` (`user:42`, `post:abc`).
+Helps when you `SCAN` or `KEYS` for debugging.
+
+## Cache invalidation
+
+When data changes, invalidate:
+
+```js
+async function updateUser(id, updates) {
+  const user = await db.users.update(id, updates);
+  await redis.del(`user:${id}`);
+  return user;
+}
+```
+
+Simple. Falls apart with derived caches: if `user:42` is also part
+of `team:7:members`, invalidating one isn't enough. Strategies:
+
+- **Short TTLs** — accept staleness, no manual invalidation.
+- **Tag-based invalidation** — track cache key → tags mapping;
+  `invalidateTag('team:7')` deletes all related keys.
+- **Cache stampede protection** — when a hot key expires, many
+  requests race to repopulate it. Use a lock (below) or
+  probabilistic early refresh.
+
+## Distributed lock (SET NX EX)
+
+```js
+async function withLock(key, fn, ttlMs = 30_000) {
+  const token = crypto.randomUUID();
+  const ok = await redis.set(`lock:${key}`, token, {
+    NX: true,
+    PX: ttlMs,
+  });
+  if (!ok) throw new Error('lock not acquired');
+
+  try {
+    return await fn();
+  } finally {
+    // Release only if we still own the lock
+    await redis.eval(
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`,
+      { keys: [`lock:${key}`], arguments: [token] },
+    );
+  }
+}
+```
+
+- `NX` — set only if the key doesn't exist.
+- `PX` — expire in N ms (in case the holder crashes).
+- The Lua script ensures you only delete *your* lock, not someone
+  else's that expired and was replaced.
+
+This is the simplest correct lock. For production, look at
+**Redlock** (multi-node consensus) if you need stronger guarantees,
+or accept that a single Redis lock is "best-effort."
+
+## Rate limiting
+
+Fixed window with `INCR`:
+
+```js
+async function rateLimit(key, max, windowSec) {
+  const fullKey = `ratelimit:${key}:${Math.floor(Date.now() / 1000 / windowSec)}`;
+  const count = await redis.incr(fullKey);
+  if (count === 1) await redis.expire(fullKey, windowSec);
+  return count <= max;
+}
+
+const ok = await rateLimit(`user:${req.user.id}`, 100, 60);
+if (!ok) return res.status(429).json({ error: 'rate limited' });
+```
+
+`INCR` creates the key if missing, increments otherwise — atomic.
+Window key includes the time bucket, so it auto-rotates.
+
+Better: token bucket via Lua script (atomic check-and-decrement).
+Best: use `rate-limiter-flexible` which implements both correctly.
+See **Rate Limiting**.
+
+## Sessions
+
+```js
+import session from 'express-session';
+import { RedisStore } from 'connect-redis';
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET,
+  cookie: { httpOnly: true, secure: true, maxAge: 7 * 24 * 60 * 60 * 1000 },
+}));
+```
+
+See **Sessions**. Redis is the standard session store — fast,
+supports TTLs natively, survives app restarts.
+
+## Pub/Sub
+
+```js
+// Subscriber
+const sub = redis.duplicate();
+await sub.connect();
+await sub.subscribe('events', (message, channel) => {
+  console.log(channel, message);
+});
+
+// Publisher
+await redis.publish('events', JSON.stringify({ user: 42, action: 'login' }));
+```
+
+Fanout messaging. Publisher emits; every subscriber on that channel
+gets the message. **Not durable** — if no subscriber is listening,
+the message is lost. For durable messaging, use Redis Streams
+(below) or a real queue.
+
+## Streams
+
+Redis Streams are append-only logs with consumer groups:
+
+```js
+await redis.xAdd('events', '*', { user: '42', action: 'login' });
+await redis.xRead({ key: 'events', id: '0' }, { COUNT: 10 });
+```
+
+Like Kafka, lighter. Each consumer group reads independently;
+messages are remembered until ack'd. Good for moderate-throughput
+event-driven work without standing up Kafka.
+
+For most Express apps, BullMQ (job queue built on Redis) is easier
+than streams directly. See **Background Jobs**.
+
+## Data structures
+
+Redis isn't just key-value. It has rich types:
+
+- **Strings** — what you usually start with.
+- **Lists** — push/pop on both ends. Cheap queues.
+- **Hashes** — field-value maps. `HSET user:42 name "Jon" email ...`.
+- **Sets** — unordered unique members. Set ops (union, intersect).
+- **Sorted sets** — set + score per member. Used for leaderboards,
+  rate limiters, priority queues.
+- **Bitmaps**, **HyperLogLogs**, **Streams**, **Geo**.
+
+Picking the right type matters. A leaderboard in a sorted set is
+O(log n); the same in a JSON blob you parse and sort is O(n) on
+every read.
+
+## Transactions and pipelining
+
+```js
+// Pipeline — batch commands, one round trip
+const pipeline = redis.multi();
+pipeline.set('a', '1');
+pipeline.set('b', '2');
+pipeline.incr('counter');
+const results = await pipeline.exec();
+```
+
+Not atomic by default (other clients see intermediate state). Add
+`WATCH` to make it optimistic-transactional, or use Lua scripts
+for true atomicity.
+
+For 100 cache writes in a row, pipelining cuts ~99 round trips off
+your latency.
+
+## Persistence
+
+Redis has two persistence modes:
+
+- **RDB** — periodic snapshots. Fast restart; some data loss on
+  crash.
+- **AOF** — append-only log of every write. Slower; near-zero
+  data loss.
+- **Both** can be combined.
+
+For caches, RDB is fine (you'd warm the cache on restart anyway).
+For session stores, AOF is safer. For "this is the only copy of the
+data," use a real database, not Redis.
+
+## Memory pressure
+
+Redis is in-memory. You will hit memory limits.
+
+Configure `maxmemory-policy`:
+
+- `noeviction` — return errors on writes when full. Safe for
+  unique data (session stores).
+- `allkeys-lru` — evict least recently used. Right for caches.
+- `volatile-ttl` — evict shortest-TTL keys first.
+
+For a cache, set `maxmemory` and `allkeys-lru`. Memory grows until
+the limit; eviction keeps it there.
+
+## Connecting in Express
+
+One connection (or one set of duplicated connections for pub/sub)
+per process, opened at startup, reused. Don't connect per-request.
+
+```js
+import { createClient } from 'redis';
+export const redis = createClient({ url: process.env.REDIS_URL });
+redis.on('error', (err) => logger.error({ err }, 'redis error'));
+await redis.connect();
+```
+
+Handle reconnects. The client auto-reconnects on disconnect, but
+queued commands during the gap might fail. Treat Redis as
+best-effort for caches (just skip the cache layer if it errors);
+treat it as a hard dependency only for things you really can't run
+without (e.g., distributed locks for safety).
+
+## When Redis isn't the answer
+
+- **Durable data** — use Postgres.
+- **Complex queries** — Redis has data structures, not a query
+  language. Computation lives in your app.
+- **Huge datasets** — RAM is expensive. Disk-backed databases
+  scale further per dollar.
+- **Strong consistency across replicas** — Redis Cluster trades
+  consistency for performance. Not the right tool for "must never
+  lose a write."
+
+Redis is fast and simple. Lean on it for speed, but know its limits.

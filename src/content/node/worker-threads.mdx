@@ -1,0 +1,208 @@
+export const level = 'senior';
+
+# Worker Threads
+
+`worker_threads` runs JavaScript on a separate OS thread inside the
+same Node process. They share memory (via `SharedArrayBuffer`),
+communicate via message passing, and crash independently of the main
+thread. They're the right answer when you have CPU-bound work that
+would otherwise block the event loop.
+
+## Why they exist
+
+Node's main thread runs all your JavaScript. A 200ms sync calculation
+blocks every request for 200ms. Multiply by 100 concurrent users:
+20-second tail latency on what should be cheap requests.
+
+The fixes:
+
+1. **Don't do CPU work in handlers** — push it to a queue and a
+   separate worker service.
+2. **Use a native binding** that does the work outside JS (`sharp`,
+   `bcrypt` async).
+3. **Run it in a worker thread** — same process, different thread.
+
+Option 3 is worker threads. They're cheaper than child processes
+(shared memory, lower spawn cost) but more isolated than just
+"another async function" (independent event loop, no shared state by
+default).
+
+## A first worker
+
+```js
+// worker.js
+import { parentPort } from 'node:worker_threads';
+
+parentPort.on('message', (input) => {
+  const result = expensiveSync(input);
+  parentPort.postMessage(result);
+});
+```
+
+```js
+// main.js
+import { Worker } from 'node:worker_threads';
+
+const worker = new Worker('./worker.js');
+
+worker.on('message', (result) => console.log(result));
+worker.on('error', (err) => console.error(err));
+worker.on('exit', (code) => console.log('worker exited', code));
+
+worker.postMessage({ data: 'work' });
+```
+
+Each worker has its own V8 isolate — its own memory, its own event
+loop. They can run truly in parallel with the main thread.
+
+## Message passing
+
+Messages are structured-cloned (deep-copied) between threads:
+
+```js
+worker.postMessage({ rows: bigArray });  // copy
+```
+
+For large data this copy is expensive. Two alternatives:
+
+### `transferList` (move ownership)
+
+```js
+const buffer = new ArrayBuffer(10 * 1024 * 1024);  // 10MB
+
+worker.postMessage({ buffer }, [buffer]);
+// After this, `buffer` is detached on the sender side
+```
+
+The buffer is *transferred*, not copied — the main thread can no
+longer use it but the worker can. Fast (no copy), but the sender
+loses access.
+
+Transferable types: `ArrayBuffer`, `MessagePort`, `ReadableStream`,
+`WritableStream`, `TransformStream`.
+
+### `SharedArrayBuffer` (true sharing)
+
+```js
+const shared = new SharedArrayBuffer(1024);
+const view = new Int32Array(shared);
+
+worker.postMessage({ shared });
+// Both threads can read/write `view` simultaneously
+```
+
+`SharedArrayBuffer` doesn't copy. Both threads see the same memory.
+Use `Atomics` for coordinated reads/writes — without them you have
+race conditions.
+
+```js
+Atomics.add(view, 0, 1);             // atomic increment
+Atomics.wait(view, 0, expected);     // block until value changes
+Atomics.notify(view, 0, 1);          // wake N waiters
+```
+
+This is real multi-threading. Powerful, easy to write subtle bugs.
+
+## Worker pools
+
+Spawning a worker per task is wasteful — startup costs a few ms.
+Maintain a pool of workers and dispatch:
+
+```js
+import { Worker } from 'node:worker_threads';
+import { availableParallelism } from 'node:os';
+
+class WorkerPool {
+  #workers = [];
+  #queue = [];
+
+  constructor(file, size = availableParallelism()) {
+    for (let i = 0; i < size; i++) {
+      const w = new Worker(file);
+      w.idle = true;
+      this.#workers.push(w);
+    }
+  }
+
+  run(input) {
+    return new Promise((resolve, reject) => {
+      const worker = this.#workers.find(w => w.idle);
+      if (!worker) return this.#queue.push({ input, resolve, reject });
+
+      worker.idle = false;
+      worker.once('message', (result) => {
+        worker.idle = true;
+        resolve(result);
+        const next = this.#queue.shift();
+        if (next) this.run(next.input).then(next.resolve, next.reject);
+      });
+      worker.once('error', reject);
+      worker.postMessage(input);
+    });
+  }
+}
+```
+
+For production use, `piscina` is a battle-tested worker-pool library
+with proper queueing, transferable handling, and graceful shutdown.
+Don't roll your own unless the example above is genuinely all you need.
+
+## Worker threads vs child_process vs cluster
+
+| | Cost | Isolation | Shared memory | Best for |
+| --- | --- | --- | --- | --- |
+| Worker thread | Low | V8 isolate | Yes (SAB) | CPU-bound JS |
+| Child process (fork) | Medium | Full process | No (IPC only) | Sandboxing, untrusted code |
+| Cluster | Medium | Full process | No | Saturating CPUs with HTTP servers |
+
+For "I want to use more cores for CPU work in the current request,"
+use worker threads. For "I want to run untrusted/separate Node code,"
+use child processes. For "I want N HTTP servers on N CPUs," use
+cluster (or just run N containers — the modern equivalent).
+
+## What workers can't do
+
+- **Access the DOM** (irrelevant in Node, but mentioned because
+  it's true in browsers).
+- **Modify shared global state** — each worker has its own globals.
+- **Open the same TCP listener** without `cluster`'s socket sharing.
+- **Be cheap for trivial tasks** — message-passing overhead is real.
+  A 1ms sync calc isn't worth offloading.
+
+## What they cost
+
+- **Memory**: each worker has its own V8 heap (~30MB+ minimum).
+- **Spawn time**: tens of milliseconds.
+- **Coordination overhead**: every `postMessage` involves
+  serialization (or at minimum a structured clone walk).
+
+Profile before adopting. If your "CPU-bound" work is actually I/O
+plus a fast computation, a worker thread won't help.
+
+## Common patterns where they win
+
+- **Image / video processing** when not using a native binding.
+- **PDF generation** (the `puppeteer`/`pdf-lib` of yours).
+- **Encryption / hashing** at high concurrency, if `crypto` doesn't
+  cover it.
+- **Parsing large CSV / JSON** in object mode.
+- **Compute-heavy ML inference** (better with ONNX runtime, but
+  workers can host it).
+
+## In Express specifically
+
+```js
+import { app } from './app.js';
+import { Worker } from 'node:worker_threads';
+
+const pool = createPool('./image-worker.js', 4);
+
+app.post('/thumbnail', async (req, res) => {
+  const result = await pool.run({ image: req.file.buffer });
+  res.type('image/png').send(result);
+});
+```
+
+The handler returns immediately when the worker finishes — but the
+main thread didn't do the CPU work. Tail latency stays low across all
+endpoints because the event loop isn't blocked.

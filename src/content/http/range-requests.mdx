@@ -1,0 +1,192 @@
+export const level = 'senior';
+
+# Range Requests
+
+A range request asks for *part* of a resource: "give me bytes 1000
+through 1999 of this file." It's what makes video scrubbing,
+download resumption, and parallel downloads work. Express's
+`res.sendFile` handles them automatically; for custom routes you do
+it yourself.
+
+## The headers
+
+Client → server:
+
+```
+Range: bytes=0-499
+```
+
+"Send me bytes 0 through 499 inclusive." Multiple ranges:
+
+```
+Range: bytes=0-499, 1000-1499
+```
+
+"Send me both these chunks." (Multi-range responses use
+`multipart/byteranges` — uncommon in practice; most servers either
+support single ranges or reject multi.)
+
+The open-ended forms:
+
+- `Range: bytes=500-` — from byte 500 to the end.
+- `Range: bytes=-500` — the last 500 bytes.
+
+## The response
+
+Success — partial content:
+
+```
+HTTP/1.1 206 Partial Content
+Content-Type: video/mp4
+Content-Range: bytes 0-499/8675309
+Content-Length: 500
+
+<bytes>
+```
+
+- `206` instead of `200`.
+- `Content-Range` says which part this is, and the total size.
+- `Content-Length` is the size of *this part*.
+
+Failure — unsatisfiable range (asked for bytes past the end):
+
+```
+HTTP/1.1 416 Range Not Satisfiable
+Content-Range: bytes */8675309
+```
+
+The `*` for the actual range means "I can't fulfill what you asked,
+but the total is 8675309."
+
+## Letting the client know you support it
+
+Optional but recommended:
+
+```
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Length: 8675309
+```
+
+`Accept-Ranges: bytes` tells the client "I support range requests
+in bytes." Browsers and download managers check this before trying.
+The other valid value is `Accept-Ranges: none`.
+
+## Express handles `sendFile` automatically
+
+```js
+app.get('/videos/:id', (req, res) => {
+  res.sendFile(getVideoPath(req.params.id));
+});
+```
+
+`res.sendFile` (and `express.static`) honor `Range` requests. Browser
+video players use this transparently — scrubbing in a `<video>`
+element sends range requests for the new position.
+
+If you stream the file yourself, you're back to handling it manually.
+
+## Manual handling
+
+```js
+import { createReadStream, statSync } from 'node:fs';
+
+app.get('/files/:name', (req, res) => {
+  const path = getPath(req.params.name);
+  const stat = statSync(path);
+  const total = stat.size;
+
+  const range = req.headers.range;
+  if (!range) {
+    res.set({
+      'Content-Length': total,
+      'Content-Type': 'application/octet-stream',
+      'Accept-Ranges': 'bytes',
+    });
+    return createReadStream(path).pipe(res);
+  }
+
+  // Parse "bytes=START-END"
+  const match = range.match(/^bytes=(\d+)-(\d*)$/);
+  if (!match) return res.sendStatus(400);
+
+  const start = parseInt(match[1], 10);
+  const end = match[2] ? parseInt(match[2], 10) : total - 1;
+
+  if (start >= total || end >= total) {
+    return res.status(416).set('Content-Range', `bytes */${total}`).end();
+  }
+
+  res.status(206).set({
+    'Content-Range': `bytes ${start}-${end}/${total}`,
+    'Accept-Ranges': 'bytes',
+    'Content-Length': end - start + 1,
+    'Content-Type': 'application/octet-stream',
+  });
+  createReadStream(path, { start, end }).pipe(res);
+});
+```
+
+The error handling is brittle by design — you reject anything you
+don't fully understand. Malformed range headers are a 400. Out-of-
+bounds ranges are 416.
+
+## Where it matters
+
+- **Video / audio streaming.** Browsers send range requests as the
+  user scrubs.
+- **Download resumption.** A client whose download died at 2GB
+  re-requests `Range: bytes=2147483648-` to pick up.
+- **Parallel downloads.** Tools like `aria2` open multiple
+  connections, each fetching a different range, then stitch them.
+- **Image / video processing pipelines.** Tools that only need a
+  file's header (e.g., to read dimensions) range-request the first
+  few KB.
+
+If your service serves large files (and you can't put a CDN in
+front), implementing range support is what makes the experience
+acceptable.
+
+## Range support and compression
+
+You usually can't compress and range together. `Content-Encoding:
+gzip` rewrites the byte stream — byte N of the compressed file
+doesn't correspond to byte N of the original. Browsers know this:
+they pick one or the other.
+
+Most file servers serve large files **uncompressed** (they're
+already compressed anyway — videos, archives, images) and let range
+requests work. Text files small enough to compress probably don't
+benefit from range support.
+
+## Range and CDN
+
+CDNs cache files in chunks. A range request might hit a CDN that
+has the relevant chunk cached and never touches your origin. This
+is why CDNs are so effective for large file delivery — the first
+request warms the cache; everyone else gets it from the edge.
+
+Configure cache rules to allow this: `Cache-Control: public, max-age=...`
+without `no-store`, and the CDN handles range serving transparently.
+
+## What NOT to range-request
+
+Dynamic content. A range request against `/api/users?page=2` is
+nonsensical — the response isn't a static byte sequence; it could
+change between calls. Implement pagination at the application level
+instead (see **Pagination**).
+
+## Testing
+
+```bash
+curl -H "Range: bytes=0-99" -I https://example.com/big.bin
+# HTTP/1.1 206 Partial Content
+# Content-Range: bytes 0-99/12345678
+
+curl -H "Range: bytes=0-99" -o chunk.bin https://example.com/big.bin
+# downloads exactly 100 bytes
+```
+
+Worth verifying once when you implement custom range support. It's
+one of the things that looks right until you try to scrub a video
+and discover the implementation can't handle `Range: bytes=12345-`.

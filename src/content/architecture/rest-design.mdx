@@ -1,0 +1,282 @@
+export const level = 'mid';
+
+# REST API Design
+
+REST is the dominant HTTP API style for a reason: it's predictable,
+caches well, and most clients (browsers, mobile, SDKs) understand
+it natively. "Doing REST" can mean anything from "rigorous
+HATEOAS" to "an HTTP API I made up." This page is the pragmatic
+middle — the design choices that make APIs pleasant to consume and
+maintain.
+
+## Resources, not actions
+
+The URL identifies a resource. The HTTP method specifies the action.
+
+```
+GET    /users          → list users
+POST   /users          → create a user
+GET    /users/42       → get one user
+PUT    /users/42       → replace user 42
+PATCH  /users/42       → update fields on user 42
+DELETE /users/42       → delete user 42
+```
+
+What you avoid:
+
+```
+GET  /getUser?id=42        # method is in the URL, not the verb
+POST /users/createNew      # POST + action verb
+POST /deleteUser           # destructive action via POST
+```
+
+The first version is symmetric, predictable, and uses HTTP the way
+it was designed.
+
+## Plurals or singulars?
+
+**Plurals.** `/users`, `/orders`, `/posts`. Consistent: the
+collection is `/users`, an item is `/users/42`.
+
+Don't mix `/user/42` and `/users` — pick one and stick to it.
+
+## Nested resources
+
+```
+GET /users/42/posts          # posts by user 42
+GET /users/42/posts/7        # post 7 by user 42
+```
+
+Nesting communicates ownership. It's also okay to have a flat
+counterpart:
+
+```
+GET /posts?author_id=42
+```
+
+The flat version is often easier to filter and paginate. Use
+whichever fits your access pattern. Don't nest more than two levels
+deep — `/orgs/1/projects/2/issues/3/comments/4` gets ugly fast.
+
+## Status codes
+
+Use the right one. See **Status Codes** in the Express section.
+Short version:
+
+- **200** — OK, with body.
+- **201** — Created (after POST). Include `Location` header for the
+  new resource.
+- **204** — No content (after DELETE or empty PUT).
+- **400** — Bad request (malformed input).
+- **401** — Unauthenticated.
+- **403** — Authenticated but not allowed.
+- **404** — Not found.
+- **409** — Conflict (e.g., creating something that already exists).
+- **422** — Unprocessable entity (validation failed). Optional;
+  many APIs use 400 for this.
+- **429** — Rate-limited.
+- **500** — Internal error.
+
+## Filtering, sorting, pagination
+
+Query parameters:
+
+```
+GET /users?role=admin&active=true&sort=-created_at&limit=20&cursor=...
+```
+
+Conventions:
+
+- **`?key=value`** for equality filters.
+- **`?key__gt=42`** or **`?key=gt:42`** for comparisons. Pick one
+  and document it.
+- **`?sort=-created_at`** for descending; **`?sort=created_at`**
+  for ascending. The `-` prefix is a common convention.
+- **`?limit=20&cursor=...`** for pagination (see **Pagination**).
+
+Don't put filters in the body for `GET` requests. It violates HTTP's
+caching model (caches key on URL, not body).
+
+## Field selection
+
+For large resources where clients only need a subset:
+
+```
+GET /users/42?fields=id,name,email
+```
+
+Saves bandwidth and database work. The client opts in; the default
+is the full representation.
+
+GraphQL formalizes this; for REST it's a useful manual feature.
+
+## Versioning
+
+When you have to make breaking changes, version. Three common ways:
+
+- **URL path**: `/v1/users`, `/v2/users`.
+- **Header**: `API-Version: 2`.
+- **Media type**: `Accept: application/vnd.example.v2+json`.
+
+Path-based is most common — clear in logs, easy to route at the
+proxy, no header juggling. Header-based is more "pure REST" but
+operationally fiddly.
+
+See **API Versioning** for the full treatment.
+
+## Errors
+
+Consistent error shape so clients can handle them uniformly:
+
+```json
+{
+  "error": "validation_failed",
+  "message": "email is required",
+  "details": [
+    { "field": "email", "code": "required" }
+  ]
+}
+```
+
+The status code says the category. The body says specifically what
+went wrong.
+
+Don't return `200 OK` with an error in the body. The status code
+*is* the contract.
+
+## IDs
+
+UUIDs are usually better than incrementing integers for public
+APIs:
+
+- Can't be guessed/iterated (some IDOR-class bugs go away).
+- Don't leak how many records exist (`/users/12345` tells the world
+  you have at least 12,345 users).
+- Mergeable across systems.
+
+The downside (bigger, no natural sort) is usually negligible.
+UUIDv7 gives you time-ordered UUIDs that index well.
+
+## Dates and times
+
+Use **ISO 8601** strings:
+
+```json
+{ "created_at": "2026-05-20T14:30:00Z" }
+```
+
+Always UTC (`Z` suffix). Always full precision. The format is
+universally parseable.
+
+Don't invent custom formats. Don't return Unix timestamps unless
+you have a specific reason (the API is for a low-level client where
+parsing is slow, like an embedded device).
+
+## Idempotency
+
+Idempotent: doing it twice has the same effect as doing it once.
+
+- `GET`, `PUT`, `DELETE`, `HEAD`, `OPTIONS` — idempotent.
+- `POST`, `PATCH` — not idempotent by default.
+
+For non-idempotent operations the client wants to retry safely
+(e.g., creating an order after a network blip), use
+**idempotency keys**:
+
+```
+POST /orders
+Idempotency-Key: e3f7c2a4-...
+```
+
+The server stores the key + result. A retry with the same key
+returns the same result without creating a duplicate. See
+**Idempotency**.
+
+## HATEOAS, briefly
+
+Pure REST says responses should include links to related resources:
+
+```json
+{
+  "id": 42,
+  "name": "Jon",
+  "links": {
+    "self": "/users/42",
+    "posts": "/users/42/posts"
+  }
+}
+```
+
+It works. Almost nobody does it fully. The pragmatic middle:
+document your URL conventions in the API spec (OpenAPI), and the
+client knows where to go without runtime hyperlinks.
+
+## OpenAPI / Swagger
+
+A machine-readable spec for your API. Lets you:
+
+- Generate client SDKs in many languages.
+- Validate requests/responses in tests.
+- Render interactive API docs.
+- Drive contract tests.
+
+For any non-trivial public API, write the spec. For an internal API
+shared with a few teams, also write the spec — onboarding new
+engineers is dramatically faster.
+
+Tools: `swagger-jsdoc` for inline doc, `openapi-typescript` for
+TS types, `redocly` for hosting docs.
+
+## Hypermedia formats: JSON:API and friends
+
+If you want stronger conventions, **JSON:API** (jsonapi.org) is a
+detailed spec covering pagination, filtering, relationships, sparse
+fieldsets, errors. Pick it if you want a standard answer for all
+the design questions.
+
+Most APIs don't follow it strictly. The ideas are still worth
+reading.
+
+## What "RESTful" doesn't mean
+
+- It doesn't mean "uses JSON" (REST is method/URL, not format).
+- It doesn't mean "has a GET endpoint for every resource."
+- It doesn't mean "uses HTTP verbs perfectly correctly."
+
+"REST" has become a vague compliment. Building an API that's
+**predictable** to a competent HTTP client is the actual goal —
+which usually looks like REST, but the conformance matters less
+than the predictability.
+
+## When NOT REST
+
+- **Highly nested or graph-shaped queries** → GraphQL is better.
+- **Bidirectional real-time** → WebSockets (see the topic).
+- **Streaming responses** → SSE (server-sent events).
+- **RPC where the client knows the operation name** → tRPC or gRPC.
+
+REST is good for most CRUD-shaped APIs. It's a poor fit for
+push-driven, graph-traversal, or RPC-style workloads.
+
+## Practical checklist
+
+For each endpoint:
+
+- [ ] Path uses plurals and resources.
+- [ ] Method matches the action's semantics.
+- [ ] Status codes are right (especially the 4xx range).
+- [ ] Error shape is consistent across endpoints.
+- [ ] Pagination is cursor-based for large collections.
+- [ ] Mutating endpoints support idempotency where it matters.
+- [ ] Timestamps are ISO 8601 UTC.
+- [ ] Documented in OpenAPI.
+
+For the API as a whole:
+
+- [ ] Versioning strategy chosen.
+- [ ] Auth scheme documented (`Authorization` header? Cookie?).
+- [ ] Rate limits documented.
+- [ ] Deprecation policy documented.
+
+REST design is mostly choosing conventions and applying them
+consistently. The choices aren't critical; the consistency is.

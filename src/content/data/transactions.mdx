@@ -1,0 +1,268 @@
+export const level = 'mid';
+
+# Transactions
+
+A transaction groups multiple statements into a single atomic
+operation. Either all of them happen or none of them do. For
+anything where partial application would be a bug — money transfers,
+multi-row updates, complex business operations — they're not optional.
+
+## The shape
+
+```js
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]);
+  await client.query('COMMIT');
+} catch (err) {
+  await client.query('ROLLBACK');
+  throw err;
+} finally {
+  client.release();
+}
+```
+
+Three rules:
+
+1. **All queries use the same client** — not the pool directly. The
+   pool doesn't know about your transaction.
+2. **Always release the client** in `finally`. Forgetting leaks
+   connections.
+3. **Always handle errors** — without `ROLLBACK`, the transaction
+   hangs open until timeout.
+
+## ACID
+
+The four guarantees databases provide for transactions:
+
+- **A**tomicity — all-or-nothing.
+- **C**onsistency — constraints hold before and after.
+- **I**solation — concurrent transactions don't see each other's
+  intermediate state (well, depending on isolation level).
+- **D**urability — once committed, it survives crashes.
+
+Postgres provides all four out of the box. MySQL's InnoDB engine
+does too. MongoDB historically didn't (single-doc atomic only);
+recent versions added multi-doc transactions.
+
+## Isolation levels
+
+This is where transactions get subtle. Concurrent transactions can
+see each other's work in surprising ways depending on the level:
+
+| Level | Dirty reads | Non-repeatable reads | Phantom reads | Lost updates |
+| --- | --- | --- | --- | --- |
+| Read Uncommitted | possible | possible | possible | possible |
+| Read Committed (Postgres default) | no | possible | possible | possible |
+| Repeatable Read | no | no | no (in PG) | no |
+| Serializable | no | no | no | no |
+
+**Read Committed** (the default in Postgres):
+
+- You see other transactions' committed changes during your
+  transaction.
+- The same `SELECT` run twice can return different rows.
+
+**Serializable**: behaves as if transactions ran one at a time.
+Slowest. Postgres detects serialization conflicts and aborts one
+of the conflicting transactions — your app must retry.
+
+```js
+await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+```
+
+For most code, Read Committed is fine. Reach for higher isolation
+only when you have specific concurrency problems.
+
+## What can go wrong: lost updates
+
+Two requests both read a balance, both decrement it:
+
+```
+T1: SELECT balance FROM accounts WHERE id = 1;  -- 100
+T2: SELECT balance FROM accounts WHERE id = 1;  -- 100
+T1: UPDATE accounts SET balance = 90 WHERE id = 1;
+T2: UPDATE accounts SET balance = 80 WHERE id = 1;  -- overwrites T1!
+```
+
+End state: `balance = 80`. The user paid 20 but actually owes 20 +
+10 = 30. Money lost.
+
+Three fixes:
+
+### 1. Atomic update
+
+```sql
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+```
+
+No read-then-write race. The database does the arithmetic. Always
+prefer this when possible.
+
+### 2. Row-level locking
+
+```sql
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;  -- locks the row
+-- ... compute new balance ...
+UPDATE accounts SET balance = $1 WHERE id = 1;
+COMMIT;
+```
+
+`FOR UPDATE` blocks other transactions from reading-for-update or
+writing that row until you commit/rollback. Use when you need to
+make a decision based on the current value before writing.
+
+### 3. Optimistic locking
+
+```sql
+SELECT balance, version FROM accounts WHERE id = 1;  -- version = 5
+
+UPDATE accounts
+SET balance = $1, version = version + 1
+WHERE id = 1 AND version = 5;  -- only succeeds if nobody else updated
+```
+
+If the update affected 0 rows, someone else won the race. Retry.
+
+Tradeoff: pessimistic locks block; optimistic locks let everyone
+race and retry losers. Optimistic is usually faster under low
+contention; pessimistic wins under heavy contention.
+
+## Deadlocks
+
+Two transactions waiting on each other's locks:
+
+```
+T1: locks row A, waits for lock on row B
+T2: locks row B, waits for lock on row A
+```
+
+Both wait forever. Postgres detects deadlocks and aborts one of
+the transactions automatically — you handle the error and retry.
+
+```js
+try {
+  await runTxn();
+} catch (err) {
+  if (err.code === '40P01') {        // deadlock detected
+    return retry(runTxn, 3);
+  }
+  throw err;
+}
+```
+
+Prevention: always acquire locks in the same order across all
+code paths.
+
+## Serializable + retry
+
+Postgres's Serializable Snapshot Isolation can spuriously abort
+transactions when it detects a potential serialization anomaly:
+
+```js
+try {
+  await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+  // ... work ...
+  await client.query('COMMIT');
+} catch (err) {
+  if (err.code === '40001') {        // serialization failure
+    await client.query('ROLLBACK');
+    return retry(...);
+  }
+  throw err;
+}
+```
+
+The pattern is consistent: if you use higher isolation levels, your
+code must be retry-safe. Make the work inside the transaction
+idempotent (or at least repeatable).
+
+## Long transactions are bad
+
+A transaction holds locks and consumes a connection. Long
+transactions:
+
+- Block writers waiting on the same rows.
+- Prevent vacuum from cleaning up dead tuples (Postgres-specific
+  bloat).
+- Tie up a pool connection.
+
+**Don't** await network calls (other services, third parties) inside
+a transaction. Open the transaction, do the DB work fast, commit,
+*then* call the external service.
+
+## Cross-service transactions don't exist
+
+If your "transaction" involves Postgres + sending an email + calling
+a payment API, you can't put them all in a SQL transaction. They're
+different systems with different consistency.
+
+Patterns for this:
+
+- **Outbox pattern**: write the side-effect intention (a row in an
+  `outbox` table) inside the transaction. A separate worker picks
+  it up and performs the side effect at-least-once. See
+  **Background Jobs**.
+- **Saga**: a sequence of local transactions, each with a
+  compensating action if a later step fails.
+- **Two-phase commit**: ancient, rarely used in modern systems.
+
+For most cases, the outbox pattern is the right answer.
+
+## Savepoints (nested-ish transactions)
+
+```sql
+BEGIN;
+INSERT INTO orders ...;
+SAVEPOINT order_inserted;
+  INSERT INTO line_items ...;        -- might fail
+  -- if it fails:
+ROLLBACK TO SAVEPOINT order_inserted;
+COMMIT;                                -- order kept, line_items rolled back
+```
+
+Useful for "try this, fall back if it fails, but keep the outer
+transaction." Most ORMs expose savepoints as nested transactions.
+
+## In your app
+
+A typical Express transaction wrapper:
+
+```js
+async function transaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Use it:
+await transaction(async (client) => {
+  await client.query('UPDATE ... ');
+  await client.query('INSERT ... ');
+});
+```
+
+Now every `transaction(...)` call is correctly wrapped. The handler
+only writes the actual work.
+
+## When you don't need a transaction
+
+- Single SQL statement → already atomic. No transaction needed.
+- Read-only multi-step query → no atomicity concern.
+- Independent side effects you can retry → idempotent operations
+  don't need transactions.
+
+Don't wrap every query in a transaction reflexively. It adds
+overhead and confusion.

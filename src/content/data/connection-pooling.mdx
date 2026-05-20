@@ -1,0 +1,241 @@
+export const level = 'mid';
+
+# Connection Pooling
+
+Opening a database connection is expensive: TCP handshake, TLS,
+authentication, and for Postgres, the server forks an entire
+process. Doing this per HTTP request costs tens of ms and limits
+your throughput. A connection pool keeps connections open and
+hands them out to requests as needed.
+
+## Without a pool
+
+```js
+// Bad — per-request connection
+app.get('/users/:id', async (req, res) => {
+  const client = new pg.Client(connStr);
+  await client.connect();                  // ~10-50ms
+  const { rows } = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
+  await client.end();
+  res.json(rows[0]);
+});
+```
+
+Every request opens, queries, closes. Under load: Postgres maxes
+out its connection slots (default 100), the server starts rejecting
+new connections, the app falls over.
+
+## With a pool
+
+```js
+import pg from 'pg';
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+});
+
+app.get('/users/:id', async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM users WHERE id = $1',
+    [req.params.id],
+  );
+  res.json(rows[0]);
+});
+```
+
+The pool keeps up to 10 connections open. Each query checks one out,
+runs, and returns it. The connection handshake happens once per
+connection, not per query.
+
+## Sizing the pool
+
+The math:
+
+```
+total connections = pool size × number of app instances
+```
+
+If you run 4 Express processes with `max: 25`, you'll open up to
+100 connections to Postgres. Make sure Postgres's `max_connections`
+is higher than your max possible total, with headroom.
+
+Common gotcha: deploying autoscaling without thinking about pool
+sizing. 20 instances × 25 connections = 500. Most Postgres
+instances default to 100.
+
+**Per-instance pool size** rule of thumb:
+
+- Single CPU, small app: `max: 10`.
+- Larger app, lots of concurrent users: `max: 20-30`.
+- Beyond that, you're probably I/O-bound on the DB, not connection-
+  bound. More connections won't help.
+
+Postgres-specific: each connection forks a process and uses ~10MB
+RAM. Hundreds of connections is real load on the DB box.
+
+## Why oversizing hurts
+
+Once Postgres has too many active connections:
+
+- Memory pressure.
+- Context-switching overhead between backends.
+- Queries fight for the same shared buffers, locks, CPUs.
+
+A smaller pool with queueing in the app often outperforms a huge
+pool. The pool waits for a connection to free up; the DB doesn't
+collapse under contention.
+
+## Connection pool exhaustion
+
+When all connections are in use, new queries wait. If the wait
+exceeds `connectionTimeoutMillis`, the request errors with
+`Error: timeout exceeded when trying to connect`.
+
+Causes:
+
+- Slow queries hogging connections. Fix the queries.
+- Transactions held open too long. Always `COMMIT`/`ROLLBACK` quickly.
+- Leaked connections (rare with `pool.query` — common with
+  `pool.connect` + forgotten release).
+
+```js
+// Manual checkout — must release in finally
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  // ...
+  await client.query('COMMIT');
+} catch (err) {
+  await client.query('ROLLBACK');
+  throw err;
+} finally {
+  client.release();   // ← critical
+}
+```
+
+Forgetting `client.release()` leaks. The pool's `max` connections
+get permanently checked out; new requests time out.
+
+## PgBouncer / external pooling
+
+For high-concurrency apps, an external connection pooler like
+**PgBouncer** sits between your apps and Postgres:
+
+```
+app1 ─┐
+app2 ─┤
+app3 ─┼─▶ PgBouncer ─▶ Postgres (small fixed pool)
+app4 ─┘
+```
+
+PgBouncer multiplexes thousands of client connections onto a small
+number of real backend connections. Modes:
+
+- **Session pooling**: a client keeps its assigned backend connection
+  for the whole session. Same as no pooling, really.
+- **Transaction pooling**: connection is released back after each
+  transaction. Most common.
+- **Statement pooling**: released after each statement. Most
+  efficient, but breaks prepared statements and other session state.
+
+Tradeoff: PgBouncer transaction mode disables session-level
+features (prepared statements at the Postgres level, `LISTEN/NOTIFY`,
+session variables). Most app code is fine; specific patterns aren't.
+
+Cloud Postgres providers (Supabase, Neon, RDS Proxy) bundle
+PgBouncer (or equivalent) — you may already be using it without
+realizing.
+
+## Read replicas
+
+Once write traffic outgrows one box:
+
+```
+            ┌─▶ Replica 1 (read)
+Primary ────┤
+            └─▶ Replica 2 (read)
+```
+
+Writes go to the primary. Reads can go to replicas. Lag is the
+gotcha — replicas are eventually consistent. Reading immediately
+after a write may see stale data.
+
+In Express, you typically maintain two pools:
+
+```js
+const writePool = new pg.Pool({ connectionString: process.env.PRIMARY_URL });
+const readPool = new pg.Pool({ connectionString: process.env.REPLICA_URL });
+
+await writePool.query('INSERT INTO ...');
+await readPool.query('SELECT * FROM ...');
+```
+
+And route queries deliberately. Some ORMs/drivers automate this
+(read/write splits); most leave it as your problem.
+
+## Health check the pool
+
+```js
+app.get('/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+```
+
+If the DB is unreachable, fail the readiness probe. Load balancer
+stops sending traffic until you recover. See **Observability**.
+
+## Idle connection timeouts
+
+Cloud databases (and aggressive firewalls) sometimes close idle TCP
+connections without warning. Your pool's idle connections appear
+healthy but error on use.
+
+`pg.Pool` reconnects on error transparently, but there's a brief
+window where in-flight queries fail. Mitigations:
+
+- `idleTimeoutMillis` slightly less than the network's idle timeout.
+- Health-check the connection before use (`pool.query('SELECT 1')`
+  periodically).
+- Implement a retry layer in your DB calls.
+
+This is the source of the classic "the API starts erroring every
+5 minutes at 4am" issue.
+
+## Drivers besides node-postgres
+
+- **`postgres.js`** — fast, modern API, tagged-template literals
+  for parameterized queries. Becoming popular.
+- **`mysql2`** — MySQL/MariaDB driver, has its own `createPool`.
+- **`mssql`** — SQL Server.
+- **ORMs** (`prisma`, `drizzle`, `typeorm`) wrap a driver. They use
+  pools under the hood.
+
+API specifics differ; the principles (pool sizing, exhaustion,
+release discipline) are universal.
+
+## What good pool config looks like
+
+For a typical Express service on a managed Postgres (or PgBouncer):
+
+```js
+new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,                          // per-process
+  min: 2,                            // keep a couple warm
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+  application_name: 'my-app',        // shows up in pg_stat_activity
+});
+```
+
+`application_name` is a great quality-of-life setting — when you
+look at `pg_stat_activity` (Postgres's "who's connected and what
+are they doing"), you can see which app the connection came from.

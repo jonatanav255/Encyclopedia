@@ -1,0 +1,245 @@
+export const level = 'mid';
+
+# Postgres
+
+PostgreSQL is the default choice for new server-side projects.
+ACID, mature, rich type system, generous open-source license, and
+the feature set has kept pace with anything proprietary. From an
+Express perspective: pick `pg` (the driver) or a builder/ORM on top
+of it, and you can build most of what you need.
+
+## The driver
+
+```bash
+pnpm add pg
+```
+
+```js
+import pg from 'pg';
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,                                   // max connections
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+});
+
+const { rows } = await pool.query('SELECT NOW()');
+```
+
+`pg.Pool` is the connection pool — use it. Almost never `pg.Client`
+directly in app code. See **Connection Pooling**.
+
+## Parameterized queries
+
+```js
+await pool.query(
+  'SELECT * FROM users WHERE email = $1 AND active = $2',
+  [email, true],
+);
+```
+
+`$1`, `$2` are placeholders. **Never** concatenate user input into
+the SQL string — that's SQL injection. The placeholders pass values
+out-of-band; the database never confuses data and code.
+
+## Types map automatically
+
+`pg` converts between SQL types and JS:
+
+- `INTEGER`, `BIGINT` → `number` (BIGINT is technically risky if
+  larger than 2^53; pg can return strings — see `pg-types`).
+- `TEXT`, `VARCHAR` → `string`.
+- `BOOLEAN` → `boolean`.
+- `JSONB`, `JSON` → JS object (auto-parsed).
+- `TIMESTAMP`, `TIMESTAMPTZ` → `Date`.
+- `UUID` → `string`.
+- `ARRAY` → JS array.
+
+For most apps this just works. If you need different mappings (e.g.,
+return `BIGINT` as strings to be safe), `pg-types` lets you override.
+
+## `RETURNING` instead of select-after-insert
+
+```js
+const { rows } = await pool.query(`
+  INSERT INTO users (name, email)
+  VALUES ($1, $2)
+  RETURNING id, created_at
+`, [name, email]);
+const newUser = rows[0];
+```
+
+One round trip instead of two. Get the auto-generated id, the
+timestamp, anything else the database filled in.
+
+`RETURNING` works on `UPDATE` and `DELETE` too.
+
+## JSONB
+
+Postgres's JSON support is excellent. `JSONB` (binary, indexed)
+gives you schemaless storage when you need it without leaving the
+relational world:
+
+```sql
+CREATE TABLE events (
+  id SERIAL PRIMARY KEY,
+  data JSONB NOT NULL
+);
+
+-- Query into the JSON
+SELECT data->>'username' AS username
+FROM events
+WHERE data->'meta'->>'env' = 'prod';
+
+-- Index a JSON path
+CREATE INDEX events_username_idx ON events ((data->>'username'));
+```
+
+`->` returns JSON; `->>` returns text. The double-paren index syntax
+is mandatory for expression indexes.
+
+JSONB is great for:
+
+- Event payloads where the shape is variable.
+- Settings / preferences blobs.
+- Storing structured data you don't need to query into often.
+
+It is NOT a substitute for proper schema for data you query
+constantly — relational columns are still faster and clearer.
+
+## UUIDs vs serial IDs
+
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ...
+);
+```
+
+`gen_random_uuid()` is built-in (Postgres 13+). UUIDs avoid the
+"id collision when merging databases" and "leaking record count via
+sequential ids" problems. Tradeoff: bigger (16 bytes vs 4), no
+natural sort order.
+
+For new projects, UUIDs are usually the right default. Specifically
+UUIDv7 (time-ordered UUIDs) gives you UUID safety + B-tree-friendly
+insert order — use the `uuid` package's `v7()` if your Postgres is
+older.
+
+## Time columns
+
+```sql
+created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+```
+
+Use **`TIMESTAMPTZ`** (with timezone), not `TIMESTAMP`. Postgres
+internally stores everything in UTC; `TIMESTAMPTZ` makes the
+timezone semantics explicit and consistent.
+
+For `updated_at`, set it via trigger or in app code on every
+update. Postgres doesn't auto-update like some other databases.
+
+## Constraints
+
+Use them. Database constraints catch bugs that application logic
+misses:
+
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL CHECK (length(name) > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+- `NOT NULL` — column can't be null.
+- `UNIQUE` — values must be distinct.
+- `CHECK` — arbitrary boolean expression must hold.
+- `FOREIGN KEY` — values must reference an existing row.
+- `PRIMARY KEY` — unique + not null + indexed.
+
+Constraints fail at write time with explicit error codes
+(`23505` for unique violation, etc.). Catch them and respond
+appropriately:
+
+```js
+try {
+  await pool.query('INSERT INTO users (email) VALUES ($1)', [email]);
+} catch (err) {
+  if (err.code === '23505') return res.status(409).json({ error: 'email taken' });
+  throw err;
+}
+```
+
+## Common types
+
+| SQL | JS | Notes |
+| --- | --- | --- |
+| `INTEGER` | number | -2^31 to 2^31 |
+| `BIGINT` | number/string | Larger range; use string for safety |
+| `NUMERIC(p,s)` | string (default) | Exact decimal — money! |
+| `TEXT` | string | Variable length, no limit |
+| `VARCHAR(n)` | string | Length-limited (Postgres doesn't enforce performance benefit) |
+| `BOOLEAN` | boolean | True/false |
+| `UUID` | string | 16 bytes stored |
+| `JSONB` | object | Binary JSON; indexable |
+| `TIMESTAMPTZ` | Date | UTC internally |
+| `TEXT[]` | string[] | Array of text |
+
+**For money**, use `NUMERIC`, never `FLOAT`. Floating-point math
+doesn't sum cleanly (0.1 + 0.2 ≠ 0.3 at the byte level).
+
+## Migrations
+
+Don't run DDL ad-hoc. Use a migration tool:
+
+- `knex` — JavaScript migration framework.
+- `drizzle-kit` — schema-first, generates migrations from a TS
+  schema.
+- `node-pg-migrate` — Postgres-specific.
+- `flyway`, `sqitch` — language-agnostic.
+
+A migration file describes a change (`CREATE TABLE`, `ALTER TABLE`,
+etc.) and ideally how to undo it. Apply in order; the tool records
+which have run. See **Migrations**.
+
+## Performance basics
+
+- **EXPLAIN ANALYZE** every query you care about. It shows the plan
+  and actual timing. Indexes used? Sequential scan on a big table?
+- **Connection pooling** — each connection is expensive (Postgres
+  forks a process). Use a pool. See **Connection Pooling**.
+- **N+1 queries** — fetching a list of N items and then making one
+  query per item is the slowest possible shape. Use joins or batch
+  fetches.
+
+## Postgres-specific features worth knowing
+
+- **`UPSERT`** (`INSERT ... ON CONFLICT DO UPDATE`) — atomic
+  insert-or-update.
+- **CTEs** (`WITH ... SELECT ...`) — readable multi-step queries.
+- **Window functions** — `ROW_NUMBER OVER (...)`, etc.
+- **Full-text search** — `tsvector` + `@@` operator. Good enough
+  for many cases without Elasticsearch.
+- **`LISTEN` / `NOTIFY`** — pub/sub built into the database.
+- **Logical replication** — stream changes to other systems.
+- **PostGIS** — geographic queries (radius search, etc.).
+- **Row-level security** — multi-tenant isolation in the DB itself.
+
+## In Express
+
+The shape that works:
+
+1. One `pg.Pool` instance, shared across the process.
+2. Parameterized queries everywhere.
+3. Use `RETURNING` to avoid extra round trips.
+4. Map Postgres error codes to HTTP statuses in your error
+   middleware.
+5. Migrations under version control, run as part of deploy.
+
+Postgres + Express is one of the most pleasant stacks you can build
+on. It scales further than people think before you need to reach
+for fancier infrastructure.

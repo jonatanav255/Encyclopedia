@@ -1,0 +1,185 @@
+export const level = 'mid';
+
+# N+1 Queries
+
+The slowest possible shape for a database-backed feature: one query
+to get a list, then one query per item to get its details. For 100
+items you make 101 queries — 100 of them serial round trips,
+totaling hundreds of ms even on a fast database.
+
+## The classic example
+
+```js
+// Bad: N+1
+const posts = await db.query('SELECT * FROM posts LIMIT 50');
+for (const post of posts) {
+  post.author = await db.query('SELECT * FROM users WHERE id = $1', [post.authorId]);
+}
+return posts;
+```
+
+For 50 posts, you've made 51 queries. Each one is its own network
+round trip. Total time: ~50ms × 51 = 2.5 seconds for what should
+be ~10ms.
+
+The pattern is everywhere because it's the "obvious" way to write
+the code. Lists of orders, each with line items. Users, each with
+roles. Comments, each with their authors.
+
+## The fixes
+
+### 1. JOIN
+
+```sql
+SELECT p.*, u.name AS author_name, u.email AS author_email
+FROM posts p
+LEFT JOIN users u ON u.id = p.author_id
+LIMIT 50;
+```
+
+One query. The database engine is designed for this. Read 50 rows,
+get author info in the same scan.
+
+Caveat: if the post → author relationship is one-to-many in either
+direction, you get duplicate rows. A `LEFT JOIN` from posts to
+comments returns one row per comment. You then have to group
+client-side or query differently.
+
+### 2. Batch fetch (`IN`)
+
+When JOIN would explode the result set:
+
+```js
+const posts = await db.query('SELECT * FROM posts LIMIT 50');
+const authorIds = [...new Set(posts.map(p => p.authorId))];
+const authors = await db.query(
+  'SELECT * FROM users WHERE id = ANY($1)',
+  [authorIds],
+);
+const byId = new Map(authors.map(a => [a.id, a]));
+for (const post of posts) {
+  post.author = byId.get(post.authorId);
+}
+```
+
+Two queries. Look up authors by id in a `Map` instead of querying
+per post.
+
+### 3. DataLoader
+
+`dataloader` is a library that batches and caches per-request:
+
+```js
+import DataLoader from 'dataloader';
+
+const userLoader = new DataLoader(async (ids) => {
+  const users = await db.query('SELECT * FROM users WHERE id = ANY($1)', [ids]);
+  const byId = new Map(users.map(u => [u.id, u]));
+  return ids.map(id => byId.get(id) ?? null);
+});
+
+// Calls during the same tick get batched:
+const a = userLoader.load(1);   // -- batched --
+const b = userLoader.load(2);   // -- batched --
+const c = userLoader.load(3);   // -- batched --
+// One actual query: SELECT * FROM users WHERE id IN (1, 2, 3)
+```
+
+Each handler creates its own loader (request-scoped). The loader
+collects calls within a tick, batches them into one DB call,
+returns each caller their value.
+
+Designed for GraphQL — where the field resolver pattern makes N+1
+trivially easy to write — but useful anywhere.
+
+## Detecting N+1
+
+The symptoms:
+
+- One endpoint is dramatically slower than its analogues.
+- DB metrics show high query count, low per-query latency.
+- Traces show many small DB calls in a row inside one handler.
+
+Tools:
+
+- **OpenTelemetry / APM** — request traces show every DB call as a
+  span. If you see 50 spans for one handler, you have an N+1.
+- **`pg_stat_statements`** — Postgres aggregates query stats. Look
+  for a query with very high `calls` and low per-call time — that's
+  often an N+1.
+- **Local development** — log every query. If a list endpoint
+  prints 50 lines, fix it before deployment.
+
+## ORM-specific patterns
+
+### Prisma
+
+```js
+// N+1
+const posts = await prisma.post.findMany();
+for (const p of posts) {
+  p.author = await prisma.user.findUnique({ where: { id: p.authorId } });
+}
+
+// Fixed: use include or select
+const posts = await prisma.post.findMany({
+  include: { author: true },
+});
+```
+
+Prisma's `include` runs an additional batch query, not a JOIN.
+Cleaner result shape (no duplicates), still O(1) extra queries.
+
+### Drizzle
+
+```js
+// N+1
+const posts = await db.select().from(posts);
+for (const p of posts) {
+  p.author = await db.select().from(users).where(eq(users.id, p.authorId));
+}
+
+// Fixed with leftJoin
+const rows = await db.select().from(posts).leftJoin(users, eq(users.id, posts.authorId));
+```
+
+Same idea.
+
+### TypeORM / Sequelize
+
+Both have `relations` / `include` options that fetch related records
+in a single batched query. Use them.
+
+## When N+1 is acceptable
+
+It exists. Don't make it a religion.
+
+- **N is tiny** (1–5 items). The overhead is negligible.
+- **You can't predict which related entities you need** until you
+  see each one. (Rare, but happens — heavily dynamic queries.)
+- **Caching is good** — if each per-item query is a cache hit, the
+  cost is trivial.
+
+For routine list endpoints, JOIN or batch. For special-purpose
+code where you've measured and confirmed it's fine, the simple loop
+can stay.
+
+## Worst-case: N+M+...
+
+You fetch posts. For each post, you fetch the author. For each
+author, you fetch their roles. Now you have N × M queries. Same
+pattern, deeper. The fix is the same: batch each level.
+
+## In practice
+
+The discipline:
+
+1. Whenever you write `for (const x of list)` containing a DB call,
+   pause.
+2. Ask: can this be a JOIN or a batched `IN`?
+3. If yes, rewrite. If no, justify.
+
+Make this a code-review habit. N+1 is one of the most common
+performance bugs in production, and almost every instance is fixable
+in a single sitting. Catching them before they ship is much
+cheaper than fixing them under outage pressure.

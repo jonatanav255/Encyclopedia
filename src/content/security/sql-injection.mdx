@@ -1,0 +1,220 @@
+export const level = 'mid';
+
+# SQL Injection
+
+The classic. User input becomes part of a SQL query string, the
+database treats it as code instead of data, the attacker reads your
+entire database (or writes to it, or drops tables). It's been on
+every "common vulnerabilities" list for 25 years and still happens
+weekly.
+
+## The bug
+
+```js
+app.get('/users', (req, res) => {
+  db.query(`SELECT * FROM users WHERE email = '${req.query.email}'`);
+});
+```
+
+Request: `/users?email='%20OR%201=1--`. The SQL becomes:
+
+```sql
+SELECT * FROM users WHERE email = '' OR 1=1--'
+```
+
+`1=1` is always true; `--` comments out the rest. Returns every
+user.
+
+The attacker can do worse:
+
+```
+?email='; DROP TABLE users; --
+```
+
+Or read other tables:
+
+```
+?email=' UNION SELECT credit_card FROM payments WHERE '1'='1
+```
+
+This is decades of attacker creativity at this point. The defense
+is one line.
+
+## The fix: parameterized queries
+
+```js
+// node-postgres
+db.query('SELECT * FROM users WHERE email = $1', [req.query.email]);
+
+// mysql2
+db.query('SELECT * FROM users WHERE email = ?', [req.query.email]);
+
+// kysely / drizzle / prisma
+db.selectFrom('users').where('email', '=', req.query.email).execute();
+```
+
+The placeholder (`$1`, `?`) is a *binding* point. The driver sends
+the SQL and the parameter values **separately** to the database.
+The database compiles the SQL once and substitutes the values
+without re-parsing. There's no string interpolation; injection is
+impossible.
+
+Every modern SQL driver supports this. Use it.
+
+## Where the trap lurks
+
+The literal `${input}` string template is the obvious case. The
+non-obvious ones:
+
+### "Identifiers" (table/column names)
+
+Placeholders only work for **values**. Identifiers must come from a
+whitelist:
+
+```js
+// Bad
+db.query(`SELECT * FROM users ORDER BY ${req.query.sortBy}`);
+
+// Good
+const SORTABLE = ['name', 'created_at', 'email'];
+if (!SORTABLE.includes(req.query.sortBy)) return res.sendStatus(400);
+db.query(`SELECT * FROM users ORDER BY ${req.query.sortBy}`);
+```
+
+Validate against an allowlist before interpolating. Never interpolate
+the user's raw value into a column or table name.
+
+### Dynamic IN lists
+
+```js
+// Bad
+const ids = req.body.ids.join(',');
+db.query(`SELECT * FROM users WHERE id IN (${ids})`);
+
+// Good
+db.query('SELECT * FROM users WHERE id = ANY($1)', [req.body.ids]);
+```
+
+Postgres has `= ANY(array)` for variable-length lists. MySQL has
+similar. Or generate placeholders dynamically:
+
+```js
+const placeholders = req.body.ids.map((_, i) => `$${i + 1}`).join(',');
+db.query(`SELECT * FROM users WHERE id IN (${placeholders})`, req.body.ids);
+```
+
+Still safe — every value passes through a placeholder.
+
+### LIKE patterns
+
+```js
+db.query('SELECT * FROM users WHERE name LIKE $1', [`%${req.query.q}%`]);
+```
+
+Safe from injection. But user input containing `%` or `_` is now
+treated as a LIKE wildcard. Usually fine; if it isn't, escape:
+
+```js
+const escaped = req.query.q.replace(/[%_]/g, '\\$&');
+```
+
+### ORM "escape hatches"
+
+Most ORMs let you drop to raw SQL:
+
+```js
+db.$queryRawUnsafe(`SELECT * FROM users WHERE email = '${email}'`);
+```
+
+These bypass the safety. Never with user input.
+
+## NoSQL injection
+
+Same idea, different database:
+
+```js
+// MongoDB
+await users.findOne({ email: req.body.email });
+```
+
+If `req.body.email` is `{ $ne: null }`, you get "find a user whose
+email is not null" — bypass auth.
+
+Fix: validate that input is the type you expect. zod or similar:
+
+```js
+const Schema = z.object({ email: z.string() });
+const { email } = Schema.parse(req.body);
+await users.findOne({ email });   // now guaranteed to be a string
+```
+
+Mongo specifically has `safe-mongo`-style sanitizers, but the
+principle is universal: validate input types at the boundary.
+
+## Stored XSS via injected SQL
+
+A nastier compound: attacker injects HTML/JS into the database (via
+SQL injection or just a missing validation). Your app reads it back
+and renders it without escaping. Now you have stored XSS on top of
+the injection.
+
+Mitigations:
+
+- Escape on output (templating engines do this by default).
+- Validate on input (don't store HTML in fields where you don't
+  expect it).
+- Content Security Policy (helmet defaults).
+
+## ORMs aren't magic
+
+People assume "I'm using an ORM, I'm safe from SQL injection."
+Mostly true, but:
+
+- Raw query escape hatches bypass safety.
+- `LIKE` patterns are values to the ORM, but the patterns can be
+  weaponized in subtle ways.
+- Identifier injection (column/table names) is still your problem.
+
+The ORM removes 95% of the risk. The remaining 5% requires the
+same discipline as raw drivers.
+
+## Detection
+
+In production, look for:
+
+- Unusual error rates (failed queries from injection attempts).
+- Logs containing suspicious patterns (`UNION`, `--`, `OR 1=1`,
+  `' OR '`).
+- WAF (Web Application Firewall) alerts.
+- Query auditing (slow queries that look unusual).
+
+For new code: code review. Search the diff for string interpolation
+in queries.
+
+## Test for it
+
+```js
+test('rejects injection in email field', async () => {
+  const res = await request(app).get(`/users?email='%20OR%201=1--`);
+  expect(res.body.length).toBe(0);   // didn't return all users
+});
+```
+
+A few of these in your test suite costs little and catches regressions.
+
+## In Express specifically
+
+Defenses, in order:
+
+1. **Schema validation** at the boundary (zod). Untyped input
+   doesn't even reach query code.
+2. **Parameterized queries** for every database call.
+3. **ORM or query builder** rather than raw strings.
+4. **Allowlists** for identifiers.
+5. **No `$queryRawUnsafe`** with user input.
+6. **WAF** at the edge — last line of defense for the cases the
+   above missed.
+
+The fix is cheap. The bug is catastrophic. Internalize the pattern;
+flag it instantly in code review; never ship a query that
+concatenates user input.

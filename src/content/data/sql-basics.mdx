@@ -1,0 +1,249 @@
+export const level = 'junior';
+
+# SQL Basics
+
+Most Express apps talk to a SQL database. You don't need to be a
+DBA, but you do need to be able to read and write queries, understand
+joins, and not write the kind of code that pulls 100k rows when it
+needs 50. This is the floor.
+
+## The four basic operations
+
+```sql
+SELECT id, name FROM users WHERE active = true ORDER BY name LIMIT 50;
+INSERT INTO users (name, email) VALUES ('Jon', 'jon@example.com');
+UPDATE users SET name = 'Jonathan' WHERE id = 42;
+DELETE FROM users WHERE id = 42;
+```
+
+CRUD: create (INSERT), read (SELECT), update (UPDATE), delete
+(DELETE). 95% of what you'll write.
+
+## SELECT in depth
+
+```sql
+SELECT u.id, u.name, COUNT(p.id) AS post_count
+FROM users u
+LEFT JOIN posts p ON p.author_id = u.id
+WHERE u.created_at > NOW() - INTERVAL '30 days'
+GROUP BY u.id, u.name
+HAVING COUNT(p.id) > 0
+ORDER BY post_count DESC
+LIMIT 10;
+```
+
+The execution order isn't the read order. Logically:
+
+1. **FROM** + **JOIN** — figure out which rows to consider.
+2. **WHERE** — filter rows before grouping.
+3. **GROUP BY** — collapse rows into groups.
+4. **HAVING** — filter groups.
+5. **SELECT** — choose columns / compute aggregates.
+6. **ORDER BY** — sort.
+7. **LIMIT** / **OFFSET** — paginate.
+
+Knowing the order explains why you can't reference a `SELECT` alias
+in `WHERE` (it doesn't exist yet) but can in `ORDER BY`.
+
+## JOINs
+
+```sql
+SELECT u.name, p.title
+FROM users u
+INNER JOIN posts p ON p.author_id = u.id;     -- only users with posts
+```
+
+| Type | Returns |
+| --- | --- |
+| `INNER JOIN` | Rows where the join condition matches in both |
+| `LEFT JOIN` | All left rows; nulls for missing right |
+| `RIGHT JOIN` | All right rows; nulls for missing left (rarely used) |
+| `FULL JOIN` | All rows from both sides, nulls where no match |
+| `CROSS JOIN` | Cartesian product (every left × every right) |
+
+If you're unsure, `LEFT JOIN` is the most common in app code —
+"give me the user and any posts they have."
+
+## WHERE conditions
+
+```sql
+WHERE active = true
+  AND created_at > NOW() - INTERVAL '7 days'
+  AND name ILIKE 'jon%'        -- Postgres case-insensitive LIKE
+  AND email IS NOT NULL
+  AND role IN ('admin', 'editor')
+  AND tags && ARRAY['featured'];   -- Postgres array overlap
+```
+
+Operators: `=`, `!=` (or `<>`), `<`, `>`, `<=`, `>=`, `LIKE`,
+`ILIKE` (Postgres), `IN (...)`, `BETWEEN`, `IS NULL`, `IS NOT NULL`.
+
+**NULL is special**: `x = NULL` is never true (or false — it's NULL).
+Use `IS NULL` / `IS NOT NULL`.
+
+## Aggregates
+
+```sql
+SELECT
+  COUNT(*) AS total,
+  COUNT(DISTINCT author_id) AS unique_authors,
+  AVG(score) AS avg_score,
+  MAX(created_at) AS latest
+FROM posts;
+```
+
+`COUNT(*)` counts rows; `COUNT(col)` counts non-null values of that
+column. `AVG`, `SUM`, `MIN`, `MAX` ignore nulls.
+
+Aggregates without `GROUP BY` collapse the entire result to one row.
+
+## GROUP BY
+
+```sql
+SELECT author_id, COUNT(*) AS post_count
+FROM posts
+GROUP BY author_id;
+```
+
+Collapses rows. Every column in `SELECT` must either be in
+`GROUP BY` or wrapped in an aggregate. Postgres is strict; MySQL
+has historically been lax (and bites people).
+
+## ORDER BY and LIMIT
+
+```sql
+ORDER BY created_at DESC, id DESC
+LIMIT 20 OFFSET 40;
+```
+
+`OFFSET 40` skips 40 rows. Used naively for pagination — **don't**.
+Offset pagination scans + discards the skipped rows, getting slower
+as the user clicks page 100, 1000. Use cursor pagination instead.
+See **Pagination**.
+
+## INSERT
+
+```sql
+INSERT INTO users (name, email) VALUES ('Jon', 'jon@example.com');
+
+INSERT INTO users (name, email)
+  VALUES ('Jon', 'jon@example.com')
+  RETURNING id, created_at;       -- Postgres: get the new row back
+
+INSERT INTO users (name, email)
+SELECT name, email FROM imports WHERE pending = true;
+```
+
+`RETURNING` (Postgres) gives you the auto-generated columns (id,
+timestamps) without a follow-up `SELECT`. Huge ergonomics win.
+
+## UPDATE
+
+```sql
+UPDATE users
+SET name = 'Jonathan',
+    updated_at = NOW()
+WHERE id = 42;
+```
+
+**Always have a `WHERE`** unless you really want to update every row.
+The number of "I forgot WHERE and updated all 4 million users"
+stories is endless.
+
+`RETURNING` works on UPDATE too:
+
+```sql
+UPDATE users SET active = false WHERE id = 42 RETURNING *;
+```
+
+## DELETE
+
+```sql
+DELETE FROM users WHERE id = 42;
+DELETE FROM users WHERE created_at < NOW() - INTERVAL '5 years';
+```
+
+Same warning: no WHERE means delete everything.
+
+Many apps don't actually delete — they **soft-delete** by setting a
+`deleted_at` column. Lets you "undo" and preserves audit trails.
+Tradeoff: every SELECT needs `WHERE deleted_at IS NULL`.
+
+## NULL semantics
+
+NULL means "unknown." It propagates through expressions:
+
+- `NULL + 5` is NULL.
+- `NULL = NULL` is NULL (not true).
+- `'jon' = NULL` is NULL.
+- `NULL AND true` is NULL; `NULL OR true` is true.
+
+Use `IS NULL` / `IS NOT NULL` to test. `COALESCE(col, default)`
+returns the first non-NULL.
+
+## Indexes
+
+A B-tree index on `email`:
+
+```sql
+CREATE INDEX users_email_idx ON users (email);
+```
+
+Now `WHERE email = 'jon@example.com'` is O(log n) instead of O(n).
+The downside: indexes slow down writes and take disk space.
+
+Rule of thumb: index columns you `WHERE` or `JOIN ON` frequently.
+Don't index every column. See **Indexing**.
+
+## Transactions
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+-- or ROLLBACK; if anything failed
+```
+
+Either both updates happen or neither does. Critical for anything
+involving money, related rows, or invariants. See **Transactions**.
+
+## In Express
+
+You won't write SQL strings directly with concatenation — that's
+SQL injection waiting to happen. Use:
+
+- **A query builder** — `kysely`, `knex`. Pretty, type-safe-ish,
+  generates parameterized SQL.
+- **An ORM** — `prisma`, `drizzle`, `typeorm`. Higher-level, model
+  classes, migrations included.
+- **The driver directly with placeholders** — `pg`, `mysql2`. Most
+  control, more boilerplate.
+
+```js
+// node-postgres
+const { rows } = await db.query(
+  'SELECT * FROM users WHERE email = $1',
+  [email],
+);
+```
+
+The `$1` is a placeholder; the driver passes `email` as a parameter,
+not interpolated into the SQL. Safe from injection. See
+**SQL Injection**.
+
+## What to learn next
+
+- **Joins beyond INNER/LEFT** — `LATERAL` joins, subqueries.
+- **Window functions** — `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`. Hugely
+  powerful for analytics queries.
+- **CTEs** (`WITH foo AS (...) SELECT ...`) — readable multi-step
+  queries.
+- **`EXPLAIN`** — see what the database actually does. Read every
+  `EXPLAIN` until you can guess what the plan will be.
+- **Index types** — B-tree, hash, GIN, GiST. Different data shapes
+  want different indexes.
+
+For most Express handlers, the basic CRUD + joins + WHERE filters
+get you everywhere. The advanced stuff is a force multiplier when
+you need it.

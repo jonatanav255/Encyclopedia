@@ -1,0 +1,212 @@
+export const level = 'senior';
+
+# Child Process
+
+`node:child_process` runs other programs from inside Node. You use it
+to invoke CLIs (`ffmpeg`, `git`, `imagemagick`), shell pipelines, or
+to spawn a long-lived helper process. It's also one of the easiest
+places to introduce a remote code execution vulnerability — read this
+before you `exec(userInput)`.
+
+## The four APIs
+
+| API | Returns | Spawns shell? | When to use |
+| --- | --- | --- | --- |
+| `spawn` | ChildProcess (streams) | No | Long output, streaming |
+| `exec` | ChildProcess (buffered) | Yes | Short output, convenience |
+| `execFile` | ChildProcess (buffered) | No | Like exec, but no shell |
+| `fork` | ChildProcess (IPC) | No | Spawn another Node process |
+
+The shell distinction matters a lot — `exec` runs your command
+through `/bin/sh -c`, which means shell metacharacters (`;`, `|`, `&`,
+`$()`) are interpreted. That's the injection vector.
+
+## Safe by default: `spawn` or `execFile`
+
+```js
+import { spawn } from 'node:child_process';
+
+const child = spawn('ffmpeg', ['-i', userInputPath, 'out.mp4']);
+child.stdout.pipe(process.stdout);
+child.stderr.pipe(process.stderr);
+child.on('exit', (code) => console.log('exited', code));
+```
+
+Arguments are passed as an array — they go through `execve` without
+a shell interpretation. `userInputPath` containing `;` or `&&` is
+treated as one filename, not a chain of commands. This is the
+default-safe pattern.
+
+For non-streaming convenience without the shell:
+
+```js
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileP = promisify(execFile);
+
+const { stdout } = await execFileP('git', ['rev-parse', 'HEAD']);
+```
+
+## The dangerous one: `exec`
+
+```js
+import { exec } from 'node:child_process';
+
+exec(`convert ${userInput} out.png`, (err, stdout) => {});
+//        ^^^^^^^^^^^^^^^^
+//        Shell will interpret ;, &&, $(), backticks here
+```
+
+User sends `; rm -rf /` and you've handed them shell access. The
+whole reason `exec` exists is shell features (pipes, redirects, env
+expansion). If you want those, you accept the responsibility for
+escaping.
+
+Use cases for `exec` that are actually safe:
+
+- Constant commands with no user input.
+- Properly escaped input via a vetted helper (and even then, prefer
+  `spawn` with `shell: false`).
+
+```js
+// If you genuinely need a shell pipeline
+const child = spawn('sh', ['-c', 'gzip < input.log > input.log.gz']);
+// Inputs are baked in, not concatenated. Safer.
+```
+
+## Streaming output
+
+For long-running processes, `spawn` is the only option that won't
+buffer the entire output in memory:
+
+```js
+const child = spawn('tail', ['-F', '/var/log/app.log']);
+
+child.stdout.on('data', (chunk) => {
+  // process line-by-line
+});
+
+child.on('exit', (code, signal) => {
+  console.log('exit', code, 'signal', signal);
+});
+
+// Stop it
+child.kill('SIGTERM');
+```
+
+`exec` and `execFile` default to a 200KB buffer — exceed it and the
+process errors out with `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`. Either
+raise `maxBuffer` or switch to `spawn`.
+
+## Awaiting a process
+
+The promise-based `execFile`/`exec` are convenient:
+
+```js
+import { promisify } from 'node:util';
+const execFileP = promisify(execFile);
+
+try {
+  const { stdout, stderr } = await execFileP('git', ['status']);
+  console.log(stdout);
+} catch (err) {
+  // err.code = exit code, err.stderr = stderr output
+}
+```
+
+For `spawn`-based code, wrap manually:
+
+```js
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (c) => (stdout += c));
+    child.stderr.on('data', (c) => (stderr += c));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`exit ${code}: ${stderr}`));
+    });
+  });
+}
+```
+
+Node 22+ has a higher-level `node:util.parseArgs`-style runner via
+`util.promisify(spawn)` etc., but rolling this helper is a one-time
+cost.
+
+## `stdio` configuration
+
+Controls how the child's standard streams connect:
+
+```js
+spawn(cmd, args, {
+  stdio: ['ignore', 'pipe', 'pipe'],   // [stdin, stdout, stderr]
+});
+```
+
+Options per stream:
+
+- `'pipe'` — readable/writable from parent (default).
+- `'ignore'` — `/dev/null`.
+- `'inherit'` — share the parent's stream (useful for printing logs
+  straight to the parent's stdout).
+- A file descriptor.
+
+`stdio: 'inherit'` is the right pick when you don't need to capture
+output and just want the child to print to your terminal.
+
+## `fork` for Node-to-Node
+
+```js
+import { fork } from 'node:child_process';
+
+const worker = fork('./worker.js');
+worker.send({ task: 'process', file: 'input.csv' });
+worker.on('message', (result) => console.log(result));
+worker.on('exit', (code) => console.log('worker exited', code));
+```
+
+`fork` is a specialization of `spawn` that starts a Node process with
+an IPC channel built in. `child.send`/`process.send` exchange
+structured-cloneable values. Useful for CPU-bound work you want
+isolated, or as a base for the `cluster` module.
+
+For most "I want to run heavy work off the main thread" cases, prefer
+**worker_threads** — they share memory and have lower overhead. Use
+`fork` when you actually want a separate process (memory isolation,
+crash containment).
+
+## Resource leaks
+
+Forgotten children keep running after the parent exits. Two
+safeguards:
+
+- `child.unref()` — Node won't wait on this child during shutdown.
+  Good for "this child is fire-and-forget; if I exit, kill it."
+- Explicit `child.kill()` in a `SIGTERM` handler.
+
+For long-lived helpers, structure cleanup deliberately. A common bug
+is the parent crashes, the child stays, and now the next deploy fails
+to bind a port because the old child is still holding it.
+
+## Performance
+
+Each child process is a full fork — for short tasks the overhead is
+significant (10s of ms minimum). If you find yourself spawning
+processes per request, ask whether a long-lived worker, a worker
+thread, or a native Node implementation would be faster.
+
+For example: don't `exec('convert ...')` to shrink an image per
+request. Use `sharp` (a Node-native libvips binding). The performance
+difference is 10–100×.
+
+## Common bugs
+
+- Using `exec` with user input → RCE.
+- `maxBuffer` exceeded on long-running `exec` → use `spawn`.
+- Not handling `error` events → uncaught errors crash the process.
+- Not waiting for `'close'` (only `'exit'`) → stdout buffer might
+  not be fully consumed yet.
+- Spawning processes that themselves never exit, no shutdown logic.

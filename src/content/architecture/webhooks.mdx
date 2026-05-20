@@ -1,0 +1,272 @@
+export const level = 'senior';
+
+# Webhooks
+
+A webhook is a callback HTTP request from a service to your server,
+sent when something happens. "When a payment succeeds, hit this
+URL." "When a Git push lands, ping this URL." They invert the
+normal "poll for changes" pattern — the source pushes, you react.
+
+## The shape
+
+Your server exposes a URL. The third party POSTs to it:
+
+```
+POST https://api.yourapp.com/webhooks/stripe
+Content-Type: application/json
+Stripe-Signature: t=1730000000,v1=abc123...
+
+{
+  "id": "evt_123",
+  "type": "payment_intent.succeeded",
+  "data": { ... }
+}
+```
+
+You process the payload, do whatever it implies (mark order paid,
+send receipt), and respond with 200.
+
+## Securing the endpoint
+
+The webhook URL is public. Anyone can hit it. Without verification,
+an attacker sends fake "payment succeeded" events to mark their
+orders paid.
+
+Three common verification mechanisms:
+
+### Signature verification
+
+The sender HMACs the payload with a shared secret. Your server
+verifies the signature:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+  const sig = req.get('Stripe-Signature');
+  const expected = createHmac('sha256', process.env.WEBHOOK_SECRET)
+    .update(req.body)
+    .digest('hex');
+
+  if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return res.status(401).send('invalid signature');
+  }
+  // process the event
+});
+```
+
+Two things to notice:
+
+1. **`express.raw`** — the signature is over the *raw bytes*. If
+   `express.json()` parses first, you compute the signature over the
+   reserialized JSON, which won't match.
+2. **`timingSafeEqual`** — comparison must be constant-time.
+   Otherwise a timing attack can guess the signature byte by byte.
+
+Most webhook providers (Stripe, GitHub, Slack) have a library that
+does the verification for you — use it.
+
+### Shared-secret in URL
+
+```
+POST https://api.yourapp.com/webhooks/foo?secret=xyz
+```
+
+Less secure (the secret appears in URL logs at every hop) but
+simpler. Use only when signature verification isn't supported.
+
+### IP allowlist
+
+Only accept requests from the sender's known IP ranges. Useful as
+defense-in-depth; not sufficient alone (IPs can change; not all
+senders publish ranges).
+
+## Idempotency
+
+Webhooks are usually delivered **at-least-once**. The sender retries
+on failure (or perceived failure). Your handler **must** be safe to
+run multiple times on the same event.
+
+Two approaches:
+
+### Event-ID deduplication
+
+Each webhook event has an ID. Store seen IDs:
+
+```js
+app.post('/webhooks/stripe', verifySignature, async (req, res) => {
+  const event = JSON.parse(req.body);
+
+  const seen = await redis.set(`seen:webhook:${event.id}`, '1', {
+    NX: true, EX: 7 * 24 * 60 * 60,
+  });
+  if (!seen) return res.sendStatus(200);   // duplicate, already processed
+
+  await processEvent(event);
+  res.sendStatus(200);
+});
+```
+
+`SET NX` returns OK only if the key didn't exist. Atomic dedup.
+
+### Idempotent handlers
+
+Make the work itself idempotent:
+
+```js
+// Setting state to a known value — idempotent
+await db.orders.update({ id: orderId }, { paid_at: NOW() });
+
+// Vs incrementing — not idempotent
+await db.orders.update({ id: orderId }, { receipt_count: receipt_count + 1 });
+```
+
+If every handler is idempotent on its own, duplicates are harmless.
+
+In practice, do both — dedupe the event AND write idempotent
+handlers.
+
+## Respond fast
+
+The sender has a timeout (often 5–30 seconds). If you take longer,
+they retry — sending the same event again, which you must dedupe
+again, while the original is still running. Pile-up.
+
+Pattern: **acknowledge quickly, process asynchronously**:
+
+```js
+app.post('/webhooks/stripe', verifySignature, async (req, res) => {
+  const event = JSON.parse(req.body);
+  await queue.enqueue('webhook-process', event);
+  res.sendStatus(200);
+});
+```
+
+The HTTP handler does the absolute minimum (verify, enqueue, ack).
+A separate worker processes the queue asynchronously. The sender
+sees a fast 200 and stops retrying.
+
+## Retry policy
+
+If you return 5xx or time out, the sender retries. Most providers
+use exponential backoff with a max retry window (Stripe: ~72 hours,
+GitHub: ~8 hours).
+
+Returning **4xx** usually tells the sender "stop retrying — this
+is a permanent failure." Use this for signature mismatches,
+unrecognized event types, etc.
+
+Returning **2xx** = "I got it, don't retry." Even if processing
+failed asynchronously, you can return 200 quickly to stop retries
+and handle errors in your own retry loop.
+
+## Common bugs
+
+### Signature failure due to JSON re-serialization
+
+`express.json()` parses, your code re-serializes, the signature is
+over your re-serialized bytes — which probably doesn't match the
+original (whitespace, key order). Always use `express.raw` for
+signed webhook bodies.
+
+### Processing in the request handler
+
+A slow database call inside the handler → sender times out → sends
+again → another slow handler → pile-up → DB is now under heavy
+load just from retries.
+
+Always enqueue + return fast.
+
+### Ignoring event order
+
+Webhooks aren't ordered. Event B (with type
+`payment.refund_failed`) might arrive before event A (with type
+`payment.refunded`). Your handler must tolerate out-of-order events
+— check the current state of the resource, don't assume the
+sequence.
+
+### Trusting the payload
+
+Even with a valid signature, the payload could be a replay attack
+(an old event re-sent by the same signature). Stripe puts a
+`timestamp` in the signature header; reject events older than ~5
+minutes:
+
+```js
+const timestamp = parseInt(sig.match(/t=(\d+)/)[1], 10);
+const now = Math.floor(Date.now() / 1000);
+if (Math.abs(now - timestamp) > 300) {
+  return res.status(401).send('stale signature');
+}
+```
+
+### Logging webhook bodies
+
+Webhook bodies often contain sensitive data (PII, payment details,
+customer info). Log the event type and IDs, redact the rest.
+
+## Outgoing webhooks (when you're the sender)
+
+If your service notifies others:
+
+- Sign every request.
+- Retry with exponential backoff on 5xx (don't retry on 4xx).
+- Cap retry duration (don't try forever).
+- Make events have stable IDs so receivers can dedupe.
+- Log delivery attempts so customers can audit.
+- Let receivers configure their endpoint, secret, and which events
+  they want.
+
+This is its own product. Many companies use a service like Svix or
+build their own webhook-delivery infrastructure.
+
+## Local development
+
+Webhook senders can't reach `localhost`. Tools that help:
+
+- **ngrok** — tunnel a public URL to your local port.
+- **smee.io** — GitHub's webhook proxy.
+- **Stripe CLI** — `stripe listen --forward-to localhost:3000/webhooks/stripe`.
+- **Cloudflare Tunnel** — free alternative to ngrok.
+
+Test webhook handlers against real events from a sandbox/dev env
+during development. The sandbox events tell you a lot about the
+real shape of the data.
+
+## Testing in CI
+
+Don't try to receive real webhooks in CI. Instead:
+
+- Capture real events once (locally), save the JSON.
+- Re-play them at your handler in tests.
+
+```js
+test('processes payment.succeeded', async () => {
+  const event = JSON.parse(fs.readFileSync('fixtures/payment-succeeded.json'));
+  const res = await request(app)
+    .post('/webhooks/stripe')
+    .set('Stripe-Signature', generateTestSignature(event))
+    .send(event);
+
+  expect(res.status).toBe(200);
+  expect(await db.orders.findById(...).paid_at).toBeTruthy();
+});
+```
+
+Real events, real flows, no flaky network.
+
+## In summary
+
+Webhook handlers have an outsized blast radius — they often
+trigger billing, communication, or important state changes. Treat
+them with extra discipline:
+
+- Verify the signature.
+- Dedupe by event ID.
+- Acknowledge quickly; process async.
+- Make handlers idempotent.
+- Don't trust the payload beyond the signature.
+- Log delivery and processing for auditing.
+
+The payoff is correctness when the sender is misbehaving (excessive
+retries) and resilience when your service is overloaded.

@@ -1,0 +1,255 @@
+export const level = 'senior';
+
+# API Versioning
+
+Every public API eventually changes in ways that break existing
+clients. Versioning is how you do that without breaking everyone at
+once. The choices are mechanical — URL, header, media type — but
+the implications for client management and operational complexity
+are real.
+
+## What needs versioning
+
+Breaking changes need a new version. What's a breaking change:
+
+- Removing a field, endpoint, or method.
+- Changing a field's type or semantics.
+- Changing required parameters.
+- Changing error response format.
+- Changing default behavior (e.g., default sort order).
+- Renaming anything in the contract.
+
+What's **not** a breaking change (and shouldn't bump versions):
+
+- Adding new endpoints.
+- Adding new optional fields to requests.
+- Adding new fields to responses (clients should ignore unknown
+  fields).
+- Adding new optional headers.
+- Adding new status codes (for new conditions).
+
+The rule: existing clients keep working without changes. Anything
+else is a breaking change.
+
+## URL path versioning
+
+```
+GET /v1/users/42
+GET /v2/users/42
+```
+
+The most common approach. Pros:
+
+- **Visible in logs, traces, monitoring** — you can see which
+  version is being used.
+- **Easy to route at the proxy** — different versions can go to
+  different services if needed.
+- **Easy to deprecate** — stop traffic to `/v1` at the proxy when
+  it's time.
+
+Cons:
+
+- Considered "not RESTful" by purists (the URL is supposed to
+  identify the resource, not its representation).
+- URLs change between versions (annoying for documentation and SDKs).
+
+For most APIs, this is the right default. It's pragmatic and
+operationally easy.
+
+## Header versioning
+
+```
+GET /users/42
+API-Version: 2
+```
+
+Or, more "RESTfully," via `Accept`:
+
+```
+GET /users/42
+Accept: application/vnd.example.v2+json
+```
+
+Pros:
+
+- URLs don't change between versions.
+- "More RESTful."
+
+Cons:
+
+- Less visible — you can see the version only by inspecting headers.
+- Routing at the proxy is harder.
+- Easier to forget to set; default-version behavior is its own
+  problem.
+
+Used by some major APIs (GitHub historically). Acceptable; not what
+most teams pick today.
+
+## Query parameter versioning
+
+```
+GET /users/42?api_version=2
+```
+
+Sometimes used as a fallback or for opt-in to new behavior. Not
+common as the primary scheme. Avoid making it the default.
+
+## How to coexist between versions
+
+Three implementation strategies:
+
+### 1. Separate routes per version
+
+```js
+app.use('/v1', v1Routes);
+app.use('/v2', v2Routes);
+```
+
+The most straightforward. Each version is its own handler. Code
+duplication for shared behavior, but the boundaries are clear.
+
+### 2. Shared logic, version-aware controllers
+
+```js
+app.get('/v1/users/:id', controllers.getUser({ version: 'v1' }));
+app.get('/v2/users/:id', controllers.getUser({ version: 'v2' }));
+
+// controllers.getUser internally branches on version
+```
+
+Less duplication, but version logic threads through the codebase.
+Easy to introduce bugs ("oh, v1 still expects this format").
+
+### 3. Latest-only + transform layer
+
+The actual logic only supports the latest version. A transform
+layer at the boundary downconverts requests/responses for older
+versions:
+
+```
+client v1 request → upcast → latest handler → response → downcast → v1 response
+```
+
+This is what Stripe famously does. Brilliant when you have many
+versions to maintain; significant infrastructure investment. Most
+teams don't need this — but if you have 50+ active API versions,
+this is the only sustainable pattern.
+
+## When to bump the version
+
+Conservatively. Each version you support is ongoing cost — bug
+fixes, security patches, documentation. Most APIs run with 2–3
+active major versions; older ones are deprecated and eventually
+removed.
+
+Aim to make most changes additive (no version bump). Save major
+version bumps for genuine semantic shifts — new auth model, new
+data model, new pagination scheme.
+
+## Deprecation
+
+When you have a successor version, deprecate the old one:
+
+1. **Announce** — blog post, email to API consumers, dashboard
+   warning.
+2. **Add a deprecation header** to responses:
+   ```
+   Deprecation: true
+   Sunset: Sat, 31 Dec 2026 23:59:59 GMT
+   Link: <https://docs.example.com/migrate-to-v2>; rel="deprecation"
+   ```
+3. **Reach out to high-volume users** — they can be hard to migrate
+   without coordination.
+4. **Monitor usage** — which clients are still on the old version?
+   What's their traffic share?
+5. **Eventual sunset** — return 410 Gone or 301 to the new endpoint.
+
+The timeline depends on your audience. Public APIs with paying
+customers typically give 6–12+ months. Internal APIs with one
+client team can deprecate in weeks.
+
+## What major vs minor versions mean (semver-ish)
+
+REST APIs usually only expose major versions in the URL. Minor and
+patch happen transparently (additive changes that don't break
+existing clients). This keeps the version namespace small.
+
+If you find yourself wanting "v2.3" in URLs, you're tracking
+something that probably shouldn't be in the URL. Use additive
+changes instead.
+
+## SDKs and clients
+
+Every API is consumed by SDKs (yours or third-party). Versioning
+affects them too:
+
+- The SDK has its own version number, independent of the API
+  version.
+- The SDK pins to a specific API version internally.
+- Bumping the SDK to use a new API version is a separate, conscious
+  decision.
+
+Clients shouldn't be silently upgraded to a new API version. The
+upgrade should be an explicit "we now support API v2" SDK release.
+
+## A note on internal vs public APIs
+
+For **public APIs**:
+
+- Versioning is a contract. Take it seriously.
+- Document the deprecation policy upfront.
+- Don't break things without notice.
+
+For **internal APIs** between services you control:
+
+- You can deploy both sides together; versioning is less critical.
+- But once an API is shared across teams/services with their own
+  release cycles, the same discipline applies.
+- Many "internal" APIs become public at some point — design like
+  they will be.
+
+## The case for not versioning
+
+Some APIs maintain backward compatibility forever and never version.
+Stripe is the famous example: every change is additive or opt-in
+via a header (`Stripe-Version: 2026-05-20`). The version-as-header
+approach (which is essentially per-request, dated, opt-in) lets
+them ship continuous changes without breaking anyone.
+
+This requires extreme discipline — but it's the gold standard for
+how to evolve an API that real businesses depend on.
+
+## In Express
+
+```js
+import v1 from './routes/v1.js';
+import v2 from './routes/v2.js';
+
+app.use('/v1', v1);
+app.use('/v2', v2);
+
+// Add the deprecation header on v1:
+app.use('/v1', (req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Sunset', 'Sat, 31 Dec 2026 23:59:59 GMT');
+  next();
+});
+```
+
+Simple and explicit. Add monitoring on each version's traffic so
+you know when it's safe to sunset.
+
+## Pick a strategy and document it
+
+Whichever you pick:
+
+- **Write down the policy.** "We use URL versioning. We support 2
+  major versions at any time. Deprecation has a 12-month
+  sunset."
+- **Apply it consistently.** Don't mix URL versioning in some places
+  and header versioning in others.
+- **Plan for v2 before you launch v1.** "How would I add a v2
+  later?" is part of the design conversation.
+
+A versioning strategy you can explain to a new engineer in two
+sentences is a good strategy.

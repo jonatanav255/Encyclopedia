@@ -1,0 +1,230 @@
+export const level = 'senior';
+
+# TLS
+
+TLS (Transport Layer Security) is the encryption layer that turns
+HTTP into HTTPS. Modern web apps don't really speak plain HTTP
+anymore — except internally, between trusted services. Knowing what
+TLS does and where it terminates explains a lot of production
+behavior.
+
+## What TLS provides
+
+Three guarantees:
+
+- **Confidentiality** — third parties can't read the data in
+  transit.
+- **Integrity** — third parties can't modify the data in transit
+  without detection.
+- **Authentication** — the client can verify the server's identity
+  (and optionally, vice versa).
+
+It does NOT protect data at rest, or once it's inside the server, or
+after the proxy decrypted it. TLS is about the wire.
+
+## The handshake (TLS 1.3)
+
+```
+Client ──ClientHello (supported ciphers, ALPN, extensions)──▶ Server
+       ◀──ServerHello (chosen cipher, cert, key exchange)──
+       ──Finished──▶ Server
+       ◀──Finished──
+```
+
+Then encrypted application data flows. The whole handshake is one
+round trip ("1-RTT"). TLS 1.2 was two round trips; the upgrade is
+significant.
+
+**0-RTT resumption** lets a returning client send data with the
+first packet, using a key derived from a previous session. Faster
+but introduces replay risks for non-idempotent requests — use it
+only for `GET`-like calls.
+
+## Certificates
+
+A cert binds a domain to a public key. Issued by a Certificate
+Authority (CA) the client trusts. The chain:
+
+```
+Your cert ─signed by─▶ Intermediate ─signed by─▶ Root CA (trusted)
+```
+
+The client trusts the root; the chain proves your cert is
+trustworthy. Browsers ship with a bundle of trusted roots; you can
+add custom ones (`NODE_EXTRA_CA_CERTS` env var for Node).
+
+## Where to get a cert
+
+- **Let's Encrypt** — free, automated. The default for new projects.
+  Renew every 90 days; `certbot` or `acme.sh` automates this.
+- **Cloudflare / CDN providers** — included with their service.
+- **Commercial CAs** — DigiCert, Sectigo. Almost no reason to pay
+  anymore unless you need EV or specific compliance.
+
+For internal services, you can run your own CA (`step ca`, HashiCorp
+Vault). Trust it only in the systems that need to.
+
+## Where TLS terminates
+
+The proxy in front of Node almost always handles TLS. The proxy has
+the certificate, decrypts, forwards plain HTTP to Node on a local
+network.
+
+```
+internet ──HTTPS:443──▶ nginx ──HTTP:3000──▶ Node
+```
+
+Pros:
+
+- Node doesn't manage certs.
+- TLS handshake CPU lives where it's optimized (nginx in C).
+- Renewal/rotation is a proxy operation, no app changes.
+
+Cons:
+
+- Traffic between the proxy and Node is plain. If they're on
+  different hosts, that link is unencrypted.
+- For zero-trust networks, this isn't acceptable.
+
+## Mutual TLS (mTLS)
+
+The server presents a cert (standard); the client *also* presents
+one. The server checks the client cert against a trust store. Used
+for service-to-service auth in zero-trust setups, IoT devices, and
+some enterprise APIs.
+
+```js
+import { createServer } from 'node:https';
+
+createServer({
+  key: fs.readFileSync('server-key.pem'),
+  cert: fs.readFileSync('server-cert.pem'),
+  ca: fs.readFileSync('client-ca.pem'),
+  requestCert: true,
+  rejectUnauthorized: true,        // reject clients without valid certs
+}, app);
+```
+
+In a service mesh (Istio, Linkerd), mTLS is handled by sidecars —
+your app code stays unaware.
+
+## Cert pinning
+
+The client hardcodes the expected cert (or public key). Defends
+against CA compromise — even a valid cert from a different issuer
+won't be accepted.
+
+Tradeoff: brittle. If you rotate certs without updating the pinned
+client, everything breaks. Mobile apps used to pin aggressively;
+the practice has softened because the operational cost is high.
+
+For internal services where you control both ends, pinning is
+sometimes the right call. For public web traffic, the WebPKI is
+usually enough.
+
+## Common production gotchas
+
+### Expired cert
+
+The single most common cause of "the site is down." Auto-renew
+(Let's Encrypt + certbot), monitor expiry as a metric, alert at
+30 days remaining.
+
+### Cert mismatch
+
+Cert is for `example.com`, request comes to `www.example.com`.
+Either the cert needs both names (SAN: `subjectAltName`), or you
+need a wildcard cert (`*.example.com`), or you need separate certs.
+
+### Chain not configured
+
+You served only the leaf cert, not the intermediates. Some clients
+build the chain anyway from cached intermediates; others (notably,
+some mobile apps) don't. Serve the full chain (`fullchain.pem` in
+Let's Encrypt's parlance).
+
+### Old TLS versions
+
+TLS 1.0 and 1.1 are deprecated. Disable them at the proxy. Some
+elderly clients break — usually that's the right call anyway.
+Minimum TLS 1.2 in 2026; 1.3 if you can.
+
+### Cipher suite mismatches
+
+The proxy and the client need a cipher in common. Modern defaults
+are sane; don't manually configure cipher lists unless you have
+compliance reasons. The Mozilla SSL Configuration Generator gives
+good baselines.
+
+## SNI (Server Name Indication)
+
+The client tells the server which hostname it wants during the
+handshake — *before* encryption. The server picks the matching
+cert.
+
+This is what makes virtual hosting (multiple HTTPS sites on one IP)
+work. Every reverse proxy supports it. Almost every client uses it.
+
+The privacy downside: SNI is plaintext, so observers see which
+hostname you're connecting to. **Encrypted Client Hello (ECH)** is
+the in-progress fix; not deployed everywhere yet.
+
+## Testing TLS
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com
+```
+
+Shows the cert chain, cipher chosen, TLS version. Useful for
+debugging "the cert is fine on Chrome but my Node service can't
+connect."
+
+`testssl.sh` gives a comprehensive report. SSL Labs (ssllabs.com)
+gives an A-F grade.
+
+## TLS in Node
+
+```js
+import https from 'node:https';
+import fs from 'node:fs';
+
+https.createServer({
+  key: fs.readFileSync('key.pem'),
+  cert: fs.readFileSync('cert.pem'),
+}, app).listen(443);
+```
+
+This works but for production, terminate at the proxy. Reasons:
+
+- Node's TLS is fine but not as battle-tested as nginx's.
+- Cert rotation while Node is running is awkward.
+- HTTPS/HTTP/2/3 termination at the edge is what the rest of the
+  stack expects.
+
+Run TLS in Node only when there's no proxy (rare) or for testing.
+
+## NODE_EXTRA_CA_CERTS
+
+A common production headache: an internal service uses a
+corporate-CA-signed cert. Node doesn't trust it.
+
+```bash
+NODE_EXTRA_CA_CERTS=/path/to/corporate-ca.pem node server.js
+```
+
+Adds your CA to Node's trust store. The right answer; better than
+`NODE_TLS_REJECT_UNAUTHORIZED=0`, which is "trust everything,"
+which is "no TLS."
+
+## Common mistakes
+
+- Disabling cert validation in dev, leaving it disabled in prod.
+- Pinning certs and forgetting to update the pin during rotation.
+- Hardcoding `.pem` paths that don't exist in production.
+- Not monitoring cert expiry.
+- Running plain HTTP between services without considering the
+  trust boundary.
+
+For Express specifically: don't try to run TLS in your app process.
+Let the proxy handle it. Configure `app.set('trust proxy', 1)` so
+`req.secure` and `req.protocol` read correctly. Done.

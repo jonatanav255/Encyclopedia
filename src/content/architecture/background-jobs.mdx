@@ -1,0 +1,292 @@
+export const level = 'mid';
+
+# Background Jobs
+
+A background job is work that doesn't happen during the HTTP
+request: sending an email, processing an upload, rebuilding a
+report, syncing with a third-party API. The reason: requests should
+respond fast; some work shouldn't block them; some work has to be
+retryable.
+
+## Why "queue the work" beats "do it now"
+
+A user submits an order. Naively:
+
+```js
+app.post('/orders', async (req, res) => {
+  const order = await db.orders.create(...);
+  await sendConfirmationEmail(order);     // 800ms
+  await syncToWarehouse(order);            // 2s
+  await notifyAnalytics(order);            // 200ms
+  res.status(201).json(order);             // user waited 3s+
+});
+```
+
+Three problems:
+
+1. **Latency** — the user waited 3 seconds for things they don't
+   care about.
+2. **Reliability** — if the email service is down, the order
+   creation fails entirely.
+3. **Coupling** — the order endpoint knows about email, warehouse,
+   and analytics.
+
+The right shape:
+
+```js
+app.post('/orders', async (req, res) => {
+  const order = await db.orders.create(...);
+  await queue.add('post-order-tasks', { orderId: order.id });
+  res.status(201).json(order);             // ~50ms
+});
+
+// In a worker process:
+queue.process('post-order-tasks', async (job) => {
+  const order = await db.orders.findById(job.data.orderId);
+  await sendConfirmationEmail(order);
+  await syncToWarehouse(order);
+  await notifyAnalytics(order);
+});
+```
+
+The user gets a fast response. Side effects happen async. Failures
+retry. The order endpoint only knows about the order itself.
+
+## The library: BullMQ
+
+For Node, **BullMQ** is the standard. Redis-backed, mature,
+production-tested.
+
+```js
+import { Queue, Worker } from 'bullmq';
+
+const connection = { host: 'redis', port: 6379 };
+const queue = new Queue('orders', { connection });
+
+// Producer
+await queue.add('process', { orderId: 42 });
+
+// Consumer (separate process or even separate service)
+new Worker('orders', async (job) => {
+  if (job.name === 'process') {
+    await processOrder(job.data.orderId);
+  }
+}, { connection });
+```
+
+BullMQ handles persistence, retries, scheduled jobs, repeating
+jobs, priorities. You write the job logic and the framework handles
+the orchestration.
+
+Older `bull` (without "MQ") is the predecessor; new projects use
+BullMQ.
+
+## Patterns
+
+### Fire-and-forget side effects
+
+After the main work succeeds, queue side effects:
+
+```js
+await db.transaction(async (tx) => {
+  const order = await tx.orders.create(...);
+  await tx.outbox.create({ event: 'order.created', payload: order });
+});
+
+// Outbox worker picks up and queues:
+const events = await db.outbox.findUnsent();
+for (const e of events) await queue.add(e.event, e.payload);
+```
+
+The **outbox pattern**: writing to the queue inside the same
+transaction as the business write. The queue write is just a row in
+a database table. A separate worker scoops them up. Guarantees you
+don't lose events on crash between "transaction commits" and "queue
+enqueue."
+
+### Scheduled jobs (cron)
+
+```js
+await queue.add('daily-report', {}, {
+  repeat: { cron: '0 9 * * *' },     // 9am daily
+});
+```
+
+Replaces ad-hoc cron jobs running in the system crontab. Better
+visibility, better failure handling, scales across instances.
+
+### Delayed jobs
+
+```js
+await queue.add('send-reminder', { userId }, {
+  delay: 24 * 60 * 60 * 1000,       // 24 hours
+});
+```
+
+"Do this in 24 hours" without needing a scheduler thread.
+
+### Retries with backoff
+
+```js
+await queue.add('flaky-task', data, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+});
+```
+
+5 retries with exponential delay. Built into BullMQ. See
+**Retries & Backoff**.
+
+### Job priorities
+
+```js
+await queue.add('low', data, { priority: 10 });
+await queue.add('high', data, { priority: 1 });
+```
+
+Lower number = higher priority. Use sparingly; usually separate
+queues are clearer than priority levels within one queue.
+
+## Worker deployment
+
+Workers are separate processes from the HTTP server. Two common
+shapes:
+
+### Same image, different entrypoint
+
+```dockerfile
+CMD ["node", "server.js"]
+```
+
+vs
+
+```dockerfile
+CMD ["node", "worker.js"]
+```
+
+Same code, different startup. Deploy both as separate services.
+Workers scale independently of HTTP.
+
+### One process, multiple roles
+
+Some apps run workers and HTTP in the same Node process for
+simplicity:
+
+```js
+// server.js
+import './app.js';
+import './workers/orders.js';     // attaches a BullMQ worker
+app.listen(3000);
+```
+
+Fine for small apps. Falls apart at scale — HTTP traffic and CPU-
+bound job processing fight for the event loop. Split when you need
+to.
+
+## Idempotency
+
+Jobs can run twice (retries, network issues, deliberate retries).
+The work must be idempotent — see **Idempotency**. For example:
+
+```js
+// Idempotent — uses unique constraint
+async function sendOrderEmail(orderId) {
+  const sent = await db.email_log.create({ order_id: orderId, type: 'confirmation' }).catch(err => null);
+  if (!sent) return;     // already sent
+  await mailer.send(...);
+}
+```
+
+Or use a deduplication key:
+
+```js
+await queue.add('send-email', data, { jobId: `email:${orderId}` });
+```
+
+BullMQ ignores `add` for an existing `jobId` (the job is the same).
+
+## Observability
+
+Workers need monitoring as much as HTTP:
+
+- **Queue depth** — how many jobs waiting? Rising trend = workers
+  can't keep up.
+- **Processing time** — p50/p99 per job type.
+- **Failure rate** — what's failing? Why?
+- **Retry rate** — high retries mean either flaky downstream or
+  buggy code.
+
+BullMQ has built-in metrics. There are dashboards (`bull-board`,
+`taskforce.sh`) that show queues and let you retry/cancel from a
+UI.
+
+## What can go wrong
+
+### Poison messages
+
+A job that fails every retry — bad data, code bug, missing
+dependency. Without intervention, retries forever (or up to your
+limit), consuming worker capacity.
+
+After max retries, BullMQ moves the job to a **failed** state.
+Monitor failed-job count; alert on it. Periodically inspect and
+clear.
+
+### Jobs that never finish
+
+A worker crashes mid-job. The job is "active" but no worker is
+running it. BullMQ has stalled-job detection — periodically checks
+for active jobs without an associated worker heartbeat and
+re-queues them. Configurable timeout.
+
+### Workers crashing
+
+Workers should be stateless and quick to restart. If a worker
+process crashes, the orchestrator restarts it; the queue is
+unaffected.
+
+### Memory leaks in long-running workers
+
+Workers process millions of jobs over their lifetime. Even small
+per-job leaks add up. Watch worker memory; restart on a schedule
+if necessary.
+
+## When NOT to use a queue
+
+- The work is **fast** (< 100ms) and the user wants to see the
+  result. Just do it inline.
+- The work is a single read or trivial mutation. Queues add ops
+  complexity.
+- The work needs to be transactional with the request (rare —
+  usually a sign the work should be inline).
+
+For everything else, the rule of thumb is: if it's a side effect of
+the user's action, queue it.
+
+## Other queues
+
+- **AWS SQS** — managed, simple, infinite scale, at-least-once,
+  no scheduled jobs.
+- **Google Pub/Sub** — pub-sub semantics, push or pull delivery.
+- **Kafka** — log-based, ordered partitions, harder to operate but
+  the standard for event-streaming.
+- **RabbitMQ** — classic message broker, complex routing.
+
+For most Express apps starting with one Redis instance: BullMQ.
+The others come in when you outgrow it (multi-region, very high
+throughput, complex routing).
+
+## In Express specifically
+
+The pattern:
+
+1. HTTP handler does the synchronous work (validate, create the
+   primary entity).
+2. Enqueues follow-up work (BullMQ).
+3. Returns fast.
+4. Workers run in separate processes, picking up jobs.
+
+This separation is one of the most impactful architectural moves
+you can make. Response times drop, reliability goes up, the code
+clarifies into "what the user did" vs "what we do because of it."
+Worth setting up early.

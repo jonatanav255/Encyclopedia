@@ -1,0 +1,247 @@
+export const level = 'senior';
+
+# Prototype Pollution
+
+A JavaScript-specific class of vulnerability where an attacker
+modifies `Object.prototype` (or another shared prototype), affecting
+every object in the process. Subtle, common in older libraries,
+sometimes catastrophic.
+
+## The mechanism
+
+In JS, every object inherits from `Object.prototype` unless created
+with `Object.create(null)`. If you can write to that shared
+prototype, you change the default behavior of every object that
+inherits from it.
+
+```js
+const obj = {};
+console.log(obj.isAdmin);            // undefined
+
+Object.prototype.isAdmin = true;
+console.log(obj.isAdmin);            // true ← polluted
+
+const newObj = {};
+console.log(newObj.isAdmin);         // true ← every new object too
+```
+
+Now `if (user.isAdmin)` is true for any user, even users who don't
+have `isAdmin` set.
+
+## How user input gets in
+
+Common patterns where code accidentally allows prototype
+modification:
+
+### Deep merge
+
+```js
+function merge(target, source) {
+  for (const key in source) {
+    if (typeof source[key] === 'object') {
+      target[key] = target[key] || {};
+      merge(target[key], source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+const opts = { name: 'default' };
+merge(opts, JSON.parse(req.body));   // ← danger
+```
+
+Attacker sends:
+
+```json
+{ "__proto__": { "isAdmin": true } }
+```
+
+`merge` recursively walks into `__proto__` and sets `isAdmin: true`
+on it. Now `Object.prototype.isAdmin === true` for every object in
+the process.
+
+### Object setters via bracket access
+
+```js
+function setNested(obj, path, value) {
+  const parts = path.split('.');
+  let current = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    current = current[parts[i]] = current[parts[i]] || {};
+  }
+  current[parts[parts.length - 1]] = value;
+}
+
+setNested(config, req.query.path, req.query.value);
+```
+
+`req.query.path = '__proto__.toString'` overwrites `toString` on
+every object.
+
+### Parsing query strings
+
+`qs.parse('a[__proto__][b]=c')` will set `Object.prototype.b = 'c'`
+in older `qs` versions. (Modern `qs` blocks this by default.)
+Express used `qs` for `req.query` by default; current Express 5
+uses null-prototype objects to mitigate.
+
+## The dangerous keys
+
+Three magic keys that target the prototype:
+
+- **`__proto__`** — the standard. `obj.__proto__` is the prototype.
+- **`constructor`** — `obj.constructor.prototype` is the prototype.
+- **`prototype`** — only on constructor functions; less common
+  attack vector.
+
+Any code that writes to these from user input is vulnerable.
+
+## The damage
+
+Prototype pollution can:
+
+- **Bypass auth**: `Object.prototype.isAdmin = true` makes every
+  user an admin.
+- **Modify framework behavior**: setting `Object.prototype.then`
+  breaks promises in weird ways.
+- **Cause DoS**: `Object.prototype.length = -1` breaks every array
+  iteration.
+- **Enable RCE**: in some templating libraries or sandboxed code,
+  the prototype is part of the execution environment. Pollute the
+  right key, get code execution.
+
+## Defenses
+
+### 1. Null-prototype objects
+
+```js
+const safe = Object.create(null);
+safe.foo = 'bar';
+// safe.__proto__ is undefined; safe is not polluted
+```
+
+Express 5's `req.query`, `req.params`, and `req.body` (from
+`express.json()`) use this. Older Express did not.
+
+When you accept user input and build structures from it, use null-
+prototype:
+
+```js
+const parsed = Object.create(null);
+Object.assign(parsed, JSON.parse(req.body));
+```
+
+### 2. Freeze the prototype
+
+```js
+Object.freeze(Object.prototype);
+```
+
+After this, attempts to modify `Object.prototype` silently fail (in
+non-strict mode) or throw (in strict mode). Belt-and-suspenders.
+
+The catch: some libraries rely on extending Object.prototype at
+startup (rare, but exists). Test this against your dependencies
+before shipping.
+
+### 3. Block dangerous keys
+
+```js
+function safeAssign(target, source) {
+  for (const key of Object.keys(source)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      continue;
+    }
+    target[key] = source[key];
+  }
+}
+```
+
+Whitelist-based assignment refuses to set the magic keys.
+
+### 4. Use libraries with prototype-pollution-safe defaults
+
+- **`lodash`**: ≥ 4.17.12 patched `lodash.merge`, `lodash.set`,
+  `lodash.zipObjectDeep`. Older versions are vulnerable.
+- **`hoek`**: deep merge utility used by Hapi; had a famous CVE in
+  2018. Stay current.
+- **`mongoose`**: had pollution-via-query CVE; current versions
+  handle it.
+
+Audit your dependencies. `npm audit` / `pnpm audit` flag known
+prototype-pollution CVEs.
+
+### 5. Validate input shape
+
+Schema validation (zod) prevents unexpected keys from being
+processed at all:
+
+```js
+const Schema = z.object({
+  name: z.string(),
+  email: z.string(),
+}).strict();      // reject extra keys
+
+const data = Schema.parse(req.body);
+```
+
+`__proto__` isn't in the schema; it gets rejected (in strict mode).
+
+## Detection in your code
+
+Audit for:
+
+- Recursive deep-merge / deep-set functions on user input.
+- `lodash.merge(obj, userInput)` — check lodash version.
+- Bracket-access via user-controlled paths.
+- JSON.parse'd input merged into config objects.
+
+A grep for the words `merge`, `set`, and `defaults` over your codebase
+is a reasonable first pass.
+
+## Live testing
+
+```js
+// Run in a Node REPL after starting your app
+const r = await fetch('http://localhost:3000/some-endpoint', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ __proto__: { polluted: true } }),
+});
+
+// Now check if Object.prototype is polluted in your test process
+// (you can't check the server's prototype from outside, but you can
+//  reproduce the attack and inspect the server's state).
+```
+
+For real auditing, tools like `socket.dev` and Snyk catch known
+pollution vectors in dependencies.
+
+## Why it's still a thing
+
+- JavaScript's prototype model is permissive by design.
+- Many legacy libraries treat input as trusted.
+- Deep cloning / merging is everywhere.
+- Detection requires understanding both the language and the
+  specific code path.
+
+It's been on OWASP's radar for years; CVEs keep appearing. The
+defense is durable code patterns (null-prototype, validation,
+strict modes), not "remember to be careful."
+
+## In Express
+
+Express 5 mitigates the most common vectors (null-prototype
+`req.query`, `req.params`). For everything else:
+
+- Validate every input shape (zod, ajv).
+- Update dependencies; check `pnpm audit` regularly.
+- For deep merge of user input, use a safe library
+  (`merge-deep`-with-prototype-protection, `lodash.merge` ≥ 4.17.12).
+- Don't `Object.assign` user input directly into config objects.
+
+For most apps, following modern hygiene means this is no longer a
+top-three risk. For older apps with bespoke utility functions
+operating on user JSON, audit them specifically.

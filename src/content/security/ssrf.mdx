@@ -1,0 +1,232 @@
+export const level = 'senior';
+
+# SSRF
+
+Server-Side Request Forgery: your server fetches a URL the user
+provided. Attacker provides a URL pointing at your internal
+network. Your server, which has network access the attacker
+doesn't, returns the response. This is how cloud credentials leak
+and internal services get probed.
+
+## The bug
+
+```js
+app.get('/preview', async (req, res) => {
+  const r = await fetch(req.query.url);
+  res.type('image/png').send(await r.arrayBuffer());
+});
+```
+
+Innocent-looking: fetch a URL on behalf of the user, return the
+result. The attacker sends:
+
+```
+GET /preview?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+That's the **AWS EC2 metadata endpoint**. From inside an EC2
+instance, it returns IAM credentials. Your innocent preview endpoint
+just leaked your server's credentials to the attacker.
+
+Variants:
+
+- **GCP**: `http://metadata.google.internal/computeMetadata/v1/`
+- **Azure**: `http://169.254.169.254/metadata/instance`
+- **Internal services**: `http://internal-redis:6379`,
+  `http://elasticsearch:9200`
+- **Localhost**: `http://localhost:8080/admin`
+
+Any service reachable from the server is reachable through your
+SSRF.
+
+## The full impact
+
+Beyond credential theft:
+
+- **Internal port scanning** — probe what services exist behind the
+  firewall.
+- **Reading from internal APIs** — admin endpoints, monitoring,
+  metrics that aren't externally exposed.
+- **Writing to internal services** — SSRF + a PUT/POST endpoint
+  inside.
+- **Bypassing IP allowlists** — many internal systems trust requests
+  from the server's IP.
+
+SSRF is a *force multiplier* on weak internal security. If you have
+defense-in-depth (which you should), each layer slows the attacker
+down. If your internal services trust the network, SSRF is RCE.
+
+## Defenses
+
+No single fix is enough. Layer them.
+
+### 1. Whitelist domains
+
+```js
+const ALLOWED = new Set([
+  'images.example.com',
+  'cdn.partner.com',
+]);
+
+app.get('/preview', async (req, res) => {
+  const url = new URL(req.query.url);
+  if (!ALLOWED.has(url.hostname)) return res.status(400).json({ error: 'host not allowed' });
+  if (url.protocol !== 'https:') return res.status(400).json({ error: 'https only' });
+
+  const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  res.type(r.headers.get('content-type')).send(Buffer.from(await r.arrayBuffer()));
+});
+```
+
+If you can enumerate the legitimate domains, do. This blocks the
+entire attack class.
+
+### 2. Block private IP ranges
+
+When you can't whitelist, deny:
+
+- `10.0.0.0/8`
+- `172.16.0.0/12`
+- `192.168.0.0/16`
+- `127.0.0.0/8` (localhost)
+- `169.254.0.0/16` (link-local, includes metadata endpoint)
+- `0.0.0.0/8`
+- IPv6 equivalents: `::1`, `fc00::/7`, `fe80::/10`
+
+The tricky part: **DNS resolution can change between your check and
+the actual request**. An attacker registers a DNS record that
+resolves to `1.2.3.4` for the validation check, then to
+`169.254.169.254` for the actual fetch. This is called **DNS
+rebinding**.
+
+Defense: resolve the hostname yourself, check the resolved IP, then
+fetch by IP (with the original hostname as `Host` header for SNI):
+
+```js
+import { lookup } from 'node:dns/promises';
+import net from 'node:net';
+
+async function safeUrl(url) {
+  const u = new URL(url);
+  if (!['http:', 'https:'].includes(u.protocol)) throw new Error('protocol');
+
+  const { address, family } = await lookup(u.hostname);
+
+  if (family === 4 && isPrivateIPv4(address)) throw new Error('private ip');
+  if (family === 6 && isPrivateIPv6(address)) throw new Error('private ip');
+
+  return { url, address };
+}
+```
+
+For real production code, use `ssrf-req-filter` or similar — they
+handle the DNS rebinding race correctly.
+
+### 3. Egress firewall
+
+The right architectural fix: your server **cannot reach** internal
+services or the metadata endpoint. The OS / network rejects the
+packet.
+
+Cloud platforms:
+
+- **AWS IMDSv2**: requires a token obtained via PUT, not GET.
+  Mitigates the metadata endpoint specifically. Enable it.
+- **GCP** has similar header-based protections.
+- **VPC security groups / firewall rules**: explicit allowlist of
+  outbound destinations. Even if SSRF works at the application
+  layer, the packet never leaves the server.
+
+Egress filtering is the most reliable defense — it doesn't depend
+on application code getting validation right.
+
+### 4. No redirects
+
+```js
+fetch(url, { redirect: 'manual' });
+```
+
+Without this, the server fetches `https://safe.com` which redirects
+to `http://internal/admin`. The internal URL was never validated
+because the user only specified `safe.com`. Disable redirects, or
+re-validate each hop.
+
+### 5. Specific protocols
+
+```js
+if (!['http:', 'https:'].includes(url.protocol)) {
+  throw new Error('only http/https allowed');
+}
+```
+
+Block `file://`, `gopher://`, `ftp://`, `dict://`, etc. These can
+exfiltrate local files (`file://`) or talk to weird internal services
+(`gopher://localhost:6379` can speak Redis protocol).
+
+## A real-world example
+
+Capital One in 2019. SSRF in their WAF allowed an attacker to hit
+the AWS metadata endpoint, steal IAM credentials, and download 100M
+customer records.
+
+- The SSRF itself was a configuration issue, not application code.
+- The metadata endpoint was reachable. IMDSv2 didn't exist yet.
+- The stolen credentials had broad S3 access.
+
+Each layer that wasn't there made the attack possible. Egress
+filtering. IMDSv2. Least-privilege IAM. Each would have stopped or
+limited it.
+
+## In Express
+
+Common SSRF-able endpoints:
+
+- Image / OG-image preview generators.
+- URL shorteners (the redirect-tracking part).
+- "Import from URL" features.
+- Webhook receivers (sometimes).
+- PDF generation from URL.
+- Anything calling `fetch(req.body.url)`.
+
+Audit them. Add the defenses above. Egress-filter regardless.
+
+## What it isn't
+
+CORS doesn't help — CORS is a *browser* policy. SSRF happens
+server-side; `curl` doesn't honor CORS. Same with SameSite cookies,
+Content Security Policy, etc. — all browser-side.
+
+## Testing
+
+```js
+test('rejects metadata endpoint URL', async () => {
+  const res = await request(app).get('/preview?url=http://169.254.169.254/');
+  expect(res.status).toBe(400);
+});
+
+test('rejects localhost URL', async () => {
+  const res = await request(app).get('/preview?url=http://localhost/');
+  expect(res.status).toBe(400);
+});
+```
+
+A few targeted tests pin down the most common attack patterns. Run
+them in CI.
+
+## When you do need a URL-fetch endpoint
+
+It's a legitimate feature in many products. The discipline:
+
+1. Whitelist where possible.
+2. Block private IPs (with DNS rebinding-safe lookup).
+3. Disable redirects or revalidate each hop.
+4. Restrict protocols.
+5. Set a timeout.
+6. Set a max response size.
+7. Strip auth headers — the original request might have included
+   them; don't forward.
+8. Egress firewall as the last line.
+
+Item 6 is sometimes overlooked: a fetched URL can be 10GB of
+garbage. Cap the response size with a streaming check that aborts
+past N bytes.

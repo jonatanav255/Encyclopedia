@@ -1,0 +1,209 @@
+export const level = 'mid';
+
+# Migrations
+
+A migration is a versioned, scripted change to your database
+schema. The opposite is "running `ALTER TABLE` from the psql
+prompt." Migrations are how schema changes survive multiple
+environments, multiple developers, and rollback.
+
+## Why bother
+
+You build a feature; it needs a new column. You add it locally
+with `ALTER TABLE`. Now:
+
+- Your coworker's branch breaks because they don't have the column.
+- The CI test database doesn't have it either.
+- Production deploys silently — your new code runs against an old
+  schema, errors at runtime.
+
+A migration file solves all three: it's a script that says "add
+this column," committed alongside the code. Every environment runs
+the same scripts in the same order. Everyone has the same schema.
+
+## Tools
+
+Pick one:
+
+- **knex** — JS migration framework. Mature, runtime-agnostic.
+- **drizzle-kit** — schema-first. You write a TS schema; the tool
+  generates SQL migrations from diffs.
+- **node-pg-migrate** — Postgres-specific, plain JS.
+- **prisma** — schema-first ORM with built-in migrations.
+- **flyway** / **sqitch** — language-agnostic SQL migration runners.
+
+For new Node projects, **drizzle** or **prisma** if you want
+schema-as-code; **knex** if you prefer hand-written migrations.
+
+## A migration's shape (knex example)
+
+```js
+// migrations/20260520_create_users.js
+export const up = async (knex) => {
+  await knex.schema.createTable('users', (t) => {
+    t.uuid('id').primary().defaultTo(knex.raw('gen_random_uuid()'));
+    t.text('email').notNullable().unique();
+    t.text('name').notNullable();
+    t.timestamps(true, true);
+  });
+};
+
+export const down = async (knex) => {
+  await knex.schema.dropTable('users');
+};
+```
+
+`up` applies the change; `down` undoes it. Tools store which
+migrations have been applied (usually in a `migrations` table); on
+deploy, they run pending ones in order.
+
+## Ordering
+
+Migration files have timestamps in their names. The tool runs them
+chronologically. This means:
+
+- Two devs creating migrations on the same day need to coordinate
+  the order, or one's will run "before" the other in CI.
+- You can't reorder migrations after they've been applied somewhere.
+  History is immutable.
+
+## The two-step deploy
+
+For schema changes that are *not* backward-compatible with the old
+code, deploy in two steps:
+
+1. **Add the new schema, keep the old.** New code can use either;
+   old code still works because nothing it knows about changed.
+2. **Run the migration to deprecate the old structure** after the
+   new code has been deployed everywhere.
+
+Example: renaming a column from `username` to `display_name`.
+
+- **Deploy 1**: add `display_name`. Code writes to both. Reads
+  prefer `display_name` but fall back to `username`. Backfill old
+  rows.
+- **Deploy 2**: drop `username`. Code only uses `display_name`.
+
+Skip step 1 and you have a window where old instances are serving
+traffic against a new schema (or vice versa) and breaking.
+
+## Things that lock
+
+In Postgres, some `ALTER TABLE`s acquire an `ACCESS EXCLUSIVE` lock,
+which blocks reads and writes:
+
+- `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ...` — older
+  Postgres rewrites the table. (Postgres 11+ optimizes constant
+  defaults, no rewrite.)
+- `CREATE INDEX` — blocks writes (use `CREATE INDEX CONCURRENTLY`
+  to avoid).
+- `ALTER TABLE ... RENAME COLUMN` — instant in metadata, but the
+  exclusive lock blocks anyone in the middle of a query on that
+  table.
+
+For a busy production database, even a brief exclusive lock causes
+visible spikes. Strategies:
+
+- Use `CONCURRENTLY` for index changes.
+- Set a `lock_timeout` so the migration fails fast rather than
+  queuing behind long transactions and stalling everyone.
+- Schedule risky migrations during low-traffic windows.
+- Use the two-step deploy pattern to spread risk over multiple
+  releases.
+
+## Reversibility
+
+`down` lets you roll back. In practice, only the most recent
+migration is realistically reversible. Once you've migrated data
+forward and dropped the old columns, rolling back means data loss.
+
+Many teams write `down` as throw-on-call:
+
+```js
+export const down = async () => {
+  throw new Error('cannot reverse production migration');
+};
+```
+
+This is fine. Code rollback ≠ database rollback. To roll back a
+release, the right move is usually deploying the previous code with
+the new schema — keep the schema backward-compatible (above) so
+this is possible.
+
+## Backfills
+
+Sometimes you don't just change schema; you transform existing data.
+For small tables, do it in the migration:
+
+```js
+export const up = async (knex) => {
+  await knex.schema.alterTable('users', (t) => {
+    t.text('display_name');
+  });
+  await knex.raw('UPDATE users SET display_name = name');
+  await knex.schema.alterTable('users', (t) => {
+    t.text('display_name').notNullable().alter();
+  });
+};
+```
+
+For huge tables, **don't do the backfill in the migration** — it
+holds a lock and blocks writes. Instead:
+
+1. Migration adds the column (no default → fast).
+2. Background job backfills in batches.
+3. Migration (later) makes it NOT NULL.
+
+## Migrations and CI
+
+Your test suite should:
+
+1. Drop the test database.
+2. Run all migrations from scratch.
+3. Run tests.
+
+This proves the migrations work and the schema is consistent.
+
+Most CI setups use a fresh database per run (or transactional
+rollback after each test) to keep tests isolated.
+
+## Common bugs
+
+- **Hand-edited migrations.** Someone changed a migration file
+  after running it. Now your migration history is inconsistent across
+  environments.
+- **Out-of-order applications.** Two developers create migrations
+  with overlapping timestamps; merge order differs from local order.
+- **Non-idempotent migrations.** `INSERT` without `ON CONFLICT` —
+  running twice fails. Tools usually run each migration only once,
+  but mistakes happen.
+- **Migrations that work locally but fail on prod data.** A `NOT
+  NULL` constraint with no default fails on existing nullable rows.
+  Test against realistic data sizes.
+
+## What migrations are NOT for
+
+- **Seeding** — populating dev / test data. Use a separate seed
+  script. Different concerns: schema vs data.
+- **One-off scripts** — "rename John to Johnathan in the user
+  table." If it's truly one-off and not part of schema evolution,
+  run it as an ad-hoc script with audit trail (not a migration).
+
+## In Express deployment
+
+The conventional flow:
+
+1. Build the Docker image.
+2. Push it.
+3. On deploy: run `pnpm run migrate` *before* starting the new
+   application processes.
+4. Then start the new processes.
+
+For zero-downtime deploys, the migrations must be backward-compatible
+with the still-running old code. If they're not, follow the two-step
+deploy pattern.
+
+Some platforms run migrations automatically during deploy (Vercel
+build steps, Heroku release phase). Others give you a hook.
+Hand-running migrations from a maintainer's laptop in 2026 is a
+process smell.

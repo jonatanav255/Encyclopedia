@@ -1,0 +1,184 @@
+export const level = 'senior';
+
+# Process Signals
+
+Unix signals are how the OS, orchestrators, and other processes tell
+your Node service to do something — start, stop, reload, dump state.
+Handling them correctly is what separates "process gets killed mid-deploy
+and clients see resets" from "rolling deploys are invisible."
+
+## The signals you'll see
+
+| Signal | Default action | What it usually means |
+| --- | --- | --- |
+| **SIGINT** | Terminate | Ctrl+C in your terminal |
+| **SIGTERM** | Terminate | Orchestrator says "please exit" — graceful |
+| **SIGKILL** | Terminate (uncatchable) | Hard kill, after grace period |
+| **SIGHUP** | Terminate | Historically "tty closed"; now "reload config" |
+| **SIGQUIT** | Terminate + core dump | Ctrl+\\ |
+| **SIGUSR1** | Terminate | Reserved for app use (often: dump state) |
+| **SIGUSR2** | Terminate | Reserved for app use |
+
+`SIGTERM` is the important one. Kubernetes, ECS, systemd, pm2 — all
+send `SIGTERM` first, wait a configurable grace period (default 30s),
+then send `SIGKILL`.
+
+## Listening for signals
+
+```js
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received');
+  shutdown();
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received');
+  shutdown();
+});
+```
+
+`SIGKILL` and `SIGSTOP` **cannot** be caught — the OS just terminates
+the process. That's why graceful shutdown has to fit inside the
+orchestrator's grace period.
+
+## The graceful shutdown shape
+
+```js
+import { app } from './app.js';
+
+const server = app.listen(process.env.PORT ?? 3000);
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, draining...`);
+
+  // 1. Fail readiness probe (LB stops sending traffic)
+  app.locals.healthy = false;
+  await wait(5000);
+
+  // 2. Stop accepting new HTTP connections
+  await new Promise((r) => server.close(r));
+
+  // 3. Close in-process resources
+  await db.end();
+  await redis.disconnect();
+  await queue.close();
+
+  // 4. Flush logs and exit cleanly
+  process.exit(0);
+}
+
+// Hard cap so we don't exceed the orchestrator's grace period
+setTimeout(() => {
+  console.error('forced exit');
+  process.exit(1);
+}, 25_000).unref();
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+```
+
+See **Graceful Shutdown** (in `express/`) for the full Express
+context. The Node-platform piece is: catch the signal, do the work,
+exit explicitly. Don't rely on Node's default handler (which is
+immediate termination).
+
+## Re-throwing signals
+
+Sometimes you wrap your app in a script (e.g., `tini` as PID 1 in a
+Docker container, or a supervisor). The signal flows through them to
+you. Your job is to handle it; their job is to forward it.
+
+The classic Docker bug: an `npm start` script forks `node`, but `npm`
+itself catches `SIGTERM` first and doesn't forward — so Node never
+sees it, runs until SIGKILL, drops connections.
+
+Fix: use `tini` as PID 1, or use `exec` in your start script:
+
+```sh
+#!/bin/sh
+exec node server.js     # exec replaces the shell, so Node is PID 1
+```
+
+## `SIGHUP` and config reload
+
+The convention is: `SIGHUP` means "reload config without restarting."
+Useful for daemons; less so for Node services that are usually
+restarted by their orchestrator anyway.
+
+```js
+process.on('SIGHUP', async () => {
+  console.log('reloading config');
+  await reloadConfig();
+});
+```
+
+In containers, prefer a rolling deploy over `SIGHUP` reload. The
+orchestrator does the right thing already; you don't have to invent
+it.
+
+## `SIGUSR2` for triggers
+
+Nothing in Node uses `SIGUSR1`/`SIGUSR2` by default (well — `SIGUSR1`
+historically triggered the debugger; that's deprecated). Use them for
+your own triggers:
+
+```js
+process.on('SIGUSR2', () => {
+  const snapshot = { heap: v8.getHeapStatistics(), uptime: process.uptime() };
+  fs.writeFileSync(`/tmp/snapshot-${Date.now()}.json`, JSON.stringify(snapshot));
+});
+```
+
+Send from the shell:
+
+```bash
+kill -USR2 <pid>
+```
+
+Now you can dump state from a running process without restarting it.
+Handy for live debugging.
+
+## Sending signals
+
+```js
+process.kill(pid, 'SIGTERM');     // Send signal to another process
+process.kill(process.pid, 'SIGUSR2'); // Send to self
+process.kill(pid, 0);              // Test if pid exists (no signal sent)
+```
+
+`process.kill(pid, 0)` is the trick for "is this process still
+alive?" — throws if not.
+
+## Common bugs
+
+- **Ignoring `SIGTERM`** — process drops in-flight requests on every
+  deploy. The single biggest production hygiene issue.
+- **Synchronous work in the handler** — your shutdown logic is async;
+  if your handler is sync and slow, the loop is blocked and nothing
+  else gets done.
+- **Not setting a hard timeout** — graceful shutdown hangs forever on
+  a stuck DB query, exceeds grace period, orchestrator SIGKILLs.
+- **Calling `process.exit()` directly from non-shutdown code** —
+  skips cleanup, drops logs in flight. Only exit from controlled
+  paths.
+- **Running `npm start` as PID 1** — npm eats `SIGTERM`. Use `exec`
+  or `tini`.
+
+## What about Windows?
+
+Windows doesn't really have signals. Node emulates `SIGINT`,
+`SIGTERM`, `SIGBREAK`, `SIGHUP` for cross-platform code. The behavior
+matches Unix reasonably well, but don't expect more exotic signals
+(`SIGUSR1/2`) to work the same way.
+
+For production Linux services, this doesn't matter. For dev on
+Windows, it might.
+
+## In Express
+
+The whole point of caring about signals: make `SIGTERM` trigger
+your graceful shutdown so deploys don't drop requests. See **Graceful
+Shutdown**. Everything else is bonus.

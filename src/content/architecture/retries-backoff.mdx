@@ -1,0 +1,307 @@
+export const level = 'senior';
+
+# Retries & Backoff
+
+Networks fail. Downstream services flake. Databases time out. The
+question isn't "will operations fail" but "how do you handle the
+failure." Retries with the right backoff strategy turn most
+transient failures into invisible blips. The wrong strategy turns
+them into self-inflicted outages.
+
+## When to retry
+
+- **Transient failures** — network errors, 5xx responses,
+  timeouts, "service temporarily unavailable."
+- **Resource conflicts** — 409 in some specific cases (optimistic
+  locking).
+- **Throttling** — 429 with `Retry-After`.
+
+## When NOT to retry
+
+- **4xx** (except 408, 429) — these mean the *request* is wrong.
+  Retrying won't fix it.
+- **Non-idempotent operations without idempotency keys** — you
+  might double-process. See **Idempotency**.
+- **The caller explicitly said "don't retry"** — sometimes signaled
+  by a header.
+
+The default-safe behavior: retry only on errors that the docs say
+are retryable, or on network errors.
+
+## The retry shapes
+
+### Fixed delay
+
+```
+retry after 1s, 1s, 1s, 1s...
+```
+
+The simplest. Wrong for most use cases — under load, every retrier
+hits the downstream at the same cadence, prolonging the outage
+("retry storms").
+
+### Exponential backoff
+
+```
+retry after 100ms, 200ms, 400ms, 800ms, 1600ms...
+```
+
+Each delay doubles. The retriers naturally spread out as time
+passes. Standard for almost everything.
+
+```js
+const delay = baseDelay * 2 ** attempt;
+```
+
+### Exponential backoff with jitter
+
+```
+retry after 100ms±50ms, 200ms±100ms, 400ms±200ms, ...
+```
+
+Without jitter, retriers across many clients all retry at exactly
+the same multiples of the base delay. They synchronize into a
+"thundering herd" — every retry attempt is a coordinated burst.
+
+Jitter spreads them out:
+
+```js
+function delayWithJitter(attempt, base = 100) {
+  const exponential = base * 2 ** attempt;
+  const jitter = Math.random() * exponential;
+  return Math.min(exponential + jitter, 30_000);  // cap at 30s
+}
+```
+
+**Full jitter** randomizes between 0 and the exponential delay:
+
+```js
+const delay = Math.random() * (base * 2 ** attempt);
+```
+
+AWS recommends full jitter — they have the data to back it up.
+
+## Implementation
+
+```js
+async function retry(fn, { maxAttempts = 5, baseDelay = 100 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err)) throw err;
+      if (attempt === maxAttempts - 1) break;
+      const delay = Math.random() * (baseDelay * 2 ** attempt);
+      await new Promise(r => setTimeout(r, Math.min(delay, 30_000)));
+    }
+  }
+  throw lastErr;
+}
+
+function isRetryable(err) {
+  if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') return true;
+  if (err.status >= 500) return true;
+  if (err.status === 429) return true;
+  return false;
+}
+```
+
+That's a baseline. For production, use a library (`p-retry`,
+`async-retry`, `cockatiel`) — they handle the edge cases.
+
+## Honor `Retry-After`
+
+When a server returns 429 or 503, it often includes:
+
+```
+Retry-After: 60
+```
+
+Or:
+
+```
+Retry-After: Wed, 21 Oct 2025 07:28:00 GMT
+```
+
+The first is "wait N seconds"; the second is "wait until this
+time." Respect it. Your computed backoff might be too short.
+
+```js
+function getRetryAfter(res) {
+  const header = res.headers['retry-after'];
+  if (!header) return null;
+  const seconds = parseInt(header, 10);
+  if (!isNaN(seconds)) return seconds * 1000;
+  return new Date(header).getTime() - Date.now();
+}
+```
+
+## Setting a budget
+
+Don't retry forever. Total time budgets matter:
+
+- **Max attempts** — usually 3 to 5. Beyond that, you're delaying
+  the inevitable failure response.
+- **Max total time** — the whole operation can take at most N
+  seconds. Past that, return failure.
+- **Per-request timeout** — each attempt has its own timeout, not
+  the cumulative time.
+
+```js
+async function retryWithBudget(fn, { maxTime = 10_000 }) {
+  const start = Date.now();
+  while (Date.now() - start < maxTime) {
+    try { return await fn(); } catch (err) {
+      if (!isRetryable(err)) throw err;
+      await sleep(jitter());
+    }
+  }
+  throw new Error('retry budget exhausted');
+}
+```
+
+## The bigger picture: circuit breakers
+
+When a downstream is consistently failing, retrying just amplifies
+the load. A **circuit breaker** stops calling for a while:
+
+```
+closed → (failures pile up) → open → (timeout) → half-open → (success) → closed
+```
+
+- **Closed**: normal operation, requests pass through.
+- **Open**: don't even try; fail fast. Saves the downstream.
+- **Half-open**: try one request; if it succeeds, go back to closed.
+
+Implementation with `cockatiel`:
+
+```js
+import { Policy } from 'cockatiel';
+
+const breaker = Policy
+  .handleAll()
+  .circuitBreaker(10_000, /* breakLength */ 5);   // open for 10s after 5 failures
+
+const result = await breaker.execute(() => fetch(upstream));
+```
+
+Pair retries with a circuit breaker. Retry transient errors; break
+the circuit when the failure rate is sustained.
+
+## Bulkhead
+
+When you have multiple downstreams (DB, cache, third party APIs),
+don't let one failing downstream consume all your concurrency.
+Limit per-downstream concurrent calls:
+
+```js
+import pLimit from 'p-limit';
+
+const dbLimit = pLimit(20);     // max 20 concurrent DB calls
+const apiLimit = pLimit(5);     // max 5 concurrent third-party calls
+
+await dbLimit(() => db.query(...));
+```
+
+If the third-party API hangs, only 5 of your requests are stuck;
+the rest still work.
+
+## Idempotency, again
+
+If you're retrying mutating operations (POST, PATCH), you need
+idempotency. Either:
+
+- The operation is naturally idempotent (PUT to a known state).
+- You use idempotency keys.
+
+See **Idempotency**. Retrying without this can cause duplicate
+operations — payments, emails, you-name-it.
+
+## Retries in queues
+
+For queued jobs (BullMQ etc.), retries are first-class:
+
+```js
+queue.add('task', data, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+});
+```
+
+The queue handles delay and persistence. Your code just does the
+work; failures are retried automatically. See **Background Jobs**.
+
+## What can go wrong
+
+### Retry storms
+
+A downstream blip causes every caller to retry simultaneously.
+Each retry hits the same downstream, which is now under double
+load, which fails more requests, which trigger more retries...
+
+Mitigations:
+
+- Jitter.
+- Caps on total retry rate.
+- Circuit breakers.
+
+### Hidden retries piling up
+
+Library A retries 3 times. Library B (calling A) retries 3 times.
+Library C (calling B) retries 3 times. Total: 27 actual requests
+per logical operation. Each hits the same downstream.
+
+Audit the retry behavior of each layer. Either disable retries in
+all but one, or factor in the multiplication.
+
+### Retries that hide bugs
+
+A flaky test "passes if you retry." A flaky deploy "succeeds on
+the third attempt." Now the underlying bug is invisible. Monitoring
+retry rate is critical — high retry rate is a symptom, not a fix.
+
+### Retrying after timeout extension
+
+The request itself took 10 seconds and timed out. You retry. The
+new request also takes 10 seconds. Now the user has waited 20
+seconds for a single logical operation.
+
+Set a deadline up front: "this operation must finish in 15
+seconds total." Retries fit inside that budget; once it's exhausted,
+fail.
+
+## Default-safe library config
+
+For outbound HTTP calls:
+
+```js
+import got from 'got';
+
+const client = got.extend({
+  timeout: { request: 5000 },
+  retry: {
+    limit: 3,
+    methods: ['GET', 'PUT', 'HEAD', 'DELETE', 'OPTIONS'],
+    statusCodes: [408, 429, 500, 502, 503, 504],
+    errorCodes: ['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'],
+    backoffLimit: 30_000,
+  },
+});
+```
+
+`got` retries idempotent methods by default and skips non-idempotent
+ones unless you opt in. Sane defaults.
+
+## The mental model
+
+Retries handle **transient** failures. Circuit breakers handle
+**sustained** failures. Bulkheads handle **localized** failures.
+
+Combine them. Each is cheap; together they make your service
+resilient to whole classes of downstream problems without complex
+logic in handlers.
+
+The wrong move is putting all your faith in retries. They're a
+hammer; the system needs other tools.

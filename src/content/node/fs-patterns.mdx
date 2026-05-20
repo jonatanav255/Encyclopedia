@@ -1,0 +1,214 @@
+export const level = 'mid';
+
+# Filesystem Patterns
+
+The `node:fs` module is older than promises and most of its surface
+shows it — there are three APIs (callback, sync, promise), the order
+of arguments is sometimes inconsistent, and the sync ones will
+happily block your event loop forever. The good news: the modern
+patterns are narrow and worth memorizing.
+
+## Use `fs/promises`
+
+```js
+import { readFile, writeFile, stat, mkdir, readdir } from 'node:fs/promises';
+
+const text = await readFile('config.json', 'utf8');
+await writeFile('out.txt', 'hello', 'utf8');
+const s = await stat('package.json');
+await mkdir('build', { recursive: true });
+const entries = await readdir('src', { withFileTypes: true });
+```
+
+This is the API you almost always want. Forget the callback version;
+forget the sync version unless you have a specific reason.
+
+## Sync APIs: when, exactly
+
+The `*Sync` variants block the event loop until they finish. For a
+small file on local SSD that's microseconds, fine. For a network FS,
+a big file, or under contention, you've stalled every request the
+process is handling.
+
+The only legitimate uses:
+
+- **CLI scripts** where there's no event loop to block.
+- **App startup** before `app.listen()` — config loading, key
+  reading. The process isn't serving traffic yet.
+- **Crash-time cleanup** in `uncaughtException` handlers when you're
+  about to die anyway.
+
+Inside request handlers, **never**.
+
+## Reading a whole file
+
+```js
+await readFile('config.json', 'utf8');     // string
+await readFile('image.png');                // Buffer
+```
+
+Pass an encoding for text; omit for binary. The whole file is loaded
+into memory — fine for small files, bad for large ones. If it might
+be bigger than a few MB, stream it.
+
+## Streaming a large file
+
+```js
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+
+await pipeline(createReadStream('huge.log'), res);
+```
+
+Constant memory regardless of file size. See **Streams**.
+
+## Atomic writes
+
+`writeFile` is *not* atomic — a crash mid-write leaves a truncated
+file. For config files or anything where partial state is worse than
+old state, write to a temp file and rename:
+
+```js
+import { writeFile, rename } from 'node:fs/promises';
+
+async function writeAtomic(path, data) {
+  const tmp = `${path}.tmp.${process.pid}`;
+  await writeFile(tmp, data);
+  await rename(tmp, path);  // rename is atomic on the same filesystem
+}
+```
+
+`rename` is atomic when source and destination are on the same
+filesystem. Cross-FS rename copies under the hood — not atomic.
+
+## Checking if a file exists
+
+The classic question, with a trap:
+
+```js
+// Don't
+if (await stat(path).then(() => true, () => false)) {
+  await readFile(path);
+}
+
+// Do
+try {
+  const data = await readFile(path);
+} catch (err) {
+  if (err.code === 'ENOENT') {
+    // file doesn't exist
+  } else {
+    throw err;
+  }
+}
+```
+
+The `stat`-then-read pattern is a TOCTOU race (time-of-check to
+time-of-use): the file might be deleted between the check and the
+read. Just try the operation and handle the error.
+
+`ENOENT`, `EACCES`, `EISDIR`, `EMFILE` (too many open files), and
+`EBUSY` are the error codes you'll actually see.
+
+## Directories
+
+```js
+await mkdir('a/b/c', { recursive: true });    // mkdir -p
+await readdir('src');                          // string[]
+await readdir('src', { withFileTypes: true }); // Dirent[]
+await readdir('src', { recursive: true });     // recursive (Node 20+)
+```
+
+`withFileTypes` returns `Dirent` objects with `isFile()` / `isDirectory()`
+methods — avoids a separate `stat` per entry, which is much faster
+on big directories.
+
+## Watching for changes
+
+```js
+import { watch } from 'node:fs/promises';
+
+const ac = new AbortController();
+const watcher = watch('config', { signal: ac.signal });
+
+for await (const event of watcher) {
+  console.log(event.eventType, event.filename);
+}
+
+// somewhere else: ac.abort();
+```
+
+`fs.watch` is platform-dependent and unreliable on some configurations
+(network mounts, edited files in some editors). For dev-time
+hot-reloading use a higher-level library (`chokidar`). For production
+"watch for config changes," prefer signals (`SIGHUP`) or polling.
+
+## Permissions
+
+`chmod`, `chown`, and the file mode in `mkdir/writeFile`:
+
+```js
+await writeFile('secret.key', data, { mode: 0o600 });   // rw for owner only
+await mkdir('uploads', { mode: 0o755 });
+```
+
+The mode is an octal number; `0o600` is `rw-------`. Important for
+secrets — anything readable by others is a leak waiting to happen.
+
+`process.umask()` controls the default mask. Set it once in startup
+if you care about defaults.
+
+## Paths
+
+```js
+import path from 'node:path';
+
+path.join('a', 'b', 'c');          // "a/b/c" (or "a\\b\\c" on Windows)
+path.resolve('a', 'b');             // absolute path
+path.dirname('/a/b/c.txt');         // "/a/b"
+path.basename('/a/b/c.txt');        // "c.txt"
+path.extname('c.txt');              // ".txt"
+import.meta.dirname;                // current file's dir (Node 20+)
+```
+
+Never concatenate paths with `+` — it breaks on Windows. Always
+`path.join`. `path.resolve` from the project root is the safest pattern.
+
+## Path traversal
+
+User-supplied paths are dangerous:
+
+```js
+// User sends ?file=../../etc/passwd
+app.get('/files', async (req, res) => {
+  const data = await readFile(req.query.file);   // BAD
+});
+```
+
+Always resolve and check:
+
+```js
+const safeRoot = path.resolve('/var/uploads');
+const requested = path.resolve(safeRoot, req.query.file);
+if (!requested.startsWith(safeRoot + path.sep)) {
+  return res.sendStatus(400);
+}
+const data = await readFile(requested);
+```
+
+`path.resolve` collapses `..` segments. The `startsWith` check (with
+the separator) ensures we didn't escape the allowed root. Off-by-one
+without the separator is a classic bug — `/var/uploadsX` would pass
+without it.
+
+## Performance notes
+
+- **The libuv thread pool** (default 4 threads) handles `fs` calls
+  on Linux/macOS. Heavy concurrent FS load saturates the pool and
+  blocks each other. Tune `UV_THREADPOOL_SIZE` (env var) up to 128
+  if profiling shows pool contention.
+- **`open` is expensive**. For repeated reads of the same file,
+  `fs.open` once and reuse the `FileHandle`.
+- **`readFile` is sequential** — it reads the file in one syscall
+  loop. For huge files you can read by chunks with `read` and a
+  position, but you almost never need to.

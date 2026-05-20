@@ -1,0 +1,156 @@
+export const level = 'mid';
+
+# Streams
+
+Streams are how Node moves data through your process without buffering
+the whole thing in memory. Every `fs.createReadStream`, every HTTP
+request and response, every TCP socket — they're all streams. Knowing
+them turns "this works for 1MB" into "this works for 100GB."
+
+## The four types
+
+- **Readable**: emits chunks (e.g. `fs.createReadStream`, `req`).
+- **Writable**: accepts chunks (e.g. `fs.createWriteStream`, `res`).
+- **Duplex**: both at once, independent (e.g. TCP socket).
+- **Transform**: a Duplex where output is a function of input
+  (e.g. `zlib.createGzip`).
+
+```js
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+
+await pipeline(
+  createReadStream('big.log'),
+  createGzip(),
+  createWriteStream('big.log.gz'),
+);
+```
+
+Three streams glued together. Memory stays constant; throughput is
+limited by the slowest link.
+
+## Object mode vs binary mode
+
+- **Binary mode** (default): chunks are `Buffer`s. The fast path —
+  no per-chunk allocations beyond the buffer itself.
+- **Object mode** (`objectMode: true`): chunks are arbitrary values
+  (objects, parsed rows). Used by libraries like `csv-parse` that
+  emit one record per chunk.
+
+Object mode is convenient but slower. Use it at boundaries (parser
+output, DB cursor rows); use binary mode for the heavy lifting (file
+I/O, network I/O, compression).
+
+## Backpressure
+
+The point of streams. A fast producer can't outrun a slow consumer
+because `.write()` returns `false` when the consumer's buffer is full
+— and `pipe`/`pipeline` honors that signal.
+
+```js
+// Manual, hard mode
+function writeMany(stream, data) {
+  for (const chunk of data) {
+    if (!stream.write(chunk)) {
+      stream.once('drain', () => writeMany(stream, /* remaining */));
+      return;
+    }
+  }
+}
+
+// Idiomatic
+await pipeline(source, transform, dest);
+```
+
+`pipeline` waits for `'drain'` automatically and propagates errors
+across the chain. Manual `.write()` loops that ignore the return
+value are how processes run out of memory.
+
+## `pipe` vs `pipeline`
+
+```js
+// Old API
+source.pipe(transform).pipe(dest);
+source.on('error', cleanup);
+transform.on('error', cleanup);
+dest.on('error', cleanup);
+
+// Modern API
+import { pipeline } from 'node:stream/promises';
+await pipeline(source, transform, dest);
+```
+
+`pipeline` handles error propagation and cleanup. `pipe` doesn't —
+an error in one stream leaves the others dangling, leaking file
+descriptors. Use `pipeline` for anything new.
+
+## Async iterators
+
+Readable streams are async iterable:
+
+```js
+const stream = createReadStream('big.log');
+for await (const chunk of stream) {
+  process(chunk);
+}
+```
+
+Cleaner than `'data'` listeners. Errors throw from the loop.
+Backpressure is automatic — the iterator only pulls the next chunk
+when you ask for it.
+
+Object-mode example (a DB cursor):
+
+```js
+const cursor = db.users.find().cursor();
+for await (const user of cursor) {
+  await processUser(user);
+}
+```
+
+Process one row at a time, constant memory, regardless of result size.
+
+## Transform streams
+
+Sit between source and destination, modifying data:
+
+```js
+import { Transform } from 'node:stream';
+
+const upper = new Transform({
+  transform(chunk, _enc, cb) {
+    cb(null, chunk.toString().toUpperCase());
+  },
+});
+
+await pipeline(process.stdin, upper, process.stdout);
+```
+
+Two patterns: call `cb(err, output)` once, or `this.push(output)`
+multiple times and call `cb()` at the end (for one-to-many transforms
+like splitting on newlines).
+
+## Common pitfalls
+
+- **Forgetting `pipeline`**. Using `pipe` and not cleaning up on errors.
+- **Reading the whole stream into memory** (`await stream.toArray()`
+  or accumulating chunks). Defeats the point. If you need the whole
+  thing in memory, `await fs.promises.readFile` directly.
+- **Mixing `'data'` listeners with `await` consumption**. The `'data'`
+  listener puts the stream in flowing mode and races the iterator.
+- **Not handling client disconnect on HTTP streams**. If the client
+  goes away mid-stream, you keep producing data nobody reads.
+
+## When to stream
+
+- Files bigger than RAM (or bigger than you want resident).
+- Network responses where time-to-first-byte matters.
+- Anything you can produce incrementally.
+- Pipelines (compress, parse, transform, persist).
+
+## When not to
+
+- Small payloads — overhead dominates.
+- Anything you need to know the full content of before responding.
+- Random-access reads on a single file (just use `fs.read`).
