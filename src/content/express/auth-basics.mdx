@@ -2,6 +2,170 @@ export const level = 'mid';
 
 # Auth Basics
 
-_Placeholder._ Where the auth middleware sits in the chain, how to
-attach `req.user`, session vs. JWT vs. API key, and what "logged in"
-actually means at the protocol level.
+Authentication is "who is this?" Authorization is "are they allowed to do
+this?" Express doesn't ship auth — it ships middleware, and you write
+auth as middleware that runs before protected routes.
+
+## Where it sits
+
+```js
+app.use(express.json());
+
+app.post('/login', loginHandler);              // public
+
+app.use(requireAuth);                           // everything below is gated
+
+app.get('/me', meHandler);                     // protected
+app.get('/admin', requireRole('admin'), adminHandler); // also role-gated
+```
+
+Mount `requireAuth` once, and every route registered *after* it requires
+auth. Public routes (login, public docs, health checks) go *before* it.
+
+## A session-based `requireAuth`
+
+```js
+function requireAuth(req, res, next) {
+  if (!req.session?.userId) {
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
+  next();
+}
+```
+
+That's it. The session middleware has already populated `req.session`. The
+auth middleware just checks whether `userId` is set. If yes, continue;
+if no, 401.
+
+For the user object, fetch it lazily:
+
+```js
+async function attachUser(req, res, next) {
+  if (req.session?.userId) {
+    req.user = await db.users.findById(req.session.userId);
+  }
+  next();
+}
+```
+
+Attach `req.user` before the auth check so handlers downstream can use it.
+
+## A JWT-based `requireAuth`
+
+```js
+import jwt from 'jsonwebtoken';
+
+function requireAuth(req, res, next) {
+  const header = req.get('Authorization');
+  if (!header?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'no token' });
+  }
+  const token = header.slice(7);
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'invalid token' });
+  }
+}
+```
+
+`jwt.verify` checks the signature *and* the expiry. A tampered or expired
+token throws — catch and return 401.
+
+## Session vs JWT — the actual tradeoff
+
+People debate this. The practical answer:
+
+- **Session** if you can afford a session store and need easy revocation
+  ("log this user out everywhere right now"). Almost every web app.
+- **JWT** if the token has to travel to many services and a shared session
+  store would be a bottleneck, *and* you have a plan for revocation
+  (short expiry + refresh tokens, or a blocklist).
+
+For an internal admin tool or a single-app product, you almost certainly
+want sessions.
+
+## Authorization: roles and ownership
+
+Authentication says "this is Jon." Authorization decides whether Jon can
+do a specific thing.
+
+```js
+function requireRole(role) {
+  return (req, res, next) => {
+    if (req.user?.role !== role) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    next();
+  };
+}
+
+app.delete('/users/:id', requireAuth, requireRole('admin'), deleteUser);
+```
+
+Owner checks live in the handler, not middleware, because they depend on
+the resource:
+
+```js
+app.patch('/posts/:id', requireAuth, async (req, res) => {
+  const post = await db.posts.findById(req.params.id);
+  if (!post) return res.sendStatus(404);
+  if (post.authorId !== req.user.id) return res.sendStatus(403);
+  // ... safe to update
+});
+```
+
+## Hashing passwords
+
+Never store plain passwords. Use a slow, salted hash:
+
+```js
+import bcrypt from 'bcrypt';
+
+const hash = await bcrypt.hash(password, 12);
+await db.users.create({ email, passwordHash: hash });
+
+// later
+const ok = await bcrypt.compare(input, user.passwordHash);
+```
+
+`bcrypt.compare` is constant-time — it doesn't leak timing info that
+would help guess the hash.
+
+Use the async versions. `bcrypt.hashSync` blocks the event loop for tens
+of ms per call; under load that's catastrophic for tail latency.
+
+For new projects, `argon2` is the more modern choice. Both are fine.
+
+## 401 vs 403, again
+
+- **401**: not authenticated. No token, expired token, bad signature.
+- **403**: authenticated, but not allowed. Wrong role, not the owner,
+  feature flag off.
+
+Pick the right one — middleware that returns 403 for missing credentials
+is a small but real bug, because it tells the client "stop trying to
+log in" when actually they should.
+
+## CSRF
+
+If you use cookie-based sessions, your authenticated endpoints are
+exposed to CSRF — another site can trigger requests that include the
+victim's cookie. Mitigations:
+
+1. **`SameSite: lax`** on the session cookie (modern browsers default).
+2. **CSRF tokens** — a per-session token, sent in a header, validated on
+   every state-changing request. The `csurf` package was the classic
+   middleware for this; it's deprecated, so most apps now use a custom
+   middleware or a package like `csrf-csrf`.
+3. **Double-submit cookies** for SPAs.
+
+JWT-in-`Authorization`-header is CSRF-immune because the browser doesn't
+attach `Authorization` automatically to cross-site requests.
+
+## Don't write your own crypto
+
+`jwt`, `bcrypt`, `argon2`, `express-session`, `csrf-csrf` — use them.
+Custom token formats, custom HMAC schemes, custom password hashing are
+how leaks happen.

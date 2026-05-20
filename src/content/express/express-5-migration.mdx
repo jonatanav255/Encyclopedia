@@ -2,6 +2,172 @@ export const level = 'senior';
 
 # Express 5 Migration
 
-_Placeholder._ Breaking changes from 4 → 5: async error forwarding,
-`req.params` becoming a plain object, route-pattern syntax changes
-(no more `*` wildcard), and what `path-to-regexp` v8 means.
+Express 5 landed as stable in late 2024 after ~10 years in beta. It's
+a careful, mostly-backward-compatible upgrade — but a few changes
+will bite you if you don't read the migration notes. Knowing what
+changed lets you upgrade with confidence instead of reactively
+chasing breaks.
+
+## Why upgrade
+
+The headline reasons:
+
+- **Async error forwarding.** Rejected promises from `async` handlers
+  now propagate to error middleware automatically. No more `wrap(fn)`.
+- **Modern `path-to-regexp`.** v6 → v8. Stricter, predictable
+  patterns. Old wildcard syntax replaced.
+- **Drops support for Node < 18.** Modern runtime baseline.
+- **Removes deprecated APIs** that have been warning for years.
+
+If your app is on Node 18+ and you don't depend on the removed APIs,
+the upgrade is usually one afternoon.
+
+## The breaking changes that matter
+
+### Async error forwarding (good break)
+
+```js
+// Express 4 — wrap required
+app.get('/users/:id', async (req, res, next) => {
+  try {
+    const user = await db.users.findById(req.params.id);
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Express 5 — just throw
+app.get('/users/:id', async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+  res.json(user);
+});
+```
+
+After upgrading, you can delete every `try/catch + next(err)` and
+every `wrap(fn)` helper. Errors automatically reach your error
+middleware.
+
+If you imported `express-async-errors` for the same purpose, remove
+it — it's now redundant.
+
+### Route patterns (`path-to-regexp` v8)
+
+Old:
+
+```js
+app.get('/files/*', (req, res) => {
+  console.log(req.params[0]); // matched part
+});
+
+app.get('/users/:id?', (req, res) => { /* optional param */ });
+
+app.get('/test/*.*', handler);
+```
+
+New:
+
+```js
+app.get('/files/*splat', (req, res) => {
+  console.log(req.params.splat); // matched parts as array
+});
+
+app.get('/users{/:id}', (req, res) => { /* optional segment */ });
+```
+
+The unnamed wildcard `*` is gone. You name it now (`*splat`,
+`*path`, whatever). Optional segments use `{...}` braces.
+
+This breaks routes that worked in Express 4. Audit every `*` and `?`
+in your route patterns.
+
+### `req.query` is now a `null`-prototype object
+
+In Express 4, `req.query` was a regular `Object` (with prototype
+chain). That was a prototype-pollution vector — a malicious
+`?__proto__[admin]=true` could pollute every object in your process.
+
+In Express 5, `req.query` is created with `Object.create(null)`. No
+prototype chain. Safer, but:
+
+```js
+req.query instanceof Object  // false in Express 5
+req.query.hasOwnProperty(x)  // throws — no prototype
+Object.hasOwn(req.query, x)   // use this instead
+```
+
+Same for `req.params` and `req.body` (if you're using `express.json()`).
+
+### `res.redirect` no longer accepts a `back`
+
+```js
+res.redirect('back');  // Express 4
+```
+
+Express 5 removed this convenience. Read `Referer` yourself if you
+need it:
+
+```js
+res.redirect(req.get('Referer') ?? '/');
+```
+
+### `res.json` no longer auto-pretty-prints
+
+In Express 4 with `app.set('json spaces', 2)`, `res.json` indented
+output. In Express 5 the setting is gone — handle it yourself if you
+want pretty JSON in development:
+
+```js
+if (process.env.NODE_ENV !== 'production') {
+  app.set('json spaces', 2);  // still works via the json replacer mechanism
+}
+```
+
+### `app.del()` → `app.delete()`
+
+`app.del()` was the original method (since `delete` is a JS keyword).
+Removed in Express 5 — use `app.delete()` (which has worked for ages
+as an alias).
+
+### Removed: `req.acceptsCharset`, `req.acceptsEncoding`, `req.acceptsLanguage`
+
+Singular forms. Replaced by the plural — `req.acceptsCharsets(...)`,
+`req.acceptsEncodings(...)`, `req.acceptsLanguages(...)`.
+
+## Things that didn't change
+
+The mental model is the same. Middleware, routers, `req.params`,
+`req.query`, error middleware via 4-arg arity — all still work.
+Most apps need only a handful of small adjustments.
+
+## A migration recipe
+
+1. **Read the official changelog**. The Express 5 migration guide on
+   expressjs.com lists everything.
+2. **Bump Node to 18+** if you haven't.
+3. **Upgrade Express**: `pnpm add express@5`.
+4. **Run the test suite**. Most failures are in the route patterns
+   and the missing `app.del`.
+5. **Audit route patterns** for `*` and optional `?` syntax.
+6. **Delete async wrappers** (`wrap()`, `express-async-errors`).
+   Verify error middleware still catches them.
+7. **Audit `req.query` usage** — anything depending on the prototype
+   chain breaks.
+8. **Deploy to staging**, watch metrics for unexpected behavior.
+
+## When NOT to upgrade
+
+Few reasons:
+
+- You're on Node < 18 and can't upgrade. (Why?)
+- You depend on a third-party middleware that hasn't been updated to
+  v5-compatible. Most popular ones have been; check each.
+
+Otherwise: Express 5 is the right baseline for new code, and the
+upgrade is genuinely worth doing for the async error change alone.
+
+## Looking forward
+
+Express's pace of change is glacial — Express 4 lasted a decade. Don't
+expect Express 6 anytime soon. The framework is intentionally stable.
+What you learn about Express 5 will likely still be current in 2030.

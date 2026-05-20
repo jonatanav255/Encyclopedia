@@ -2,5 +2,192 @@ export const level = 'senior';
 
 # Streaming
 
-_Placeholder._ When to stream responses instead of buffering, how
-`res.write` + `res.end` differ from `res.send`, and backpressure basics.
+Most Express responses you've written are *buffered*: build the whole
+body in memory, then send it. That's fine for kilobytes. For
+megabytes of file data, large JSON exports, or anything you want the
+client to start receiving before you finish producing — you stream.
+
+## Buffered vs streamed
+
+```js
+// Buffered — whole file in memory before sending
+app.get('/download', async (req, res) => {
+  const data = await fs.readFile('huge.zip');
+  res.send(data);
+});
+
+// Streamed — bytes flow through, no big buffer
+app.get('/download', (req, res) => {
+  fs.createReadStream('huge.zip').pipe(res);
+});
+```
+
+The streamed version uses constant memory regardless of file size. The
+buffered version blows up at scale.
+
+## `res` is a writable stream
+
+Express's `res` object is a Node `http.ServerResponse`, which is a
+writable stream. You can pipe into it.
+
+```js
+import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+
+app.get('/download', async (req, res) => {
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Content-Disposition', 'attachment; filename="export.zip"');
+  await pipeline(createReadStream('export.zip'), res);
+});
+```
+
+`pipeline` from `node:stream/promises` is the modern way to pipe — it
+handles cleanup if either side errors or the client disconnects.
+Without it, an error in the source stream can leave the response
+hanging.
+
+## Streaming JSON
+
+Building a 100MB JSON response in memory is wasteful. Stream it:
+
+```js
+import { stringify } from 'JSONStream';   // or similar
+
+app.get('/events', async (req, res) => {
+  res.set('Content-Type', 'application/json');
+  res.write('[');
+
+  const cursor = db.events.find().cursor();
+  let first = true;
+  for await (const event of cursor) {
+    if (!first) res.write(',');
+    first = false;
+    res.write(JSON.stringify(event));
+  }
+
+  res.write(']');
+  res.end();
+});
+```
+
+Or use `ndjson` (newline-delimited JSON) instead — each row is a
+separate JSON object on its own line. Easier to stream, easier to parse
+client-side without buffering the whole array.
+
+```js
+res.set('Content-Type', 'application/x-ndjson');
+for await (const event of cursor) {
+  res.write(JSON.stringify(event) + '\n');
+}
+res.end();
+```
+
+## Server-Sent Events (SSE)
+
+A one-way streaming protocol over HTTP. The connection stays open and
+the server pushes events as they happen.
+
+```js
+app.get('/stream', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const interval = setInterval(() => {
+    res.write(`data: ${JSON.stringify({ now: Date.now() })}\n\n`);
+  }, 1000);
+
+  req.on('close', () => clearInterval(interval));
+});
+```
+
+Client side, the browser's `EventSource` reconnects automatically and
+parses the protocol for you. SSE is much simpler than WebSockets when
+you only need server → client.
+
+## Backpressure
+
+The big risk in streaming: producing faster than `res` can flush.
+Without backpressure handling, you fill the internal buffer until
+memory is exhausted.
+
+```js
+// Wrong — ignores backpressure
+for (const chunk of chunks) {
+  res.write(chunk);
+}
+
+// Right — wait when the buffer is full
+for (const chunk of chunks) {
+  if (!res.write(chunk)) {
+    await new Promise(resolve => res.once('drain', resolve));
+  }
+}
+```
+
+`res.write` returns `false` when the internal buffer is full — that's
+your signal to pause until `'drain'` fires.
+
+`pipeline` and `pipe` handle this for you. The reason to use them
+instead of manual `write` loops.
+
+## Client disconnects
+
+When a streaming client gives up halfway:
+
+```js
+req.on('close', () => {
+  // client gone — clean up
+  cursor.close();
+  clearInterval(interval);
+});
+```
+
+Without this, you keep producing data nobody is reading, leaking
+resources. The longer the stream, the more critical this is.
+
+## When to stream
+
+- Large file downloads / uploads
+- Real-time updates (SSE, WebSockets)
+- Large data exports (CSV, NDJSON)
+- Proxy responses (piping `fetch` result to `res`)
+- Anything where time-to-first-byte matters
+
+## When not to stream
+
+- Small responses (< a few KB) — overhead isn't worth it.
+- Anything you need to compute fully before knowing the status code.
+  Once you've called `res.write`, the status is committed; you can't
+  change your mind.
+
+## The transform pattern
+
+Modify data as it streams through:
+
+```js
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+
+const csvifier = new Transform({
+  objectMode: true,
+  transform(row, _enc, cb) {
+    cb(null, `${row.id},${row.name}\n`);
+  },
+});
+
+app.get('/users.csv', async (req, res) => {
+  res.set('Content-Type', 'text/csv');
+  await pipeline(db.users.find().cursor(), csvifier, res);
+});
+```
+
+DB cursor → transform → HTTP response, all streaming, constant memory.
+
+## Gzip
+
+Compressed responses can also stream — `compression` middleware
+handles it transparently. Don't gzip already-compressed payloads
+(images, videos, zips). See **Compression**.

@@ -2,5 +2,155 @@ export const level = 'mid';
 
 # File Uploads
 
-_Placeholder._ Why `express.json()` can't parse `multipart/form-data`,
-how `multer` handles it, memory vs disk storage, and size limits.
+A file upload is a `multipart/form-data` body — multiple parts with their
+own headers, separated by boundaries. `express.json()` and
+`express.urlencoded()` can't parse it. You need `multer`.
+
+## The setup
+
+```js
+import multer from 'multer';
+
+const upload = multer({ dest: 'uploads/' });
+
+app.post('/avatar', upload.single('avatar'), (req, res) => {
+  console.log(req.file);
+  // {
+  //   fieldname: 'avatar',
+  //   originalname: 'me.jpg',
+  //   mimetype: 'image/jpeg',
+  //   destination: 'uploads/',
+  //   filename: '8a3f...c1',     // generated, not the original
+  //   path: 'uploads/8a3f...c1',
+  //   size: 124823,
+  // }
+  res.json({ ok: true });
+});
+```
+
+`upload.single('avatar')` parses the field named `avatar` from the form
+and writes the file to `uploads/`. The handler runs only after the file
+is fully received.
+
+## Multiple files
+
+```js
+app.post('/photos', upload.array('photos', 10), (req, res) => {
+  console.log(req.files); // array, max 10
+  res.json({ uploaded: req.files.length });
+});
+```
+
+For mixed fields (some files, some text):
+
+```js
+const fields = upload.fields([
+  { name: 'avatar', maxCount: 1 },
+  { name: 'banner', maxCount: 1 },
+]);
+
+app.post('/profile', fields, (req, res) => {
+  console.log(req.files.avatar[0]);  // file
+  console.log(req.body.name);         // text fields
+});
+```
+
+## Memory vs disk storage
+
+```js
+// Disk — multer writes to disk, gives you a path
+const diskUpload = multer({ dest: 'uploads/' });
+
+// Memory — multer keeps the buffer on req.file.buffer
+const memUpload = multer({ storage: multer.memoryStorage() });
+```
+
+- **Disk** is fine for small/medium files you want to process or move later.
+- **Memory** is convenient if you immediately re-upload to object storage,
+  but a single big file pins RAM. Cap the size aggressively.
+
+For real production uploads, the right path is usually:
+
+1. Frontend gets a signed URL from your server.
+2. Frontend uploads directly to S3 / R2 / GCS.
+3. Server only handles metadata.
+
+That way the file never touches your Node process.
+
+## Size limits
+
+Always set them. Defaults are infinite — a single client can fill your
+disk.
+
+```js
+const upload = multer({
+  dest: 'uploads/',
+  limits: {
+    fileSize: 5 * 1024 * 1024,   // 5MB per file
+    files: 10,                    // max files per request
+    fields: 20,                   // max non-file fields
+  },
+});
+```
+
+Multer throws a `MulterError` if any limit is exceeded — handle it in
+your error middleware.
+
+## File-type filtering
+
+The `mimetype` from the upload is **client-supplied** and easily faked.
+For safety, validate by reading the actual bytes (magic numbers) using a
+library like `file-type`:
+
+```js
+import { fileTypeFromBuffer } from 'file-type';
+
+app.post('/avatar', upload.single('avatar'), async (req, res, next) => {
+  const type = await fileTypeFromBuffer(req.file.buffer);
+  if (!type || !['jpg', 'png', 'webp'].includes(type.ext)) {
+    return res.status(400).json({ error: 'unsupported file type' });
+  }
+  // ... safe to process
+});
+```
+
+Trusting `req.file.mimetype` alone gets you "evil.jpg" that's actually
+an HTML file the browser will execute.
+
+## The filename trap
+
+`multer` rewrites filenames by default so collisions don't happen.
+**Don't** put `req.file.originalname` directly into a path:
+
+```js
+fs.renameSync(req.file.path, `uploads/${req.file.originalname}`); // bad
+```
+
+An attacker can name their file `../../etc/passwd`. Always sanitize or
+generate filenames server-side.
+
+## Streaming uploads
+
+For large uploads, you don't want to buffer the whole file. Use
+`multer` with `storage` pointed at a writable stream, or use a library
+designed for direct-to-S3 uploads. Or, again, use signed URLs and let
+S3 take the bytes.
+
+## Cleaning up
+
+If your handler errors after a successful upload, the file is still on
+disk. Delete it:
+
+```js
+app.post('/avatar', upload.single('avatar'), async (req, res, next) => {
+  try {
+    await processFile(req.file);
+    res.json({ ok: true });
+  } catch (err) {
+    await fs.promises.unlink(req.file.path).catch(() => {});
+    next(err);
+  }
+});
+```
+
+Or use memory storage and never touch disk.

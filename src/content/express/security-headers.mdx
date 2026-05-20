@@ -2,5 +2,180 @@ export const level = 'senior';
 
 # Security Headers
 
-_Placeholder._ `Content-Security-Policy`, `Strict-Transport-Security`,
-`X-Frame-Options`, and what `helmet` actually sets by default.
+A set of response headers that browsers honor to harden your site against
+XSS, clickjacking, MIME sniffing, and friends. None of them stop a
+determined server-side attack, but together they raise the cost of common
+browser-mediated exploits dramatically. `helmet` is the package that
+sets sensible defaults for all of them.
+
+## The setup
+
+```js
+import helmet from 'helmet';
+
+app.use(helmet());
+```
+
+That single line sets ~12 security headers with reasonable defaults.
+Worth understanding what each one does so you can tune them — because
+the strict defaults will sometimes break your app.
+
+## The big ones
+
+### `Strict-Transport-Security` (HSTS)
+
+```
+Strict-Transport-Security: max-age=15552000; includeSubDomains
+```
+
+Tells the browser "for the next N seconds, only talk to me over HTTPS,
+even if the user types `http://`." Once a browser has seen this, an
+attacker can't downgrade-attack the user.
+
+Only set HSTS once you're *certain* you'll never need plain HTTP again
+— the browser remembers. Start with a short `max-age`, ramp up.
+
+### `Content-Security-Policy` (CSP)
+
+The big one. CSP tells the browser what sources of scripts, styles,
+images, etc. are allowed:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example.com
+```
+
+A strict CSP makes XSS dramatically harder. An attacker who can inject
+HTML into your page still can't load `<script src="https://evil.com">`
+because the browser refuses.
+
+CSP is also the easiest header to break your own app with. Inline
+scripts (`<script>...</script>`) and event handlers (`onclick="..."`)
+violate the default. You'll need to either:
+
+- Use `script-src 'unsafe-inline'` (weakens it).
+- Use nonces (per-request random string in the header and the script
+  tag) — strong but requires templating.
+- Move all JS to external files.
+
+For a new app, start strict. For an existing app, run CSP in
+**report-only** mode first (`Content-Security-Policy-Report-Only`),
+collect reports, then enforce.
+
+### `X-Content-Type-Options: nosniff`
+
+```
+X-Content-Type-Options: nosniff
+```
+
+Stops browsers from guessing a response's MIME type. Without this, a
+file you served as `text/plain` might be interpreted as HTML or JS by
+the browser if it "looks like" one — a classic XSS via uploaded
+"images" that are actually HTML.
+
+Always on. No reason to disable.
+
+### `X-Frame-Options` / `frame-ancestors`
+
+```
+X-Frame-Options: DENY
+```
+
+Stops other sites from embedding yours in an `<iframe>`. Without it,
+attackers can clickjack — overlay your UI inside an invisible frame
+and trick users into clicking buttons they can't see.
+
+Modern equivalent (and what CSP uses):
+
+```
+Content-Security-Policy: frame-ancestors 'none'
+```
+
+If you legitimately need to be embedded somewhere (an embedded widget,
+a Notion integration), use `ALLOW-FROM` or `frame-ancestors
+https://allowed.com`.
+
+### `Referrer-Policy`
+
+```
+Referrer-Policy: strict-origin-when-cross-origin
+```
+
+Controls what the browser sends in `Referer` on outbound links. The
+default reveals the full URL — including query strings — to every site
+you link to. For privacy and to avoid leaking session tokens in URLs,
+restrict it.
+
+`strict-origin-when-cross-origin` is helmet's default: full URL for
+same-origin, just the origin for cross-origin, nothing for HTTPS →
+HTTP.
+
+### `Permissions-Policy`
+
+Controls which browser features your site can use:
+
+```
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+```
+
+This denies camera/mic/location access entirely. Tighten or loosen
+based on what your app actually needs. Especially important for sites
+that can be embedded (it cascades to iframes).
+
+## Don't advertise your stack
+
+```js
+app.disable('x-powered-by');
+```
+
+Express sets `X-Powered-By: Express` by default — useful information
+for attackers, useless for users.
+
+## Helmet defaults are good
+
+Out of the box `helmet()` sets:
+
+- HSTS (1 year, includeSubDomains, preload not set)
+- CSP (strict default — `default-src 'self'`, no inline scripts)
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: SAMEORIGIN`
+- `Referrer-Policy: no-referrer`
+- A few others
+
+Customize when defaults break things:
+
+```js
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", 'https://cdn.example.com'],
+      imgSrc: ["'self'", 'data:', 'https:'],
+    },
+  },
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+}));
+```
+
+## CSP in development
+
+The strict CSP defaults break a lot of dev workflows — Vite injects
+inline scripts, error overlays use `eval`, etc. Two approaches:
+
+1. Disable CSP in dev: `helmet({ contentSecurityPolicy: false })` gated
+   on `NODE_ENV`.
+2. Use a separate, looser CSP for dev.
+
+Don't ship the dev config to production.
+
+## Test what you set
+
+`securityheaders.com` and Mozilla Observatory will scan your live URL
+and rate the headers. Aim for an A+. Free, fast, surfaces things you
+missed.
+
+## Headers are not the only layer
+
+Helmet hardens what the browser does with your responses. It doesn't
+help with SQL injection, auth bugs, IDOR, or any server-side issue.
+Use it alongside, not instead of, input validation, parameterized
+queries, and authorization checks.

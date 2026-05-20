@@ -2,6 +2,161 @@ export const level = 'mid';
 
 # Sessions
 
-_Placeholder._ `express-session` basics, picking a store (memory is a
-trap — Redis, Postgres, etc), the session-id cookie, and the
-performance/cost tradeoff vs. stateless JWT.
+A session is server-side state tied to a client by a cookie. The cookie
+holds nothing but an opaque ID; the data — user info, cart, CSRF token,
+whatever — lives in a session store. `express-session` is the standard
+middleware.
+
+## The setup
+
+```js
+import session from 'express-session';
+
+app.use(session({
+  secret: process.env.SESSION_SECRET,        // signs the session ID cookie
+  resave: false,                              // only write to store on change
+  saveUninitialized: false,                   // don't create sessions for anon
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,         // 1 week
+  },
+}));
+
+app.post('/login', (req, res) => {
+  // ... verify credentials ...
+  req.session.userId = user.id;
+  res.json({ ok: true });
+});
+
+app.get('/me', (req, res) => {
+  if (!req.session.userId) return res.sendStatus(401);
+  res.json({ userId: req.session.userId });
+});
+```
+
+What happens on each request:
+
+1. `express-session` reads the session ID cookie.
+2. Loads the matching session from the store, attaching it to `req.session`.
+3. Your handler reads/writes `req.session.*`.
+4. On response, if anything changed, the store is updated.
+
+## Picking a store
+
+The default is `MemoryStore`. **Don't use it in production.**
+
+- Lost on restart.
+- Doesn't share across processes — clustered Node, multiple containers,
+  serverless: all break.
+- Grows unbounded.
+
+Use a real store:
+
+- **Redis** (`connect-redis`) — fast, supports TTL natively, the
+  conventional choice.
+- **Postgres** (`connect-pg-simple`) — fewer moving parts if you already
+  have a Postgres.
+- **MongoDB** (`connect-mongo`) — fine if Mongo is already in your stack.
+
+```js
+import { RedisStore } from 'connect-redis';
+import { createClient } from 'redis';
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET,
+  // ...
+}));
+```
+
+## Session vs JWT
+
+| | Session | JWT |
+| --- | --- | --- |
+| Server-side state | Yes | No (stateless) |
+| Token size | Small (just an ID) | Bigger (carries claims) |
+| Revoke a single user | Easy (delete from store) | Hard (blocklist required) |
+| Survives a server restart | Yes (in a real store) | Yes |
+| Works across origins | With CORS + cookies | Easy (header) |
+| Mobile/native clients | Cookies are awkward | Natural fit |
+
+For traditional web apps: sessions. For pure APIs consumed by mobile/SPAs
+that don't want cookies: JWT. For everything in between: probably still
+sessions, because revocation matters.
+
+## What to store
+
+Keep sessions small. The session is loaded on every request.
+
+**Good in a session:**
+- User ID
+- CSRF token
+- Cart items (for a small site)
+- Flash messages
+
+**Bad in a session:**
+- The user's full profile (re-fetch from DB)
+- File contents
+- Anything you can recompute cheaply
+
+If a session field is heavy, store an ID and look up the value on the few
+routes that need it.
+
+## Lifecycle
+
+```js
+// Reset the session (login, role change, anything sensitive)
+req.session.regenerate((err) => {
+  // session ID rotated, old data gone
+  req.session.userId = user.id;
+  res.redirect('/');
+});
+
+// Log out
+req.session.destroy((err) => {
+  res.clearCookie('connect.sid');
+  res.redirect('/login');
+});
+
+// Touch a session (extend expiry without changing data)
+req.session.touch();
+```
+
+**Rotate the session ID on login.** Otherwise, an attacker who tricked
+the victim into accepting their pre-set cookie can use the same ID after
+the victim logs in (session fixation).
+
+## `resave` and `saveUninitialized`
+
+Both default to `true` in the docs but should almost always be `false`:
+
+- `resave: false` — don't write to the store unless the session actually
+  changed. Saves a lot of writes.
+- `saveUninitialized: false` — don't create a session for a request that
+  doesn't set anything. Otherwise every anonymous visitor gets a session
+  row.
+
+The defaults exist for backward compatibility. New code should override
+both.
+
+## CSRF
+
+Sessions live in cookies, which the browser sends automatically — so
+session-authenticated endpoints are CSRF-able. Either:
+
+- Set `sameSite: 'lax'` (good default) or `'strict'` (paranoid).
+- Use a CSRF token stored in the session, sent in a header by your frontend.
+
+See **Auth Basics**.
+
+## In production: TLS only
+
+If your session cookie isn't `secure: true`, an attacker on the same
+Wi-Fi can read the session ID over plain HTTP and impersonate the user.
+Terminate HTTPS at the reverse proxy and set `secure: true`. If you also
+have `trust proxy` enabled, `express-session` will honor it for the
+`secure` cookie attribute.

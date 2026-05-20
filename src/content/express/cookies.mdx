@@ -2,6 +2,143 @@ export const level = 'mid';
 
 # Cookies
 
-_Placeholder._ `res.cookie` / `req.cookies`, `cookie-parser`, signed
-cookies, `HttpOnly` / `Secure` / `SameSite`, and what survives a
-browser restart.
+A cookie is a small piece of data the server sends in `Set-Cookie`, the
+browser stores, and includes back on every subsequent request via the
+`Cookie` header. It's how the web survived statelessness.
+
+## Setting cookies
+
+```js
+res.cookie('userId', '42');                       // basic
+res.cookie('sessionId', 'abc', {
+  httpOnly: true,                                  // JS can't read it
+  secure: true,                                    // only over HTTPS
+  sameSite: 'lax',                                 // CSRF mitigation
+  maxAge: 24 * 60 * 60 * 1000,                     // 24 hours in ms
+  path: '/',
+  domain: 'example.com',
+});
+res.clearCookie('userId');
+```
+
+`res.cookie` adds a `Set-Cookie` header to the response. Multiple
+`res.cookie` calls add multiple headers (legal — browsers handle them
+all). No need for separate middleware to *set* cookies.
+
+## Reading cookies
+
+You **do** need middleware to *read* them — Express doesn't parse the
+`Cookie` header by default.
+
+```js
+import cookieParser from 'cookie-parser';
+app.use(cookieParser('a-secret-for-signing'));
+
+app.get('/', (req, res) => {
+  console.log(req.cookies);        // { userId: '42' }
+  console.log(req.signedCookies);  // signed cookies only
+});
+```
+
+## The security options that actually matter
+
+### `httpOnly`
+
+Cookie is sent over HTTP but **not** readable from JavaScript
+(`document.cookie`). Use this for session IDs and auth tokens. An XSS
+attacker who runs `document.cookie` still gets nothing.
+
+### `secure`
+
+The browser only includes the cookie on HTTPS requests. Plain HTTP
+requests don't see it. Always set this in production.
+
+### `sameSite`
+
+Controls whether the cookie is sent on cross-site requests:
+
+- `'strict'` — never sent cross-site. Strongest CSRF protection, but
+  breaks "click a link from another site to my logged-in page."
+- `'lax'` — sent on top-level navigations (clicking a link) but not on
+  cross-site POSTs or iframes. The modern default for most apps.
+- `'none'` — sent on every request. Required if your cookie genuinely
+  needs to work across origins (third-party auth, embedded widgets).
+  Must be paired with `secure: true`.
+
+Browsers default unset cookies to `Lax`. You'll still want to set it
+explicitly for clarity.
+
+## Signed cookies
+
+A signed cookie is a cookie plus an HMAC of its value, using a server
+secret. The browser can read or even modify the cookie, but if it does,
+the signature won't validate on the way back.
+
+```js
+app.use(cookieParser('long-random-secret'));
+
+app.get('/login', (req, res) => {
+  res.cookie('userId', '42', { signed: true });
+});
+
+app.get('/profile', (req, res) => {
+  const id = req.signedCookies.userId;
+  if (!id) return res.sendStatus(401);
+  // ...
+});
+```
+
+`req.signedCookies.userId` is the original value if the signature
+checked out, or `false` if it was tampered with.
+
+Signed cookies are **not encrypted** — the value is still readable. If
+the value is sensitive (more than just "this user is X"), encrypt it,
+or just store the secret in a session and only put the session ID in the
+cookie.
+
+## Cookies vs sessions vs JWT
+
+- **Cookie alone**: stores actual data on the client. Limited to ~4kb,
+  visible to the user, sent on every request.
+- **Session**: cookie holds an opaque session ID; data lives server-side
+  in a session store. Cookie stays tiny; you can put anything in the
+  session. Server controls lifecycle (revoke, force logout). See
+  **Sessions**.
+- **JWT**: signed token containing claims. Stateless (no server lookup),
+  but you can't revoke a single token without extra machinery.
+
+The right choice depends on whether you can afford a server-side store
+(usually yes) and whether you need revocation (usually yes).
+
+## CSRF and cookies
+
+Cookies are sent automatically by the browser on every request to your
+domain — including requests *triggered by other sites*. If you only use
+cookies for auth, you need CSRF protection: either `SameSite: lax/strict`,
+a CSRF token in a header, or both. See **Auth Basics**.
+
+## Domain and path
+
+- **`path`** — Cookie is only sent for URLs starting with that path. Most
+  cookies use `/`.
+- **`domain`** — Cookie is sent to that domain and subdomains. Without
+  setting it, the cookie is host-only (only the exact host).
+
+Be specific. Setting `domain: '.example.com'` shares the cookie with every
+subdomain — which might be what you want, or might be a leak.
+
+## A reasonable default
+
+For most apps:
+
+```js
+res.cookie('sessionId', value, {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+});
+```
+
+`secure` toggles by env so it still works on `http://localhost` during
+development.

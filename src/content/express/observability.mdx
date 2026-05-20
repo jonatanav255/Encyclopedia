@@ -2,6 +2,196 @@ export const level = 'senior';
 
 # Observability
 
-_Placeholder._ Metrics (RED: rate/errors/duration), traces
-(OpenTelemetry), structured logs, and the three-pillar question:
-"can I find out what's slow without redeploying?"
+Logs tell you *what* happened. Metrics tell you *how often* and
+*how fast*. Traces tell you *where* it happened across services. The
+three together are observability — the ability to understand a system
+you didn't anticipate breaking, without redeploying to add `console.log`s.
+
+## The three pillars
+
+### Metrics
+
+Aggregated numbers over time, low cardinality, cheap to store.
+Prometheus is the de-facto standard.
+
+```js
+import client from 'prom-client';
+
+client.collectDefaultMetrics();    // CPU, memory, GC, event-loop lag
+
+const httpRequests = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status'],
+});
+
+const httpDuration = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Request duration in seconds',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+});
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    const labels = {
+      method: req.method,
+      route: req.route?.path ?? 'other',
+      status: res.statusCode,
+    };
+    httpRequests.inc(labels);
+    httpDuration.observe(labels, seconds);
+  });
+  next();
+});
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.send(await client.register.metrics());
+});
+```
+
+Prometheus scrapes `/metrics` every 15s. Grafana dashboards on top.
+You can now answer: "what's the p99 latency on `/users/:id` over the
+last hour?"
+
+### Logs
+
+Already covered (see **Logging**). For observability specifically:
+
+- Structured JSON so you can query.
+- Include the `requestId` on every line.
+- Log at meaningful levels — `info` for state changes, `warn` for
+  recoverable, `error` for failures.
+- Don't log every successful request *body*. Do log every error.
+
+### Traces
+
+A trace is a record of how one request flowed through your system —
+which functions ran, in what order, for how long, including calls to
+other services. The OpenTelemetry standard does this:
+
+```bash
+npm install @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node
+```
+
+```js
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+
+const sdk = new NodeSDK({
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+```
+
+Auto-instrumentation hooks into Express, `http`, `pg`, `redis`, etc.,
+and emits spans. Ship them to Jaeger, Zipkin, Honeycomb, Datadog —
+they visualize the trace as a waterfall.
+
+For a slow request, you can now see exactly where the time went:
+"180ms in Express → 150ms in `db.query` → 5ms in Redis." Without
+traces you'd be guessing.
+
+## The RED method
+
+For HTTP services, three metrics per route tell you 90% of what you
+need:
+
+- **R**ate: requests/second.
+- **E**rrors: error rate (4xx, 5xx).
+- **D**uration: latency percentiles (p50, p95, p99).
+
+If R drops to zero, the service is down. If E spikes, something
+broke. If D rises, something slowed down. Three dashboards, three
+alerts, you'll catch most outages.
+
+The Prometheus example above gives you all three for free from the
+two metrics defined.
+
+## The USE method
+
+For systems-level metrics:
+
+- **U**tilization: CPU%, memory%, event-loop lag%.
+- **S**aturation: how full are the queues (DB pool, request queue)?
+- **E**rrors: low-level failures.
+
+`prom-client`'s `collectDefaultMetrics` gives you most of this. Add
+DB pool stats from your client and you're covered.
+
+## SLIs, SLOs, SLAs
+
+- **SLI** (indicator): a metric you actually measure. "p99 latency."
+- **SLO** (objective): the target. "p99 latency < 500ms over 30 days."
+- **SLA** (agreement): what you promise customers. Usually weaker than
+  the SLO so you have headroom.
+
+The SLO is what alerts should be tied to. Don't alert on "5xx > 0" —
+that's noise. Alert on "5xx rate has burned through 5% of the error
+budget in the last hour" (burn rate alerting).
+
+## Error tracking
+
+Sentry, Rollbar, Bugsnag, etc. — services that aggregate, deduplicate,
+and notify on errors with full context (stack traces, breadcrumbs,
+user info):
+
+```js
+import * as Sentry from '@sentry/node';
+
+Sentry.init({ dsn: process.env.SENTRY_DSN });
+
+// Express handler
+app.use(Sentry.Handlers.requestHandler());
+app.use(Sentry.Handlers.tracingHandler());
+// ... routes ...
+app.use(Sentry.Handlers.errorHandler());
+```
+
+These are not a substitute for metrics — they catch *what broke*,
+not *how often things are broken*. Use both.
+
+## Health vs readiness
+
+Two different checks:
+
+- **Liveness** (`/health`): "is the process alive?" If it returns
+  non-200, restart me. Should NOT check the database — if the DB is
+  down, restarting Node doesn't help.
+- **Readiness** (`/ready`): "should I receive traffic?" Returns
+  non-200 if DB pool exhausted, downstream services down, or during
+  shutdown. The load balancer stops routing to you.
+
+```js
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.get('/ready', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+```
+
+## What good observability lets you do
+
+Without it, debugging a production issue:
+
+> "Users say it's slow. Look at logs. Nothing obvious. Maybe it's the
+> database? Maybe the cache? Let me grep through 8 services."
+
+With it:
+
+> "Latency dashboard shows p99 spiked at 14:02. Trace shows the
+> spike is in `users-service`'s call to `auth-service`. Auth-service
+> metrics show `verify-token` p99 jumped 10×. Cause: a Redis instance
+> failover. 12 minutes to root cause."
+
+That's the value. It's not free — you pay in storage and engineering
+time. But on a service of any size, it pays back the first time
+something breaks at 3am.

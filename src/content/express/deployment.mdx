@@ -2,6 +2,208 @@ export const level = 'senior';
 
 # Deployment
 
-_Placeholder._ Reverse proxy in front of Node (nginx, ALB), HTTPS
-termination, health-check endpoints, container vs. PaaS tradeoffs, and
-zero-downtime deploys.
+Getting Express from `localhost:3000` to production. The differences are
+mostly about *what's around* Node — the reverse proxy, the TLS layer,
+the process supervisor, the orchestrator — and how to make Node behave
+correctly inside them.
+
+## The standard topology
+
+```
+internet → CDN → LB / reverse proxy → Node process(es)
+```
+
+Each layer has a job:
+
+- **CDN** (Cloudflare, Fastly, Vercel): caches static assets, absorbs
+  DDoS, terminates TLS at the edge, geo-routes.
+- **Load balancer / reverse proxy** (ALB, nginx, Caddy): distributes
+  across replicas, terminates HTTPS, does request-level routing.
+- **Node**: runs your code, talks plain HTTP locally.
+
+Node should almost never be the outermost layer. Even for a small
+side project, a reverse proxy gives you HTTPS, compression, static
+file serving, and rate limiting without burning Node CPU on them.
+
+## HTTPS termination
+
+The proxy terminates TLS — the client connects via HTTPS to the
+proxy, the proxy forwards plain HTTP to Node on the internal network.
+Node never sees a certificate.
+
+This means:
+
+- Set `app.set('trust proxy', 1)` so `req.secure` / `req.protocol`
+  read the `X-Forwarded-Proto` header correctly.
+- Set session cookies as `secure: true` — they'll still work because
+  the proxy reports the original connection was HTTPS.
+- Don't run a custom `https` server in Node. Plain `http.Server` is
+  fine.
+
+## Process management
+
+Node crashes. Bugs, OOM, the network. The process supervisor restarts
+it. Three common options:
+
+- **systemd** unit file (Linux, traditional).
+- **pm2** (a Node-aware supervisor).
+- **Container orchestrator** (Kubernetes, ECS, Fly, Render, Railway).
+
+For a single VPS: systemd is enough. For anything you want to scale
+or operate seriously: containers + orchestrator. The advantage of
+the orchestrator approach is that Node's crash handling reduces to
+"exit on fatal error," and the platform handles the rest.
+
+## Docker
+
+The conventional pattern: one process per container, multi-stage
+build.
+
+```dockerfile
+# build stage
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+
+# runtime stage
+FROM node:22-alpine
+WORKDIR /app
+COPY --from=build /app /app
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+Things to actually do:
+
+- **Use Alpine** for small images. ~50MB vs 1GB for full Debian.
+- **Pin Node** to a specific minor (`22.10`). Floating tags break
+  reproducibility.
+- **Drop privileges**. `USER node` runs as non-root.
+- **Use `npm ci`**, not `npm install` — deterministic installs from
+  the lockfile.
+- **Multi-stage builds**: dev dependencies disappear from the final
+  image.
+- **`HEALTHCHECK`** so orchestrators know when the container is ready.
+
+## Health endpoints
+
+```js
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.get('/ready', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+```
+
+- **`/health`** — process alive? Used by liveness probes. Returns
+  200 unconditionally.
+- **`/ready`** — *ready for traffic*? Checks dependencies. Used by
+  readiness probes and the LB. Returns 503 during shutdown or when
+  DB is unreachable.
+
+The distinction matters: failing `/health` triggers a restart;
+failing `/ready` just stops new traffic.
+
+## Zero-downtime deploys
+
+Two patterns:
+
+### Rolling
+
+Bring up the new version one instance at a time. Old instances keep
+serving until each new one passes `/ready`. The LB never has zero
+healthy backends.
+
+This is what Kubernetes Deployments and ECS Rolling Updates do by
+default. Requires graceful shutdown (see **Graceful Shutdown**) so
+draining instances don't drop in-flight requests.
+
+### Blue/green
+
+Run two complete stacks. Switch the LB from blue to green. Roll back
+by flipping back. Easy rollback, double the infrastructure during a
+deploy. Common in regulated environments where rollback speed
+matters.
+
+Rolling is the default; blue/green for high-stakes services.
+
+## Environment configuration
+
+Configuration via env vars (see **Environment**), set by the
+platform — never baked into the image. The same image runs in
+staging and prod, only the env differs.
+
+For secrets:
+
+- **Kubernetes**: Secrets, mounted as env or files.
+- **AWS**: Parameter Store / Secrets Manager via IAM.
+- **Hosted PaaS** (Railway, Fly, Render, Heroku): platform UI / CLI.
+
+Never put secrets in the Dockerfile or commit them to git.
+
+## Reverse proxy basics (nginx)
+
+```nginx
+upstream node {
+  server 127.0.0.1:3000;
+  keepalive 32;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name api.example.com;
+  ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+  location / {
+    proxy_pass http://node;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+}
+```
+
+The `Upgrade`/`Connection` headers are required for WebSockets to
+work through the proxy. The `X-Forwarded-*` headers are what
+`trust proxy` reads.
+
+## When to skip the reverse proxy
+
+Only on a managed platform that already provides one. Fly, Render,
+Vercel, Cloudflare Workers, Railway — they have HTTPS + LB built in.
+Your code just runs Node and listens on a port; the platform handles
+everything in front.
+
+In any other setup, run a real reverse proxy.
+
+## Logs and metrics in deployment
+
+Write logs to stdout. The platform collects them. Don't write to
+`./logs/app.log` from inside the container — those files vanish on
+restart.
+
+Expose `/metrics` if running Prometheus, or send to a managed APM
+(Datadog, NewRelic, Sentry).
+
+## Rollback
+
+The most important deployment skill: rollback works fast and easily.
+
+- Tag every image with the git SHA.
+- Keep the previous N images available.
+- Verify rollback works before you need it — practice it.
+
+A deploy that you can't roll back from is a hostage situation.

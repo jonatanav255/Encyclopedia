@@ -2,6 +2,214 @@ export const level = 'senior';
 
 # WebSockets
 
-_Placeholder._ HTTP upgrade handshake, where `ws` and `socket.io` plug
-into an Express server, sharing auth state with HTTP routes, and what
-sticky routing requires.
+HTTP is request/response — the client asks, the server answers, the
+connection is mostly idle. WebSockets are bidirectional: an open
+connection over which either side can send messages at any time. For
+chat, multiplayer games, live dashboards, collaborative editing —
+WebSockets fit where polling would burn resources.
+
+## How it starts
+
+WebSockets begin as an HTTP request with a special `Upgrade` header:
+
+```
+GET /ws HTTP/1.1
+Host: api.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+```
+
+The server responds:
+
+```
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+After 101, the TCP connection stops speaking HTTP and starts speaking
+the WebSocket binary frame protocol. Express never sees those frames —
+they bypass the HTTP request lifecycle entirely.
+
+## Two libraries
+
+- **`ws`** — low-level, fast, just the WebSocket protocol.
+- **`socket.io`** — `ws` plus channels, rooms, automatic reconnection,
+  fallback to long-polling, broadcast helpers. Easier for chat-like
+  workloads.
+
+For raw WebSockets where you control both ends, use `ws`. For
+"realtime chat with reconnects across networks," use `socket.io`.
+
+## Sharing the HTTP server
+
+```js
+import { createServer } from 'node:http';
+import { WebSocketServer } from 'ws';
+import { app } from './app.js';
+
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws, req) => {
+  ws.on('message', (data) => {
+    ws.send(`echo: ${data}`);
+  });
+  ws.send('hello');
+});
+
+server.listen(3000);
+```
+
+The same TCP server handles HTTP and WebSocket upgrades. Express
+handles HTTP; `ws` handles the upgrade requests on the path it's
+attached to.
+
+For multiple WS endpoints, intercept upgrades manually:
+
+```js
+const chatWss = new WebSocketServer({ noServer: true });
+const adminWss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url === '/chat') {
+    chatWss.handleUpgrade(req, socket, head, (ws) => {
+      chatWss.emit('connection', ws, req);
+    });
+  } else if (req.url === '/admin') {
+    adminWss.handleUpgrade(req, socket, head, (ws) => {
+      adminWss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+```
+
+## Authentication
+
+The Upgrade request is just an HTTP request. You can authenticate it
+the same way:
+
+```js
+server.on('upgrade', async (req, socket, head) => {
+  const token = new URL(req.url, 'http://x').searchParams.get('token');
+  const user = await verifyToken(token);
+  if (!user) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  req.user = user;
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+```
+
+For cookie-based sessions, parse the cookie from the Upgrade request
+and look up the session in the same store Express uses. Same auth
+logic, different transport.
+
+## The scaling problem
+
+WebSockets are **stateful**: each connection lives on one specific
+worker process. That breaks two assumptions:
+
+### Broadcasting
+
+User A on worker 1 sends a message. Users B and C are connected to
+worker 2. Worker 1 doesn't know about them. To broadcast across
+workers, use a pub/sub layer:
+
+```js
+import { createClient } from 'redis';
+const sub = createClient();
+const pub = createClient();
+await sub.connect();
+await pub.connect();
+
+sub.subscribe('chat', (msg) => {
+  // Send to every local connection
+  for (const ws of wss.clients) ws.send(msg);
+});
+
+ws.on('message', (data) => {
+  pub.publish('chat', data);    // fan out via Redis
+});
+```
+
+`socket.io` has a `redis-adapter` that does this for you.
+
+### Sticky sessions
+
+If the client reconnects, it might land on a different worker — losing
+its room membership, subscriptions, etc. Either:
+
+- Make the connection stateless (re-subscribe on connect).
+- Use sticky routing at the LB (IP-hash, or a cookie set during the
+  initial connection).
+
+Modern load balancers support sticky for WebSockets natively.
+
+## When the connection dies
+
+Networks drop. Phones go to sleep. Tunnels close. Three keep-alive
+mechanisms:
+
+- **Native ping/pong**: `ws` sends ping frames; clients respond
+  automatically. If no pong comes back, the server can terminate.
+- **Application-level heartbeat**: client and server send `{ type:
+  'ping' }` messages every N seconds.
+- **Server-driven detection**:
+
+```js
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30_000);
+
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+});
+```
+
+Without this, half-open connections (TCP says "alive," other side is
+gone) pile up forever.
+
+## Server-Sent Events vs WebSockets
+
+If you only need **server → client** streaming (live notifications,
+progress updates, dashboards), SSE is much simpler — it's just an
+HTTP response that never ends. See **Streaming**. Use WebSockets when
+you need bidirectional. Use SSE for one-way.
+
+## What NOT to do in Express alongside WebSockets
+
+- **Request/response over WS** that should be a regular HTTP call.
+  WS doesn't have the same caching, logging, instrumentation. Use it
+  for genuine real-time stuff only.
+- **Long polling** on Express routes when you really want WebSockets.
+  It works but doesn't scale — connections hold workers, retries
+  amplify load.
+- **Treating WS as a free replacement for a queue.** If you need
+  durability or backpressure, use a real queue (BullMQ, Kafka, SQS).
+  WS is best-effort.
+
+## Production checklist
+
+- Auth on Upgrade.
+- Ping/pong heartbeat.
+- Redis pub/sub for cross-worker messages.
+- Reasonable max-message-size to prevent memory attacks.
+- Track connection count as a metric.
+- Connection-level rate limiting (otherwise one client can flood
+  one worker).
+- Reconnect logic in the client (or use socket.io which has it).

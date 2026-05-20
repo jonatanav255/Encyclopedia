@@ -2,5 +2,184 @@ export const level = 'senior';
 
 # Caching
 
-_Placeholder._ HTTP caching headers (`Cache-Control`, `ETag`,
-`Last-Modified`), conditional requests, and where Express fits in the chain.
+The fastest response is the one you don't compute. HTTP caching is a
+protocol-level mechanism that lets the browser, intermediate CDNs, and
+your reverse proxy avoid round-tripping to Express for things that
+haven't changed.
+
+## The two big response headers
+
+### `Cache-Control`
+
+The primary instruction. Examples:
+
+```
+Cache-Control: no-store
+Cache-Control: no-cache
+Cache-Control: public, max-age=3600
+Cache-Control: private, max-age=60, must-revalidate
+Cache-Control: public, max-age=31536000, immutable
+```
+
+Common directives:
+
+- **`max-age=N`** — cache this for N seconds.
+- **`public`** / **`private`** — `public` means intermediate caches
+  (CDNs) can cache it; `private` means only the user's browser can.
+- **`no-cache`** — confusingly named. The cache MUST revalidate
+  before using its copy. The copy is still cached.
+- **`no-store`** — actually don't cache. Use for sensitive data.
+- **`immutable`** — promise the resource won't change for `max-age`.
+  Skip even the validation request. Use with content-hashed filenames.
+- **`stale-while-revalidate=N`** — serve stale for N seconds while
+  fetching a fresh copy in the background. Great for "fast feel + still
+  fresh."
+
+### `ETag` / `Last-Modified`
+
+Validators — the cache asks "is this still current?" using these.
+
+```
+ETag: "abc123"
+Last-Modified: Wed, 23 Oct 2024 14:00:00 GMT
+```
+
+Next request from the cache:
+
+```
+GET /users/42 HTTP/1.1
+If-None-Match: "abc123"
+If-Modified-Since: Wed, 23 Oct 2024 14:00:00 GMT
+```
+
+Your server checks. If still current, return **304 Not Modified** with
+no body. The cache reuses its copy.
+
+## Express defaults
+
+Express adds a weak ETag for HTML responses automatically. Configure:
+
+```js
+app.set('etag', 'strong');     // strong ETag
+app.set('etag', false);         // turn it off
+```
+
+`express.static` does ETag + Last-Modified for files on disk
+automatically. For dynamic routes you wire it up yourself.
+
+## Conditional handlers
+
+```js
+app.get('/users/:id', async (req, res) => {
+  const user = await db.getUser(req.params.id);
+  res.set('ETag', `"${user.version}"`);
+
+  if (req.fresh) {
+    return res.sendStatus(304);
+  }
+  res.json(user);
+});
+```
+
+`req.fresh` is `true` when the client's `If-None-Match` or
+`If-Modified-Since` matches what you just set on `res`. You bail with a
+304 — no body sent, bandwidth saved.
+
+## A reasonable policy
+
+```js
+app.use('/assets', express.static('public', {
+  maxAge: '7d',                    // public assets cache for 7 days
+  immutable: true,                  // we use hashed filenames
+}));
+
+app.get('/api/me', (req, res) => {
+  res.set('Cache-Control', 'private, no-store');  // never cache user data
+  res.json(req.user);
+});
+
+app.get('/api/news', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+  res.json(news);
+});
+```
+
+Three lessons:
+
+1. Hashed static assets: cache forever (immutable, max-age=1y).
+2. Per-user data: never cache.
+3. Public, slowly-changing data: short max-age + stale-while-revalidate.
+
+## In-memory caching inside Express
+
+Sometimes you cache *inside* Node — a result you computed, keyed by
+some input. Two libraries:
+
+- **`lru-cache`** — bounded by item count, evicts least-recently-used.
+- **Redis** — shared across instances, persists, but adds network hops.
+
+```js
+import { LRUCache } from 'lru-cache';
+const cache = new LRUCache({ max: 1000, ttl: 60_000 });
+
+app.get('/expensive', async (req, res) => {
+  const cached = cache.get(req.url);
+  if (cached) return res.json(cached);
+
+  const result = await compute(req.query);
+  cache.set(req.url, result);
+  res.json(result);
+});
+```
+
+**Problem**: in-process cache doesn't share across instances. With 4
+Node workers, you have 4 caches. For consistency, use Redis. For speed
+and tolerable inconsistency, LRU.
+
+## Cache invalidation
+
+The famous one: "there are only two hard things in CS, cache
+invalidation and naming things." Strategies:
+
+- **TTL** — accept staleness up to N seconds. Simplest.
+- **Version in key** — when data changes, bump a version
+  (`/users/42?v=3`). Old caches become unreachable.
+- **Explicit purge** — call `cache.delete(key)` on writes. Doesn't work
+  for CDN/browser caches you don't control.
+- **`Cache-Control: no-cache`** — caches keep a copy but revalidate on
+  every request. Cheaper than re-fetching but always fresh.
+
+For CDN-level cache, most providers expose a purge API. For user
+browsers, you can't purge — design the URL/header strategy assuming
+clients won't help you.
+
+## What never to cache
+
+- Authenticated responses with `Cache-Control: public`. A shared cache
+  (CDN, proxy) might serve user A's data to user B.
+- Anything containing secrets — even `private` cache lives on disk on
+  the client.
+- Responses to non-idempotent methods (`POST`, `PATCH`, `DELETE`).
+  Caches ignore them by default; don't undo that.
+
+## The `Vary` header
+
+If your response varies based on a request header (`Accept-Language`,
+`Accept-Encoding`, `Authorization`), you must tell caches:
+
+```
+Cache-Control: public, max-age=60
+Vary: Accept-Language, Authorization
+```
+
+Without `Vary`, the cache might serve the English copy to a French
+client, or your data to someone else. `Vary: Authorization` effectively
+disables shared caching — which is usually what you want for
+auth-dependent responses.
+
+## CDN > origin caching
+
+If you have any real traffic, caching at the CDN (Cloudflare, Fastly,
+Vercel Edge) is dramatically more effective than caching in Express.
+The request never reaches your server. Configure `Cache-Control`
+correctly and let the CDN do most of the work.

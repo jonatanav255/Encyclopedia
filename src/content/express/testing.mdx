@@ -2,6 +2,158 @@ export const level = 'mid';
 
 # Testing
 
-_Placeholder._ `supertest` against an Express `app` instance,
-testing middleware in isolation, mocking vs. integration, and why
-`app.listen()` doesn't have to run for tests.
+The Express object you build is itself a request handler — you don't need
+a running server to test it. `supertest` drives the app in-memory, sending
+real-shape HTTP requests through it and giving you the response back. That
+makes integration tests fast and deterministic.
+
+## Setup
+
+```bash
+npm install -D supertest vitest
+```
+
+Refactor `app.listen` out of the file that builds the app:
+
+```js
+// app.js
+import express from 'express';
+export const app = express();
+app.use(express.json());
+app.get('/', (req, res) => res.json({ ok: true }));
+```
+
+```js
+// server.js
+import { app } from './app.js';
+app.listen(process.env.PORT ?? 3000);
+```
+
+Tests import `app`, not `server.js`. No port, no socket.
+
+## A basic test
+
+```js
+import request from 'supertest';
+import { app } from './app.js';
+import { test, expect } from 'vitest';
+
+test('GET / returns ok', async () => {
+  const res = await request(app).get('/');
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ ok: true });
+});
+
+test('POST /users validates input', async () => {
+  const res = await request(app)
+    .post('/users')
+    .send({ email: 'not-an-email' });
+  expect(res.status).toBe(400);
+});
+```
+
+`supertest` returns a thenable. Each call hits your real middleware stack —
+parsers, auth, routes, error handlers, the whole thing.
+
+## Headers, cookies, auth
+
+```js
+await request(app)
+  .post('/admin')
+  .set('Authorization', `Bearer ${token}`)
+  .send({ data: 'x' });
+
+// Persistent session across requests:
+const agent = request.agent(app);
+await agent.post('/login').send({ email, password });
+await agent.get('/me');     // cookies from the login carry over
+```
+
+`request.agent(app)` is the right pick when you want to log in and then
+hit multiple authenticated endpoints in the same test.
+
+## Testing middleware in isolation
+
+You don't have to mount middleware into an app to test it — you can call
+it directly:
+
+```js
+test('requireAuth rejects without session', () => {
+  const req = { session: {} };
+  const res = {
+    status: vi.fn().mockReturnThis(),
+    json: vi.fn(),
+    sendStatus: vi.fn(),
+  };
+  const next = vi.fn();
+
+  requireAuth(req, res, next);
+
+  expect(res.sendStatus).toHaveBeenCalledWith(401);
+  expect(next).not.toHaveBeenCalled();
+});
+```
+
+This is faster and more focused, but it tests the function's contract,
+not how it composes. Use both kinds of tests.
+
+## Mocking vs not
+
+You'll hit the classic tradeoff: mock the database (fast tests, narrow
+guarantees) or run a real one (slower, catches real bugs).
+
+For most production services the right balance:
+
+- **Unit tests**: pure functions (validators, formatters, business rules).
+  No mocks needed.
+- **Integration tests with real DB**: spin up a test database
+  (Postgres in a container, or SQLite for simple schemas). Test the full
+  middleware stack against it. Slower but catches the bugs that matter.
+- **Contract tests against external APIs**: mock the third party
+  (Stripe, SendGrid). Hitting them in tests is flaky and costly.
+
+Use a transaction-rollback pattern to isolate tests if the DB is
+shared:
+
+```js
+beforeEach(async () => { await db.query('BEGIN'); });
+afterEach(async () => { await db.query('ROLLBACK'); });
+```
+
+Every test starts in a clean state without dropping tables.
+
+## Async errors
+
+`supertest` resolves its promise even on 4xx/5xx — you assert on the
+status. It only rejects on connection-level failures (which don't happen
+in-memory).
+
+```js
+const res = await request(app).post('/throws');
+expect(res.status).toBe(500);   // your error handler must respond
+```
+
+If a handler throws and your error middleware doesn't catch it, the test
+hangs until vitest's timeout. That's a real bug — fix the handler.
+
+## Test isolation
+
+Avoid module-level state in your app code: any singleton that holds
+data (an in-memory cache, a counter) leaks between tests. Reset
+explicitly in `beforeEach` or wire it through the request so it can be
+swapped per test.
+
+## End-to-end vs integration
+
+`supertest` doesn't open a port. That's an integration test — Express +
+middleware + handlers + DB. For full end-to-end (a real browser hitting
+a real running server), use Playwright or Cypress against `npm run dev`.
+You want both, but in different quantities — 90% integration, 10% E2E
+for the critical flows.
+
+## Coverage isn't the goal
+
+Tests exist so you can change code with confidence, not to hit a number.
+A test that asserts `res.status === 200` and nothing else is worse than
+no test — it gives false security and forces busywork on every refactor.
+Test behavior, not implementation.

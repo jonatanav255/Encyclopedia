@@ -2,6 +2,96 @@ export const level = 'mid';
 
 # Trust Proxy
 
-_Placeholder._ `app.set('trust proxy', ...)`, what changes for
-`req.ip` / `req.protocol` / `req.secure`, and why getting this wrong
-breaks rate limiting and HTTPS detection behind a load balancer.
+In production your Node process almost never talks directly to the
+client. There's a reverse proxy (nginx, ALB, Cloudflare, Heroku
+router) in between, and that proxy is what the client connects to. By
+the time the request reaches Node, the "client" is the proxy — same
+IP, plain HTTP — and a lot of things lie. `app.set('trust proxy', ...)`
+tells Express how to untangle this.
+
+## What goes wrong without it
+
+```js
+app.get('/whoami', (req, res) => {
+  res.json({
+    ip: req.ip,             // → 127.0.0.1 (the proxy)
+    secure: req.secure,     // → false (proxy → node is HTTP)
+    protocol: req.protocol, // → 'http'
+  });
+});
+```
+
+That's wrong for every real client. The actual client IP is in the
+`X-Forwarded-For` header that the proxy set. The actual protocol is
+in `X-Forwarded-Proto`. Express ignores those by default — for a good
+reason: an upstream you don't trust can spoof them.
+
+## Telling Express which proxy to trust
+
+```js
+app.set('trust proxy', 1);            // trust 1 proxy hop
+app.set('trust proxy', 'loopback');   // trust 127.0.0.1, ::1
+app.set('trust proxy', '10.0.0.0/8'); // CIDR range
+app.set('trust proxy', true);          // trust everything — DANGEROUS
+```
+
+With `trust proxy` set:
+
+- `req.ip` becomes the real client IP from `X-Forwarded-For`.
+- `req.ips` is the full chain (when behind multiple proxies).
+- `req.protocol` reads `X-Forwarded-Proto`.
+- `req.secure` reads it too.
+- `req.hostname` reads `X-Forwarded-Host`.
+
+## Pick the right value
+
+The value answers: "how many hops do you trust?"
+
+- **`1`** — you have one reverse proxy in front (nginx, ALB).
+- **`2`** — you have a CDN in front of your reverse proxy
+  (Cloudflare → ALB → Node).
+- **CIDR / IP** — you trust specific proxy IPs by network range.
+- **`true`** — trust *every* claimed forwarded address. Never do this
+  in production. Any client can spoof `X-Forwarded-For` and your rate
+  limiter thinks each request comes from a different IP.
+
+When in doubt, set the smallest number that matches your real
+topology.
+
+## Why it matters
+
+A surprising amount of code depends on `req.ip` and `req.secure`:
+
+- **Rate limiting** keys by IP. With `trust proxy` off, every request
+  looks like it's from the proxy — you're rate-limiting all your users
+  collectively.
+- **HTTPS redirects.** `if (!req.secure) res.redirect(...)` causes an
+  infinite redirect loop without `trust proxy`, because Node never
+  *is* `secure` behind the proxy.
+- **Session cookies** with `secure: true` won't be set if Express
+  thinks the connection is HTTP.
+- **CSRF and audit logs** record IPs. Without trust, every log line is
+  the same proxy IP.
+
+## In production
+
+For most setups:
+
+```js
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+```
+
+Behind Cloudflare → ALB → Node (two hops): set it to `2`. Behind
+Heroku, Render, Fly, Railway: usually `1` — check the platform docs.
+
+## Don't trust headers you don't need
+
+If you don't run behind a proxy, leave `trust proxy` at its default
+(off). Otherwise an attacker can just send their own `X-Forwarded-For`
+header and you'll log/limit by whatever they claim.
+
+The principle: trust comes from network position, not headers. Express
+needs to know which network positions are trustworthy, and that's what
+`trust proxy` configures.

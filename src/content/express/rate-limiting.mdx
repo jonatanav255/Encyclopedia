@@ -2,5 +2,172 @@ export const level = 'senior';
 
 # Rate Limiting
 
-_Placeholder._ Why naive in-memory counters break across instances,
-token bucket vs. fixed window, and how to key by user vs. IP.
+A rate limit caps how many requests a single client can make in a given
+window. The reasons range from boring (protect a downstream service from
+overload) to existential (stop a credential-stuffing bot from burning
+through your login endpoint). Done right it's invisible; done wrong it
+blocks legitimate users or fails to slow attackers down.
+
+## The simplest version
+
+```js
+import rateLimit from 'express-rate-limit';
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000,        // 1 minute
+  max: 100,                    // 100 requests per IP per window
+  standardHeaders: true,       // expose RateLimit-* headers
+  legacyHeaders: false,
+});
+
+app.use(limiter);
+```
+
+What happens:
+
+- The limiter counts requests per IP.
+- When an IP exceeds 100 in the last 60 seconds, subsequent requests
+  get **429 Too Many Requests**.
+- The response includes `RateLimit-Limit`, `RateLimit-Remaining`, and
+  `RateLimit-Reset` headers so clients know when to retry.
+
+## Multiple limits
+
+Apply different limits to different routes:
+
+```js
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,    // 15 minutes
+  max: 5,                       // 5 attempts per IP
+  message: { error: 'too many login attempts' },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1000,
+});
+
+app.post('/login', loginLimiter, loginHandler);
+app.use('/api', apiLimiter, apiRouter);
+```
+
+Login should be tight. The main API can be looser. Don't apply one
+global limit and call it done.
+
+## In-memory is a trap in production
+
+`express-rate-limit` defaults to an in-memory store. That works for one
+process. It fails the moment you scale:
+
+- **Multiple workers** (Node cluster, pm2) — each worker has its own
+  counter. Real limit is `max × workers`.
+- **Multiple instances** (containers, regions) — same problem times N.
+- **Restarts** — the counter resets, attackers wait for a deploy.
+
+For anything multi-process, use a shared store:
+
+```js
+import RedisStore from 'rate-limit-redis';
+import { createClient } from 'redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  store: new RedisStore({
+    sendCommand: (...args) => redis.sendCommand(args),
+  }),
+});
+```
+
+All workers + instances share the same counter. The limit is real.
+
+## Keying
+
+By default the key is `req.ip`. That's only correct when `trust proxy`
+is set right (see **Trust Proxy**) — otherwise everyone shares the
+same key.
+
+For authenticated users, key by user instead of IP:
+
+```js
+rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+});
+```
+
+This stops one bad-actor IP from being able to brute-force across many
+hijacked sessions, and one user from spamming through many IPs.
+
+## Fixed window vs token bucket vs sliding window
+
+- **Fixed window** (default): "max N per minute." Simple but allows
+  bursts at the boundary — 100 requests at 12:00:59 and another 100 at
+  12:01:00 means 200 in two seconds.
+- **Sliding window**: limit applies to any rolling N-second period.
+  Smoother, more accurate. `rate-limiter-flexible` does this.
+- **Token bucket**: bucket of N tokens refills at rate R. Each request
+  consumes a token. Bursts allowed up to bucket size, then steady at
+  refill rate. Closer to how real systems should behave.
+
+For most apps, the fixed-window default is fine. For protecting an
+expensive endpoint, prefer token bucket via `rate-limiter-flexible`.
+
+## What to do when limited
+
+Send `429`, include `Retry-After`, and **don't be silent**:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+RateLimit-Reset: 1730000030
+Content-Type: application/json
+
+{"error": "rate_limited", "retry_after": 30}
+```
+
+Well-behaved clients honor `Retry-After`. Browsers don't, but your
+SDKs and integrations should.
+
+## Defense in depth
+
+Application-level rate limiting is not the strongest layer:
+
+1. **CDN / WAF** (Cloudflare, AWS WAF) — blocks abusive IPs before
+   they reach your origin. Cheaper than burning Node CPU on bots.
+2. **Reverse proxy** (nginx) — connection limits, request rate limits
+   at the edge.
+3. **Express middleware** — application-aware limits (per-user,
+   per-endpoint).
+4. **Business logic** — exponential backoff for repeated login
+   failures, account lockout, captchas.
+
+Don't lean entirely on the Express layer. By the time a request
+reaches Node, you've already paid for it.
+
+## What rate limiting can't fix
+
+- **Distributed attacks** — 10k IPs each making 1 request per second
+  blow past any reasonable per-IP limit. You need WAF/CDN-level
+  defenses.
+- **Resource exhaustion from one big request** — a 100MB JSON payload
+  doesn't count against per-minute limits but can pin your server. Use
+  size limits (`express.json({ limit })`).
+- **Slow-loris** — clients that send bytes very slowly to hold
+  connections open. Set timeouts on the HTTP server.
+
+## Don't accidentally limit your own services
+
+If your monitoring or healthcheck hits the same endpoint from the same
+IP, they get rate-limited too. Skip them:
+
+```js
+rateLimit({
+  // ...
+  skip: (req) => req.ip === '127.0.0.1' || req.path === '/health',
+});
+```

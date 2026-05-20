@@ -2,6 +2,121 @@ export const level = 'senior';
 
 # Compression
 
-_Placeholder._ `compression` middleware (gzip/brotli), when not to
-compress (already-compressed payloads, tiny responses), and why the
-reverse proxy often does this instead.
+HTTP supports response body compression: the server sends fewer bytes,
+the browser decompresses them. For text-heavy responses (HTML, JSON, CSS,
+JS) the wins are dramatic — often 70–80% smaller. The `compression`
+middleware does this transparently.
+
+## The setup
+
+```js
+import compression from 'compression';
+app.use(compression());
+```
+
+That's it. The middleware:
+
+1. Checks the request's `Accept-Encoding` header.
+2. If the client supports `gzip` (or `br` for newer versions), wraps
+   `res.write` and `res.end` to compress the outgoing stream.
+3. Sets `Content-Encoding: gzip` on the response.
+4. Updates `Vary: Accept-Encoding` so caches store the compressed
+   variant correctly.
+
+The handlers downstream don't know it's happening — they `res.json`
+or `res.send` normally, and bytes go out compressed.
+
+## When NOT to compress
+
+Compressing wastes CPU and gains nothing for:
+
+- **Already-compressed payloads**: JPEGs, PNGs (already DEFLATE),
+  WebP, MP4, ZIP files. The compressor tries, fails, and you pay CPU
+  for ~0% savings.
+- **Very small responses**: under ~1KB, the compression headers + dict
+  overhead make the response *bigger*.
+- **HTTPS-only sensitive data**: BREACH and CRIME attacks exploit
+  compression to leak secrets in some narrow cases (when an attacker
+  can inject content into a response containing a secret). For
+  per-user pages with auth tokens in the body, this matters.
+
+The middleware has `filter` for the first two:
+
+```js
+import compression from 'compression';
+
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);  // default: skips already-compressed types
+  },
+  threshold: 1024,    // skip responses smaller than 1KB
+}));
+```
+
+Defaults are usually fine — `compression.filter` correctly skips
+`image/*`, `video/*`, and `audio/*`.
+
+## Brotli vs gzip
+
+Brotli is newer, compresses ~20% better than gzip, and is supported by
+all modern browsers. It's slower to compress at maximum quality but
+fine at default levels.
+
+Node's built-in `zlib` supports both. `compression` defaults to gzip
+but you can switch:
+
+```js
+import compression from 'compression';
+import { constants } from 'node:zlib';
+
+app.use(compression({
+  // brotli when supported, gzip fallback
+  brotli: { params: { [constants.BROTLI_PARAM_QUALITY]: 4 } },
+}));
+```
+
+Brotli quality 4 is a reasonable production setting — bigger payload
+than max quality, much faster to produce.
+
+## The reverse-proxy alternative
+
+In production with nginx, Cloudflare, or another HTTP proxy in front
+of Node, you usually want **the proxy** to handle compression, not
+Express:
+
+- Proxies are written in C/Rust and compress much faster than Node.
+- They cache compressed variants in memory.
+- They free Node CPU for actual app logic.
+
+If your proxy is doing it, disable in Express:
+
+```js
+if (process.env.NODE_ENV !== 'production') {
+  app.use(compression());  // dev only
+}
+```
+
+Check by running `curl -H 'Accept-Encoding: gzip' -I https://yoursite/`
+and looking at `Content-Encoding`.
+
+## Compression and streaming
+
+Compression works on streams — the middleware wraps `res` in a
+transform. Streaming JSON, NDJSON, or files all compress fine. The
+client receives the compressed stream and decompresses incrementally.
+
+The catch: compressed responses can't easily resume from a byte offset
+(no native HTTP range requests over a compressed stream). For
+file downloads where range support matters, ship uncompressed (the
+file's already compressed anyway, usually).
+
+## CPU vs bandwidth
+
+The whole point: you trade CPU (compression cost) for bandwidth
+(transferred bytes). The tradeoff is almost always worth it for
+text payloads — your CPU is much cheaper than the user's RTT.
+
+When it's NOT worth it: low-traffic services on tiny VMs where CPU is
+scarce, and you're behind a CDN that already caches and compresses.
+Then let the CDN do it; Node doesn't need to.

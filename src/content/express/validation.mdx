@@ -2,5 +2,171 @@ export const level = 'mid';
 
 # Validation
 
-_Placeholder._ Why you should never trust `req.body`, where validation belongs
-in the middleware chain, and the schema-first vs. ad-hoc tradeoff.
+Never trust `req.body`, `req.params`, or `req.query`. They're whatever
+the client sent. Validation is the layer that converts "untyped JSON
+from the internet" into "data my handler can safely use."
+
+## Why this matters
+
+Without validation:
+
+- `req.body.amount` could be a string, an object, `null`, or undefined.
+- `req.params.id` could be `'abc'` when you expected a number.
+- `req.body` could contain extra fields you didn't intend to save.
+
+Three failure modes follow:
+
+1. Crashes and 500s when downstream code blows up on bad input.
+2. Storing garbage in the database, corrupting downstream logic.
+3. Security holes — mass-assignment (`req.body.isAdmin = true`),
+   prototype pollution, SQL/NoSQL injection.
+
+A validator at the edge of every handler is the cheapest fix.
+
+## Pick a schema library
+
+Three serious options in JS:
+
+- **[zod](https://zod.dev/)** — TypeScript-first, infers static types
+  from schemas, great DX. The current default for new projects.
+- **[ajv](https://ajv.js.org/)** — JSON Schema compiler, fastest, what
+  you want if you already have JSON Schema (OpenAPI specs, etc.).
+- **[joi](https://joi.dev/)** — older, fluent API, no TS inference. Fine
+  if you already use it.
+
+The rest of this page uses zod because of the type inference.
+
+## A minimal example
+
+```js
+import { z } from 'zod';
+
+const CreateUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+  age: z.number().int().min(0).max(150).optional(),
+});
+
+app.post('/users', (req, res) => {
+  const parsed = CreateUserSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: 'validation_failed',
+      issues: parsed.error.issues,
+    });
+  }
+  const input = parsed.data;   // fully typed in TS
+  // ... safe to use input.email, input.name, input.age
+});
+```
+
+What the schema enforces:
+
+- `email` must be a string and look like an email.
+- `name` must be a non-empty string ≤ 100 chars.
+- `age` is optional, but if present must be an int 0–150.
+- **Extra fields are silently dropped** by default — no
+  mass-assignment risk.
+
+## Validation as middleware
+
+To avoid repeating the same `safeParse` boilerplate everywhere:
+
+```js
+const validate = (schema) => (req, res, next) => {
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: 'validation_failed',
+      issues: parsed.error.issues,
+    });
+  }
+  req.body = parsed.data;     // replace with parsed (and coerced) data
+  next();
+};
+
+app.post('/users', validate(CreateUserSchema), (req, res) => {
+  // req.body is now typed + validated
+});
+```
+
+Now the route handler can pretend the input is already safe.
+
+## Validate every input, not just body
+
+Params and query strings need validation too:
+
+```js
+const GetUserParams = z.object({
+  id: z.coerce.number().int().positive(),
+});
+
+const ListUsersQuery = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  sort: z.enum(['name', 'createdAt']).default('createdAt'),
+});
+
+app.get('/users/:id', (req, res) => {
+  const { id } = GetUserParams.parse(req.params);
+  // ...
+});
+```
+
+`z.coerce.number()` converts the string param to a number before
+validating — critical because everything in `req.params` and
+`req.query` arrives as a string.
+
+## Don't trust the result type without validation
+
+In TypeScript:
+
+```ts
+const body = req.body as CreateUserInput; // ❌ lie
+```
+
+`as` is just a cast — it doesn't check anything. Runtime input is
+shaped however the client made it. **Always** validate, then trust
+the result.
+
+## Return useful error responses
+
+The default zod errors are verbose. Reshape into something a client
+can use:
+
+```js
+function formatIssues(error) {
+  return error.issues.map(i => ({
+    path: i.path.join('.'),
+    message: i.message,
+  }));
+}
+
+if (!parsed.success) {
+  return res.status(400).json({
+    error: 'validation_failed',
+    issues: formatIssues(parsed.error),
+  });
+}
+```
+
+A client gets `{ path: 'email', message: 'Invalid email' }` instead of
+the full zod blob. Form UIs can map this back to fields directly.
+
+## When to validate
+
+- **At the request boundary**, always. Body, params, query.
+- **At external service boundaries** (third-party webhook bodies, S3
+  event payloads).
+- **At database read boundaries**, if the database might contain old
+  records that don't match your current schema.
+
+You can also validate *outputs* (the response body) in tests as a
+schema check — useful for catching API drift.
+
+## Don't validate everywhere
+
+Inside your service, once a value has been validated, treat it as
+typed. Re-validating internally is noise.
+
+Boundaries: validate. Internals: trust.

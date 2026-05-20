@@ -2,6 +2,167 @@ export const level = 'senior';
 
 # Async Errors
 
-_Placeholder._ `unhandledRejection` in Express 4 vs Express 5
-auto-forwarding, why a single missed `try/catch` can take down a
-process, and how this differs from sync error handling.
+Two errors that don't get caught by your normal error-handling middleware
+will take a Node process down: **unhandled promise rejections** and
+**uncaught exceptions in async callbacks**. Express helps with the first
+kind (in v5) but neither story is automatic in v4. Understanding what
+each one *is* and where it comes from is what stops 3am crashes.
+
+## The two flavors
+
+### Unhandled promise rejection
+
+```js
+async function loadUser(id) {
+  return await db.users.findById(id); // throws
+}
+
+app.get('/users/:id', async (req, res) => {
+  const user = await loadUser(req.params.id);
+  res.json(user);
+});
+```
+
+In Express 4: the rejection propagates up. The router only catches
+sync throws, so the rejection bubbles into Node as `unhandledRejection`.
+The request hangs (client times out). Node 15+ then terminates the
+process by default.
+
+In Express 5: rejected promises are forwarded to `next(err)` and your
+error middleware handles it. See **Async Handlers**.
+
+### Uncaught exception in async work
+
+```js
+app.post('/jobs', (req, res) => {
+  setImmediate(() => {
+    throw new Error('boom');     // ← Express can't catch this
+  });
+  res.json({ ok: true });
+});
+```
+
+Anything thrown outside the synchronous request stack is invisible to
+Express. The framework's error handler never runs. Node fires
+`uncaughtException` and (by default) kills the process.
+
+## The unhandled rejection trap
+
+```js
+async function notify(user) {
+  await sendEmail(user);  // can reject
+}
+
+app.post('/users', async (req, res) => {
+  const user = await createUser(req.body);
+  notify(user);          // ← no await, no .catch
+  res.status(201).json(user);
+});
+```
+
+`notify` rejects. No one is listening. `unhandledRejection` fires.
+Process down.
+
+The fix is always one of:
+
+1. `await` it (synchronously wait — handler responds slower).
+2. `.catch(handler)` it (fire-and-forget, but errors are caught).
+3. Push the work to a queue and let a worker handle it (best — gives
+   you retries, observability, durability).
+
+```js
+notify(user).catch((err) => logger.error({ err }, 'notify failed'));
+```
+
+## The Express 4 wrap pattern
+
+```js
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get('/users/:id', wrap(async (req, res) => {
+  const user = await db.users.findById(req.params.id);
+  res.json(user);
+}));
+```
+
+This catches the *await* path. It still doesn't help with
+fire-and-forget promises inside the handler. Nothing does — only
+`await` or `.catch` does.
+
+## Process-level handlers
+
+You can — and should — install last-resort handlers:
+
+```js
+process.on('unhandledRejection', (reason, promise) => {
+  logger.fatal({ reason }, 'unhandledRejection');
+  // Give logger a tick to flush, then exit so orchestrator restarts.
+  setTimeout(() => process.exit(1), 100);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException');
+  setTimeout(() => process.exit(1), 100);
+});
+```
+
+The orthodox advice is to *crash on uncaught*: the process is in an
+unknown state. Restart cleanly via your orchestrator (systemd,
+Kubernetes, pm2). The opposite advice — swallow the error and keep
+going — leaves you running with corrupt state.
+
+## Don't catch what you can't handle
+
+Inside handlers, only catch errors you actually handle:
+
+```js
+try {
+  await sendEmail(user);
+} catch (err) {
+  // log and continue — failing to email isn't fatal
+}
+
+try {
+  await db.users.create(input);
+} catch (err) {
+  // ??? — re-throw and let error middleware decide
+  throw err;
+}
+```
+
+A bare `try/catch` that just logs and returns 200 hides bugs. Either
+recover meaningfully or let the error propagate.
+
+## Express's default error handler
+
+If you don't define one and an error reaches the end of the stack,
+Express ships with a fallback that returns 500 + a stack trace (in
+dev) or 500 + a minimal message (prod). It's a last line of defense,
+not what you should rely on.
+
+Add your own at the bottom:
+
+```js
+app.use((err, req, res, next) => {
+  req.log?.error({ err }, 'request failed');
+  res.status(err.status ?? 500).json({
+    error: err.expose ? err.message : 'internal error',
+  });
+});
+```
+
+`err.expose` is a common convention (used by `http-errors`) — true
+means "this message is safe to send to the client." False means
+"don't leak internals."
+
+## Tying it together
+
+The discipline that keeps a Node service standing:
+
+1. Upgrade to Express 5, or wrap every async handler.
+2. Never fire-and-forget promises — always `await` or `.catch`.
+3. Move long-running work out of the request lifecycle entirely.
+4. Install process-level handlers as a final safety net, and crash.
+5. Use a process supervisor (systemd, Kubernetes, pm2) so crashes
+   become restarts, not outages.

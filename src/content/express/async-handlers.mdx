@@ -2,6 +2,121 @@ export const level = 'mid';
 
 # Async Handlers
 
-_Placeholder._ Why a thrown error in an `async` route hangs the request
-in Express 4, how Express 5 forwards rejections automatically, and the
-`wrap(fn)` pattern when you can't upgrade.
+Modern Express handlers are usually `async` — they `await` a database call,
+hit an external API, or read a file. But there's a subtle trap: in Express
+4, a rejected promise from an async handler is **not** caught automatically.
+Express 5 fixed this. Knowing the difference is what separates "works in
+the happy path" from "production stays up."
+
+## The trap
+
+```js
+// Express 4 — this hangs the request on a thrown error
+app.get('/users/:id', async (req, res) => {
+  const user = await db.findUser(req.params.id);  // throws
+  res.json(user);
+});
+```
+
+If `db.findUser` rejects, the `await` propagates the rejection up. Express
+4's router only catches **synchronously thrown** errors. The rejection
+becomes an unhandled rejection. The client sits waiting until its timeout.
+
+## The Express 4 fix: a wrapper
+
+A higher-order function that converts rejections into `next(err)` calls:
+
+```js
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get('/users/:id', wrap(async (req, res) => {
+  const user = await db.findUser(req.params.id);
+  res.json(user);
+}));
+```
+
+`Promise.resolve(...)` handles both async and sync handlers safely; `.catch(next)`
+forwards the error to your error-handling middleware. Almost everyone wraps
+this in a tiny library or copies it once.
+
+The `express-async-errors` package does this globally by monkey-patching
+Express — `import 'express-async-errors'` once and every async handler is
+covered. It works, but the monkey-patch is implicit and surprises people.
+
+## Express 5: it just works
+
+```js
+// Express 5 — no wrapper needed
+app.get('/users/:id', async (req, res) => {
+  const user = await db.findUser(req.params.id);
+  res.json(user);
+});
+```
+
+Express 5 calls `Promise.resolve(handler(...)).catch(next)` for you. A
+rejected promise is forwarded to error-handling middleware exactly like a
+synchronous throw.
+
+## What about middleware?
+
+Same rule. Async middleware in Express 4 needs the same wrapper:
+
+```js
+app.use(wrap(async (req, res, next) => {
+  req.user = await loadUser(req);
+  next();
+}));
+```
+
+In Express 5, no wrapper required.
+
+## The other half: forgetting `await`
+
+The wrapper helps with **rejected** promises. It can't help with
+**unawaited** ones:
+
+```js
+app.post('/jobs', async (req, res) => {
+  startSlowJob(req.body);    // ← no await — returns a promise we drop
+  res.json({ status: 'ok' });
+});
+```
+
+If `startSlowJob` rejects, the error never reaches Express because no one
+is awaiting the promise. The handler responds 200 even though the work
+failed.
+
+For fire-and-forget work, attach a `.catch` explicitly:
+
+```js
+startSlowJob(req.body).catch((err) => logger.error({ err }, 'job failed'));
+```
+
+Better yet: don't fire-and-forget from a request handler. Push the job to
+a queue and let a worker handle it. That way you can retry, observe, and
+control concurrency.
+
+## Why this is dangerous
+
+In Node, an unhandled promise rejection used to be a warning. In Node 15+
+it terminates the process by default (`--unhandled-rejections=throw`).
+One sloppy async handler can take the whole server down.
+
+For services that absolutely cannot crash, you can override:
+
+```js
+process.on('unhandledRejection', (err) => {
+  logger.error({ err }, 'unhandled rejection');
+});
+```
+
+But don't lean on this. Fix the source — wrap your handlers, upgrade to
+Express 5, or use `express-async-errors`.
+
+## Recap
+
+- Express 4: every async handler/middleware needs `wrap(fn)` or
+  `express-async-errors`.
+- Express 5: rejected promises become `next(err)` automatically.
+- Forgotten `await` is still a bug in both. No framework fixes that for you.

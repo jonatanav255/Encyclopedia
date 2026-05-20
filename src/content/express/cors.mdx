@@ -2,5 +2,171 @@ export const level = 'mid';
 
 # CORS
 
-_Placeholder._ Why the browser blocks cross-origin requests, what the
-preflight `OPTIONS` does, and how the `cors` middleware configures it.
+Browsers enforce the **same-origin policy**: JavaScript on
+`https://app.example.com` can't, by default, read responses from
+`https://api.example.com`. CORS (Cross-Origin Resource Sharing) is the
+mechanism a server uses to opt-in to cross-origin requests by sending
+specific response headers. If you've ever seen "blocked by CORS policy"
+in the console, you've met it.
+
+## What "origin" means
+
+`origin = protocol + host + port`. All three must match for the
+same-origin policy not to fire:
+
+| URL | URL | Same origin? |
+| --- | --- | --- |
+| `https://app.example.com` | `https://app.example.com/users` | Yes |
+| `https://app.example.com` | `https://api.example.com` | No (host) |
+| `http://app.example.com` | `https://app.example.com` | No (protocol) |
+| `https://app.example.com` | `https://app.example.com:8080` | No (port) |
+
+`localhost:3000` and `localhost:5173` count as different origins. This
+is why CORS bites you so hard in development.
+
+## What the browser does
+
+Two kinds of cross-origin requests:
+
+### Simple requests
+
+`GET` or `POST` with a basic content type
+(`application/x-www-form-urlencoded`, `multipart/form-data`,
+`text/plain`) and no custom headers. The browser sends it directly,
+then *inspects the response*. If the response lacks the right CORS
+header, the browser blocks JS from reading it — the request still
+hit your server, but the answer can't be read.
+
+### Preflighted requests
+
+Anything else — `PUT`, `DELETE`, custom headers, JSON content type —
+triggers a **preflight**. Before the real request, the browser sends
+an `OPTIONS` request asking "can I do this?" Your server must answer
+with the right headers, or the real request never happens.
+
+```
+OPTIONS /users/42 HTTP/1.1
+Origin: https://app.example.com
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: content-type, authorization
+```
+
+Your server responds:
+
+```
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: PUT
+Access-Control-Allow-Headers: content-type, authorization
+Access-Control-Max-Age: 86400
+```
+
+Only then does the browser send the actual `PUT`.
+
+## The `cors` middleware
+
+You almost never set these headers manually — use the `cors` package.
+
+```js
+import cors from 'cors';
+
+app.use(cors({
+  origin: 'https://app.example.com',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+}));
+```
+
+This handles both the response headers on real requests **and** the
+`OPTIONS` preflight responses — `app.use(cors(...))` registers a
+middleware that short-circuits `OPTIONS` requests automatically.
+
+## Configuration that matters
+
+### `origin`
+
+What origins are allowed:
+
+```js
+cors({ origin: '*' })                              // anyone (no creds)
+cors({ origin: 'https://app.example.com' })        // single origin
+cors({ origin: ['https://a.com', 'https://b.com'] }) // allowlist
+cors({                                              // dynamic check
+  origin: (incoming, cb) => {
+    if (allowlist.includes(incoming)) cb(null, true);
+    else cb(new Error('not allowed'));
+  },
+});
+```
+
+The middleware reflects the origin back in `Access-Control-Allow-Origin`,
+which is what the browser checks.
+
+### `credentials`
+
+Set `true` if you want cookies / `Authorization` headers to travel
+cross-origin:
+
+```js
+app.use(cors({
+  origin: 'https://app.example.com',
+  credentials: true,
+}));
+```
+
+The browser then sends cookies on cross-origin requests, and you set
+`Access-Control-Allow-Credentials: true` in the response.
+
+**The wildcard trap**: `origin: '*'` + `credentials: true` is **not
+allowed** by browsers. If you need credentials, you must reflect a
+specific origin.
+
+### `methods` and `allowedHeaders`
+
+By default `cors` allows `GET, HEAD, PUT, PATCH, POST, DELETE` and
+reflects whatever headers the browser asks for in
+`Access-Control-Request-Headers`. Override to lock things down:
+
+```js
+cors({
+  origin: 'https://app.example.com',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+});
+```
+
+## The right defaults
+
+For a SaaS API consumed by your own frontend:
+
+```js
+app.use(cors({
+  origin: process.env.WEB_ORIGIN,    // e.g. 'https://app.example.com'
+  credentials: true,
+}));
+```
+
+For a fully public API (read-only, no cookies):
+
+```js
+app.use(cors({ origin: '*' }));
+```
+
+## Common confusion
+
+- **"Why does my server-to-server call fail with CORS?"** It doesn't.
+  CORS is a *browser* policy. `curl` and Node's `fetch` ignore it.
+- **"The request hit my server logs but the browser shows a CORS
+  error."** That's expected. The server processed the request and
+  responded; the browser then blocked the JS from reading the response.
+  Fix the headers, not the handler.
+- **"Why is Express returning 404 on OPTIONS?"** You haven't mounted
+  `cors` middleware before your routes. Either mount it globally with
+  `app.use(cors(...))`, or per-route with `app.options(path, cors(...))`.
+
+## Don't use CORS as security
+
+CORS protects browsers from cross-site reading. It does **not** stop
+attackers from sending requests with `curl` or a different fetch
+implementation. Authentication and authorization stop that — CORS just
+controls what *browsers* will let JavaScript read.

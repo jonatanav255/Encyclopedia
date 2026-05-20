@@ -2,6 +2,205 @@ export const level = 'senior';
 
 # Performance
 
-_Placeholder._ Event-loop lag, profiling with `clinic.js` / `--prof`,
-hot paths (JSON parsing, sync crypto, regex), and where a Node service
-typically bottlenecks.
+Node performance is mostly about **the event loop**. If the loop is
+idle, you have headroom. If it's lagging, every request gets slower
+together — there's no per-request thread to insulate them. Finding what
+holds the loop and fixing it is the core skill.
+
+## Measure first
+
+You can't optimize what you can't see. Three tools that pay for
+themselves quickly:
+
+### Event-loop lag
+
+The single most important metric. How long between when the loop
+*should* tick and when it actually does:
+
+```js
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+
+setInterval(() => {
+  console.log({
+    p50: h.percentile(50) / 1e6,    // ns → ms
+    p99: h.percentile(99) / 1e6,
+    max: h.max / 1e6,
+  });
+  h.reset();
+}, 5000);
+```
+
+Healthy: p99 under ~10ms. Sustained higher: something synchronous is
+hogging the loop. p99 over 100ms: users feel it as random slow
+requests.
+
+### CPU profiling
+
+```bash
+node --prof server.js
+# generate load, then:
+node --prof-process isolate-*.log > profile.txt
+```
+
+Or use `clinic.js`:
+
+```bash
+npx clinic doctor -- node server.js
+npx clinic flame -- node server.js
+```
+
+`clinic doctor` diagnoses the broad symptom (CPU-bound, I/O-bound,
+GC, event-loop). `clinic flame` produces a flamegraph showing where
+CPU went.
+
+### Per-route latency
+
+Either a metrics library (Prometheus + `prom-client`), an APM (Datadog,
+NewRelic), or `response-time` middleware:
+
+```js
+import responseTime from 'response-time';
+app.use(responseTime((req, res, time) => {
+  histogram.observe({ route: req.route?.path ?? 'other' }, time);
+}));
+```
+
+p50/p99 per route tells you which endpoints are slow before users do.
+
+## The usual suspects
+
+### Synchronous APIs
+
+Node's "sync" file APIs (`fs.readFileSync`, `JSON.parse` on huge
+payloads, sync crypto) block the loop for as long as they run. One
+slow sync call blocks every request.
+
+```js
+// Don't
+const data = fs.readFileSync('huge.json');
+
+// Do
+const data = await fs.promises.readFile('huge.json');
+```
+
+Sync crypto is especially nasty — `bcrypt.hashSync` blocks for 50–200ms
+per call.
+
+### Large JSON payloads
+
+`JSON.parse` is sync and CPU-bound. A 10MB JSON body blocks the loop
+for ~50ms. Set the body limit (`express.json({ limit: '100kb' })`) so
+no single request can dominate.
+
+For genuinely large payloads, switch to streaming parsers (NDJSON,
+`stream-json`) — they parse incrementally.
+
+### Regex catastrophic backtracking
+
+Some regexes have exponential worst case. An attacker can send input
+that takes seconds to match, blocking the loop entirely. The classic
+example:
+
+```js
+/^(a+)+$/.test('aaaaaaaaaaaaaaaaaaaaaaaaaaaaa!')   // freezes
+```
+
+Audit user-input regexes with `safe-regex` or a linter. For untrusted
+patterns, run in a worker thread with a timeout.
+
+### Logging in the hot path
+
+`console.log` and unstructured loggers do synchronous I/O. At high
+throughput this adds significant latency. Use `pino` (async, fast),
+log at the right level, and never log on every successful request from
+within the request handler — middleware is fine because it's one log
+line per request.
+
+### Sync `bcrypt`
+
+Mentioned because it's *the* most common culprit. Use `bcrypt.hash`
+(async), not `bcrypt.hashSync`.
+
+## Where Express specifically can help
+
+### Disable unused middleware
+
+Each middleware adds overhead. If you don't accept `urlencoded`, don't
+mount the parser. If you don't need `x-powered-by`, disable it.
+
+### Reuse compiled routes
+
+`app.get('/users/:id', ...)` compiles the path regex once at startup.
+Avoid dynamically constructing routes per request.
+
+### Cache views
+
+In production, set `view cache` to true (Express does this when
+`NODE_ENV === 'production'`). Recompiling templates per request is
+expensive.
+
+### Compress at the edge, not in Node
+
+Compression burns CPU. If a CDN or reverse proxy is in front, let it
+compress. Disable `compression` middleware in production unless you
+have no proxy.
+
+## Patterns that buy a lot
+
+### Cache expensive results
+
+```js
+const cache = new LRUCache({ max: 1000, ttl: 60_000 });
+
+app.get('/expensive', async (req, res) => {
+  const cached = cache.get(req.url);
+  if (cached) return res.json(cached);
+  const result = await compute();
+  cache.set(req.url, result);
+  res.json(result);
+});
+```
+
+Even a 1-second TTL eliminates 95% of requests for popular endpoints.
+
+### Connection pools
+
+Don't create a new database connection per request — that's 10–50ms
+of TLS handshake per call. Use the pool that ships with your client
+(`pg.Pool`, `mysql2.createPool`).
+
+### Use streaming for large responses
+
+Don't buffer a 100MB CSV in memory before sending. Stream it. See
+**Streaming**.
+
+### Move work off the request path
+
+Anything not strictly needed to answer this request — email sending,
+analytics writes, cache warming — push to a queue (BullMQ, Kafka,
+SQS). The user gets a fast response, the work happens behind the
+scenes.
+
+## When to scale horizontally
+
+You've optimized the obvious things and a single instance still
+can't keep up. Now:
+
+1. Add replicas (more containers, behind a load balancer).
+2. Make sure shared state (sessions, rate limits) is in Redis.
+3. Check for shared bottlenecks (the database is now serving 4× the
+   queries — does it keep up?).
+
+CPU and bandwidth scale linearly with replicas. Database doesn't.
+
+## The most expensive line of code
+
+The one you don't run. Skip work. Cache results. Return 304s. Send
+less data. Stream instead of buffer.
+
+Profile, find the hot path, and ask "do we even need this?" before
+asking "how do we make this faster?" The biggest perf wins come from
+deletion, not optimization.

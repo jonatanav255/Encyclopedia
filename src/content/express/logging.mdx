@@ -2,5 +2,162 @@ export const level = 'mid';
 
 # Logging
 
-_Placeholder._ `morgan` for request logs, structured logging with
-`pino`, attaching a request-id for correlation, and what _not_ to log.
+Logging is what turns "the server is broken" into "the server is broken
+because the database connection pool exhausted at 14:02 UTC, and here's
+the request that pushed it over." Without it you're guessing.
+
+## Two kinds of logs
+
+- **Request logs**: one line per HTTP request. Method, path, status,
+  latency. Operational. `morgan` is the classic Express middleware.
+- **Application logs**: events from your code — errors caught, jobs
+  enqueued, "user X did Y." Structured. Use a real logger like `pino`
+  or `winston`.
+
+Both belong in a real service. They serve different questions.
+
+## Request logging with morgan
+
+```js
+import morgan from 'morgan';
+
+app.use(morgan('combined'));        // Apache-style log line
+```
+
+`morgan` has presets:
+
+- `'tiny'` — `GET /users 200 5ms 32b`
+- `'dev'` — colored, for development
+- `'combined'` — Apache-style with IP, user agent, referer
+
+Or a custom format:
+
+```js
+app.use(morgan(':method :url :status :response-time ms - :user-agent'));
+```
+
+Pipe it to a real logger so request logs and app logs end up together:
+
+```js
+app.use(morgan('combined', {
+  stream: { write: (msg) => logger.info(msg.trim()) },
+}));
+```
+
+## Application logging with pino
+
+`pino` is JSON-by-default and fast (~5× faster than winston). For a
+production service, JSON logs are what every log aggregator
+(Loki, Datadog, CloudWatch, ELK) expects.
+
+```js
+import pino from 'pino';
+
+const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+});
+
+app.use((req, res, next) => {
+  req.log = logger.child({ requestId: crypto.randomUUID() });
+  next();
+});
+
+app.post('/orders', async (req, res, next) => {
+  req.log.info({ userId: req.user.id }, 'creating order');
+  try {
+    const order = await createOrder(req.body);
+    req.log.info({ orderId: order.id }, 'order created');
+    res.status(201).json(order);
+  } catch (err) {
+    req.log.error({ err }, 'order creation failed');
+    next(err);
+  }
+});
+```
+
+Every log line is JSON with the request ID baked in. In your log
+aggregator, filter by `requestId` to see every line for one request,
+including the error.
+
+## Levels
+
+Standard levels (low to high):
+
+- **`trace`** — every detail, almost never used in production.
+- **`debug`** — verbose, useful when debugging a specific feature.
+- **`info`** — significant business events.
+- **`warn`** — recoverable problems.
+- **`error`** — something failed.
+- **`fatal`** — process can't continue.
+
+Set the threshold via `LOG_LEVEL`. Production usually wants `info`+.
+
+## Request IDs (correlation)
+
+A single request often hits multiple services and triggers many log
+lines. Without a correlation ID, you can't connect them.
+
+Generate (or read from a header) on the way in:
+
+```js
+app.use((req, res, next) => {
+  req.requestId =
+    req.get('X-Request-Id') ?? crypto.randomUUID();
+  res.set('X-Request-Id', req.requestId);
+  req.log = logger.child({ requestId: req.requestId });
+  next();
+});
+```
+
+If a reverse proxy or upstream service already attached
+`X-Request-Id`, honor it — that's how the trace stays unified across
+services.
+
+## What to log
+
+- Inbound requests (method, path, status, latency, request ID).
+- Auth events (login success, login failure, token refresh).
+- Business state changes (order placed, subscription canceled).
+- Errors with context — the request ID and the user ID and the input
+  that caused it.
+- Slow operations (database query that took too long).
+- Anything you'd want to see in an incident.
+
+## What NOT to log
+
+- Passwords, password hashes.
+- API keys, session tokens, JWTs.
+- Full credit card numbers, PII.
+- Request bodies, blindly. They contain the above.
+
+`pino` has `redact` for this:
+
+```js
+const logger = pino({
+  redact: ['req.headers.authorization', 'req.body.password'],
+});
+```
+
+Build the redact list early. Once secrets hit your logs, they're in
+backups, indexes, and on-call slack screenshots.
+
+## Don't log to disk from Node
+
+In a container or PaaS, write JSON logs to `stdout` and let the platform
+collect them. Don't `fs.appendFile` to a rotating log file from inside
+Node — that's a job for the platform (`docker logs`, the orchestrator,
+or a sidecar).
+
+`pino` writes to stdout by default. So does `console.log`. Use whichever
+gives you structured JSON.
+
+## Don't `console.log` in production
+
+`console.log` is fine for scripts. In a Node service:
+
+- No levels, so you can't filter.
+- No structured fields, so you can't query.
+- Synchronous I/O in some Node versions, which blocks the event loop.
+
+Pick a logger early. Trying to retrofit one across hundreds of files
+later is painful.

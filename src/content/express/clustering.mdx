@@ -2,6 +2,147 @@ export const level = 'senior';
 
 # Clustering
 
-_Placeholder._ Node's `cluster` module / `pm2`, running multiple
-processes per host, sticky sessions for stateful work, and why a
-single Express process underutilizes a multi-core box.
+A single Node process runs your JavaScript on a single thread. On a 4-,
+8-, or 16-core box, that single process can only saturate one core. The
+other cores sit idle. Clustering — running multiple Node processes per
+host — is how you actually use the hardware.
+
+## The two approaches
+
+- **`cluster` module** (built-in) — Node forks worker processes; the
+  primary distributes incoming connections.
+- **External supervisor** (`pm2`, systemd, Kubernetes Deployment with N
+  replicas) — run N independent Node processes; the OS or LB distributes
+  load.
+
+Both work. In modern production setups, the external supervisor wins —
+it composes better with orchestrators, doesn't require code changes,
+and treats Node like any other process.
+
+## `cluster` module
+
+```js
+import cluster from 'node:cluster';
+import os from 'node:os';
+import { app } from './app.js';
+
+if (cluster.isPrimary) {
+  const count = os.availableParallelism();
+  for (let i = 0; i < count; i++) cluster.fork();
+
+  cluster.on('exit', (worker, code) => {
+    console.log(`worker ${worker.process.pid} exited`);
+    cluster.fork();    // restart
+  });
+} else {
+  app.listen(process.env.PORT ?? 3000);
+}
+```
+
+`os.availableParallelism()` returns the number of logical CPUs. The
+primary spawns one worker per CPU. Each worker calls
+`app.listen` on the same port — Node's cluster magic round-robins
+incoming connections across them.
+
+## `pm2`
+
+```bash
+npm install -g pm2
+pm2 start server.js -i max          # one instance per CPU
+pm2 restart server                  # rolling restart
+pm2 reload server                   # zero-downtime reload
+pm2 monit                            # live dashboard
+```
+
+`pm2` wraps cluster mode with operational tooling: graceful restarts,
+crash recovery, log management, monitoring. Until orchestrators became
+standard, pm2 was *the* answer.
+
+## Kubernetes / ECS
+
+```yaml
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: app
+          image: yourapp:latest
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+```
+
+Don't cluster inside the container. Run **one Node process per
+container** and run multiple container replicas. Why:
+
+- Each container gets its own CPU allocation. Multiple processes inside
+  one container fight for the same allocation.
+- The orchestrator can move/scale individual containers.
+- Restarting a single bad worker is the orchestrator's job.
+
+If you run pm2 cluster inside a single container, you've recreated the
+orchestrator's responsibilities — badly.
+
+## The shared-state problem
+
+Multiple processes can't share in-memory state. Three things that
+break:
+
+1. **In-memory sessions** — User logs in to worker A, next request hits
+   worker B, no session there. Fix: external session store (Redis).
+2. **In-memory rate limiting** — Worker A counts to 99, worker B
+   counts to 99. Real limit is 200. Fix: Redis-backed store.
+3. **In-memory caches** — Each worker has its own cache. Memory N×,
+   cache hit rate lower. Fix: Redis, or accept it.
+
+Anything that needs to be consistent across workers needs a shared
+store. Period.
+
+## Sticky sessions
+
+For WebSockets, Server-Sent Events, or anything where the client
+expects to talk to the *same* worker across requests:
+
+- **`cluster` module**: doesn't support sticky out of the box. Use
+  `sticky-session` or hash-based routing.
+- **External LB**: enable IP-hash or cookie-based sticky routing.
+- **Better solution**: don't require sticky. Make all workers
+  stateless and put real-time state in Redis pub/sub. Then the LB can
+  do round-robin and you don't lose connections on worker restarts.
+
+## CPU vs I/O bound
+
+Clustering helps when your app is **CPU-bound**: JSON serialization,
+template rendering, image transforms, regex over big strings. Each
+worker gets its own CPU.
+
+It barely helps when you're **I/O-bound**: waiting on a database, a
+remote API, a slow disk. The event loop is already idle during the
+wait; another worker doesn't speed it up. You'd be better off
+optimizing the I/O or running more replicas (which adds network
+capacity, not just CPU).
+
+Profile first. Don't cluster blindly.
+
+## Worker threads — not the same thing
+
+`worker_threads` is a different feature: actual threads inside one
+process, sharing memory via `SharedArrayBuffer`. Useful for offloading
+specific CPU-bound work (image processing, parsing) without forking a
+whole process. Doesn't replace clustering — they solve different
+problems.
+
+## In practice
+
+For most apps in 2026:
+
+- Don't use `cluster` in code.
+- Run one Node process per container.
+- Run N container replicas behind a load balancer.
+- Use Redis for anything that needs to be shared.
+
+Simple, composable, works with every modern infrastructure. The
+`cluster` module is mostly legacy at this point — fine for hobby
+projects, awkward for production.
