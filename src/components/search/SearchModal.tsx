@@ -119,7 +119,7 @@ export function SearchModal({ open, onClose }: Props) {
             </ul>
           )}
         </div>
-        <div className="flex items-center justify-between px-4 py-2 border-t border-zinc-200 dark:border-zinc-800 text-[11px] text-zinc-500 bg-zinc-50 dark:bg-zinc-900/80">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-zinc-200 dark:border-zinc-800 text-sm text-zinc-500 bg-zinc-50 dark:bg-zinc-900/80">
           <div className="flex items-center gap-3">
             <Kbd>↑</Kbd>
             <Kbd>↓</Kbd>
@@ -127,7 +127,7 @@ export function SearchModal({ open, onClose }: Props) {
             <Kbd>↵</Kbd>
             <span>open</span>
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             <Kbd>esc</Kbd>
             <span>close</span>
           </div>
@@ -139,7 +139,7 @@ export function SearchModal({ open, onClose }: Props) {
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300">
+    <kbd className="font-mono text-xs px-2 py-1 rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300">
       {children}
     </kbd>
   );
