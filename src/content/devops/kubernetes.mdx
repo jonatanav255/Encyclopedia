@@ -1,0 +1,374 @@
+export const level = 'senior';
+
+# Kubernetes
+
+Kubernetes (k8s) is the de-facto container orchestrator. It runs
+your containers, restarts them when they crash, scales them up and
+down, routes traffic, and manages secrets. For Express apps, the
+operational model is: build a Docker image, write Kubernetes
+manifests, let the cluster run them.
+
+## The objects you'll write
+
+For a typical Express deployment:
+
+### Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/example/api:v1.2.3
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: database-url
+            - name: NODE_ENV
+              value: production
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+```
+
+Tells the cluster: "run 3 replicas of this image with these
+resources and these health probes."
+
+### Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: ClusterIP
+```
+
+A stable network endpoint for your pods. The pods come and go;
+the service stays. Other services talk to `api` (the DNS name) and
+the cluster routes the request to one of the healthy pods.
+
+### Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+Routes external traffic. The ingress controller (nginx-ingress,
+Traefik, etc.) is what speaks to the internet; the Ingress object
+is the configuration.
+
+### Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+type: Opaque
+stringData:
+  database-url: postgres://...
+  session-secret: ...
+```
+
+Configuration values that shouldn't be in plain manifests. Base64
+encoded (not encrypted by default — use sealed-secrets or external
+secret operators for that).
+
+### ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+data:
+  LOG_LEVEL: info
+  FEATURE_X_ENABLED: "true"
+```
+
+For non-sensitive config. Mounted as env vars or files.
+
+## Probes (the part most apps get wrong)
+
+### Liveness probe
+
+"Is the process alive?" If it fails, the pod is killed and
+restarted.
+
+- Should NOT check downstream dependencies. If the DB is down,
+  killing your app doesn't help.
+- Should be CHEAP. It runs every 10 seconds.
+
+```js
+app.get('/health', (req, res) => res.json({ ok: true }));
+```
+
+That's it. The handler just confirms the process is responsive.
+
+### Readiness probe
+
+"Should I get traffic?" If it fails, the pod is removed from load-
+balancing but not killed.
+
+- Can check critical dependencies. "Can I reach the DB?" is fair
+  game here.
+- Should fail during shutdown so the LB stops sending traffic
+  before the process exits.
+
+```js
+app.get('/ready', async (req, res) => {
+  if (shuttingDown) return res.sendStatus(503);
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+```
+
+### Startup probe
+
+For slow-starting apps. Disables liveness/readiness until startup
+finishes. Useful if your app needs 30 seconds to warm up. Most
+Express apps don't need this.
+
+The classic bug: liveness probe checks the DB. DB has a hiccup.
+Every pod gets killed. The pod-restart storm now amplifies the
+outage. Keep liveness simple.
+
+## Resources
+
+```yaml
+resources:
+  requests:    # guaranteed minimum
+    cpu: 100m
+    memory: 256Mi
+  limits:      # hard ceiling
+    cpu: 500m
+    memory: 512Mi
+```
+
+- `requests` — what the scheduler uses to place pods. The cluster
+  guarantees this much. Used to compute "is the node full?"
+- `limits` — the cap. CPU above this throttles; memory above this
+  kills (OOMKilled).
+
+Set both. Set requests to what your app actually uses on average;
+set limits to a comfortable headroom above.
+
+The classic Node trap: the JS heap grows to `--max-old-space-size`
+(default ~2GB). If memory limit is below that, the container OOM-
+kills the moment GC runs out of room. Either set the heap explicitly:
+
+```yaml
+env:
+  - name: NODE_OPTIONS
+    value: --max-old-space-size=400      # leave room for non-heap
+```
+
+Or set the container limit higher.
+
+## Rolling updates
+
+The default deployment strategy:
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1            # one extra pod above replicas during update
+      maxUnavailable: 0      # never below the desired count
+```
+
+Brings up new pods, waits for `readinessProbe` to pass, then
+removes old pods. Zero downtime if the new pods successfully come
+up.
+
+Failure: if the new pods never become ready, the deployment stalls.
+You see "deployment timed out." Kubernetes doesn't roll back
+automatically (unless you've configured a `ProgressDeadlineSeconds`
+and your tooling handles the rollback).
+
+## Horizontal Pod Autoscaler (HPA)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        targetAverageUtilization: 70
+```
+
+Scales replicas up/down based on CPU usage. Other metric sources
+work too — memory, custom metrics from Prometheus.
+
+For Express, CPU-based autoscaling works reasonably. If you have
+spiky traffic, watch p99 latency under autoscale events — k8s
+takes a minute or two to add capacity, and you might absorb the
+burst with overload first.
+
+## Logs
+
+Write to stdout/stderr. Kubernetes collects them. Don't try to
+write log files inside the container — they vanish on restart.
+
+```js
+// Just console.log / pino. K8s handles the rest.
+logger.info({ requestId: x }, 'request');
+```
+
+Tools that aggregate cluster logs: Loki + Grafana, Elasticsearch
++ Kibana, Datadog, cloud-native (CloudWatch, Stackdriver).
+
+## Secrets management — beyond plain Secret
+
+`kind: Secret` is base64, not encrypted. Anyone with cluster access
+can decode them. For real production:
+
+- **Sealed Secrets** — encrypted manifests that only your cluster
+  can decrypt.
+- **External Secrets Operator** — pulls from AWS Secrets Manager,
+  GCP Secret Manager, Vault, etc.
+- **HashiCorp Vault** + agent injector.
+
+Pick one. Plain `Secret` for development; encrypted-at-rest for
+production.
+
+## Namespaces
+
+Logical isolation within a cluster:
+
+```yaml
+metadata:
+  namespace: production
+```
+
+Use them to separate environments (`staging`, `production`),
+teams, or services. RBAC and network policies can scope by
+namespace.
+
+## What ops/devs typically split
+
+In a small org, the developer writes the manifests and the deploy
+tool applies them. In a larger org, a platform team provides
+abstractions (Helm charts, Kustomize bases, Crossplane) and devs
+fill in app-specific values.
+
+Either way, your Express app code doesn't change between
+environments. The manifests do.
+
+## When NOT to use Kubernetes
+
+For:
+
+- Small projects (one or two services).
+- Hobby projects.
+- Teams without ops capacity.
+
+The operational complexity is significant. Cloud-managed PaaS
+(Fly.io, Render, Railway, Vercel) gives you the deploy + scale +
+observability story without managing a cluster. For most "one
+Express app and a DB," that's the right level.
+
+Kubernetes pays off when you have:
+
+- Many services to coordinate.
+- Need for fine-grained autoscaling.
+- Complex networking (service meshes, multi-region).
+- A platform team that owns the cluster.
+
+## Local development
+
+For developing against k8s manifests:
+
+- **kind** or **minikube** — run a tiny cluster on your laptop.
+- **k3s** — lightweight production-capable k8s.
+- **Tilt** — auto-rebuild + sync code into running pods on file
+  change.
+- **Telepresence** — connect your local app to a real cluster's
+  services.
+
+You probably don't need a k8s cluster locally just to develop
+Express. `docker-compose` is simpler. Save k8s testing for
+integration or staging.
+
+## In Express
+
+The application code is unaware. Same `app.listen(3000)`. The
+difference is the **deployment** — manifests, probes, signal
+handling, env vars from secrets. Get those right and your code
+behaves the same on the cluster as it does locally.
+
+The two most important practices specific to k8s:
+
+1. **Graceful shutdown** on SIGTERM (see **Graceful Shutdown**).
+2. **Correct probes** — liveness simple, readiness checks
+   readiness honestly.
+
+Mess these up and you'll have flaky deploys. Get them right and
+deploys are invisible.

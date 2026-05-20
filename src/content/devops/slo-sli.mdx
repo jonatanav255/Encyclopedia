@@ -1,0 +1,238 @@
+export const level = 'senior';
+
+# SLI / SLO / SLA
+
+SRE (Site Reliability Engineering) gave us a small vocabulary
+for talking about reliability rigorously. Three acronyms; one
+mental model. Worth knowing because it changes how you decide
+what to alert on, how to balance velocity vs stability, and how
+much downtime is acceptable.
+
+## The three terms
+
+- **SLI** — Service Level **Indicator**. A metric you measure.
+  "99.5% of requests in the last hour returned within 500ms."
+- **SLO** — Service Level **Objective**. A target for the SLI.
+  "99.9% of requests under 500ms over 30 days."
+- **SLA** — Service Level **Agreement**. A contractual promise to
+  customers, usually weaker than the internal SLO. "99% uptime
+  or we credit your account."
+
+The order matters: SLIs are the truth. SLOs are what you commit
+to internally. SLAs are what you promise customers (with
+financial penalties for missing).
+
+## Why bother
+
+Without explicit targets:
+
+- "How reliable is good enough?" becomes infinite — every error
+  feels urgent, the team burns out chasing 100%.
+- The product can't ship features fast because every change
+  feels too risky.
+- There's no shared understanding of acceptable trade-offs.
+
+With targets:
+
+- Errors that don't burn the budget aren't emergencies.
+- Engineering can justify "we're going to spend the next
+  quarter on reliability" with data.
+- You stop arguing whether a regression "matters."
+
+## Picking SLIs
+
+A good SLI:
+
+- **Measurable** — you can compute it from existing telemetry.
+- **User-centric** — reflects actual user experience.
+- **Composable** — adding up users gives a meaningful total.
+
+Common SLIs:
+
+- **Availability**: % of requests that returned a non-5xx.
+- **Latency**: % of requests within X ms.
+- **Throughput**: requests per second.
+- **Correctness**: % of requests with the correct output.
+- **Freshness**: % of data older than X seconds.
+
+For an Express API, **availability + latency** covers most cases.
+
+## Defining the SLO
+
+The numbers people throw around:
+
+- **99%** — "two nines." ~3.6 hours of downtime per month. Casual.
+- **99.9%** — "three nines." ~43 minutes/month. Most SaaS products.
+- **99.95%** — ~22 min/month. Premium tier.
+- **99.99%** — "four nines." ~4 min/month. Hard.
+- **99.999%** — "five nines." ~26 sec/month. Telecom-level.
+
+Don't pick 99.999% for a side project. Each nine is roughly 10x
+more engineering effort.
+
+For a B2B SaaS, 99.9% over 30 days is a reasonable starting
+point.
+
+## The error budget
+
+If your SLO is 99.9%, your error budget is **0.1%**.
+
+For a service handling 10M requests/month, that's 10,000 allowed
+errors. If you've already burned 8,000 errors in week 2, you're
+in trouble — slow down releases, focus on reliability.
+
+If you've used 100 errors by end of month, you have budget to
+spare — ship features fast.
+
+The error budget operationalizes "how much breakage is okay."
+It's a useful tool for conversations with product:
+
+- "We want to ship feature X." → "We have 30% budget remaining,
+  ship it carefully."
+- "Why are we slowing down releases?" → "We burned 90% of the
+  budget last week."
+
+## Burn-rate alerting
+
+Don't alert on "5xx > 0." Alert on **burn rate**:
+
+```
+Burn rate = (errors observed) / (errors budgeted for that period)
+```
+
+If a 1-hour budget is 5 errors, and you've had 50 errors in the
+last hour, burn rate is 10×. Action: page someone.
+
+Two thresholds work well in practice:
+
+- **High burn rate** (10× over 1 hour) → page immediately. At this
+  pace you burn the whole monthly budget in days.
+- **Slow burn** (2× over 6 hours) → ticket / Slack notification.
+  Concerning, but not 3am-page worthy.
+
+Without burn-rate alerts, you'll alert on noise. With them, alerts
+correlate with real reliability impact.
+
+## How to measure SLIs
+
+For an Express service:
+
+```js
+const httpRequests = new Counter({
+  name: 'http_requests_total',
+  labelNames: ['route', 'status'],
+});
+
+const httpDuration = new Histogram({
+  name: 'http_duration_seconds',
+  labelNames: ['route'],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+});
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    const labels = { route: req.route?.path ?? 'other', status: res.statusCode };
+    httpRequests.inc(labels);
+    httpDuration.observe({ route: labels.route }, seconds);
+  });
+  next();
+});
+```
+
+Then in Prometheus / your monitoring tool, compute:
+
+```
+availability = sum(rate(http_requests_total{status!~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+latency_p99 = histogram_quantile(0.99, rate(http_duration_seconds_bucket[5m]))
+```
+
+The dashboards and alerts derive from these.
+
+See **Observability**.
+
+## Setting SLOs at the right granularity
+
+Too broad: "the service is 99.9% available." Hides per-endpoint
+problems.
+
+Too narrow: an SLO per endpoint × per region × per user tier.
+Drowns the team in numbers.
+
+Sweet spot: an SLO per critical user journey.
+
+- "GET /users/:id" — fast, available.
+- "POST /orders" — eventually consistent, available.
+- "GET /reports" — slow, less critical.
+
+The endpoints that matter to users have explicit SLOs. Background
+stuff is bucketed.
+
+## SLA: the contractual layer
+
+Customer-facing. Usually:
+
+- Less strict than your internal SLO (you want headroom).
+- Has explicit remedies (credits, refunds).
+- Excludes certain things (planned maintenance, customer error).
+
+If your SLO is 99.9%, your SLA might be 99.5% — the gap is your
+buffer.
+
+You almost never want your SLA to be at the level you're actually
+aiming for. Promise less than you can deliver.
+
+## When you don't have an SLO
+
+Symptoms:
+
+- Every error is an emergency.
+- "Reliability work" is what happens between feature work,
+  whenever there's free time.
+- Customers complain; the team disagrees on whether the complaint
+  is fair.
+- Postmortems end in "we should be more careful" rather than "we
+  should change this specific thing."
+
+The fix: write SLOs. Even crude ones. Even ones you'll revise in a
+month. Having any explicit target beats arguing about an implicit
+one.
+
+## Real-world tradeoffs
+
+- **Higher SLO ↔ slower release cadence**. Reliability and
+  velocity trade off.
+- **Stricter SLO ↔ more infrastructure cost** (replicas,
+  redundancy, monitoring).
+- **Multiple SLOs ↔ harder to reason about a release**. Pick few.
+
+The best SLOs are stable, simple, and explicitly traded off
+against velocity.
+
+## In Express specifically
+
+What matters:
+
+- Metrics that compute the SLIs (prom-client + a histogram).
+- Dashboards / alerts in your monitoring stack.
+- A weekly habit of looking at SLO consumption.
+- A clear escalation when the budget burns fast.
+
+The technical implementation is straightforward. The cultural part
+— actually using SLOs to drive decisions — is harder and more
+valuable.
+
+## Further reading
+
+Google's SRE book (free online) is the canonical source. Especially:
+
+- "Service Level Objectives" chapter.
+- "Practical Alerting" chapter.
+
+SREcon talks on YouTube — lots of teams sharing what worked and
+didn't.
+
+For most services starting out: pick one SLO (availability or
+latency), pick a number, instrument the SLI, alert on burn rate.
+That alone gets you 80% of the value. Iterate from there.

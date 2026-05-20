@@ -1,0 +1,276 @@
+export const level = 'mid';
+
+# CI/CD
+
+CI (Continuous Integration) runs tests and quality checks on every
+push. CD (Continuous Deployment) ships passing builds to production
+automatically. Combined, they turn deployment from a Friday-night
+ritual into something that happens dozens of times a day,
+uneventfully.
+
+## What CI actually does
+
+For an Express project, CI typically:
+
+1. Checks out the code.
+2. Installs dependencies (`pnpm install --frozen-lockfile`).
+3. Lints (`pnpm lint`).
+4. Type-checks (`pnpm tsc --noEmit`).
+5. Runs unit tests (`pnpm test`).
+6. Runs integration tests (often with a real DB).
+7. Builds the Docker image.
+8. Optionally: security scan, publish image.
+
+A pull request that fails any step blocks merge. A merge to `main`
+proceeds to deploy.
+
+## GitHub Actions — the most common
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+      - run: pnpm tsc --noEmit
+      - run: pnpm test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ghcr.io/example/api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+Things to notice:
+
+- **Service container** for Postgres — real DB, not a mock.
+- **Cache pnpm store** with `cache: pnpm` to speed up installs.
+- **Cache Docker layers** with `gha` cache type — huge speedup on
+  Docker builds across runs.
+- **Fixed Node version** (22).
+- **`--frozen-lockfile`** — fails if `pnpm-lock.yaml` is out of sync.
+
+## CD: deploying on merge
+
+```yaml
+deploy:
+  needs: test
+  runs-on: ubuntu-latest
+  if: github.ref == 'refs/heads/main'
+  steps:
+    - uses: actions/checkout@v4
+
+    - uses: docker/build-push-action@v5
+      with:
+        push: true
+        tags: |
+          ghcr.io/example/api:${{ github.sha }}
+          ghcr.io/example/api:latest
+
+    - run: |
+        kubectl set image deployment/api api=ghcr.io/example/api:${{ github.sha }}
+        kubectl rollout status deployment/api --timeout=5m
+```
+
+Builds, pushes, updates the running deployment. The `rollout status`
+waits for the new pods to become healthy and rolls back
+automatically (with the right flags) if they don't.
+
+## Test pyramid in CI
+
+CI time scales with test count. The pyramid:
+
+- **Unit tests** — many, fast. Run on every commit.
+- **Integration tests** — some, slower. Spin up a DB.
+- **End-to-end tests** — few, slowest. Real browser, real services.
+
+A common mistake: CI runs 100 E2E tests against a real cluster on
+every PR. Builds take 45 minutes. Devs stop reading test failures.
+Instead: keep E2Es lean and run them on `main` post-merge or in a
+nightly suite.
+
+## Branch protection
+
+GitHub repo settings:
+
+- Require PR for changes to `main`.
+- Require CI to pass before merge.
+- Require code review.
+- Require up-to-date branches.
+
+Without protection, someone pushes directly, breaks `main`, and
+the next deploy fails. Branch protection is one configuration
+toggle that prevents a class of incidents.
+
+## Secrets in CI
+
+Never hardcode secrets in workflow files. GitHub Actions has
+encrypted **repository secrets** and **environment secrets**:
+
+```yaml
+- run: ./deploy.sh
+  env:
+    DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+```
+
+Same on every CI provider. The secrets live in the platform, not
+the repo.
+
+For sensitive deploys, use OIDC instead of long-lived tokens —
+GitHub Actions can authenticate to AWS/GCP without storing
+credentials. Better security, less rotation overhead.
+
+## Cache aggressively
+
+Cold CI builds are slow. Cache:
+
+- **Package manager store** (pnpm/npm/yarn).
+- **Docker layers** (Docker BuildKit cache).
+- **Build artifacts** (compiled TS, generated files).
+- **Test fixtures** if they're expensive to compute.
+
+A 10-minute CI run becomes 2 minutes with good caching. That's the
+difference between "wait for CI" and "deploy immediately."
+
+## Required vs optional checks
+
+Required: lint, types, tests, build succeeds. Block merge if any
+fail.
+
+Optional: coverage reports, performance benchmarks, deployment
+previews. Useful but shouldn't gate the merge.
+
+Don't let optional checks slowly accumulate into required ones.
+Every required check is a chance for a flaky test to block your
+team.
+
+## Flakes are bugs
+
+If a test sometimes passes and sometimes fails on the same commit,
+it's a flake. **Flakes are bugs.** Either:
+
+- Fix the underlying race condition / non-determinism.
+- Quarantine the test (mark it `.skip`) until it's fixed.
+- Delete it if it's not worth fixing.
+
+Don't "retry the build" reflexively. That trains the team to
+ignore CI signal. Flake rate is a metric to watch.
+
+## Deploying with confidence
+
+Things that make CD safe:
+
+- **Tests** that catch real regressions, not just achieve coverage.
+- **Database migrations** that are backward-compatible.
+- **Gradual rollouts** — canary, rolling. See **Feature Flags** for
+  finer control.
+- **Easy rollback** — `kubectl rollout undo` or equivalent.
+- **Monitoring** — you see immediately if the new version is bad.
+- **Alerts on key SLOs** so you find out about issues automatically.
+
+When all five are in place, deploys are unremarkable. When one is
+missing, every deploy carries risk.
+
+## Multi-environment
+
+Common pattern:
+
+- Push to `main` → deploy to staging automatically.
+- Manual approval → promote to production.
+
+```yaml
+deploy-prod:
+  needs: deploy-staging
+  environment: production    # GitHub Environments require approval
+  steps:
+    - run: ...
+```
+
+GitHub Environments let you require approval before specific
+deploys. Use for high-stakes targets.
+
+## Monorepos
+
+For a single repo with multiple services:
+
+- **Path filters** so unrelated services don't rebuild.
+- **Affected** detection (Nx, Turborepo, Bazel).
+- **Shared cache** across packages.
+
+```yaml
+on:
+  push:
+    paths:
+      - 'apps/api/**'
+      - 'packages/shared/**'
+```
+
+Saves CI minutes; gives faster signal per PR.
+
+## What good CI/CD looks like
+
+For a team of any size:
+
+- Every push triggers tests automatically.
+- Every PR shows pass/fail in the UI.
+- Merging to `main` deploys to staging automatically.
+- Staging-to-prod promotion is one click (or automatic with
+  approval gates).
+- Rollback is fast.
+- Failed deploys notify the team immediately.
+
+Most of this is one-time setup. The day-to-day benefit is
+enormous: deploys stop being scary; bugs are caught before
+production; the team can ship multiple times a day without
+ceremony.
+
+## Common pitfalls
+
+- **CI passes locally but fails in CI** — usually environment
+  differences (Node version, OS, env vars). Pin everything.
+- **Tests pass on rerun** — flakes. Fix them.
+- **CI takes 45 minutes** — caching, parallelism, smaller test
+  suites. Slow CI kills velocity.
+- **Deploys not idempotent** — running the same deploy twice does
+  different things. Fix it.
+- **No rollback plan** — every deploy is one-way. Practice rolling
+  back before you need to.
+
+CI/CD pays back the investment immediately if you're shipping
+anything more than once a week. For a team shipping daily,
+it's mandatory.

@@ -1,0 +1,264 @@
+export const level = 'mid';
+
+# Feature Flags
+
+A feature flag is a runtime toggle that turns code paths on or off
+without redeploying. They decouple **deploy** from **release** —
+ship the code to production, enable the feature later, for some
+users only, with the ability to roll back instantly. For any
+non-trivial service this is one of the highest-leverage tools you
+can add.
+
+## The simplest version
+
+```js
+if (config.flags.newCheckoutFlow) {
+  return newCheckout(req, res);
+}
+return oldCheckout(req, res);
+```
+
+The flag is just a boolean. Change the value to switch behavior.
+The hard part isn't the `if` — it's where the boolean comes from
+and how it changes.
+
+## Three levels of sophistication
+
+### 1. Env-var flags
+
+```js
+const newCheckoutFlow = process.env.NEW_CHECKOUT === 'true';
+```
+
+Change requires a deploy (env var update). Useful for "kill
+switches" — code that's nearly ready but you might need to disable
+quickly. Not very dynamic.
+
+### 2. Config-file / database flags
+
+```js
+const flags = await db.flags.findAll();
+const isEnabled = (key) => flags.find(f => f.key === key)?.enabled;
+```
+
+Change requires updating the DB (or a config file you reload).
+Faster than a deploy. Enables an admin UI to toggle.
+
+### 3. A real feature-flag service
+
+LaunchDarkly, Unleash, Flagsmith, ConfigCat, Statsig. Provides:
+
+- **User targeting** — "enable for users in this segment."
+- **Percentage rollouts** — "5% of traffic sees the new flow."
+- **Real-time updates** — flag changes propagate in seconds, no
+  poll.
+- **Audit log** — who changed what when.
+- **Multi-environment** — different rules per env.
+
+For mature products, worth the cost.
+
+## Targeting
+
+Flags don't have to be global on/off. Common targeting axes:
+
+- **User**: by user ID (always for power users; canary for known
+  testers).
+- **Org / team**: by tenant ID.
+- **Geography**: by country.
+- **Random percentage**: 1% of traffic, then 5%, then 25%, then
+  100%.
+- **Build / version**: only for users on the new app version.
+
+```js
+function shouldShow(user, feature) {
+  if (user.role === 'beta_tester') return true;
+  if (feature.percentage === 100) return true;
+  if (feature.percentage === 0) return false;
+  // Stable per-user hash → consistent experience for the same user
+  const hash = hashUserId(user.id, feature.key);
+  return hash < feature.percentage;
+}
+```
+
+The hash-based percentage is critical: the same user always gets
+the same answer for the same flag (until you change the
+percentage). Without this, a user might see the new feature on
+one request and the old one on the next — confusing for them,
+useless for A/B testing.
+
+## What flags are for
+
+### Deploying ≠ releasing
+
+Ship the code disabled. Test in production with internal
+users. Gradually roll out. The riskiest moment in a deploy is
+the moment the new code path runs for the first user. Flags
+let that moment be controlled rather than coincide with the
+deploy itself.
+
+### Killing features fast
+
+A new feature ships with a bug. Instead of rolling back the
+deploy (which might affect other features), you flip the flag
+off. The fix can wait for the next normal release.
+
+### A/B testing
+
+Compare two versions, measure the impact. Statsig and similar
+services bake in the statistics — you don't need to build the
+analysis yourself.
+
+### Gradual rollout
+
+Start at 1% → check metrics → 5% → 25% → 100%. If anything
+spikes (errors, latency, business metrics), pause and
+investigate.
+
+### Subscription / entitlement
+
+"Pro users can use this feature." Same mechanism, but the flag
+key is the user's subscription tier.
+
+## Flags vs config
+
+Subtle distinction:
+
+- **Flags**: experiments, gradual rollouts, kill switches.
+  Temporary by nature.
+- **Config**: business rules, limits, customizations.
+  Permanent.
+
+Flags accumulate as technical debt. Config doesn't, usually.
+Treat them separately so you can clean up flags after rollouts.
+
+## Lifecycle
+
+Every flag should have:
+
+1. **A creation date.**
+2. **An owner** — who's accountable.
+3. **A target removal date** — when this is fully rolled out and
+   the old code path can be deleted.
+
+Without lifecycle, your codebase fills with old flags. Six months
+in, you have 50 flags, most stuck at "100% rolled out" for years.
+The dead branches still exist, still need to be type-checked,
+still confuse readers.
+
+Schedule cleanup. Periodically, list flags. Delete the old code
+paths and the flag.
+
+## The code-cleanup discipline
+
+After a flag is fully rolled out and proven stable:
+
+```js
+// Before
+if (config.flags.newCheckoutFlow) {
+  return newCheckout(req, res);
+}
+return oldCheckout(req, res);
+
+// After (delete the old path)
+return newCheckout(req, res);
+```
+
+And delete `oldCheckout`. And remove the flag definition.
+
+Skip this step and "feature flags" becomes "permanent if-else with
+extra steps."
+
+## Server-side vs client-side flags
+
+- **Server-side**: evaluated in Node, controls API behavior. Most
+  back-end flags.
+- **Client-side**: evaluated in the browser, controls UI.
+
+Client-side flags need to send the flag values to the client. Most
+flag services have JS SDKs that handle this. Be mindful: client
+flags are visible to users (and competitors); don't include them
+for highly sensitive A/B tests.
+
+## Anti-patterns
+
+### Tying flags to permanent business logic
+
+```js
+if (config.flags.enableTaxCalculation) { ... }
+```
+
+Tax calculation isn't a feature you experiment with — it's a
+core requirement. Don't put permanent business rules behind
+flags; that's config (or just always-on code).
+
+### Forgetting users mid-flow
+
+A user is mid-checkout. The flag flips. The next request goes
+through the new code path with state from the old one.
+
+Mitigations:
+
+- Cache the flag value at session/request start; don't re-evaluate
+  mid-flow.
+- Design flags to be safe to flip in either direction
+  (compatible state).
+
+### Flag-based emergency switches without testing
+
+A "kill switch" you've never used in production isn't a kill
+switch — it's a hope. Test it deliberately on a low-traffic day
+so you know it works when you need it.
+
+### Centralized flag evaluation as a bottleneck
+
+If every flag check makes a network call to a flag service,
+that's a latency tax on every request. Use SDKs that cache flag
+states locally and update via push (most modern services do
+this).
+
+## In Express
+
+```js
+import { FlagsService } from './flags.js';
+
+const flags = new FlagsService();
+
+app.use(async (req, res, next) => {
+  req.flags = await flags.forUser(req.user);
+  next();
+});
+
+app.get('/checkout', (req, res) => {
+  if (req.flags.newCheckoutFlow) return newCheckout(req, res);
+  return oldCheckout(req, res);
+});
+```
+
+Attach the user's flag values to `req` so every handler can
+consume them consistently. Avoid evaluating flags repeatedly per
+request — once at the request boundary is enough.
+
+## When you don't need a flag service
+
+For a small project with no team:
+
+- Env-var flags for "kill switches" — set them, redeploy.
+- DB-backed flags for "admin-controlled toggles" — simple
+  CRUD UI.
+
+Don't reach for a full flag service until you've felt the pain
+of not having one.
+
+## What flags can't do
+
+- **Replace good testing.** A flag that fails open is a bug; the
+  flag wrapped buggy code that should've been caught in CI.
+- **Replace observability.** Without metrics, "gradual rollout"
+  is hope, not science.
+- **Replace cleanup discipline.** Flags age into liabilities if
+  you don't delete them.
+
+But for an organization with the discipline to manage them well,
+feature flags are one of the most impactful operational tools. The
+ability to decouple deploy from release fundamentally changes how
+you ship software.

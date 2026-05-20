@@ -1,0 +1,314 @@
+export const level = 'mid';
+
+# Docker
+
+Docker packages your Node app and its environment into a portable
+image. The image runs the same way on your laptop, in CI, and in
+production. For Express services, it's the standard packaging unit
+— and getting the Dockerfile right matters more than people think.
+
+## A minimal Node Dockerfile
+
+```dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+
+COPY . .
+
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+That's a working image. A few things worth understanding:
+
+- **`node:22-alpine`** — Alpine Linux base, much smaller than the
+  Debian-based image. ~50MB vs ~1GB.
+- **`corepack enable`** — bundles pnpm/yarn into Node, ready to use.
+- **Lockfile copied first**, then `install`, then the rest of the
+  code — this lets Docker cache the `install` layer if your
+  dependencies didn't change.
+- **`USER node`** — drops privileges. The base image includes a
+  `node` user; don't run as root.
+
+## Layer caching
+
+Each Dockerfile instruction is a layer. Docker rebuilds a layer
+only if it (or any earlier layer) changed. The order matters for
+build speed:
+
+```dockerfile
+# Good — install is cached if only application code changed
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+
+# Bad — every code change invalidates the install layer
+COPY . .
+RUN pnpm install --frozen-lockfile
+```
+
+Put slow, rarely-changing operations earlier. Put fast, often-
+changing operations later. Your `pnpm install` should be a cache
+hit on every build that didn't change `package.json`.
+
+## Multi-stage builds
+
+For TypeScript projects (or anything with a build step):
+
+```dockerfile
+# Build stage
+FROM node:22-alpine AS build
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+
+# Runtime stage
+FROM node:22-alpine
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+```
+
+The build stage has TypeScript, dev dependencies, source files.
+The runtime stage has only the compiled output and production
+dependencies. The final image is dramatically smaller and ships
+less attack surface.
+
+## Common antipatterns
+
+### Including dev dependencies in production
+
+Without `--prod`, `node_modules` includes 200MB of `eslint`,
+`vitest`, etc. that you don't need at runtime. Bigger image,
+slower deploys, more potential vulnerabilities.
+
+### Running as root
+
+```dockerfile
+# Bad — runs as root
+CMD ["node", "server.js"]
+
+# Good — uses the node user
+USER node
+CMD ["node", "server.js"]
+```
+
+If the container is compromised, root-in-container is more
+dangerous than node-user-in-container.
+
+### `.dockerignore` missing
+
+Without it, Docker copies `node_modules`, `.git`, `.env` files,
+test fixtures, build artifacts — into your image. Slow build, huge
+image, secrets leak.
+
+```
+# .dockerignore
+node_modules
+.git
+.env
+.env.*
+*.log
+dist
+coverage
+.DS_Store
+```
+
+Always have a `.dockerignore`. Always.
+
+### Using `npm install` instead of `pnpm install --frozen-lockfile`
+
+A non-frozen install can resolve different versions than your
+lockfile says. CI builds different artifacts from local. "Works on
+my machine" reappears.
+
+Always use `--frozen-lockfile` (or `npm ci`, the equivalent).
+
+### Floating tags in `FROM`
+
+```dockerfile
+FROM node:latest        # rebuilds every day, might break things
+FROM node:22             # tracks the latest 22.x.x, occasional surprises
+FROM node:22.10-alpine   # pinned minor, manual updates
+FROM node:22.10.0-alpine # fully pinned, most stable
+```
+
+For repeatable builds, pin specific versions. Update deliberately,
+not on every CI run.
+
+## Image size
+
+Why it matters:
+
+- **Push/pull time**: a 1GB image takes longer to deploy.
+- **Cold-start time**: serverless platforms (Lambda, Cloud Run)
+  pay the image-pull cost on each cold start.
+- **Storage cost**: registries charge for storage.
+- **Attack surface**: more files = more potential vulnerabilities.
+
+How to shrink:
+
+- Multi-stage builds (above).
+- `node:22-alpine` instead of `node:22`.
+- `pnpm install --prod` (no dev deps).
+- `.dockerignore` removes junk.
+- Combine `RUN` commands so intermediate layers don't bloat the
+  final image (less impactful with modern Docker).
+- For ultra-small images, `node:22-alpine` + production deps gets
+  you to ~120MB. Distroless or `node:22-bullseye-slim` with no
+  dependencies → smaller still, but harder to debug inside.
+
+## Healthchecks
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget --quiet --tries=1 --spider http://localhost:3000/health || exit 1
+```
+
+The orchestrator (Kubernetes, ECS) usually does its own health
+checks; the `HEALTHCHECK` directive is useful for plain
+`docker run` setups.
+
+## Signals (graceful shutdown)
+
+Make sure your Node process is PID 1 inside the container and
+receives `SIGTERM`:
+
+```dockerfile
+# Bad — npm catches SIGTERM and doesn't forward
+CMD ["npm", "start"]
+
+# Good — Node is PID 1
+CMD ["node", "server.js"]
+```
+
+When the orchestrator sends `SIGTERM`, Node needs to see it to
+trigger graceful shutdown. See **Process Signals** and
+**Graceful Shutdown**.
+
+For more complex startup (e.g., wrappers), use `tini` as PID 1:
+
+```dockerfile
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+`tini` handles signal forwarding and zombie reaping correctly. Some
+base images include it by default.
+
+## Building for multiple architectures
+
+ARM machines (Apple Silicon, ARM-based servers) need ARM images.
+Building cross-platform:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest --push .
+```
+
+Builds and pushes both architectures simultaneously. The registry
+serves the right one based on the puller's platform.
+
+If you only build for `amd64` and deploy on ARM (or vice versa),
+performance is terrible (emulation) or the image fails outright.
+
+## Layered caching in CI
+
+Without setup, CI starts every build from a cold cache. Either:
+
+- Use BuildKit + cache mounts:
+  ```dockerfile
+  RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+      pnpm install --frozen-lockfile
+  ```
+- Use registry-based cache:
+  ```bash
+  docker buildx build --cache-from type=registry,ref=myapp:cache --cache-to ...
+  ```
+- Use GitHub Actions cache, or your CI provider's equivalent.
+
+A 5-minute build becomes a 30-second build when caching works.
+
+## `docker-compose` for local
+
+For local development with dependencies (Postgres, Redis):
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://postgres@db/myapp
+      REDIS_URL: redis://redis
+    depends_on: [db, redis]
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  redis:
+    image: redis:7-alpine
+```
+
+`docker-compose up` starts the whole stack. New team members
+clone the repo, run one command, have everything running.
+
+Don't use `docker-compose` for production. Use a real orchestrator.
+
+## Security hygiene
+
+- Run as non-root (`USER node`).
+- Don't store secrets in the image (they live in env vars at
+  runtime).
+- Update base images regularly (security patches).
+- Scan images for vulnerabilities (`docker scout`, Trivy, Snyk).
+- Use specific image tags, not `latest`, so updates are
+  deliberate.
+- Minimal base images (Alpine, distroless) = smaller attack surface.
+
+## What good looks like
+
+A production Express Dockerfile that hits the marks:
+
+```dockerfile
+FROM node:22.10-alpine AS build
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+
+FROM node:22.10-alpine
+WORKDIR /app
+RUN corepack enable && apk add --no-cache tini
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+COPY --from=build /app/dist ./dist
+USER node
+EXPOSE 3000
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/server.js"]
+```
+
+Multi-stage, pinned base, pnpm with frozen lockfile, prod-only deps
+in the final image, non-root user, `tini` for signal handling.
+Under 150MB for a typical Express app. Ready for production.
