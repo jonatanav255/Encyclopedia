@@ -21,10 +21,14 @@ export function TopicOverview() {
           <Link
             key={entry.slug}
             to={`/${entry.slug}`}
-            className="block rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4 hover:border-sky-500/50 hover:bg-zinc-50 dark:hover:bg-zinc-900/70 transition-colors"
+            className="group block rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 no-underline hover:border-sky-500/50 hover:bg-zinc-900 transition-colors"
           >
-            <div className="font-semibold text-zinc-900 dark:text-zinc-100">{entry.title}</div>
-            <div className="text-xs font-mono text-zinc-500 mt-1">/{entry.slug}</div>
+            <div className="font-semibold text-zinc-100 group-hover:text-sky-400 transition-colors no-underline">
+              {entry.title}
+            </div>
+            <div className="text-xs font-mono text-zinc-500 mt-1 no-underline">
+              /{entry.slug}
+            </div>
           </Link>
         ))}
       </div>
