@@ -1,0 +1,283 @@
+export const level = 'senior';
+
+# Variance
+
+Variance describes how generic types relate when their type
+parameters relate. If `Dog` is a subtype of `Animal`, is `Box<Dog>` a
+subtype of `Box<Animal>`?
+
+TypeScript's answer is "it depends" — and the rules matter when you're
+passing functions, callbacks, or generic containers around.
+
+## The four flavors
+
+- **Covariant** — `Container<Dog>` is a `Container<Animal>`. The
+  container is *at least* an Animal container.
+- **Contravariant** — `Container<Animal>` is a `Container<Dog>`. The
+  flipped direction.
+- **Invariant** — neither direction. `Container<Dog>` and
+  `Container<Animal>` are unrelated.
+- **Bivariant** — both directions (unsound but sometimes used).
+
+The classic examples:
+
+| Position | Variance |
+| --- | --- |
+| Function return | Covariant |
+| Function parameter | Contravariant (in strict mode) |
+| Read-only field | Covariant |
+| Read-write field | Invariant |
+
+## Covariant: function returns
+
+```ts
+type Producer<T> = () => T;
+
+class Animal {}
+class Dog extends Animal {}
+
+const dogProducer: Producer<Dog> = () => new Dog();
+const animalProducer: Producer<Animal> = dogProducer;  // ok
+// every dog producer is also an animal producer
+```
+
+A function that returns a `Dog` always returns an `Animal` (because
+Dog is an Animal). Returns are *covariant* — narrower returns are
+fine.
+
+## Contravariant: function parameters
+
+```ts
+type Consumer<T> = (value: T) => void;
+
+const animalConsumer: Consumer<Animal> = (a) => console.log(a);
+const dogConsumer: Consumer<Dog> = animalConsumer;   // ok
+// a consumer that accepts ANY animal can accept just dogs
+```
+
+A function that takes an `Animal` will accept a `Dog`. So
+`Consumer<Animal>` is assignable to `Consumer<Dog>`. Parameters are
+*contravariant* — wider parameters are fine.
+
+The other direction is **unsafe**:
+
+```ts
+const dogConsumer: Consumer<Dog> = (d) => d.bark();
+const animalConsumer: Consumer<Animal> = dogConsumer;
+// problem: animalConsumer might be called with a Cat — but inside it tries to .bark()
+```
+
+That's why parameters are contravariant. Narrowing breaks safety.
+
+## `strictFunctionTypes`
+
+By default TS used to allow parameter bivariance — both directions —
+for legacy reasons. With `strict: true`, `strictFunctionTypes` is
+on:
+
+```ts
+type EventHandler = (e: Event) => void;
+type MouseEvent extends Event = ...;
+
+let handler: EventHandler = (e: MouseEvent) => {};
+// error in strict mode — parameter is too narrow
+```
+
+Without `strictFunctionTypes`, this used to compile, because typical
+DOM event types are written that way. Strict mode is correct; the DOM
+typings work around it.
+
+## Method shorthand is bivariant
+
+Subtle gotcha:
+
+```ts
+type A = {
+  method(e: Event): void;        // bivariant params!
+};
+
+type B = {
+  method: (e: Event) => void;    // strict (contravariant)
+};
+```
+
+Method shorthand (`method()`) is bivariant for backwards-compat.
+Property form (`method: (e) => void`) is strict.
+
+In most code, prefer property form for safety:
+
+```ts
+type Strict = {
+  greet: (name: string) => string;     // safer
+};
+
+type Loose = {
+  greet(name: string): string;          // bivariant
+};
+```
+
+## Read-only fields: covariant
+
+```ts
+interface ReadOnlyBox<T> {
+  readonly value: T;
+}
+
+let dogBox: ReadOnlyBox<Dog>;
+let animalBox: ReadOnlyBox<Animal> = dogBox;   // ok — reading is safe
+```
+
+If you only *read* from a container, narrowing the type parameter is
+safe — you'll always get back at least what you expect.
+
+## Read-write fields: invariant
+
+```ts
+interface Box<T> {
+  value: T;
+}
+
+let dogBox: Box<Dog>;
+let animalBox: Box<Animal> = dogBox;   // error — must be invariant
+```
+
+If `animalBox = dogBox` were allowed, you could do
+`animalBox.value = new Cat()`, and now `dogBox.value` is a Cat. Crash.
+
+That's why `Box<T>` (mutable) is invariant — neither covariant nor
+contravariant.
+
+## Arrays are covariant (and unsound)
+
+```ts
+const dogs: Dog[] = [new Dog()];
+const animals: Animal[] = dogs;   // ok in TS
+animals.push(new Cat());           // also ok — but now dogs has a Cat
+```
+
+TypeScript allows this for historical/compatibility reasons. It's
+unsound but common. The fix in serious typing — and what Rust/Scala
+do — is to make mutable arrays invariant.
+
+`readonly T[]` is properly covariant:
+
+```ts
+const dogs: readonly Dog[] = [new Dog()];
+const animals: readonly Animal[] = dogs;   // ok and safe
+// can't push
+```
+
+So: use `readonly T[]` when you don't need mutation. It's both more
+type-safe and more honest about intent.
+
+## Generic constraints + variance
+
+When you write `function f<T>(arr: T[])`, the variance of T depends
+on what you do with it. TS doesn't ask you to annotate — it infers.
+
+```ts
+function copyToAnimal<T extends Dog>(dogs: T[]): Animal[] {
+  return dogs;   // covariant: T[] → Animal[] requires T extends Animal
+}
+```
+
+This works because `T extends Dog extends Animal`, and `readonly`-ish
+usage permits covariance.
+
+## Explicit variance modifiers (TS 4.7+)
+
+You can annotate variance on a generic parameter:
+
+```ts
+interface Reader<in T> { ... }     // T is used in input positions
+interface Writer<out T> { ... }    // T is used in output positions
+interface RW<in out T> { ... }     // both — invariant
+```
+
+The compiler verifies that the parameter is used consistent with the
+declared variance, and uses this info for assignability.
+
+Most app code never uses these. Library authors who care about
+precise variance — rxjs, fp-ts — do.
+
+## Function compatibility
+
+Two function types are compatible when:
+
+1. The parameter list of A can call B (B has fewer-or-equal params,
+   and each is wider).
+2. The return of B is assignable to the return of A (narrower
+   return).
+
+```ts
+type A = (x: string, y: number) => Animal;
+type B = (x: string) => Dog;
+
+const b: B = ...;
+const a: A = b;   // ok — fewer params, narrower return
+```
+
+You can pass a `B`-typed function where an `A` is expected. JS
+ignores extra arguments; the return type is compatible.
+
+## Common pitfalls
+
+### Callback param mismatch
+
+```ts
+function map<T, U>(arr: T[], fn: (item: T, index: number) => U): U[] { ... }
+
+const ids = users.map(u => u.id);                 // ok
+const ids = users.map((u, i, arr) => u.id);        // ok — extra unused param
+const ids = users.map(({ id }) => id);             // ok — wider acceptance
+```
+
+The compiler is permissive about callbacks accepting fewer arguments
+or wider types — that's contravariance of parameters in action.
+
+### Comparing two unrelated function types
+
+```ts
+type A = (x: 'a' | 'b') => void;
+type B = (x: 'b' | 'c') => void;
+
+const a: A = ...;
+const b: B = a;   // error — A's param doesn't include 'c'
+```
+
+Neither is a subtype of the other. To assign in either direction,
+the parameter types need a subset relationship.
+
+### Class hierarchies + arrays
+
+```ts
+const cats: Cat[] = [];
+function feed(animals: Animal[]) { animals.push(new Dog()); }
+
+feed(cats);   // ok in TS — but now cats has a Dog
+```
+
+The classic broken example. Fix: make `feed` accept `readonly
+Animal[]` if it doesn't mutate, or `T[]` with `T extends Animal` if it
+needs to mutate same-type.
+
+## The mental model
+
+- **In** (parameters) is contravariant. Wider is safer; narrower is
+  unsafe.
+- **Out** (returns, read-only fields) is covariant. Narrower is
+  safer; wider is unsafe.
+- **In + out** (mutable fields) is invariant. Both directions are
+  unsafe.
+
+TypeScript enforces the "safe" direction for assignability —
+contravariance for params with `strictFunctionTypes`, covariance for
+returns, invariance for mutable fields.
+
+The historical exceptions (bivariant methods, covariant arrays) exist
+because pre-TS JavaScript was full of patterns that relied on them.
+Strict mode tightens function types; `readonly` arrays cover the
+array case.
+
+In practice you don't think about variance much — the compiler tells
+you when something's wrong. When it does, this page tells you why.

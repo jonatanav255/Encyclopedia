@@ -1,0 +1,300 @@
+export const level = 'staff';
+
+# Type-level programming
+
+TypeScript's type system is Turing-complete. You can encode parsers,
+arithmetic, state machines, and routers entirely in types — the
+compiler runs them at compile time. This page is about the techniques
+that make that possible and when they're worth using.
+
+For app code, you almost never need this. For libraries (routers,
+ORMs, validation, API clients), it's how the magic happens.
+
+## Recursive types
+
+The basic engine.
+
+```ts
+type Length<T extends readonly unknown[]> = T['length'];
+
+type Reverse<T extends unknown[]> =
+  T extends [infer Head, ...infer Rest]
+    ? [...Reverse<Rest>, Head]
+    : [];
+
+type R = Reverse<[1, 2, 3]>;   // [3, 2, 1]
+```
+
+Pattern: `T extends [Head, ...Rest] ? compute(Rest) : base case`.
+That's how almost every type-level recursion looks.
+
+## Tuple arithmetic
+
+The classic trick: encode numbers as tuple lengths.
+
+```ts
+type Inc<T extends unknown[]> = [unknown, ...T];
+type Dec<T extends unknown[]> = T extends [unknown, ...infer Rest] ? Rest : [];
+
+type Add<A extends unknown[], B extends unknown[]> = [...A, ...B];
+
+type N0 = [];
+type N1 = [unknown];
+type N2 = Inc<N1>;
+type N5 = Add<N2, [unknown, unknown, unknown]>;
+type FiveAsNum = N5['length'];   // 5
+```
+
+You can multiply, divide, compare. Examples in the `type-fest` and
+`ts-toolbelt` libraries. It's slow — TS caps recursion at ~100 — but
+expressive.
+
+## String parsing
+
+Template literal types + recursion:
+
+```ts
+type Split<S extends string, D extends string> =
+  S extends `${infer First}${D}${infer Rest}`
+    ? [First, ...Split<Rest, D>]
+    : [S];
+
+type Parts = Split<'a/b/c', '/'>;   // ['a', 'b', 'c']
+
+type Trim<S extends string> =
+  S extends ` ${infer Rest}` ? Trim<Rest>
+  : S extends `${infer Rest} ` ? Trim<Rest>
+  : S;
+
+type T = Trim<'  hello  '>;   // 'hello'
+```
+
+This is how typed routers parse `'/users/:id/posts/:pid'` into `{ id:
+string; pid: string }`. The parser runs at compile time.
+
+## Distributive conditionals
+
+```ts
+type ToArray<T> = T extends any ? T[] : never;
+type R = ToArray<string | number>;   // string[] | number[]
+```
+
+Naked type parameters in conditionals distribute over unions. Use
+`[T] extends [U]` to opt out.
+
+This is the engine behind `Exclude`, `Pick`, `Extract`, and most
+union-manipulation utilities.
+
+## `infer` in advanced positions
+
+```ts
+type FirstArg<T> = T extends (a: infer A, ...rest: any[]) => any ? A : never;
+type LastArg<T> = T extends (...args: [...any, infer L]) => any ? L : never;
+type ReturnedPromise<T> = T extends (...args: any[]) => Promise<infer R> ? R : never;
+```
+
+You can `infer` from:
+
+- Tuple positions (`[infer A, infer B]`).
+- Variadic tail (`[...infer Init, infer Last]`).
+- Template literals (`` `${infer Prefix}-${infer Suffix}` ``).
+- Function parameters and returns.
+- Class instances and constructor returns.
+- Promise inner types.
+
+## Variadic tuples
+
+```ts
+type Concat<A extends unknown[], B extends unknown[]> = [...A, ...B];
+
+type Push<T extends unknown[], V> = [...T, V];
+
+type Curry<T extends (...args: any[]) => any> =
+  T extends (a: infer A, ...rest: infer R) => infer Ret
+    ? R extends []
+      ? (a: A) => Ret
+      : (a: A) => Curry<(...rest: R) => Ret>
+    : never;
+
+type C = Curry<(a: number, b: string, c: boolean) => Date>;
+// (a: number) => (b: string) => (c: boolean) => Date
+```
+
+Currying at the type level. The runtime version (`curry(fn)`) can
+match the types perfectly.
+
+## Object manipulation
+
+```ts
+type Entries<T> = { [K in keyof T]: [K, T[K]] }[keyof T];
+
+type E = Entries<{ a: 1; b: 'two' }>;
+// ['a', 1] | ['b', 'two']
+```
+
+```ts
+type FromEntries<T extends [PropertyKey, any][]> = {
+  [K in T[number] as K[0]]: K[1];
+};
+
+type O = FromEntries<[['a', 1], ['b', 'two']]>;
+// { a: 1; b: 'two' }
+```
+
+Inverse of `Entries`. Combined, you can write type-safe `entries`/
+`fromEntries` functions.
+
+## Type-level boolean logic
+
+```ts
+type IsTrue<T extends boolean> = T extends true ? true : false;
+type IsFalse<T extends boolean> = T extends false ? true : false;
+
+type And<A extends boolean, B extends boolean> = A extends true ? B : false;
+type Or<A extends boolean, B extends boolean> = A extends true ? true : B;
+type Not<A extends boolean> = A extends true ? false : true;
+```
+
+The building blocks for type-level if/else.
+
+## Type-level equality
+
+This is tricky because `T extends U ? ... : ...` does subtype testing,
+not equality.
+
+```ts
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
+    ? true : false;
+```
+
+The double-function trick is the canonical workaround. Used by
+TS-internal type-fests and assertion libraries (`tsd`).
+
+## Practical applications
+
+### Typed routes
+
+```ts
+type ExtractParam<T extends string> =
+  T extends `:${infer Param}` ? Param : never;
+
+type RouteParams<R extends string> =
+  R extends `${infer A}/${infer B}`
+    ? ExtractParam<A> | RouteParams<B>
+    : ExtractParam<R>;
+
+type P = RouteParams<'/users/:id/posts/:pid'>;
+// 'id' | 'pid'
+
+type ParamsObject<R extends string> = {
+  [K in RouteParams<R>]: string;
+};
+
+function go<R extends string>(route: R, params: ParamsObject<R>) { ... }
+
+go('/users/:id', { id: '1' });          // ok
+go('/users/:id', {});                    // error
+go('/users/:id/posts/:pid', { id: '1', pid: '2' });   // ok
+```
+
+Real routers (TanStack Router, Hono RPC) do versions of this.
+
+### SQL query typing
+
+```ts
+type ParseSelect<S extends string> =
+  S extends `SELECT ${infer Cols} FROM ${infer Table}` ? { cols: Cols; table: Table } : never;
+
+type Q = ParseSelect<'SELECT id, name FROM users'>;
+// { cols: 'id, name'; table: 'users' }
+```
+
+ORMs like Kysely use template literal types to validate SQL fragments
+and return precisely-typed rows.
+
+### Validator → type inference
+
+```ts
+import { z } from 'zod';
+
+const UserSchema = z.object({ id: z.number(), name: z.string() });
+type User = z.infer<typeof UserSchema>;
+// { id: number; name: string }
+```
+
+`z.infer` is a tiny conditional that walks the schema's runtime shape
+and pulls out the corresponding TS type. The runtime validator and
+the compile-time type stay in sync.
+
+## When NOT to
+
+- **App code.** Almost always overkill. Stick to interfaces, unions,
+  utility types.
+- **When you can't read it.** Future-you needs to maintain it. If a
+  type takes 3 minutes to understand, the cost-to-benefit is bad.
+- **When compile time matters.** Heavy type-level computation slows
+  the build. For large projects, prefer simpler types and lean on
+  validation libraries.
+
+## Tradeoffs
+
+### Compile time
+
+Complex types are slow. The TS compiler profiles types via
+`--extendedDiagnostics`. Watch for:
+
+- "Type instantiation is excessively deep."
+- "Excessive complexity."
+- Editor lag.
+
+Cache with intermediate aliases:
+
+```ts
+type A = MassiveType<T>;
+type B = AnotherMassive<A>;
+// vs
+type C = AnotherMassive<MassiveType<T>>;   // recomputed every time
+```
+
+### Error messages
+
+Type-level errors are notoriously cryptic. "Type 'X' is not
+assignable to type 'never'" usually means a conditional branch
+became unreachable. The compiler can't always tell you where.
+
+Tools help: TypeScript Error Translator (browser extension),
+`pretty-error` packages.
+
+### Debugging
+
+`type _Debug = SomeType<...>` and hovering in the editor. There's no
+"console.log a type" — just hover.
+
+For complex parsing/transformation, build up intermediate type aliases
+and inspect each step.
+
+## Libraries to study
+
+- **`type-fest`** — utility types collection. Read the source to see
+  many patterns.
+- **`ts-toolbelt`** — arithmetic, list ops, string parsing at the
+  type level.
+- **`hotscript`** — function-pipe-style higher-kinded types.
+- **TS-internal source** — `lib.es5.d.ts` etc. for built-ins.
+
+## The mental model
+
+Type-level programming treats types as inputs to a (purely
+functional, total) program that the compiler runs. The "code" you
+write is conditional types, mapped types, template literals, and
+recursion. The "values" are other types.
+
+It's a separate language inside TypeScript, with its own debugging
+woes and ergonomics. Use it sparingly. The wins for library users —
+"my router knows my param types" — are huge. The cost for library
+authors — readability, build time, error messages — is real.
+
+For 99% of code, the rule remains: simple types, validate at
+boundaries. Save the type magic for the moments where the payoff is
+clear.

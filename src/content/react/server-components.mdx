@@ -1,0 +1,336 @@
+export const level = 'staff';
+
+# Server components
+
+React Server Components (RSC) let you render parts of your component
+tree **on the server**, sending only the result (not the JS) to the
+client. The client only ships JS for the interactive components
+("client components"). The default is server; you opt into client
+where needed.
+
+This page is conceptual. The details vary by framework (Next.js App
+Router, Remix v3, TanStack Start). The mental model is largely
+shared.
+
+## The split
+
+A modern RSC app has two kinds of components:
+
+- **Server components** — run on the server. Can read files, query
+  databases, call APIs without exposing keys. Their JS doesn't ship
+  to the browser. The output is serialized JSX, streamed to the
+  client.
+
+- **Client components** — run in the browser. Can use state, effects,
+  refs, event handlers. Marked with `'use client'` at the top of the
+  file.
+
+```jsx
+// Server component (default)
+export default async function Posts() {
+  const posts = await db.posts.findMany();   // direct DB query!
+  return (
+    <ul>
+      {posts.map((p) => (
+        <li key={p.id}>
+          <h2>{p.title}</h2>
+          <LikeButton postId={p.id} />     {/* client component */}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+```jsx
+// Client component
+'use client';
+
+export function LikeButton({ postId }) {
+  const [liked, setLiked] = useState(false);
+  return <button onClick={() => setLiked(!liked)}>{liked ? '♥' : '♡'}</button>;
+}
+```
+
+Server `Posts` queries the database directly. Client `LikeButton`
+gets `postId` as a serialized prop and runs in the browser.
+
+## What server components can do
+
+- **Run async** — `async function Component() { const data = await fetch(...); ... }`.
+- **Access secrets** — database connection strings, API keys.
+- **Read the filesystem** — read MDX, JSON, anything Node can.
+- **Skip the bundle** — their code doesn't ship to the client.
+- **Render markdown / heavy templates** without sending the
+  parser to the client.
+
+## What server components can't do
+
+- **Use state** (`useState`) or effects (`useEffect`).
+- **Use refs** (`useRef`).
+- **Handle events** (`onClick`, `onChange`).
+- **Use browser APIs** (`document`, `window`).
+- **Use context** that hasn't crossed a client boundary.
+
+If you need any of those, switch to a client component.
+
+## The boundary
+
+`'use client'` at the top of a file marks it (and everything it
+exports) as a client component. From there down the tree, you're in
+client territory.
+
+A server component can render a client component:
+
+```jsx
+// Server component
+import { LikeButton } from './LikeButton';
+
+export default function Post() {
+  return <LikeButton postId={42} />;
+}
+```
+
+A client component **can't import a server component**, but it can
+have server components passed as children (or as props that are
+`children`-like):
+
+```jsx
+// Server
+<ClientLayout>
+  <ServerContent />     {/* server component as children */}
+</ClientLayout>
+```
+
+```jsx
+// Client
+'use client';
+
+export function ClientLayout({ children }) {
+  return <div className="container">{children}</div>;
+}
+```
+
+The client component wraps server content. The server content runs
+on the server, gets serialized, and is rendered inside the client's
+shell on the browser.
+
+This pattern — "the leaves can be server, the interactive shells are
+client" — is how you keep most of your JS bundle small while still
+having interactivity.
+
+## Server actions
+
+The other half of RSC. A **server action** is a function that runs
+on the server but can be called from the client:
+
+```jsx
+'use server';
+
+export async function deletePost(postId) {
+  await db.posts.delete({ where: { id: postId } });
+  revalidatePath('/posts');
+}
+```
+
+```jsx
+'use client';
+
+import { deletePost } from './actions';
+
+export function DeleteButton({ postId }) {
+  return <button onClick={() => deletePost(postId)}>Delete</button>;
+}
+```
+
+The click on the client invokes `deletePost`, which runs on the
+server — no manual `/api/posts/delete` endpoint, no fetch boilerplate.
+The framework wires it up.
+
+Server actions can also be used directly as form actions:
+
+```jsx
+<form action={deletePost}>
+  <input type="hidden" name="id" value={postId} />
+  <button>Delete</button>
+</form>
+```
+
+The form posts to the server; React handles serialization. Progressive
+enhancement works automatically — even without JS, the form
+submits.
+
+## Data fetching
+
+```jsx
+async function UserPage({ params }) {
+  const user = await db.users.findUnique({ where: { id: params.id } });
+  const posts = await db.posts.findMany({ where: { authorId: params.id } });
+
+  return (
+    <>
+      <h1>{user.name}</h1>
+      <PostList posts={posts} />
+    </>
+  );
+}
+```
+
+No `useEffect`, no loading state, no error state — just `await`.
+The component is `async`. The framework streams the rendered HTML
+to the client when the data arrives.
+
+Pair with Suspense to load in parallel:
+
+```jsx
+function Page() {
+  return (
+    <>
+      <Suspense fallback={<UserSkeleton />}>
+        <UserPanel />
+      </Suspense>
+      <Suspense fallback={<PostsSkeleton />}>
+        <PostsPanel />
+      </Suspense>
+    </>
+  );
+}
+```
+
+Each panel fetches and streams independently. The user sees one
+appear, then the other.
+
+## Why server components
+
+- **Smaller client bundles** — most of your component code doesn't
+  ship.
+- **Direct data access** — no API layer just for your own UI.
+- **Better security** — secrets stay on the server.
+- **Streaming** — pages show progressively as data resolves.
+- **SEO** — server-rendered HTML is the source of truth.
+
+## When client components are still right
+
+- **Anything interactive** — buttons, forms, dropdowns, modals,
+  charts.
+- **Anything using browser APIs** — `IntersectionObserver`,
+  `Geolocation`, `localStorage`.
+- **State-heavy UI** — multi-step wizards, complex forms, editors.
+
+A typical RSC app has client components for forms, navigation,
+animated bits, and rich interactivity. Everything else stays on the
+server.
+
+## The bundle picture
+
+```
+Old SPA:
+  All component code shipped to the browser.
+  Bundle: 200KB+ for a typical app.
+
+RSC app:
+  Only client components ship.
+  Bundle: often 50KB or less for the same UX.
+```
+
+The reduction depends on the app. Marketing/content-heavy apps get
+huge wins (most of the page is static; only the navbar is interactive).
+SPAs are mostly interactive and benefit less.
+
+## Hydration
+
+In an RSC app, the browser receives:
+
+- HTML rendered on the server.
+- JS for client components only.
+- A serialized "RSC payload" that connects server and client pieces.
+
+Hydration attaches the client JS to the server-rendered HTML. The
+process is faster than full client rendering because most of the
+tree is already markup, not JS.
+
+## Common pitfalls
+
+### `useState` in a server component
+
+```jsx
+export default function Component() {
+  const [count, setCount] = useState(0);   // ERROR — no state on server
+}
+```
+
+Add `'use client'` at the top of the file.
+
+### Passing functions as props to client components
+
+```jsx
+// Server
+export default function Page() {
+  const handler = () => console.log('hi');
+  return <ClientButton onClick={handler} />;
+}
+```
+
+Functions can't be serialized across the server/client boundary.
+Either:
+
+- Make the parent a client component.
+- Use a server action (`'use server'`).
+
+### Forgetting `'use client'` at the top
+
+```jsx
+import { useState } from 'react';
+
+export function Button() {
+  const [open, setOpen] = useState(false);
+  ...
+}
+```
+
+This errors at build time — `useState` is a client hook. Add
+`'use client'` as the first line.
+
+### Importing client code from server components inadvertently
+
+Sometimes a "helper" file uses browser-only globals. Importing it
+into a server component breaks the build. Frameworks vary on how
+loud the error is.
+
+The rule: keep client-only code in client-only files, marked.
+
+### Waterfalls within server components
+
+```jsx
+async function Page() {
+  const user = await fetchUser();
+  const posts = await fetchPosts(user.id);   // serial — waits for user
+}
+```
+
+If `fetchPosts` doesn't need `user`'s result, parallelize:
+
+```jsx
+const [user, posts] = await Promise.all([fetchUser(), fetchPosts(id)]);
+```
+
+Same principle as in regular async code, but with the consequences
+on the page-render side.
+
+## The mental model
+
+A modern React app is **server-by-default, client-by-exception**.
+
+Server components are async functions that can directly fetch data
+and render UI. Their JS doesn't ship. Client components handle
+interactivity. The two compose: server wrap client wrap server.
+
+Server actions are server-side functions callable from the client —
+removing the boilerplate of a hand-written API for your own
+internal use.
+
+This is a different mental model from classic React (where
+everything is client). It's where modern frameworks (Next.js App
+Router, Remix v3) are heading. Worth understanding even if you're
+building a classic SPA, because the patterns are becoming the
+default.

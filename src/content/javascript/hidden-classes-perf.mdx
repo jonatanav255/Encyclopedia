@@ -1,0 +1,302 @@
+export const level = 'staff';
+
+# V8 internals and performance
+
+The V8 engine (Chrome, Node, Edge, Deno) compiles your JavaScript
+through several stages and optimizes hot code aggressively. Most of
+the time you don't need to think about it. When you do — when a hot
+path is slow — knowing the basics helps you make code the optimizer
+actually likes.
+
+## The pipeline
+
+V8 has multiple compilation tiers:
+
+1. **Ignition** — bytecode interpreter. Runs everything by default,
+   gathers type feedback.
+2. **Sparkplug** — non-optimizing compiler. Fast to produce, decent
+   speed. (Added 2021.)
+3. **Maglev** — mid-tier optimizing compiler. (Added 2023.)
+4. **TurboFan** — the heavy optimizer. Produces near-machine-code
+   from hot bytecode using type feedback.
+
+Code moves up the tiers as it becomes "hot" (executed many times).
+The optimizer makes assumptions based on observed types and bails
+back to a lower tier if those assumptions break ("deoptimization").
+
+The work you do — write predictable, monomorphic code — keeps the
+optimizer happy.
+
+## Hidden classes
+
+Every object in V8 has a **hidden class** (also called "shape" or
+"map") describing its structure: which properties exist, in what
+order, at what offsets.
+
+Two objects with the same property names added in the same order
+share a hidden class.
+
+```js
+const a = {}; a.x = 1; a.y = 2;     // shape: {x@0, y@1}
+const b = {}; b.x = 1; b.y = 2;     // SAME shape — fast
+const c = {}; c.y = 1; c.x = 2;     // shape: {y@0, x@1} — different!
+```
+
+When you write `obj.x`, V8 caches the offset at the call site (an
+"inline cache"). Same shape → cache hit, near-instant. Different shape
+→ cache miss, slower fallback.
+
+For hot code:
+
+```js
+// Good — consistent shape
+class Point {
+  constructor(x, y) { this.x = x; this.y = y; }
+}
+const points = arr.map(p => new Point(p.x, p.y));
+```
+
+```js
+// Bad — different shapes per object
+const points = arr.map(p => {
+  const o = {};
+  if (p.x !== undefined) o.x = p.x;
+  if (p.y !== undefined) o.y = p.y;
+  return o;
+});
+```
+
+The conditional property addition produces N different shapes —
+slowing every access that operates on `points`.
+
+## What ruins hidden classes
+
+- **Adding properties after construction.** Every "addition" creates a
+  new shape transition. Initialize everything in the constructor.
+- **Deleting properties** (`delete obj.x`). Triggers a switch to
+  "dictionary mode" — slow lookup, no inline caching. Set to
+  `undefined` instead if you must.
+- **Adding properties in different orders.** Shapes diverge.
+- **Setting prototype after the fact** (`Object.setPrototypeOf`).
+  Invalidates everything.
+- **Sparse arrays / non-integer keys on arrays.** Drops the array out
+  of "packed" mode into "dictionary" mode.
+
+## Monomorphic vs polymorphic vs megamorphic
+
+When V8 sees a property access in hot code, it tracks how many shapes
+have passed through:
+
+- **Monomorphic** — one shape. Fastest. Optimizer can inline.
+- **Polymorphic** — 2-4 shapes. Still fast, lookup goes through small
+  cache.
+- **Megamorphic** — 5+ shapes. Falls back to slow dictionary lookup.
+
+```js
+function getX(obj) { return obj.x; }
+
+getX({ x: 1 });               // monomorphic — one shape
+getX({ x: 1, y: 2 });         // polymorphic — two shapes
+getX({ x: 1, z: 3 });         // polymorphic — three
+// ... more variety pushes toward megamorphic
+```
+
+In hot library code, this matters. App code usually has consistent
+shapes anyway.
+
+## Numbers
+
+V8 distinguishes:
+
+- **Small integers (SMIs)** — fit in 31 bits. Stored inline, no
+  allocation.
+- **Doubles** — 64-bit floats. Boxed in some contexts (heap object).
+
+Switching a value from int to float "tags" it as a double — slows
+arithmetic that previously assumed int.
+
+```js
+let n = 0;
+for (let i = 0; i < 1e6; i++) n += i;   // SMI math the whole way
+
+let m = 0.0;
+for (let i = 0; i < 1e6; i++) m += i;   // double math
+```
+
+Both are fast. The pathological case is *flipping* between them in a
+hot loop — store an int sometimes, a double sometimes — that
+invalidates type assumptions.
+
+## Arrays
+
+V8 has several internal representations along two axes (element kind ×
+density):
+
+- **Packed SMI** — array of integers, no holes. Fastest.
+- **Packed double** — array of floats, no holes.
+- **Packed object** — array of objects, no holes.
+- **Holey** — same three with holes. Slightly slower.
+- **Dictionary** — sparse or huge. Hash map. Much slower.
+
+Stay packed. Don't:
+
+```js
+const a = new Array(1000);   // creates holey array
+a[100] = 1;                  // sparse — dictionary mode
+
+const a = [];
+for (let i = 0; i < 1000; i++) a.push(i);  // packed SMI
+```
+
+Adding string indices to an array also transitions it to dictionary
+mode:
+
+```js
+const a = [1, 2, 3];
+a.foo = 'bar';   // dictionary mode now
+```
+
+Just don't.
+
+## Function inlining
+
+TurboFan inlines small functions into their callers, removing call
+overhead. To stay inlineable:
+
+- Small body (heuristic; recent V8s inline up to ~100 bytecode bytes).
+- Called with monomorphic argument shapes.
+- Not `try`/`catch`-wrapped (used to disable inlining; less true in
+  recent V8s).
+
+```js
+const add = (a, b) => a + b;
+function sum(arr) {
+  let s = 0;
+  for (const n of arr) s = add(s, n);   // `add` likely inlined
+  return s;
+}
+```
+
+You rarely write code with inlining in mind, but breaking it explains
+mystery slowdowns ("I refactored to a separate function and it's
+20% slower").
+
+## Deoptimization
+
+When V8 makes an assumption (this function always receives integers)
+and it's violated, it deoptimizes — falls back to an earlier tier.
+Re-optimizes later, possibly with the new assumption.
+
+Frequent deoptimization is bad. Causes:
+
+- Type changes in hot loops.
+- New properties added to objects in hot loops.
+- `try`/`catch` in hot loops (engine-version dependent).
+- Calling a function with widely varying argument types.
+
+Profile with `--trace-deopt` (Node) to see what's bailing.
+
+## `JSON.parse` is fast
+
+V8 optimizes `JSON.parse` for objects with consistent shapes — it
+recognizes "this is the same shape as last time" and skips work.
+
+Implication: parsing 10,000 records of the same shape is very fast.
+Parsing 10,000 records of *different* shapes is much slower because
+each one creates a new hidden class.
+
+API design implication: don't dynamically include or exclude fields
+in your JSON response; always include the same set (with `null` for
+missing) for objects you'll parse many of.
+
+## Strings
+
+V8 has multiple string representations:
+
+- **One-byte (Latin-1)** — ASCII-only strings.
+- **Two-byte (UCS-2)** — anything with a non-ASCII character.
+- **Cons string** — `a + b` is sometimes stored as a tree, not
+  flattened, until accessed.
+
+Implications:
+
+- Append-heavy code may build big trees. Reading them (`.length`,
+  `[i]`) triggers flattening — a copy.
+- Joining many strings into one is best done with `Array.join`, which
+  flattens once.
+
+```js
+// Bad
+let s = '';
+for (const x of items) s += x + ',';
+
+// Good
+const s = items.join(',');
+```
+
+## Memory pressure
+
+Allocation costs:
+
+- A new object is cheap — V8 bump-allocates in young space.
+- Young-space GC is fast (~ms).
+- Old-space GC is slower and can pause the main thread.
+
+Pressure shows up as `--trace-gc` lines spamming or `process.memoryUsage()`
+climbing without bound.
+
+Reducing pressure:
+
+- Pool objects in tight loops (`object.x = ... ; object.y = ...` on
+  the same instance, instead of `{ x, y }` per iteration). Only worth
+  it for millions of iterations.
+- Avoid string concatenation in tight loops (per above).
+- Avoid `arguments` access in modern code (deoptimization in some
+  cases); use rest parameters.
+
+## When to bother
+
+Almost never. Modern V8 is fantastic. App code, even sloppy app code,
+runs fast.
+
+Bother when:
+
+- You profile and see a specific hot path eating CPU.
+- You've already minimized algorithmic complexity (don't optimize a
+  bubble sort).
+- You're building a library or game engine — hot code for users.
+- You see `--trace-deopt` spam under load.
+
+Premature micro-optimization makes code uglier without measurable
+wins. The advice in this page is for the rare case where you've
+profiled and need to squeeze.
+
+## The diagnostic toolkit
+
+```bash
+node --trace-gc app.js                          # GC events
+node --trace-opt --trace-deopt app.js           # optimization / deopt
+node --print-bytecode app.js                    # bytecode dump
+node --print-opt-code --code-comments app.js    # optimized machine code
+node --prof app.js                              # CPU profiler
+node --inspect app.js                           # DevTools
+```
+
+`clinic.js` (`pnpm dlx clinic doctor -- node app.js`) gives a nice
+visual summary of CPU, event-loop lag, and memory.
+
+## The mental model
+
+V8 is happy when you:
+
+- Always pass the same shape of object to the same function.
+- Always pass the same type (int vs float, string vs object) to the
+  same parameter.
+- Never delete properties.
+- Initialize all object properties at construction.
+- Keep arrays packed.
+- Don't `eval` or `with` (full deopt).
+
+Most of this falls out naturally from "write idiomatic class- and
+function-shaped code." The places it matters are tight loops, library
+internals, and parsers — where every cycle counts.

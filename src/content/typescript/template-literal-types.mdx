@@ -1,0 +1,244 @@
+export const level = 'senior';
+
+# Template literal types
+
+Template literal types (TS 4.1+) let you build string types out of
+other string types. They're the cleanest way to express "this string
+follows a pattern" — route paths, event names, CSS units, etc.
+
+## The basics
+
+```ts
+type Greeting = `hello, ${string}`;
+const a: Greeting = 'hello, world';   // ok
+const b: Greeting = 'hi';              // error
+```
+
+Backticks in type position. Anything that gets interpolated must be
+a string literal type or `string`/`number`/`bigint`/`boolean`/etc.
+
+When all interpolations are literal unions, the result is a literal
+union too:
+
+```ts
+type Verb = 'get' | 'set';
+type Field = 'name' | 'age';
+type Getter = `${Verb}${Capitalize<Field>}`;
+// 'getName' | 'getAge' | 'setName' | 'setAge'
+```
+
+This combinatorial expansion is what makes template literal types
+useful for deriving APIs.
+
+## Built-in string transformers
+
+```ts
+type Upper = Uppercase<'hello'>;       // 'HELLO'
+type Lower = Lowercase<'HELLO'>;        // 'hello'
+type Cap = Capitalize<'hello'>;         // 'Hello'
+type Uncap = Uncapitalize<'Hello'>;     // 'hello'
+```
+
+Pure built-in utilities. Use inside template literals to compute
+names:
+
+```ts
+type Setter<T extends string> = `set${Capitalize<T>}`;
+type T = Setter<'name'>;   // 'setName'
+```
+
+## Inferring with template literals
+
+You can extract parts of a string using `infer` in a conditional:
+
+```ts
+type ExtractDomain<T extends string> = T extends `${string}@${infer D}` ? D : never;
+
+type A = ExtractDomain<'jon@example.com'>;   // 'example.com'
+type B = ExtractDomain<'no-at-sign'>;         // never
+```
+
+```ts
+type Split<S extends string, D extends string> =
+  S extends `${infer First}${D}${infer Rest}`
+    ? [First, ...Split<Rest, D>]
+    : [S];
+
+type Parts = Split<'a/b/c', '/'>;   // ['a', 'b', 'c']
+```
+
+You're doing string parsing at the type level. Useful for typed
+route params, CSS values, branded IDs.
+
+## Real-world patterns
+
+### Typed routes
+
+```ts
+type Route =
+  | '/users'
+  | '/users/:id'
+  | '/posts'
+  | '/posts/:id/comments';
+
+type Params<R extends Route> = R extends `${string}:${infer P}/${infer Rest}`
+  ? { [K in P | keyof Params<`/${Rest}`>]: string }
+  : R extends `${string}:${infer P}`
+    ? { [K in P]: string }
+    : Record<string, never>;
+
+function go<R extends Route>(route: R, params: Params<R>) { ... }
+
+go('/users/:id', { id: '42' });   // ok
+go('/users', {});                  // ok
+go('/users/:id', {});              // error — missing id
+```
+
+This is a simplified version of how libraries like `tanstack/router`
+derive param types from path strings.
+
+### Tailwind-like utility names
+
+```ts
+type Spacing = '0' | '1' | '2' | '4' | '8';
+type Direction = 'm' | 'p';
+type Side = 't' | 'r' | 'b' | 'l';
+
+type ClassName = `${Direction}${Side | ''}-${Spacing}`;
+
+const c: ClassName = 'mt-4';   // ok
+const c2: ClassName = 'mz-4';  // error
+```
+
+You can express the whole utility namespace as a type.
+
+### Event names
+
+```ts
+type EventTarget = 'button' | 'input' | 'form';
+type EventName = 'click' | 'change' | 'submit';
+type Event = `on${Capitalize<EventName>}${Capitalize<EventTarget>}`;
+
+// 'onClickButton' | 'onClickInput' | ... | 'onSubmitForm'
+```
+
+For typed event systems where event names follow a convention.
+
+### Snake-case to camelCase
+
+```ts
+type CamelCase<S extends string> = S extends `${infer Head}_${infer Tail}`
+  ? `${Head}${Capitalize<CamelCase<Tail>>}`
+  : S;
+
+type A = CamelCase<'user_id'>;          // 'userId'
+type B = CamelCase<'first_name_long'>;  // 'firstNameLong'
+```
+
+Combined with mapped types, you can transform an entire interface's
+keys:
+
+```ts
+type CamelKeys<T> = {
+  [K in keyof T as CamelCase<K & string>]: T[K];
+};
+
+type Snake = { user_id: number; first_name: string };
+type Camel = CamelKeys<Snake>;
+// { userId: number; firstName: string }
+```
+
+A common need when consuming snake_case JSON APIs.
+
+## Pattern matching with template literals
+
+```ts
+type IsEmail<T extends string> = T extends `${string}@${string}.${string}`
+  ? true
+  : false;
+
+type A = IsEmail<'jon@example.com'>;   // true
+type B = IsEmail<'not-email'>;          // false
+```
+
+You're encoding regex-like matching in the type system. Useful for
+typed builders that reject invalid input at compile time.
+
+## Limits and pitfalls
+
+### Recursion depth
+
+```ts
+type Repeat<S extends string, N extends number, R extends string = ''>
+  = R['length'] extends N ? R : Repeat<S, N, `${R}${S}`>;
+```
+
+For large N this blows the recursion limit. TypeScript caps type
+recursion (~100 levels). For deeper computation, refactor or accept
+the limit.
+
+### Distributivity surprises
+
+```ts
+type Wrap<T> = T extends string ? `[${T}]` : never;
+
+type A = Wrap<'a' | 'b'>;   // '[a]' | '[b]' — distributed
+```
+
+Conditional types distribute over unions; that includes string
+unions in template literals. Usually what you want; occasionally not.
+
+### Computation cost
+
+Template literal types with deep recursion + large unions can slow
+typechecking. If your editor lags:
+
+- Cache complex types with intermediate aliases.
+- Reduce union size.
+- Memoize via type aliases (TS caches them).
+
+### Non-string interpolations
+
+```ts
+type Foo = `count: ${number}`;
+const a: Foo = 'count: 5';     // ok
+const b: Foo = 'count: 5.5';   // ok — number is wide
+const c: Foo = 'count: abc';   // error
+```
+
+`number` accepts any numeric form. To narrow to integers, you'd need
+deeper pattern matching (or just accept the precision tradeoff).
+
+## When to reach for them
+
+- **Deriving API names** from a base set (getters, setters, events).
+- **Validating route patterns** statically.
+- **Typing builders** where the input string controls subsequent
+  types.
+- **Converting case** (snake → camel) in TS land.
+- **Branded IDs** with format hints.
+
+## When NOT to
+
+- For plain runtime string formatting — use template literals at the
+  value level, not the type level.
+- When the input isn't statically known — template literal types
+  only work for compile-time-known strings.
+- When the type computation slows the build noticeably.
+
+## The mental model
+
+A template literal type is **string interpolation that returns a
+type**. Inputs are unions of string literals; outputs are unions of
+strings built from them. Combined with `infer`, you get pattern
+matching.
+
+Most app code never needs them directly. Most modern TS libraries
+(routers, ORM clients, CSS-in-JS) use them heavily under the hood to
+derive types from your usage. That's why your `tRPC` query has the
+exact param signatures of the procedure — template literal types
+parsed the path and connected the pieces.
+
+For everyday code, the built-in transforms (`Uppercase`,
+`Capitalize`) + template literals get you 90% of the wins. Save
+deeper pattern matching for cases where it genuinely pays off.

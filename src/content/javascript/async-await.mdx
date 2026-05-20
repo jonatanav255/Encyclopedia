@@ -1,0 +1,267 @@
+export const level = 'mid';
+
+# `async` / `await`
+
+`async` and `await` are syntactic sugar on top of promises. They don't
+add capability; they make code that uses promises read top-to-bottom
+like synchronous code.
+
+## What `async` does
+
+Declaring a function `async`:
+
+1. **Wraps the return value in a promise.** Whether you return `42`
+   or `Promise.resolve(42)`, callers get a promise that fulfills with
+   `42`.
+2. **Wraps thrown errors as rejections.** A `throw new Error('x')`
+   inside an `async` function becomes a rejected promise.
+3. **Enables `await` inside the function.**
+
+```js
+async function get() {
+  return 42;
+}
+
+get();                     // Promise<42>
+get().then(v => console.log(v)); // 42
+```
+
+```js
+async function fail() {
+  throw new Error('nope');
+}
+
+fail();                    // Promise rejected with Error('nope')
+fail().catch(e => console.error(e.message)); // "nope"
+```
+
+## What `await` does
+
+`await expr` pauses the function until `expr` settles:
+
+- If `expr` is a promise, the result is its fulfilled value (or its
+  rejection is thrown).
+- If `expr` is anything else, `await` wraps it in `Promise.resolve`
+  and resolves immediately on the next microtask tick.
+
+```js
+async function fetchUser() {
+  const res = await fetch('/api/user');  // pauses until fetch settles
+  if (!res.ok) throw new Error('bad');
+  const user = await res.json();          // pauses until body parses
+  return user;
+}
+```
+
+Behind the scenes the engine rewrites this into a `.then` chain, but
+you read it like sync code.
+
+## Error handling
+
+`await` rethrows rejected promises as exceptions. `try`/`catch` is
+your tool:
+
+```js
+async function get() {
+  try {
+    const user = await fetchUser();
+    return user;
+  } catch (err) {
+    console.error('fetch failed:', err);
+    throw err;             // re-throw — let the caller decide
+  }
+}
+```
+
+If you don't catch, the rejection propagates up to whoever awaits
+`get()`. If nobody does, you get an unhandled rejection.
+
+## Parallel awaits
+
+`async`/`await` doesn't parallelize anything by default. Every
+`await` waits.
+
+```js
+// Sequential — slow
+const a = await fetchA();   // wait 200ms
+const b = await fetchB();   // wait another 200ms
+// total: 400ms
+```
+
+```js
+// Parallel — fast
+const pA = fetchA();        // start
+const pB = fetchB();        // start
+const a = await pA;
+const b = await pB;
+// total: ~200ms
+```
+
+Or, more idiomatically:
+
+```js
+const [a, b] = await Promise.all([fetchA(), fetchB()]);
+```
+
+`Promise.all` rejects on the first rejection and ignores the rest.
+For "fetch all, tell me which succeeded," use `Promise.allSettled`.
+
+## Loops + await
+
+```js
+for (const id of ids) {
+  await fetchUser(id);     // sequential — total = sum of per-fetch
+}
+```
+
+```js
+await Promise.all(ids.map(fetchUser)); // parallel — total = max of per-fetch
+```
+
+If `ids` is huge, parallel can DoS the target. Use bounded concurrency:
+
+```js
+import pLimit from 'p-limit';
+const limit = pLimit(20);
+await Promise.all(ids.map(id => limit(() => fetchUser(id))));
+```
+
+## `forEach` doesn't await
+
+```js
+[1, 2, 3].forEach(async (n) => {
+  await save(n);
+});
+console.log('done');   // logs IMMEDIATELY — save promises are discarded
+```
+
+`forEach` ignores return values. Each `async` callback returns a
+promise that nobody awaits.
+
+Use `for...of` (sequential) or `Promise.all` (parallel) instead.
+
+## Returning vs awaiting
+
+These look the same but behave differently in `try`/`catch`:
+
+```js
+async function pass() {
+  return doAsync();         // returns the promise; caller awaits
+}
+
+async function caught() {
+  return await doAsync();   // awaits here; any rejection caught by THIS function
+}
+```
+
+Use `return await` when you have a `try`/`catch` around it and want
+the error caught locally. Otherwise just `return` is fine (and
+slightly more efficient).
+
+## Mixing styles
+
+```js
+// All three work; they're equivalent
+async function getA() {
+  const res = await fetch('/api');
+  return res.json();
+}
+
+async function getB() {
+  return fetch('/api').then(res => res.json());
+}
+
+function getC() {
+  return fetch('/api').then(res => res.json());  // no async needed
+}
+```
+
+`getC` returns a promise directly — no extra wrapping. Don't mark a
+function `async` just out of habit if it has no `await`.
+
+## `async` in callbacks
+
+Passing an `async` function as a callback to something that doesn't
+expect a promise can cause silent issues:
+
+```js
+[1, 2, 3].map(async n => n + 1);    // returns [Promise, Promise, Promise]
+[1, 2, 3].sort(async (a, b) => a - b); // BROKEN — sort needs a sync comparator
+```
+
+`map` is fine — you wrap the result in `Promise.all`. `sort`,
+`filter`, `find`, `reduce` are not — they call the callback
+synchronously and ignore the returned promise.
+
+## Top-level await
+
+In ES modules you can `await` at the top level (no enclosing async
+function):
+
+```js
+// init.mjs
+const config = await loadConfig();
+export { config };
+```
+
+Anything that imports `init.mjs` waits for it. Powerful for setup,
+but can serialize startup if every module top-level-awaits something.
+
+CJS doesn't support this. In Node CJS files, wrap in
+`(async () => { ... })()` if you need to.
+
+## Async iteration
+
+`for await...of` consumes async iterables (`Readable` streams,
+`fetch` body parts, custom generators):
+
+```js
+for await (const chunk of stream) {
+  process(chunk);
+}
+```
+
+Same semantics as `for...of`, except each iteration may `await` a
+promise from the iterator's `next()`.
+
+## Cancellation
+
+Promises (and therefore `async`/`await`) don't cancel. The standard
+way to abort underlying work is `AbortSignal`:
+
+```js
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 1000);
+
+try {
+  const res = await fetch('/api', { signal: ac.signal });
+  // ...
+} catch (err) {
+  if (err.name === 'AbortError') {
+    console.log('cancelled');
+  } else {
+    throw err;
+  }
+}
+```
+
+The `fetch` itself is what's cancellable; the promise rejects with an
+`AbortError`. Build your own async code to honor signals when you can.
+
+## Common bugs
+
+- **Forgetting `await`**: `doAsync()` instead of `await doAsync()` —
+  next line runs before the work finishes. Linters catch this.
+- **Awaiting in a loop when you meant parallel**: huge latency hit.
+- **Catching too broadly**: `try { await doMany(); } catch {}` hides
+  unrelated bugs. Catch the specific call that can fail.
+- **Returning before async work finishes**: same as "forgetting
+  await."
+
+## The mental model
+
+`async function` = "I return a promise. My body looks synchronous but
+I can `await`."
+`await x` = "Stop here until `x` resolves; rethrow if it rejects."
+
+That's it. Everything else is just promises in a friendlier outfit.

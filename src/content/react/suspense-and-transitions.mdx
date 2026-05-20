@@ -1,0 +1,338 @@
+export const level = 'senior';
+
+# Suspense and transitions
+
+Suspense is React's mechanism for declaring "this part of the UI
+might not be ready yet — show this fallback in the meantime."
+Combined with transitions, it gives you smooth loading UX without
+manual coordination of loading/error/data states.
+
+## The basics
+
+```jsx
+<Suspense fallback={<Spinner />}>
+  <UserProfile id={42} />
+</Suspense>
+```
+
+If anything in the subtree "suspends" (signals that it's waiting on
+data), React shows the fallback. When the data is ready, React renders
+the real content.
+
+The trick: components don't return a loading state — they just
+throw a promise. The nearest `<Suspense>` ancestor catches it.
+
+## How a component suspends
+
+The modern way: `use(promise)`:
+
+```jsx
+function UserProfile({ id }) {
+  const user = use(fetchUser(id));   // suspends until resolved
+  return <h1>{user.name}</h1>;
+}
+```
+
+If `fetchUser(id)` returns a promise that's not yet resolved, `use`
+throws the promise. React catches it, suspends, shows the fallback.
+When the promise resolves, React re-renders and `use` returns the
+value.
+
+In practice you don't `use(fetch(...))` directly because that would
+fire a new request every render. You use a library that caches the
+promises:
+
+- **TanStack Query**'s `useSuspenseQuery`.
+- **Relay** (uses Suspense natively).
+- **Next.js** server components with async data.
+- **SWR** with `suspense: true`.
+
+## Nested Suspense
+
+```jsx
+<Suspense fallback={<PageSkeleton />}>
+  <Layout>
+    <Suspense fallback={<UserCardSkeleton />}>
+      <UserCard id={id} />
+    </Suspense>
+    <Suspense fallback={<FeedSkeleton />}>
+      <Feed userId={id} />
+    </Suspense>
+  </Layout>
+</Suspense>
+```
+
+Each `<Suspense>` boundary catches suspensions in its subtree. The
+inner ones let parts of the page load independently. The outer one
+catches the very first suspension (e.g., the layout itself).
+
+The visual effect: the page shell renders fast; specific sections
+show their own loading states; everything fills in as data arrives.
+
+## Suspense with transitions
+
+Without transitions, when state changes and a Suspense boundary
+suspends, the fallback flashes:
+
+```jsx
+function App() {
+  const [id, setId] = useState(1);
+  return (
+    <Suspense fallback={<Spinner />}>
+      <UserProfile id={id} />
+    </Suspense>
+  );
+}
+```
+
+Click "next user" → component suspends → fallback shows briefly →
+new content appears. The flash is jarring.
+
+With `useTransition`:
+
+```jsx
+function App() {
+  const [id, setId] = useState(1);
+  const [isPending, startTransition] = useTransition();
+
+  return (
+    <>
+      <button onClick={() => startTransition(() => setId(id + 1))}>
+        Next user
+      </button>
+      {isPending && <FadeIn />}
+      <Suspense fallback={<Spinner />}>
+        <UserProfile id={id} />
+      </Suspense>
+    </>
+  );
+}
+```
+
+The transition tells React: "this update isn't urgent; keep the
+previous content visible while the new one loads." The fallback
+doesn't flash; the old content stays, optionally dimmed via
+`isPending`.
+
+This is the modern "loading without flicker" pattern.
+
+## Error boundaries vs Suspense
+
+Suspense handles "data not yet here." Error boundaries handle "data
+loading failed."
+
+```jsx
+<ErrorBoundary fallback={<Error />}>
+  <Suspense fallback={<Spinner />}>
+    <UserProfile id={id} />
+  </Suspense>
+</ErrorBoundary>
+```
+
+If `fetchUser` rejects, the error bubbles to the nearest error
+boundary. If it pends, the Suspense boundary catches it.
+
+You almost always pair them. Many libraries (`react-query`, `swr`)
+provide error boundaries; for app code, write your own (see
+**Error boundaries**).
+
+## Streaming SSR
+
+Modern frameworks (Next.js, Remix, TanStack Start) use Suspense for
+streaming:
+
+1. The server renders the shell HTML.
+2. Suspended sections are placeholders.
+3. The server sends HTML chunks as data resolves.
+4. The browser progressively replaces placeholders with real content.
+
+The user sees the page shell instantly, even if some sections take
+seconds to load. No client-side waterfalls.
+
+This is one of the biggest wins of Suspense — it works the same
+in SSR streaming and client-side rendering.
+
+## What can suspend
+
+Officially:
+
+- `use(promise)` — the canonical way.
+- Library hooks built on `use` or on the older "throw a promise"
+  pattern.
+- `lazy(() => import('./X'))` — code splitting.
+
+```jsx
+const LazyDashboard = lazy(() => import('./Dashboard'));
+
+<Suspense fallback={<Spinner />}>
+  <LazyDashboard />
+</Suspense>
+```
+
+`React.lazy` is the simplest Suspense use case — dynamically import
+a component and show a fallback while the JS loads.
+
+## Avoiding waterfalls
+
+```jsx
+function App() {
+  return (
+    <Suspense fallback={<Spinner />}>
+      <UserProfile id={id} />
+      <UserPosts userId={id} />   // both fetch in parallel
+    </Suspense>
+  );
+}
+```
+
+Both components suspend independently. They start their fetches in
+parallel; React waits for both before rendering the children.
+
+The anti-pattern:
+
+```jsx
+function App() {
+  return (
+    <Suspense fallback={<Spinner />}>
+      <UserProfile id={id}>
+        <UserPosts userId={id} />   // child renders AFTER parent
+      </UserProfile>
+    </Suspense>
+  );
+}
+```
+
+If `UserProfile` waits to render until its data arrives, `UserPosts`
+doesn't start fetching until then. That's a waterfall — sequential
+where they could be parallel.
+
+The fix: kick off both fetches at the top level (in a parent that
+doesn't suspend) or use library features like Relay's "fetch alongside"
+patterns.
+
+## React 19 actions
+
+For form submissions, React 19's actions integrate with Suspense:
+
+```jsx
+function MyForm() {
+  const [state, formAction, isPending] = useActionState(async (prevState, formData) => {
+    const result = await save(formData);
+    return { ok: true, result };
+  }, { ok: false });
+
+  return (
+    <form action={formAction}>
+      <input name="email" />
+      <button disabled={isPending}>Save</button>
+    </form>
+  );
+}
+```
+
+The action runs async; the form knows when it's pending. Pairs with
+Suspense for full progressive enhancement.
+
+## Common pitfalls
+
+### Calling `use(promise)` without a cache
+
+```jsx
+function Component() {
+  const data = use(fetch('/api'));   // BAD — new fetch every render
+}
+```
+
+`use(promise)` is stateless. Each render creates a new promise → new
+fetch → loops forever (or hammers your API).
+
+You need a library or context that returns the **same promise** for
+the same input across renders. TanStack Query's `useSuspenseQuery`,
+Relay's hooks, or a hand-rolled cache.
+
+### Showing a fallback flash
+
+```jsx
+setId(id + 1);   // urgent update → suspended boundary → fallback flashes
+```
+
+Wrap in a transition:
+
+```jsx
+startTransition(() => setId(id + 1));
+```
+
+Or use `useDeferredValue` to defer the update.
+
+### Putting fallback content too high
+
+```jsx
+<Suspense fallback={<FullPageSpinner />}>
+  <Layout>
+    <Sidebar />
+    <Main>
+      <UserData />   // ONE component suspends → whole page goes blank
+    </Main>
+  </Layout>
+</Suspense>
+```
+
+The user sees a spinner for the entire page. Move the boundary
+closer to the data:
+
+```jsx
+<Layout>
+  <Sidebar />
+  <Main>
+    <Suspense fallback={<DataSkeleton />}>
+      <UserData />
+    </Suspense>
+  </Main>
+</Layout>
+```
+
+Now only the data section flashes; the layout stays visible.
+
+### Forgetting error boundaries
+
+A rejected promise inside Suspense propagates up. Without an error
+boundary, the app crashes. Pair every Suspense boundary with an
+error boundary at a reasonable level.
+
+### Using Suspense without a framework
+
+It works, but you have to manage:
+
+- Promise caching (so `use(...)` doesn't re-fetch).
+- Hydration (mismatches between server and client suspended states).
+- Streaming (if you SSR).
+
+For real apps, use a framework. For learning, you can roll your own
+with TanStack Query + Suspense.
+
+## The mental model
+
+Suspense is **the loading-state primitive**. Components don't have
+loading states — they suspend, and a parent decides what to show
+during the suspension.
+
+Transitions are **the smoothness primitive**. They tell React
+"this update isn't urgent — keep the current UI visible while the
+new state prepares."
+
+Together: smooth, declarative loading without explicit
+`loading={true}` flags everywhere. The component just says "I want
+this data"; React (with help from a data library) handles when and
+how it appears.
+
+For most apps in 2026, the stack is:
+
+- A framework that integrates Suspense (Next.js, Remix, TanStack
+  Start).
+- TanStack Query (or Relay, SWR) for data loading.
+- Suspense boundaries near each "section that loads."
+- Error boundaries near each Suspense boundary.
+- Transitions for navigations and filter updates.
+
+Old "loading spinner per component" code feels primitive once you
+internalize the model.

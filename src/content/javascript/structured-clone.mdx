@@ -1,0 +1,225 @@
+export const level = 'senior';
+
+# `structuredClone` and value transfer
+
+JavaScript runtimes (browsers, Node, Workers) move data between
+contexts — main thread to worker, IndexedDB writes, postMessage —
+using the **Structured Clone Algorithm**. `structuredClone()` exposes
+the same algorithm directly as a synchronous deep-copy primitive.
+
+## The basics
+
+```js
+const a = { name: 'jon', tags: ['a', 'b'], nested: { x: 1 } };
+const b = structuredClone(a);
+
+a === b;                  // false — different object
+a.nested === b.nested;    // false — also cloned
+b.nested.x = 99;
+a.nested.x;               // 1 — original untouched
+```
+
+It's a true deep clone. Available natively in modern Node and
+browsers.
+
+## What it handles
+
+Way more than `JSON.parse(JSON.stringify(...))`:
+
+| Value type | JSON | structuredClone |
+| --- | --- | --- |
+| Plain objects, arrays, primitives | yes | yes |
+| `Date` | string-only | preserves `Date` |
+| `Map`, `Set` | no | yes |
+| `RegExp` | no | yes |
+| Typed arrays (`Uint8Array` etc.) | no | yes |
+| `ArrayBuffer` | no | yes |
+| `Blob`, `File` | no | yes (browser) |
+| Cyclic references | infinite loop / error | yes |
+| `undefined` | lost | preserved (inside arrays) |
+| Functions | lost | error |
+| Class instances | downgraded to plain object | downgraded to plain object |
+| DOM nodes | n/a | error |
+| Symbols | lost | error |
+
+```js
+const original = { d: new Date(), m: new Map([[1, 2]]), self: null };
+original.self = original;  // cyclic
+
+const copy = structuredClone(original);
+copy.d instanceof Date;     // true
+copy.m instanceof Map;      // true, with [[1, 2]]
+copy.self === copy;         // true — cycle preserved
+```
+
+## What it can't clone
+
+- **Functions** — throws `DataCloneError`.
+- **Class instances retain only their data**, not their prototype.
+  `new Person()` clones to a plain `{ name: ... }` (no `Person`
+  prototype).
+- **Symbols** as values or keys — throw.
+- **WeakMap, WeakSet** — throw.
+- **Promise** — throws.
+- **Error** instances — partially preserved; `name`, `message`,
+  `stack` survive in most engines.
+
+```js
+class User {
+  constructor(name) { this.name = name; }
+  greet() { return `hi ${this.name}`; }
+}
+
+const u = new User('jon');
+const copy = structuredClone(u);
+copy.greet;     // undefined — prototype lost
+copy.name;      // "jon"
+```
+
+For class-aware cloning you need a custom `clone()` method on your
+class.
+
+## Transferables
+
+In `postMessage`, you can *transfer* ownership of objects rather than
+clone them. The original side loses access, the receiving side gets
+it directly — no copy.
+
+```js
+const buf = new ArrayBuffer(1024 * 1024 * 100); // 100MB
+worker.postMessage({ buf }, [buf]);
+// buf is now "detached" on the sender side
+buf.byteLength;  // 0
+```
+
+Cheaper than cloning a 100MB buffer. Works only for transferable
+types: `ArrayBuffer`, `MessagePort`, `ReadableStream`, `WritableStream`,
+`TransformStream`, `OffscreenCanvas`.
+
+`structuredClone` accepts a `transfer` option too:
+
+```js
+const buf = new ArrayBuffer(1024);
+const copy = structuredClone({ buf }, { transfer: [buf] });
+// buf is now detached; copy.buf has the bytes
+```
+
+This is rarely useful inside the same thread (you'd usually just
+reassign), but it matches the postMessage API.
+
+## When to reach for it
+
+- **Deep cloning data** — fastest correct way in modern engines.
+- **Snapshotting state** — copy a Redux store, an undo history entry.
+- **Sending to a worker** — `postMessage` calls it under the hood.
+- **Caching values that might be mutated later** — clone on the way
+  in or out to avoid sharing.
+
+For deeply nested objects with Maps, Sets, Dates, Blobs, etc.,
+`structuredClone` beats `JSON.parse(JSON.stringify(...))` both in
+correctness and (in modern engines) speed.
+
+## When NOT to use it
+
+- **Cloning a class instance** — prototype is lost. Use a `.clone()`
+  method or a copy constructor.
+- **Cloning a tiny plain object** — overhead matters; spread is
+  faster: `{ ...obj }`.
+- **Cloning anything with functions** — it throws. You either remove
+  them first or use a library that handles them (`lodash.cloneDeep`).
+- **Performance-critical hot path with simple structures** — manual
+  clone is faster for known shapes.
+
+## vs `JSON.parse(JSON.stringify(...))`
+
+The historical idiom. Drawbacks:
+
+- Loses `undefined` (replaced with nothing or `null`).
+- Converts `Date` to ISO string (you have to know to revive).
+- Loses `Map`, `Set`, `RegExp`, `Symbol`.
+- Doesn't handle cycles — throws.
+- Loses non-enumerable properties.
+- Skips properties with function values.
+
+`structuredClone` is strictly better for everything except:
+
+- Older Node (pre-17). Polyfills exist.
+- When you specifically want JSON's stripped form.
+
+## vs `lodash.cloneDeep`
+
+`cloneDeep` is more forgiving — handles functions (copies them as-is),
+handles class instances better (copies the prototype). But it's
+slower and has a larger dependency.
+
+Use `structuredClone` for data; use `cloneDeep` for "things including
+functions/instances."
+
+## Performance
+
+```js
+// micro-benchmark, illustrative only
+structuredClone(obj)              // ~3-5× faster than JSON roundtrip in V8
+{...obj}                          // ~10-100× faster for shallow copies
+```
+
+Numbers vary by shape and size. The rule:
+
+- One-level → spread.
+- Deep, plain → `structuredClone`.
+- Deep, with prototypes/functions → `lodash.cloneDeep` or manual.
+
+## Common bugs
+
+### Cloning class instances and expecting methods
+
+```js
+class Counter {
+  count = 0;
+  inc() { this.count++; }
+}
+
+const c = new Counter();
+const copy = structuredClone(c);
+copy.inc;        // undefined — prototype gone
+```
+
+Use a `clone()` method or the constructor:
+
+```js
+class Counter {
+  count = 0;
+  clone() { const c = new Counter(); c.count = this.count; return c; }
+}
+```
+
+### Cloning containing a Promise or function
+
+```js
+structuredClone({ on: () => {} });  // throws DataCloneError
+```
+
+Remove the function before cloning, or use a different copy method.
+
+### Forgetting transferred buffers are detached
+
+```js
+const buf = new ArrayBuffer(100);
+worker.postMessage({ buf }, [buf]);
+new Uint8Array(buf);   // throws — buf is detached
+```
+
+After transfer, the original side can't use the buffer. If you still
+need it, clone instead of transfer (slower).
+
+## The mental model
+
+`structuredClone` is the *protocol* used to serialize values across
+realms (workers, postMessage, IndexedDB). Calling it directly gives
+you the same algorithm as a one-shot deep copy. It's a well-defined
+spec, fast in modern engines, and handles more types than JSON. For
+everyday "I want a deep copy of this data," it's the right answer.
+
+For *anything with functions, prototypes, or DOM nodes*, you need a
+different tool. For *trivial shallow copies*, spread is still
+fastest.

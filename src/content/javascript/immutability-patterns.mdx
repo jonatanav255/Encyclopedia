@@ -1,0 +1,313 @@
+export const level = 'senior';
+
+# Immutability patterns
+
+JavaScript is mutable by default. Objects, arrays, Maps, Sets — all
+mutable, all shared by reference. Most of the bugs in stateful apps
+come from "I changed this; something somewhere else didn't notice."
+
+Immutability — treating data as something you replace, not modify —
+removes that whole class of bug. The cost is some ergonomics, easily
+offset by tooling.
+
+## Why bother
+
+A few concrete wins:
+
+- **Change detection** — comparing references (`prev === next`) is
+  O(1) and tells you whether something changed. React, Redux, MobX,
+  Solid, Svelte, every reactive framework relies on this.
+- **Undo/redo** — keep a list of snapshots. Each is the entire
+  state; rewinding is just setting a pointer.
+- **Concurrent reads** — multiple parts of the code can hold "the
+  same" data without worrying that one will mutate it under another.
+- **Easier testing** — pure functions of immutable inputs are
+  trivially reproducible.
+
+The cost: every "change" creates a new object. With structural
+sharing (next section) this is cheaper than it sounds.
+
+## Structural sharing
+
+Copying a million-item array to add one element sounds expensive.
+With immutable libraries, it isn't:
+
+```
+[1, 2, 3, ..., 1_000_000]
+       ↓ "add 1_000_001"
+[1, 2, 3, ..., 1_000_000, 1_000_001]
+```
+
+The new array reuses the internal structure of the old. Only the
+parts that changed are copied. Functional data structures (like the
+ones in Immer.js, ClojureScript's `IList`, and Immutable.js) do this
+under the hood.
+
+In plain JS, spread *does* fully copy:
+
+```js
+const big = new Array(1e6).fill(0);
+const more = [...big, 1];   // copies the whole thing
+```
+
+But "copying the whole thing" is fast (V8 is good at this), and most
+practical updates are at the edges or affect small sub-trees. Profile
+before reaching for a library.
+
+## Plain-JS patterns
+
+### Update one field
+
+```js
+const user = { name: 'jon', age: 30 };
+
+// Instead of:
+user.age = 31;
+
+// Do:
+const newUser = { ...user, age: 31 };
+```
+
+### Update nested field
+
+```js
+const state = { user: { profile: { name: 'jon' } } };
+
+const newState = {
+  ...state,
+  user: {
+    ...state.user,
+    profile: {
+      ...state.user.profile,
+      name: 'jen',
+    },
+  },
+};
+```
+
+Verbose. Use Immer or `lodash.set` for non-trivial paths.
+
+### Add to array
+
+```js
+[...arr, item]                  // append
+[item, ...arr]                  // prepend
+[...arr.slice(0, i), item, ...arr.slice(i)] // insert at index
+```
+
+### Remove from array
+
+```js
+arr.filter((_, idx) => idx !== i);    // remove at index
+arr.filter(x => x !== unwanted);      // remove by value
+```
+
+### Update array item
+
+```js
+arr.map((x, idx) => idx === i ? newValue : x);
+arr.map(x => x.id === id ? { ...x, name: 'jen' } : x);
+```
+
+### ES2023 helpers
+
+```js
+const sorted = arr.toSorted();
+const reversed = arr.toReversed();
+const replaced = arr.with(i, newValue);
+const spliced = arr.toSpliced(i, 1);   // remove 1 at index i
+```
+
+Non-mutating versions of the corresponding mutating methods. Use them
+when available.
+
+## Object freezing
+
+```js
+const config = Object.freeze({ env: 'prod', port: 3000 });
+config.port = 8080;     // silently fails (throws in strict mode)
+```
+
+`Object.freeze` is **shallow**. Nested objects are still mutable:
+
+```js
+const c = Object.freeze({ db: { host: 'x' } });
+c.db.host = 'y';        // works — db is not frozen
+```
+
+For deep freeze:
+
+```js
+function deepFreeze(obj) {
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') deepFreeze(v);
+  }
+  return Object.freeze(obj);
+}
+```
+
+Useful for sealing configuration or test fixtures. Not for hot data
+— frozen objects can't be efficiently modified.
+
+## `const` vs immutability
+
+```js
+const arr = [1, 2, 3];
+arr.push(4);            // works — `const` doesn't freeze
+```
+
+`const` prevents *reassignment* of the binding. It doesn't make the
+value immutable. To get immutability you need `Object.freeze` or a
+library that enforces it.
+
+## Immer
+
+The most popular library for "make immutable updates feel mutable":
+
+```js
+import { produce } from 'immer';
+
+const next = produce(state, draft => {
+  draft.user.profile.name = 'jen';      // looks like mutation
+});
+
+state.user.profile.name;   // still 'jon' — original untouched
+next.user.profile.name;    // 'jen'
+```
+
+Immer tracks what you "mutated" in the draft and produces a new
+object with structural sharing. Used by Redux Toolkit, MobX 6,
+many state management libraries.
+
+The mental model:
+
+- The draft *is* a proxy. You write `draft.x = ...`.
+- Immer records changes and produces the next state.
+- Anything you didn't touch is shared (same reference).
+
+Trade-offs:
+
+- Slightly slower than handwritten spread chains for tiny updates.
+- A library dependency.
+- Worth it the moment your update logic has three levels of nesting.
+
+## Reference equality for change detection
+
+```js
+function shouldRender(prev, next) {
+  return prev !== next;   // O(1) — works because we don't mutate
+}
+```
+
+If `prev` and `next` are immutable snapshots and you always copy on
+change, `===` perfectly detects "did this update?" — without deep
+comparison.
+
+React's `useMemo`, `useCallback`, `memo`, Redux selectors, Reselect
+— all rely on this.
+
+```js
+// Mutated — `===` doesn't help
+const arr = [1, 2, 3];
+const arr2 = arr;
+arr2.push(4);
+arr === arr2;            // true — same reference, even though it changed
+
+// Immutable — `===` works
+const arr = [1, 2, 3];
+const arr2 = [...arr, 4];
+arr === arr2;            // false
+```
+
+This single property — that change always produces a new reference —
+is the foundation of efficient reactive UIs.
+
+## Records and Tuples (proposal)
+
+Stage 2 ECMAScript proposal: deeply immutable, primitive-like
+collections.
+
+```js
+// Hypothetical syntax
+const r = #{ x: 1, y: 2 };
+const t = #[1, 2, 3];
+
+#{ x: 1, y: 2 } === #{ x: 1, y: 2 };  // true — value equality, not reference
+```
+
+Compared by value, not reference. Would replace most uses of
+Immer/Immutable.js. Not shipped yet — keep an eye on it.
+
+## Map/Set immutability
+
+Both `Map` and `Set` are mutable. To "update" immutably:
+
+```js
+const m2 = new Map(m);
+m2.set(key, value);
+```
+
+This is O(n) because Map doesn't share structure. For large Maps,
+use Immutable.js's `OrderedMap` or similar.
+
+## Common bugs
+
+### Shallow copy under a mutating method
+
+```js
+const next = { ...state };
+next.list.push('item');     // mutates state.list!
+```
+
+`{ ...state }` copies one level. `next.list` is still the same array.
+Use `next.list = [...state.list, 'item']`.
+
+### `Array.from` with mutating callback
+
+```js
+const arr = Array.from({ length: 5 }, () => state.shared);
+// All five entries point to the same `shared` object.
+```
+
+If you'll mutate one of them, you'll mutate them all. Clone explicitly:
+
+```js
+const arr = Array.from({ length: 5 }, () => ({ ...state.shared }));
+```
+
+### Holding onto stale references
+
+```js
+const user = state.user;
+update(state, { user: { ...state.user, age: 31 } });
+user.age;     // 30 — stale snapshot
+```
+
+If you care about the latest, look it up from the latest state each
+time. Storing references to old state is fine for snapshots, dangerous
+for "current."
+
+## When to ease off
+
+Immutability isn't always right:
+
+- **Performance-critical inner loops** — mutation is faster. Inside a
+  function, mutate local data freely; treat its inputs as immutable.
+- **Single-owner data** — if only one place reads/writes it, the
+  benefits of immutability disappear.
+- **DOM** — the DOM is inherently mutable. Don't try to make `el.style`
+  immutable.
+
+The rule: **inputs and shared state are immutable; local data is
+mutable.** This is what React Hooks effectively enforce — `setState`
+must produce a new value, but `useReducer` reducers can use Immer to
+write "mutating" code that produces a new state.
+
+## The discipline
+
+- Default to spread/immutable-update patterns for shared state.
+- Use Immer when nesting passes two levels.
+- Use ES2023 non-mutating array methods when available.
+- Use `Object.freeze` for config and test fixtures.
+- Don't bother with immutability for purely local mutation.
+- Trust `===` for change detection only if you really never mutate.

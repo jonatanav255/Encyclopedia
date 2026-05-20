@@ -1,0 +1,272 @@
+export const level = 'mid';
+
+# Error handling
+
+JavaScript's error handling is `throw` / `try` / `catch` / `finally`,
+extended with promise rejection. The mechanics are simple; using them
+well is the hard part.
+
+## Throwing
+
+```js
+throw new Error('something broke');
+throw new TypeError('expected number');
+throw new RangeError('out of range');
+```
+
+You can `throw` anything — strings, numbers, objects — but **always
+throw an `Error`** (or subclass). Errors have:
+
+- A `message`.
+- A `stack` (engine-captured trace).
+- A constructor name (`error.name === 'TypeError'`).
+
+Throwing strings or plain objects loses the stack and breaks `catch`
+handlers that expect an `Error` shape.
+
+```js
+throw 'broken';        // bad — no stack
+throw new Error('broken'); // good
+```
+
+## Catching
+
+```js
+try {
+  doRisky();
+} catch (err) {
+  console.error(err);
+} finally {
+  cleanup();
+}
+```
+
+`finally` runs whether or not there was an error. Even if `catch`
+itself throws, or if `try` returns early.
+
+The `catch (err)` binding can be omitted (`catch { ... }`) since
+ES2019 if you don't need the error.
+
+## Custom error classes
+
+```js
+class NotFoundError extends Error {
+  constructor(resource, id) {
+    super(`${resource} ${id} not found`);
+    this.name = 'NotFoundError';
+    this.resource = resource;
+    this.id = id;
+  }
+}
+
+throw new NotFoundError('User', 42);
+```
+
+Custom errors give you:
+
+- A specific `name` to switch on.
+- Extra fields (resource, id, status code) callers can read.
+- A type for `instanceof` checks.
+
+```js
+try {
+  await getUser(42);
+} catch (err) {
+  if (err instanceof NotFoundError) return null;
+  throw err;
+}
+```
+
+Subclassing `Error` and setting `name` is enough. Modern engines
+preserve the stack correctly through `super(message)` — no need for
+`Error.captureStackTrace` unless you want to skip frames.
+
+## Error cause chains
+
+ES2022 added an `Error.cause` option:
+
+```js
+try {
+  await db.query(sql);
+} catch (err) {
+  throw new Error('failed to load user', { cause: err });
+}
+```
+
+The chained error preserves the original. `err.cause` is the inner
+one. `console.error` and most loggers print the full chain.
+
+This is the right way to wrap errors — preserve the original instead
+of swallowing it into a new generic one.
+
+## Async / promise errors
+
+In `async` functions, a `throw` becomes a rejected promise; a
+rejected promise inside an `await` becomes a `throw`:
+
+```js
+async function f() {
+  throw new Error('oops');   // rejection
+}
+
+async function g() {
+  try {
+    await f();               // throws here
+  } catch (err) {
+    console.error(err.message); // "oops"
+  }
+}
+```
+
+Without `try`/`catch`, the rejection propagates to whoever awaited
+`g()`. If no one does, it's an unhandled rejection.
+
+In `.then`-style chains, `.catch` does the same job:
+
+```js
+fetch('/api')
+  .then(res => res.json())
+  .catch(err => console.error(err));
+```
+
+Every chain needs a terminal `.catch` or a surrounding `try`/`catch`.
+
+## Common anti-patterns
+
+### Swallowing
+
+```js
+try {
+  doRisky();
+} catch (err) {
+  // silently ignore — terrible
+}
+```
+
+If you don't know what to do, **rethrow**. Eating errors hides bugs.
+
+### Catching too broadly
+
+```js
+try {
+  const data = await fetch(url);
+  return process(data);
+} catch (err) {
+  return null;   // is `null` the right answer if `process` throws?
+}
+```
+
+The `catch` blanket catches errors from `process` too, returning
+`null` and hiding logic bugs. Catch the specific call you mean to
+catch.
+
+### Returning vs throwing
+
+For "the function didn't find anything," sometimes return a sentinel
+(`null`, `undefined`); sometimes throw. Pick one per shape:
+
+- Lookup function (`findUser(id)`) — return `null` if not found.
+  Throw only for I/O or validation errors.
+- Action function (`requireUser(id)`) — throw if not found. Callers
+  who want a nullable wrap it in `try`/`catch`.
+
+The Rust/Go-style "return `[err, value]`" tuple isn't idiomatic in JS;
+exceptions are.
+
+### Forgetting `await`
+
+```js
+async function f() {
+  try {
+    doAsync();   // no await — promise dangles
+  } catch (err) {
+    // never runs
+  }
+}
+```
+
+The `catch` only sees synchronous throws. The async rejection escapes.
+Always `await` if you want `try`/`catch` to see the error.
+
+## Re-throwing
+
+```js
+try {
+  await getUser(id);
+} catch (err) {
+  log(err);
+  throw err;   // pass it along
+}
+```
+
+Or wrap it with context:
+
+```js
+catch (err) {
+  throw new Error('getUser failed', { cause: err });
+}
+```
+
+Either is fine. Re-throwing preserves the stack; wrapping adds
+information at the cost of one stack frame.
+
+## Top-level handlers
+
+Even with `try`/`catch` discipline, things slip through. Last-resort
+handlers:
+
+```js
+// Node
+process.on('uncaughtException', (err) => {
+  console.error('uncaught:', err);
+  // log, then exit — state is now unknown
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandled rejection:', reason);
+  // Node will crash by default in newer versions
+});
+```
+
+```js
+// Browser
+window.addEventListener('error', (e) => { ... });
+window.addEventListener('unhandledrejection', (e) => { ... });
+```
+
+Log the error to your tracker (Sentry, Datadog) before exiting.
+Crashing on `uncaughtException` is safer than continuing in undefined
+state.
+
+## Defensive programming
+
+The rule of thumb:
+
+- **Validate at boundaries** — user input, HTTP requests, external
+  data. Throw clear errors for bad input.
+- **Trust your own code** — don't wrap every internal call in
+  `try`/`catch`. If `add(a, b)` can't fail, don't pretend it can.
+- **Catch at the level that knows what to do.** If only the HTTP
+  handler can decide "should this be 400 or 500," catch there, not in
+  every helper.
+
+## Error logging
+
+When you log, include:
+
+- The original error (with stack).
+- Relevant context: user id, request id, what you were trying to do.
+- A unique error code if you have one — easier to search logs.
+
+Don't `console.log(err.message)`. The stack is the part you need.
+`console.error(err)` or your logger's structured form prints it.
+
+## The discipline
+
+- Always throw `Error` (or subclass).
+- Always `await` async work you want to `catch`.
+- Catch the specific operation, not a whole block.
+- Wrap errors with `cause` to preserve original information.
+- Have top-level handlers that log and exit.
+- Test the failure cases — broken paths are where bugs hide.

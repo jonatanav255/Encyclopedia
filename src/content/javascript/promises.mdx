@@ -1,0 +1,261 @@
+export const level = 'mid';
+
+# Promises
+
+A promise is an object representing a value that will become available
+later — or an error explaining why it won't.
+
+## The three states
+
+```
+pending  ──fulfill──►  fulfilled (value)
+   │
+   └────reject────►   rejected (reason)
+```
+
+A promise starts pending. It transitions to fulfilled or rejected
+exactly once and then stays there forever. This one-shot nature is
+what makes promises composable.
+
+## Creating a promise
+
+You rarely write `new Promise` by hand — most APIs return promises
+already (`fetch`, `fs.promises`, etc.). When you do need to wrap a
+callback-based API:
+
+```js
+function readFile(path) {
+  return new Promise((resolve, reject) => {
+    fs.readFile(path, (err, data) => {
+      if (err) reject(err);
+      else resolve(data);
+    });
+  });
+}
+```
+
+The two arguments are functions you call to settle the promise. Call
+neither and the promise stays pending forever (a leak).
+
+For pre-known values:
+
+```js
+Promise.resolve(42);     // already-fulfilled with 42
+Promise.reject(new Error('nope')); // already-rejected
+```
+
+## Consuming a promise
+
+```js
+fetch('/api/user')
+  .then(res => res.json())
+  .then(user => console.log(user))
+  .catch(err => console.error(err))
+  .finally(() => console.log('done'));
+```
+
+- `.then(onFulfilled, onRejected?)` — registers callbacks. Returns a
+  new promise for whatever your callback returns.
+- `.catch(onRejected)` — shortcut for `.then(undefined, onRejected)`.
+- `.finally(onFinally)` — runs regardless. Doesn't receive value or
+  error, doesn't change them. Useful for cleanup.
+
+## Chaining
+
+Each `.then` returns a new promise. Return a value and the next
+`.then` sees it; return a promise and the chain waits for it.
+
+```js
+fetch('/api/user')
+  .then(res => res.json())      // returns a promise → chain waits
+  .then(user => user.name);      // returns a string → next `.then` sees it
+```
+
+Throw inside a `.then` and the next `.catch` (further down the chain)
+handles it:
+
+```js
+fetch('/api/user')
+  .then(res => {
+    if (!res.ok) throw new Error('bad');  // jumps to .catch
+    return res.json();
+  })
+  .catch(err => console.error(err));
+```
+
+## `async`/`await`
+
+Syntactic sugar for `.then`. Returns a promise. Inside, `await`
+unwraps a promise's value (or throws if rejected):
+
+```js
+async function getUser() {
+  const res = await fetch('/api/user');
+  if (!res.ok) throw new Error('bad');
+  return res.json();
+}
+```
+
+Equivalent to the chain above, much easier to read once you have
+multiple sequential steps.
+
+Mixing `async`/`await` with `try`/`catch` is the idiomatic pattern:
+
+```js
+try {
+  const user = await getUser();
+} catch (err) {
+  console.error(err);
+}
+```
+
+## Parallel execution
+
+`async`/`await` is **sequential by default** — every `await` waits.
+For parallel work, fire the promises first and `await` them together:
+
+```js
+// Sequential — 2 × per-request latency
+const a = await fetchA();
+const b = await fetchB();
+
+// Parallel — max(latencyA, latencyB)
+const [a, b] = await Promise.all([fetchA(), fetchB()]);
+```
+
+`Promise.all` rejects on the first rejection and discards the rest.
+For partial success, use `Promise.allSettled`:
+
+```js
+const results = await Promise.allSettled([fetchA(), fetchB(), fetchC()]);
+for (const r of results) {
+  if (r.status === 'fulfilled') console.log(r.value);
+  else console.error(r.reason);
+}
+```
+
+Two other combinators:
+
+```js
+Promise.race([a, b]);    // first to settle (resolve OR reject) wins
+Promise.any([a, b, c]);  // first to fulfill wins; rejects only if all reject
+```
+
+`race` is good for timeouts (`race([request, timeout])`). `any` is
+good for "fetch from any healthy mirror."
+
+## Error handling
+
+Every chain needs a terminal `.catch` (or a surrounding `try`/`catch`
+in async). An unhandled rejection logs a warning and, in Node, can
+crash the process (`--unhandled-rejections=throw`).
+
+```js
+fetch('/api')
+  .then(res => res.json());   // BAD — no catch, error swallowed
+```
+
+If you `await` without `try`/`catch`, the error propagates up — fine
+if a caller handles it; not fine if there is no caller (top-level
+script, event handler).
+
+### Top-level handlers
+
+For belt-and-suspenders coverage in Node:
+
+```js
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandled rejection:', reason);
+  // log to your error tracker, then exit
+});
+```
+
+In browsers, `window.addEventListener('unhandledrejection', ...)`.
+
+## Common pitfalls
+
+### Forgetting to return
+
+```js
+async function bad() {
+  doAsyncWork();           // promise dangles, errors invisible
+}
+
+async function good() {
+  return doAsyncWork();    // promise awaited or chained by caller
+}
+```
+
+`eslint-plugin-promise` + `no-floating-promises` catches this.
+
+### `forEach` doesn't await
+
+```js
+[1, 2, 3].forEach(async (n) => {
+  await save(n);     // each iteration's promise is discarded
+});
+console.log('done');  // logs immediately, work still pending
+```
+
+Use a `for...of` loop (sequential) or `Promise.all(map)` (parallel):
+
+```js
+for (const n of [1, 2, 3]) await save(n);             // sequential
+await Promise.all([1, 2, 3].map(n => save(n)));        // parallel
+```
+
+### Wrapping a promise unnecessarily
+
+```js
+function getUser() {
+  return new Promise((resolve, reject) => {   // unneeded
+    fetch('/api').then(resolve, reject);
+  });
+}
+
+// Just:
+function getUser() {
+  return fetch('/api');
+}
+```
+
+This pattern (the "explicit promise construction antipattern") usually
+hides a bug or adds nothing.
+
+### Mixing `.then` and `await`
+
+```js
+const data = await fetch('/api').then(r => r.json());  // OK
+```
+
+Allowed and sometimes nice. But it makes error handling fuzzier —
+`await` rethrows, `.then` returns a promise. Pick one style per
+function.
+
+## Timing rules
+
+Promise callbacks are **microtasks** — they run between any two
+macrotasks (timers, I/O). See **Event loop**.
+
+```js
+console.log('A');
+Promise.resolve().then(() => console.log('B'));
+console.log('C');
+// A, C, B  — the .then callback runs after sync code finishes
+```
+
+`Promise.resolve()` with a synchronous value doesn't run synchronously
+— it queues the callback as a microtask.
+
+## When promises aren't enough
+
+- **Multiple values over time** — promises settle once. Use async
+  iterators or streams.
+- **Cancellation** — promises can't be cancelled. Use `AbortSignal`
+  to cancel the underlying operation; the promise still resolves or
+  rejects, but the work stops.
+- **Backpressure** — when the consumer is slower than the producer.
+  Streams handle this; promises don't.
+
+For everything else — one async operation at a time — promises are
+the right tool.

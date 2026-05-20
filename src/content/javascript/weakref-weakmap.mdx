@@ -1,0 +1,239 @@
+export const level = 'senior';
+
+# `WeakMap`, `WeakSet`, `WeakRef`
+
+Three ways to hold references that **don't** prevent the garbage
+collector from cleaning up the referenced objects.
+
+Most code never needs them. When you do need them, they're the only
+correct tool.
+
+## The problem they solve
+
+```js
+const metadata = new Map();
+function attachMeta(obj, meta) { metadata.set(obj, meta); }
+```
+
+Now anything passed to `attachMeta` is alive forever — `metadata`
+keeps it alive. Even if you "forget" the object in your own code, the
+Map still holds it.
+
+`WeakMap` lets you associate data with objects you don't own:
+
+```js
+const metadata = new WeakMap();
+function attachMeta(obj, meta) { metadata.set(obj, meta); }
+```
+
+Now when nothing else points to `obj`, the GC reclaims it and the
+`WeakMap` entry disappears too.
+
+## `WeakMap`
+
+Key-value store where the **keys must be objects** and the references
+are weak.
+
+```js
+const wm = new WeakMap();
+const key = { id: 1 };
+
+wm.set(key, 'metadata');
+wm.get(key);          // "metadata"
+wm.has(key);          // true
+wm.delete(key);       // removes
+```
+
+What you **can't** do:
+
+- Iterate (`for...of` not supported, no `entries`).
+- Get the size (`.size` doesn't exist).
+- Use primitives as keys.
+- Inspect from outside without the key.
+
+The "you can't iterate it" rule isn't capricious — iteration would
+have unpredictable results since entries can disappear between calls.
+
+## Use cases
+
+### 1. Memoization on objects
+
+```js
+const cache = new WeakMap();
+
+function expensiveCompute(obj) {
+  if (cache.has(obj)) return cache.get(obj);
+  const result = /* heavy computation using obj */;
+  cache.set(obj, result);
+  return result;
+}
+```
+
+When the caller drops `obj`, the cached result is collected too. With
+a regular `Map` the cache would grow forever.
+
+### 2. Private fields (pre-`#field` syntax)
+
+```js
+const _balance = new WeakMap();
+
+class Account {
+  constructor(amount) { _balance.set(this, amount); }
+  get balance() { return _balance.get(this); }
+  deposit(n) { _balance.set(this, this.balance + n); }
+}
+```
+
+The `_balance` WeakMap holds per-instance state that's inaccessible
+without the instance. When the instance is GC'd, the state goes with
+it.
+
+Modern code uses `#private` fields instead, but the pattern still
+shows up in libraries that need ES5 compatibility.
+
+### 3. Attaching metadata to DOM nodes
+
+```js
+const nodeMeta = new WeakMap();
+
+function tag(el, info) { nodeMeta.set(el, info); }
+function getInfo(el) { return nodeMeta.get(el); }
+```
+
+When the DOM node is removed and no JS references it, both the node
+and the metadata are GC'd. A regular Map would leak.
+
+### 4. Avoiding accidental dataset mutation
+
+DOM `dataset` puts strings on the element directly. `WeakMap` lets
+you keep richer metadata (objects, functions) without polluting the
+element.
+
+## `WeakSet`
+
+Same idea, but membership-only:
+
+```js
+const seen = new WeakSet();
+
+function visit(node) {
+  if (seen.has(node)) return;
+  seen.add(node);
+  // ...
+}
+```
+
+Useful for "have I processed this object?" without holding it.
+
+Same restrictions as `WeakMap`: no iteration, no size.
+
+## `WeakRef`
+
+A reference to a single object that doesn't prevent GC:
+
+```js
+const obj = { name: 'jon' };
+const ref = new WeakRef(obj);
+
+ref.deref();    // returns obj (or undefined if GC'd)
+```
+
+If you drop `obj`, the next `ref.deref()` may return `undefined`. May
+— there's no guarantee about *when* the engine collects.
+
+```js
+let obj = { name: 'jon' };
+const ref = new WeakRef(obj);
+obj = null;     // dropped our strong reference
+
+// Some time later (or never):
+console.log(ref.deref()); // possibly undefined, possibly still { name: 'jon' }
+```
+
+The spec deliberately leaves timing unspecified. You can't write
+"when this object is collected, do X."
+
+### Use cases
+
+Mostly caches with "if it's still in memory, reuse it; else
+recompute":
+
+```js
+const cache = new Map();
+
+function get(id) {
+  const ref = cache.get(id);
+  const obj = ref?.deref();
+  if (obj) return obj;
+
+  const fresh = loadFromDisk(id);
+  cache.set(id, new WeakRef(fresh));
+  return fresh;
+}
+```
+
+The cache holds `WeakRef`s. If GC collects an entry, the next call
+recomputes. Memory pressure naturally bounds the cache.
+
+The downside: cache entries (the `WeakRef` wrappers in the `Map`) are
+never cleaned up. Combine with `FinalizationRegistry` if that matters.
+
+## `FinalizationRegistry`
+
+Callback-when-collected:
+
+```js
+const registry = new FinalizationRegistry((held) => {
+  console.log(`object with id ${held} was collected`);
+});
+
+let user = { id: 42 };
+registry.register(user, 42);
+
+user = null;
+// later, when GC reclaims the object, the callback fires with held = 42
+```
+
+The `held` value is what you want the callback to receive — usually
+an id, name, or other "metadata" that you wouldn't want to leak via
+strong references in the callback's closure.
+
+The spec is explicit: **finalization callbacks are not guaranteed to
+run.** Don't use them for correctness:
+
+- Don't release file handles or sockets via finalizers — close them
+  explicitly.
+- Don't rely on them for logging "this was used and is now gone."
+- Don't use them for invariant enforcement.
+
+Use them for opportunistic cleanup of *purely in-memory* associations
+— e.g., removing dead `WeakRef` slots from a Map.
+
+## When NOT to use these
+
+- **As a leak fix without understanding the leak.** Half the time
+  you should be storing less, not making your references weaker.
+- **For deterministic cleanup.** WeakRef and FinalizationRegistry are
+  not guaranteed; use try/finally or AbortSignal-style explicit
+  cleanup.
+- **When a regular Map with explicit eviction works.** LRU caches are
+  often clearer than WeakRef caches.
+- **When you need iteration or size.** WeakMap/WeakSet don't support
+  these.
+
+## The mental model
+
+`Map` and `Set` hold strong references — they participate in
+reachability. `WeakMap`, `WeakSet`, and `WeakRef` don't — they're
+**observable side channels** to objects that are reachable through
+some other path.
+
+If nothing else points to the object, the weak collection is empty
+(or `.deref()` returns `undefined`). The collections don't keep their
+referents alive; they just let you ask "is it still here?"
+
+That property is exactly what you want for caches keyed by object
+identity, metadata you don't want to leak with the host, and
+observability of object lifetime. It's not what you want for
+"resource cleanup" — use explicit `close()` calls or `using`
+declarations for that.

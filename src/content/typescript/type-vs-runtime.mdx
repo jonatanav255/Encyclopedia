@@ -1,0 +1,362 @@
+export const level = 'mid';
+
+# Type-vs-runtime gap
+
+TypeScript types are **compile-time only**. They don't exist at
+runtime. This single fact explains most of the friction beginners
+have with TypeScript — and many of the subtle bugs in production
+code.
+
+## What gets erased
+
+Everything that's purely type. After compilation, none of this
+exists:
+
+```ts
+type User = { id: number };
+interface Config { port: number; }
+const u: User = { id: 1 };
+function fetch(id: number): User { ... }
+```
+
+becomes:
+
+```js
+const u = { id: 1 };
+function fetch(id) { ... }
+```
+
+The annotations, interfaces, type aliases — all gone. The JS engine
+sees only values.
+
+## What does survive
+
+- **Classes** (the class declaration is a value too).
+- **Enums** that aren't `const`.
+- **Decorators** (when target supports them).
+- **Function bodies** (annotations stripped, code preserved).
+
+```ts
+class User {           // survives
+  constructor(public id: number) {}
+}
+
+enum Color { Red, Green }   // survives
+
+const enum Const { A, B }   // erased — values inlined
+```
+
+## Why this matters
+
+You can't do this:
+
+```ts
+type User = { id: number };
+
+const x: unknown = JSON.parse(input);
+if (x instanceof User) { ... }   // error — User has no runtime form
+```
+
+The type doesn't exist at runtime, so `instanceof` has nothing to
+check against. You'd need to use a class, a discriminant field, or a
+schema library.
+
+```ts
+class User { id = 0; name = ''; }
+if (x instanceof User) { ... }   // works
+```
+
+Or a discriminant:
+
+```ts
+type User = { kind: 'user'; id: number };
+if (typeof x === 'object' && x !== null && (x as any).kind === 'user') { ... }
+```
+
+Or Zod:
+
+```ts
+const UserSchema = z.object({ id: z.number(), name: z.string() });
+const result = UserSchema.safeParse(x);
+if (result.success) { result.data.name; }  // typed and validated
+```
+
+## The boundary problem
+
+```ts
+const user: User = JSON.parse(req.body);
+user.name.toUpperCase();    // works at type level, may crash at runtime
+```
+
+Your type says `name: string`, but `JSON.parse` returns `any`. The
+compiler trusts your annotation. If the body sends `{}`, `name` is
+undefined and the next line crashes.
+
+**Every value entering your program from outside is `unknown`** until
+you validate it:
+
+- HTTP request bodies
+- HTTP response bodies (from another service)
+- Files (`fs.readFile` → string, but you assert structure)
+- Environment variables (`process.env.PORT` is typed as
+  `string | undefined`)
+- Command-line arguments
+- IPC messages
+- WebSocket messages
+- Any FFI
+
+For these, validate at the boundary. Zod, Valibot, Yup, custom guards
+— pick one and use it everywhere.
+
+```ts
+import { z } from 'zod';
+
+const Body = z.object({ email: z.string().email() });
+
+app.post('/users', (req, res) => {
+  const body = Body.parse(req.body);   // throws if invalid
+  // body is now typed and validated
+});
+```
+
+For internal data (your own code), trust the types. The boundary is
+where validation lives.
+
+## `instanceof` and types
+
+```ts
+type Animal = { name: string };
+const a: Animal = { name: 'rex' };
+a instanceof Animal;   // error — no runtime Animal
+```
+
+`instanceof` works only with classes or constructors. Types and
+interfaces have no constructor.
+
+For "what kind of value is this," use:
+
+- `typeof x === 'string'` — for primitives.
+- `Array.isArray(x)` — for arrays.
+- `x instanceof Date` — for class instances.
+- Discriminant field (`x.kind === 'success'`) — for tagged unions.
+- A type guard function (`isUser(x)`) — for arbitrary shapes.
+
+## Discriminants are runtime data
+
+```ts
+type Result =
+  | { kind: 'success'; data: User }
+  | { kind: 'error'; message: string };
+
+function handle(r: Result) {
+  if (r.kind === 'success') {
+    r.data.name;
+  }
+}
+```
+
+This works because `kind` is a real string at runtime. The compiler
+narrows based on the runtime check, but the check itself is plain JS.
+
+This is why discriminated unions are the recommended pattern for
+state machines and API responses: the discriminant exists in both
+worlds.
+
+## `enum` vs `const enum`
+
+```ts
+enum Direction { Up, Down, Left, Right }
+const enum Color { Red, Green, Blue }
+```
+
+Regular `enum` compiles to a JS object — survives at runtime, you can
+iterate `Object.keys`, etc.
+
+```js
+// compiled:
+var Direction;
+(function (Direction) {
+  Direction[Direction["Up"] = 0] = "Up";
+  ...
+})(Direction || (Direction = {}));
+```
+
+`const enum` is **erased** — its values inlined at every use site:
+
+```ts
+const c = Color.Red;
+// compiles to:
+const c = 0;
+```
+
+`const enum` is faster (no object lookup) but isn't compatible with
+`isolatedModules` — bundlers can't inline cross-file. Most modern
+configs avoid `const enum`.
+
+Modern recommendation: prefer literal-typed unions to enums entirely:
+
+```ts
+const Directions = ['Up', 'Down', 'Left', 'Right'] as const;
+type Direction = typeof Directions[number];
+```
+
+## Casting (`as`)
+
+```ts
+const x = someValue as User;
+```
+
+`as` tells the compiler "trust me." It doesn't check anything at
+runtime. If `someValue` isn't actually a User, you'll crash later.
+
+Use `as` sparingly:
+
+- At validation boundaries (`as User` after Zod parse — though Zod
+  returns typed data).
+- When TypeScript can't see what you know (rare).
+- For widening that requires explicit intent (`as const`).
+
+Never for "make the error go away." That's `any` with extra steps.
+
+### `as unknown as T` — the double cast
+
+```ts
+const x = (val as unknown) as User;
+```
+
+Casting incompatible types directly is an error. Casting through
+`unknown` defeats the check. Useful in adapters/mocks, dangerous
+everywhere else.
+
+## Non-null assertion (`!`)
+
+```ts
+const el = document.getElementById('id')!;
+el.click();
+```
+
+`!` says "I know this isn't null." If you're wrong, you crash.
+
+Same rule as `as`: use only when you can't structure the code to
+make the compiler see it, and you're certain.
+
+## `unknown` for safety
+
+```ts
+function isUser(x: unknown): x is User {
+  return typeof x === 'object'
+    && x !== null
+    && typeof (x as any).id === 'number';
+}
+
+const data: unknown = JSON.parse(input);
+if (isUser(data)) {
+  data.id;  // typed
+}
+```
+
+`unknown` is the right type at boundaries. Forces a narrow before
+use, surfaces the validation requirement.
+
+## Common bugs
+
+### Trusting external data
+
+```ts
+async function get(id: number): Promise<User> {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();   // typed as User, actually unknown
+}
+```
+
+`res.json()` is typed `Promise<any>`. You can claim it's `User`, but
+the JSON might be `{ id: '1' }` (string instead of number), `{ name:
+null }`, or `{ error: 'not found' }`.
+
+Validate with Zod or a guard.
+
+### `process.env` typing
+
+```ts
+const port = process.env.PORT;
+// typed string | undefined — even if you "know" it's set
+```
+
+The runtime really might not have it. Either:
+
+```ts
+const port = process.env.PORT ?? '3000';   // default
+```
+
+Or validate at startup:
+
+```ts
+const Env = z.object({ PORT: z.string(), DATABASE_URL: z.string() });
+const env = Env.parse(process.env);
+// env.PORT is guaranteed string from here
+```
+
+### `JSON.parse` returning `any`
+
+```ts
+const config = JSON.parse(rawConfig);
+config.port;   // typed any — no error, no safety
+```
+
+The fix: type it as `unknown` and validate:
+
+```ts
+const config: unknown = JSON.parse(rawConfig);
+const parsed = ConfigSchema.parse(config);
+```
+
+### `try`/`catch` with `useUnknownInCatchVariables`
+
+```ts
+try {
+  doStuff();
+} catch (err) {
+  // err: unknown (with the flag enabled)
+  if (err instanceof Error) console.log(err.message);
+  else console.log('unknown error');
+}
+```
+
+Forces you to narrow the caught value before using it. Catches the
+"err.message is undefined" bug.
+
+## Generating runtime info from types
+
+You can't reflect types directly. But you can:
+
+- Use Zod/Valibot — schema *is* the source of truth, and `z.infer`
+  derives the type.
+- Use code generation — OpenAPI/GraphQL schemas → types + validators
+  + clients.
+- Decorators (with `emitDecoratorMetadata`) — some frameworks
+  (NestJS, TypeORM) generate runtime info this way.
+
+The first two are cleaner. Decorators with metadata reflection are a
+TC39 stage-1 proposal at best — fragile.
+
+## The mental model
+
+Types are compile-time annotations. They:
+
+- Disappear at runtime.
+- Don't validate data.
+- Can lie if you tell them to.
+
+The compiler enforces consistency *within* your typed code. Anything
+that crosses the boundary needs runtime validation.
+
+The strongest TypeScript codebases combine:
+
+- Strict types everywhere internally.
+- Runtime validation (Zod/Valibot) at every external boundary.
+- `unknown` for "I don't know yet" — never `any`.
+- Generated types from API/database schemas — single source of truth.
+
+That gives you both: editor support and refactor safety from the
+types, and runtime safety from the validators. Either alone leaves a
+gap.

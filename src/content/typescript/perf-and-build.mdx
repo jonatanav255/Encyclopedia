@@ -1,0 +1,294 @@
+export const level = 'staff';
+
+# Performance and build
+
+TypeScript's compile speed becomes a developer-experience issue
+around 50k lines and a CI issue beyond 200k. Most codebases never hit
+the wall; some do. This page is about what to do when they do.
+
+## What's slow
+
+The bottlenecks, in roughly the order they bite:
+
+1. **Type checking** — the actual `tsc --noEmit` pass.
+2. **Editor latency** — TS server loading + recomputing.
+3. **Build pipeline** — emit, bundling, etc.
+
+Type checking dominates. Editors and bundlers can use faster code
+paths.
+
+## Diagnose first
+
+Don't guess. Profile:
+
+```bash
+pnpm exec tsc --noEmit --extendedDiagnostics
+```
+
+You get:
+
+```
+Types:              45000
+Memory used:        180MB
+Check time:         12.3s
+Total time:         14.5s
+```
+
+Per-file timing:
+
+```bash
+pnpm exec tsc --noEmit --generateTrace ./trace
+```
+
+Then open `trace/trace.json` in `chrome://tracing` to see where time
+goes. Almost always there are a few files or types responsible for
+most of the cost.
+
+## Common slow patterns
+
+### Massive utility libraries
+
+```ts
+import _ from 'lodash';
+```
+
+`@types/lodash` is huge. Use specific imports:
+
+```ts
+import isEqual from 'lodash/isEqual';
+import merge from 'lodash/merge';
+```
+
+Many libraries have this issue. Check `@types/*` size and import
+shape.
+
+### Deep mapped types over big interfaces
+
+```ts
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];
+};
+
+type ReadonlyConfig = DeepReadonly<ManyFieldConfig>;
+```
+
+Each access recomputes. If used many times, alias:
+
+```ts
+type Config = DeepReadonly<ManyFieldConfig>;
+// then reuse Config; TS caches the alias
+```
+
+### Complex conditional types
+
+```ts
+type X = SomeDeepComputation<T>;
+type Y = AnotherDeepComputation<X>;   // compounds
+```
+
+If a type takes 100ms to resolve and you use it in 100 places —
+that's potentially 10s of typechecking time. Cache aggressively.
+
+### Distributive conditionals on huge unions
+
+```ts
+type R = SomeOp<HugeUnion>;   // distributes over every member
+```
+
+Each union member triggers the conditional. For unions of 1000+
+literals, you're computing 1000+ versions. Refactor to a non-
+distributive form when possible.
+
+### Wide types passed to expensive utilities
+
+```ts
+type X = DeepPartial<{ [K in keyof T]: any }>;
+```
+
+`any` makes utilities work harder. Specific types are faster.
+
+## Strategies
+
+### `skipLibCheck`
+
+```json
+{ "skipLibCheck": true }
+```
+
+Skips type checking of `.d.ts` files. Almost always safe; saves
+seconds on most codebases. Standard.
+
+### Project references
+
+For monorepos: see **Project references**. Incremental builds — only
+recompile what changed.
+
+### Faster transpile-only bundlers
+
+For builds (not type checks), use:
+
+- **esbuild** — extremely fast, no type checking.
+- **swc** — same.
+- **Vite** — Babel/swc/esbuild under the hood.
+
+Separate type checking from transpilation:
+
+```bash
+# Dev: bundle fast, type check separately
+pnpm exec vite                       # bundles
+pnpm exec tsc --noEmit --watch       # type checks
+```
+
+The bundle is fast; type errors surface in a separate process. Most
+projects do this in 2026.
+
+### `isolatedModules` + `verbatimModuleSyntax`
+
+These flags ensure each file is independently transpilable, which
+unlocks the fast bundlers (which compile one file at a time).
+Required for esbuild/swc.
+
+### `tsserver` tuning for editors
+
+`.vscode/settings.json`:
+
+```json
+{
+  "typescript.tsserver.maxTsServerMemory": 4096,
+  "typescript.tsserver.experimental.enableProjectDiagnostics": false,
+  "typescript.disableAutomaticTypeAcquisition": true
+}
+```
+
+For very large projects, bump memory. Disable `enableProjectDiagnostics`
+to skip checking files not currently open.
+
+### `incremental` builds
+
+```json
+{ "incremental": true }
+```
+
+Caches type info in `.tsbuildinfo`. Subsequent `tsc` runs reuse
+unchanged files. Essential for fast CI; almost free for dev.
+
+### Avoid `any` and excessive narrowing
+
+```ts
+function f(x: any) {
+  x.foo.bar;   // type checker doesn't recurse; fast
+}
+```
+
+`any` is fast but defeats the point. Specific types are slower to
+check but catch bugs. Trade-off.
+
+Avoid wide narrowing chains — the compiler tracks the narrowing state
+in flow analysis, which can blow up for complex control flow.
+
+### Module-graph minimization
+
+Tree-shaking matters for type checking too — if `import * as _ from
+'lodash'` pulls in all of lodash's types, that's all checked.
+Specific imports cut the cost.
+
+### Don't `import` at the type-only boundary
+
+```ts
+import type { User } from './heavy-module.js';
+```
+
+`import type` doesn't require loading the runtime module — and the
+compiler can sometimes skip type-checking inside heavy modules if the
+top-level types are simple. Pairs well with `verbatimModuleSyntax`.
+
+## Memory
+
+Large TS projects can use multiple GB of RAM during typechecking. If
+you see "out of memory" errors:
+
+```bash
+NODE_OPTIONS=--max-old-space-size=8192 pnpm exec tsc --noEmit
+```
+
+`--max-old-space-size` in MB. 8192 = 8GB. For really huge projects
+you might bump higher.
+
+The TS server in editors also uses memory; bump via
+`typescript.tsserver.maxTsServerMemory`.
+
+## Build pipeline anatomy
+
+A typical fast modern setup:
+
+1. **Editor**: TS server runs typechecking on open files
+   (live red squiggles).
+2. **Dev server**: Vite/esbuild for instant HMR. **No type checking.**
+3. **`tsc --noEmit --watch`** in a separate terminal for project-wide
+   type checks.
+4. **CI**: `tsc --noEmit` + tests + bundle.
+
+The key insight: **bundling and type-checking are independent.**
+Don't make bundling wait for type checks; run them concurrently.
+Reserve type checks for CI as a gate.
+
+## Library author considerations
+
+If you publish a library with complex types, your users feel the
+cost.
+
+- Profile types from the consumer's perspective.
+- Avoid massive distributive conditionals.
+- Use named type aliases to give the compiler cache hits.
+- Ship pre-built `.d.ts` (don't make consumers parse your source).
+
+## When types are too complex
+
+If a type takes the compiler 10+ seconds and you can't simplify:
+
+- Move the computation runtime. Use a code generator (e.g., Zod →
+  type) at build time instead of type-level parsing.
+- Erase the precision. Sometimes `Record<string, unknown>` is fine.
+  Lose some safety, gain ergonomics.
+- Use code generation. `tRPC`, GraphQL Codegen, OpenAPI generators
+  produce types you don't have to compute at every build.
+
+## CI tips
+
+- **Cache `.tsbuildinfo`** across CI runs. With incremental builds,
+  rebuilds are dramatically faster.
+- **Parallelize**: build packages independently, type-check
+  separately, bundle in parallel.
+- **Distinguish "blocking" from "informational"**: fail PRs on type
+  errors; warn on slow types.
+
+## When to abandon strictness for speed
+
+Almost never. The strict flags catch real bugs. The right trade-off
+when types are too slow is:
+
+1. Simplify the types (refactor expensive utilities).
+2. Cache them (intermediate aliases).
+3. Move work elsewhere (code generation).
+4. Better tooling (project references, faster bundler).
+
+Turning off `strict` to make CI fast is a step backward. The bugs
+come back; the speed gain disappears as the codebase grows.
+
+## The mental model
+
+TypeScript is a compiler running a type-level program. The "program"
+is your code's types; the runtime is `tsc`. Like any program, it has
+a hot path — and like any compiler, modern bundlers can skip the hot
+path entirely for the JS-emit phase.
+
+Optimize by:
+
+- Splitting type checking from emit/bundling.
+- Caching with project references and intermediate type aliases.
+- Profiling with `--extendedDiagnostics` and `--generateTrace`.
+- Knowing when to step away from elaborate types.
+
+Most projects never need this. When you do — when CI takes 6 minutes
+and edits feel sluggish — the techniques are predictable. Profile,
+identify, simplify, cache.

@@ -62,5 +62,19 @@ export const bank: QuestionBank = {
       answer:
         'The riskiest moment in any deploy is when the new code path first runs for a user. If deploy and release are the same moment, you can\'t test in production safely.\n\nFlags let you ship code disabled, then:\n\n1. Enable for internal users — verify it works against real data.\n2. Enable for 1% of users — watch metrics for impact.\n3. Ramp gradually to 100% based on telemetry.\n4. If something\'s wrong, flip back instantly — no rollback deploy needed.\n\nDeploy becomes mechanical; release becomes a measurable, reversible decision. This is one of the single biggest reliability investments a team can make.',
     },
+
+    // --- staff ---
+    {
+      level: 'staff',
+      question: 'Design an event-driven architecture for a system that ingests 50k events/sec.',
+      answer:
+        '**Front the system with a partitioned log** (Kafka, Kinesis, RedPanda) sized for retention + replay (typically 7–30 days). Partition by entity ID (`userId`, `orderId`) — keeps per-entity ordering and enables parallel consumers.\n\n**Producers**: durable writes with at-least-once semantics; use the partition key. Buffer in-memory with backpressure to the upstream HTTP layer (return 429 if Kafka publish lags).\n\n**Consumers**: idempotent handlers, processing offsets committed only after side-effects succeed. For exactly-once semantics, use the outbox pattern + dedupe table keyed by `(event_id, consumer_group)`.\n\n**Stateful processing**: Flink or a Kafka-Streams equivalent for joins/aggregations. Stateless: just consumer groups with auto-scaling.\n\n**Schemas**: Avro / Protobuf in a registry. All breaking changes go through versioned topics or backward-compat fields. Never `JSON.parse` raw without schema.\n\n**Failure handling**: poison-message → dead-letter topic; retry with exponential backoff for transient. Alert on DLQ depth.\n\n**Observability**: lag per consumer group is the most important metric. End-to-end latency (event published → side effect applied) via trace IDs propagated through the event payload.\n\n**Cost**: 50k/s × ~1KB = ~50MB/s sustained → ~4TB/day of retention at 7 days = ~30TB. Plan partition count for parallelism (rule of thumb: 10–50 MB/s per partition).',
+    },
+    {
+      level: 'staff',
+      question: 'How do you decide between a monolith, modular monolith, and microservices?',
+      answer:
+        '**Start with a monolith.** One repo, one deploy, one database. Refactor freely. Microservices add network boundaries (latency, retries, eventual consistency, distributed tracing) before you know where the real boundaries are.\n\n**Move to a modular monolith** when the codebase has 10+ engineers stepping on each other. Same deploy, but enforced internal boundaries — one module owns its tables, others go through its exported API. No new infra to operate.\n\n**Extract a microservice** only when one of:\n- Different scaling needs (the embedding service needs GPUs; the rest is CPU).\n- Different reliability/SLO (payments must stay up while marketing experiments deploy weekly).\n- Independent ownership at the team level — the friction of cross-team coordination outweighs the friction of network calls.\n- Technology divergence (Python ML stack vs Node API).\n\n**Anti-pattern**: extracting microservices because "it\'s best practice." Cost: distributed transactions, eventual consistency, deploys that need orchestration, observability across N services, an order-of-magnitude more failure modes. Pay this cost only when the wins exceed it.\n\nThe modular monolith is undersold — most "we need microservices" situations are actually "we need module boundaries."',
+    },
   ],
 };

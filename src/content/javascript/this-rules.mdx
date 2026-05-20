@@ -1,0 +1,207 @@
+export const level = 'mid';
+
+# `this` rules in depth
+
+The four-call-mode model from **`this` basics** is the foundation.
+Here's the full picture, plus the edge cases.
+
+## The four modes, with priority
+
+When you write `fn(...)`, exactly one of these applies. Higher
+priority wins:
+
+1. **`new fn(...)`** — `this` is a fresh object.
+2. **`fn.call(t)` / `fn.apply(t)` / `bound()`** — `this` is `t`.
+3. **`obj.fn(...)`** — `this` is `obj`.
+4. **`fn(...)`** — `this` is `undefined` in strict mode, the global
+   object in sloppy mode.
+
+Arrow functions bypass all four — they don't have their own `this`,
+so the rules don't apply. They use the `this` from where they're
+*defined*.
+
+## The "implicit binding loss"
+
+The most common `this` bug:
+
+```js
+const user = {
+  name: 'jon',
+  greet() { return `hi ${this.name}`; },
+};
+
+const g = user.greet;
+g();   // "hi undefined" — extracted from the object, called as plain function
+```
+
+The function reference is just a function. Pull it off the object and
+you've lost the method-call form. Anything that takes a function
+reference does this:
+
+```js
+setTimeout(user.greet, 100);          // broken
+button.addEventListener('click', user.greet); // broken
+[1, 2, 3].forEach(user.greet);        // broken (and arity-mismatched)
+```
+
+### Fixes
+
+```js
+// 1. Pre-bind
+const g = user.greet.bind(user);
+setTimeout(g, 100);
+
+// 2. Wrap in an arrow at the call site
+setTimeout(() => user.greet(), 100);
+
+// 3. Bind in the constructor (for class methods)
+class User {
+  constructor(name) {
+    this.name = name;
+    this.greet = this.greet.bind(this);
+  }
+  greet() { return `hi ${this.name}`; }
+}
+
+// 4. Arrow class field — bound to instance automatically
+class User {
+  constructor(name) { this.name = name; }
+  greet = () => `hi ${this.name}`;
+}
+```
+
+Each has tradeoffs. The arrow-field form is concise but creates a new
+function per instance (memory cost in apps with many instances). The
+manual bind in the constructor is the same cost but explicit. The
+call-site arrow is the most flexible.
+
+## `call` vs `apply` vs `bind`
+
+All set `this`, differ in how they accept arguments and when they
+fire:
+
+```js
+function greet(greeting, mark) {
+  return `${greeting} ${this.name}${mark}`;
+}
+
+greet.call({ name: 'jon' }, 'hi', '!');          // "hi jon!"
+greet.apply({ name: 'jon' }, ['hi', '!']);       // "hi jon!"
+const bound = greet.bind({ name: 'jon' }, 'hi');
+bound('!');                                       // "hi jon!"
+```
+
+- **`call`** — invokes immediately, args passed individually.
+- **`apply`** — invokes immediately, args passed as an array.
+- **`bind`** — returns a new function with `this` (and optionally
+  some leading args) locked in. Doesn't call yet.
+
+`bind` was load-bearing before arrow functions; in modern code it's
+mostly used for partial application or for class methods passed as
+callbacks.
+
+```js
+// Partial application via bind
+function multiply(a, b) { return a * b; }
+const double = multiply.bind(null, 2);
+double(5); // 10
+```
+
+## In strict mode vs sloppy
+
+```js
+function f() { console.log(this); }
+
+f();                    // undefined (strict), window/global (sloppy)
+f.call('hi');           // 'hi'        (strict), String('hi')   (sloppy — coerced)
+f.call(null);           // null        (strict), global         (sloppy)
+f.call(undefined);      // undefined   (strict), global         (sloppy)
+```
+
+Sloppy mode coerces primitives to objects and replaces `null`/
+`undefined` with the global. Strict mode keeps whatever you passed.
+Modules and class bodies are strict by default — so most modern code
+follows the strict rules.
+
+## In arrow functions
+
+Arrow functions don't have a `this` binding. Period. Whatever the rules
+above produce is irrelevant; the arrow looks at its enclosing scope.
+
+```js
+const arrow = () => this;
+
+arrow.call({ name: 'jon' });  // not {name:'jon'} — call doesn't apply
+arrow.bind({}).call({});      // also irrelevant
+```
+
+`new arrow()` throws:
+
+```js
+const F = () => {};
+new F(); // TypeError: F is not a constructor
+```
+
+So: arrows for callbacks, regular functions or class methods for
+constructors and methods. Don't mix.
+
+## In classes
+
+```js
+class Counter {
+  count = 0;
+  inc() { this.count++; }      // method — `this` is the instance only if called as instance.inc()
+  incArrow = () => this.count++; // arrow field — `this` always the instance
+}
+
+const c = new Counter();
+c.inc();                       // 1
+c.incArrow();                  // 2
+
+const detached = c.inc;
+detached();                    // TypeError — `this` is undefined
+
+const detachedArrow = c.incArrow;
+detachedArrow();               // works — bound at construction
+```
+
+Method form is more efficient (one shared function on the prototype).
+Arrow-field form is bind-safe but per-instance.
+
+## In event handlers
+
+DOM event handlers receive a `this` set to the target element when
+declared as a method or function:
+
+```js
+button.addEventListener('click', function() {
+  this; // the button
+});
+
+button.addEventListener('click', () => {
+  this; // outer `this`, NOT the button
+});
+```
+
+If you need the element, use `e.currentTarget` (works in both, more
+explicit, doesn't depend on function form).
+
+## `globalThis`
+
+Cross-environment global object: `window` in browsers, `global` in
+Node, `self` in workers. `globalThis` is the portable one. You rarely
+*want* `this` to be the global object — `globalThis` is for when you
+need it explicitly.
+
+## The discipline
+
+- Use arrow functions for callbacks. They keep the outer `this`.
+- Use regular functions for class methods and constructors. They get
+  a proper `this` from method calls.
+- Don't pass instance methods as bare references. Bind them, wrap in
+  an arrow, or use arrow class fields.
+- Don't try to be clever with `call`/`apply`/`bind` inside arrows —
+  they don't apply.
+
+If you keep `this` confined to "methods and constructors only" and use
+arrows everywhere else, the rules above become mostly invisible.

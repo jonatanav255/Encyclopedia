@@ -1,0 +1,298 @@
+export const level = 'mid';
+
+# Declaration merging
+
+TypeScript lets you extend types — and even global types — by
+re-declaring them. The compiler merges multiple declarations of the
+same name into one. Used carefully, it's the main way to augment
+third-party libraries.
+
+## What can merge
+
+Interfaces merge:
+
+```ts
+interface User { id: number; }
+interface User { name: string; }
+
+const u: User = { id: 1, name: 'jon' };
+```
+
+Namespaces merge:
+
+```ts
+namespace Foo { export const x = 1; }
+namespace Foo { export const y = 2; }
+
+Foo.x;  // 1
+Foo.y;  // 2
+```
+
+Function + namespace:
+
+```ts
+function format(d: Date): string { return d.toISOString(); }
+namespace format {
+  export const VERSION = '1.0';
+}
+
+format(new Date());
+format.VERSION;   // '1.0'
+```
+
+Class + namespace gives you "static" members at the type level:
+
+```ts
+class Counter {
+  static count = 0;
+  inc() { Counter.count++; }
+}
+namespace Counter {
+  export type Listener = (n: number) => void;
+}
+
+const l: Counter.Listener = (n) => console.log(n);
+```
+
+## What can't merge
+
+- `type` aliases — two of the same name conflict.
+- `const`/`let`/`var` with the same name — conflict.
+- Classes (the value side) — duplicating the class is an error.
+- Interfaces with conflicting member types.
+
+## Augmenting third-party types
+
+The most common use case. Add fields to a library's type:
+
+```ts
+// global.d.ts
+declare global {
+  namespace Express {
+    interface Request {
+      user?: { id: number; email: string };
+    }
+  }
+}
+
+export {};   // makes this file a module
+```
+
+Now everywhere `Express.Request` is used, your custom `user` field is
+present. No re-implementing the library; no fork.
+
+The `export {}` is sometimes needed to make TS treat the file as a
+module rather than a global script. Otherwise the `declare global`
+becomes redundant.
+
+## Augmenting modules
+
+```ts
+// types/augmentations.d.ts
+import 'express-session';
+
+declare module 'express-session' {
+  interface SessionData {
+    userId?: number;
+    role?: string;
+  }
+}
+```
+
+Now `req.session.userId` and `req.session.role` are typed everywhere.
+
+Rules:
+
+- The `declare module 'name'` must match the module specifier
+  exactly.
+- Inside it, you re-open whatever interface you want to add to.
+- You can also add new exports if the module's typings are wrong, but
+  this is fragile — fork or patch with `tsconfig.paths` for big
+  changes.
+
+## Augmenting the global namespace
+
+For things that genuinely live on the global:
+
+```ts
+declare global {
+  interface Window {
+    myAnalytics: { track(event: string): void };
+  }
+}
+```
+
+Or:
+
+```ts
+declare global {
+  var __DEV__: boolean;
+}
+```
+
+The `var` form puts it in the value namespace. Useful for build-time
+constants (`__DEV__`, `__VERSION__`) replaced by the bundler.
+
+## Common applications
+
+### Adding a custom property to React's CSSProperties
+
+```ts
+declare module 'react' {
+  interface CSSProperties {
+    [key: `--${string}`]: string | number;
+  }
+}
+
+<div style={{ '--my-color': 'red' }} />
+```
+
+### Typing `process.env`
+
+```ts
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      DATABASE_URL: string;
+      NODE_ENV: 'development' | 'production' | 'test';
+    }
+  }
+}
+```
+
+Beware: this is **a lie** unless you validate at startup. The
+compiler won't warn if `DATABASE_URL` is missing at runtime. Couple
+with a Zod schema that validates `process.env` on boot.
+
+### Adding methods to built-ins (don't)
+
+```ts
+declare global {
+  interface Array<T> {
+    last(): T | undefined;
+  }
+}
+
+Array.prototype.last = function() { return this[this.length - 1]; };
+```
+
+Possible. **Don't.** Polluting built-in prototypes is risky — see
+the same warning in the prototypes page. Use plain functions.
+
+## Order of merging
+
+Multiple declarations merge in import/file order. Within a single
+file:
+
+```ts
+interface User { id: number; }
+interface User { id: number | string; }  // error — conflict on type
+```
+
+Two declarations can add new fields, but they can't disagree on the
+type of an existing field.
+
+For methods, signatures merge into an overload set:
+
+```ts
+interface Greeter {
+  greet(name: string): string;
+}
+interface Greeter {
+  greet(name: string, formal: boolean): string;
+}
+
+// merged:
+interface Greeter {
+  greet(name: string): string;
+  greet(name: string, formal: boolean): string;
+}
+```
+
+## Module augmentation pitfalls
+
+### `declare module './local-file'` doesn't merge
+
+For module augmentation to work, the module must be a **module** —
+i.e., have at least one `import` or `export`. Augmenting `*.d.ts`
+files without exports is treated as global.
+
+### Path matters
+
+```ts
+declare module 'express-session' { ... }   // augments the real module
+declare module './express-session' { ... } // a different module — local file
+```
+
+Pay attention to the path. Augment the package's actual name.
+
+### Augmentations must be in scope
+
+The file with `declare module` must be reachable from your TS
+compilation root. Typically, put augmentation files in
+`src/types/` and ensure they're included in `tsconfig.json` `include`.
+
+### Augmenting nested types
+
+```ts
+declare module 'express-session' {
+  interface SessionData {
+    extra: number;
+  }
+}
+```
+
+Easy when the library exports an `interface`. If the library uses
+`type` for the relevant shape, you can't merge — would need a fork
+or a fresh re-export.
+
+## Patterns to avoid
+
+### Merging unrelated concepts
+
+```ts
+interface User { name: string; }
+interface User { permissions: string[]; }  // unrelated concern?
+```
+
+Two locations declaring User both adding fields can drift apart over
+time. Either consolidate in one file or use composition (`User &
+WithPermissions`).
+
+### Global pollution
+
+Avoid `declare global` for things that aren't truly global. Adding
+"any function should be able to call `myUtil()`" is rarely correct.
+Import explicitly.
+
+### Augmenting in libraries
+
+Library code that does `declare global` infects every consumer. Don't
+do this unless absolutely necessary. Document it loudly if you must.
+
+## Class + interface merging
+
+```ts
+class Point { x = 0; y = 0; }
+interface Point { z?: number; }  // adds z to the instance type
+
+const p = new Point();
+p.z = 5;          // ok
+```
+
+You can declare additional members on a class via an interface of the
+same name. The compiler treats them as present, but the actual class
+body doesn't initialize them — you need to set them yourself.
+
+Useful for mixins and library augmentation.
+
+## The discipline
+
+- Use declaration merging for augmenting third-party types — the
+  Express `Request.user` pattern is the canonical example.
+- Prefer composition over merging for your own types — interfaces
+  that grow across files become hard to track.
+- Validate `process.env` at runtime; don't trust the declared types.
+- Don't merge built-in prototypes. Use plain functions.
+- Keep augmentation files in a dedicated `types/` folder so they're
+  discoverable.

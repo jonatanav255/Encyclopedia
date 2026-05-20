@@ -1,0 +1,265 @@
+export const level = 'senior';
+
+# Concurrent features
+
+React 18 introduced **concurrent rendering** — the ability for React
+to pause work, resume it, abandon it, or work on multiple updates
+at the same time. The mental model: rendering is no longer all-or-
+nothing.
+
+You don't typically opt into concurrent mode globally. Instead, you
+opt in *per update* with hooks like `useTransition` and `useDeferredValue`.
+
+## Why concurrent
+
+Old React: every state update is "urgent." React renders all the
+affected components synchronously, then commits to the DOM.
+Heavy renders → frame drops → janky UI.
+
+Concurrent React lets you mark some updates as **lower priority**.
+React renders them in the background, can interrupt them when
+something more urgent happens, and shows the user a responsive UI
+in the meantime.
+
+## `useTransition`
+
+Marks updates as non-urgent. The classic use: a search box where
+keystrokes should be instant, but the filtered list can lag.
+
+```jsx
+function SearchableList({ items }) {
+  const [query, setQuery] = useState('');
+  const [filtered, setFiltered] = useState(items);
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    const value = e.target.value;
+    setQuery(value);                          // urgent — input must update fast
+
+    startTransition(() => {
+      setFiltered(items.filter(...));         // lower priority — can be interrupted
+    });
+  }
+
+  return (
+    <>
+      <input value={query} onChange={handleChange} />
+      {isPending && <Spinner />}
+      <List items={filtered} />
+    </>
+  );
+}
+```
+
+The input updates instantly. The filter happens "in the background";
+if the user types again before it finishes, React abandons the
+in-flight work and starts fresh.
+
+`isPending` is `true` while the transition is in progress.
+
+## `useDeferredValue`
+
+A simpler variant: defer a value's update until React has time.
+
+```jsx
+function SearchableList({ items, query }) {
+  const deferredQuery = useDeferredValue(query);
+  const filtered = useMemo(
+    () => items.filter((i) => i.name.includes(deferredQuery)),
+    [items, deferredQuery]
+  );
+
+  return <List items={filtered} />;
+}
+```
+
+`deferredQuery` lags behind `query` when the system is busy. The
+input (using `query` directly) stays responsive; the heavy filter
+(using `deferredQuery`) catches up when there's bandwidth.
+
+Functionally similar to `useTransition`, but the responsibility
+shifts: instead of *the producer* marking updates as low priority,
+*the consumer* says "I'm willing to use a delayed version."
+
+## `useTransition` vs `useDeferredValue`
+
+| | `useTransition` | `useDeferredValue` |
+| --- | --- | --- |
+| Marks updates as low priority | Yes (at write side) | Yes (at read side) |
+| Returns `isPending` flag | Yes | No (you derive it: `query !== deferredQuery`) |
+| Wraps the setter call | Yes (`startTransition(() => setX(...))`) | No (just `useDeferredValue(value)`) |
+| Best for | Multiple updates in one event | A single value used in heavy renders |
+
+Both end up using the same underlying mechanism. Pick whichever
+reads more naturally for the case.
+
+## Automatic batching
+
+React 18 batches state updates from **anywhere**:
+
+```jsx
+async function handleClick() {
+  await api.save();
+  setA(1);            // batched with the others
+  setB(2);            // batched
+  setC(3);            // ONE re-render, with all three
+}
+```
+
+In React 17, only synchronous updates inside event handlers were
+batched. React 18 extended batching to promises, setTimeouts, and
+native event handlers. You usually don't notice; it just works.
+
+## Suspense and concurrent rendering
+
+Concurrent rendering enables modern Suspense:
+
+```jsx
+<Suspense fallback={<Spinner />}>
+  <UserProfile id={id} />
+</Suspense>
+```
+
+Inside `UserProfile`, data loading happens via `use(promise)` or a
+library that throws promises. React catches the promise, shows the
+fallback, and resumes rendering when the promise resolves.
+
+Concurrent rendering means React can:
+
+- Show the fallback without blocking the rest of the UI.
+- Resume rendering when data arrives.
+- Re-enter the same Suspense boundary if more data is needed.
+
+See **Suspense and transitions** for the deep dive.
+
+## When concurrent features help
+
+- **Search and filter** — instant input, lagged filtering.
+- **Tab switches** — switch fast even if the new tab's render is
+  heavy.
+- **Visual transitions** — the previous content stays visible while
+  the new content prepares.
+- **Anything that causes a noticeable freeze** under user input.
+
+## When they don't
+
+- **The render isn't actually heavy.** If it takes 5ms, no priority
+  juggling will help — the work isn't the bottleneck.
+- **Data fetching is the bottleneck.** Concurrent features don't
+  speed up the network. Use proper caching and prefetching.
+- **You're not running into UX issues.** Concurrent features are for
+  fixing perceived performance problems. Don't add them prophylactically.
+
+## `useId` — a related hook
+
+Not strictly concurrent, but new in React 18 for SSR compatibility:
+
+```jsx
+function Form() {
+  const id = useId();
+  return (
+    <label htmlFor={id}>Name <input id={id} /></label>
+  );
+}
+```
+
+`useId` generates a stable, unique ID that matches on server and
+client. Required for SSR'd form labels — old `Math.random()` IDs
+mismatched and broke hydration.
+
+## What changed for you
+
+If you're on React 18+:
+
+- Wrap your root in `<StrictMode>`. Catches uncleanable effects.
+- For heavy filtered lists, sprinkle `useTransition` /
+  `useDeferredValue` where input feels sluggish.
+- Trust automatic batching — write multiple `setState` calls without
+  worry.
+- For data loading, lean on Suspense + a library that supports it
+  (TanStack Query, Relay, Next.js streaming).
+
+If you're on React 17 or earlier, none of this is available. Upgrade
+the React version; the changes are largely backward-compatible.
+
+## React 19 / 20 directions
+
+- **React Compiler** — auto-memoization, less manual optimization.
+- **Actions** — built-in support for async form submissions with
+  optimistic updates.
+- **`use(promise)`** — read promises during render, suspending until
+  resolved.
+- **Server components** — render on the server, ship JSON to the
+  client.
+
+Concurrent rendering is the foundation that makes these possible.
+Even if you don't use `useTransition` directly, you're benefiting
+from concurrent infrastructure when you use Suspense or
+server-rendered React.
+
+## Common pitfalls
+
+### `startTransition` outside an event
+
+```jsx
+useEffect(() => {
+  startTransition(() => setItems(processItems()));
+}, []);
+```
+
+Works, but transitions inside effects don't have much purpose —
+effects already run after commit. The classic use is in event
+handlers.
+
+### Wrapping urgent updates
+
+```jsx
+startTransition(() => {
+  setQuery(value);   // wait, this is the urgent one!
+});
+```
+
+Only wrap the *lower-priority* updates. The urgent ones (the input
+value) should stay outside.
+
+### Long-running synchronous work
+
+```jsx
+startTransition(() => {
+  const result = veryHeavyComputation();  // blocks the loop anyway
+  setResult(result);
+});
+```
+
+`startTransition` lets React interrupt **rendering**, not arbitrary
+JS. A synchronous heavy computation still blocks. Move it to a Web
+Worker or break it into chunks if it's CPU-bound.
+
+### Expecting `useDeferredValue` to throttle inputs
+
+```jsx
+const [text, setText] = useState('');
+const deferred = useDeferredValue(text);
+<input value={deferred} onChange={(e) => setText(e.target.value)} />
+```
+
+Wait — that's wrong. The input should use `text` (urgent), not
+`deferred` (lagged). Otherwise the input visually lags behind the
+user's typing.
+
+Use `text` in the input. Use `deferred` in the expensive consumer.
+
+## The mental model
+
+Concurrent rendering lets React **interrupt and reprioritize** work.
+You opt in by marking some updates as lower-priority
+(`useTransition`) or by reading lagged values (`useDeferredValue`).
+React handles the rest.
+
+It doesn't speed up computation. It makes the UI feel snappier by
+keeping urgent interactions (typing, clicks) unblocked while heavy
+work happens in the background.
+
+For most apps, you'll use these hooks in two or three specific
+places — search boxes, tab switches, big virtualized lists. The
+rest of your code stays the same as React 17.

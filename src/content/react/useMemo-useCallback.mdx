@@ -1,0 +1,320 @@
+export const level = 'senior';
+
+# `useMemo` and `useCallback`
+
+Two memoization hooks. `useMemo` caches a computed value; `useCallback`
+caches a function. Both return the same reference across renders as
+long as their dependencies don't change.
+
+They are **performance hints**, not semantic features. The wrong use
+makes code slower, not faster.
+
+## `useMemo`
+
+```jsx
+const expensive = useMemo(() => computeExpensiveValue(a, b), [a, b]);
+```
+
+React calls the function on first render and stores the result.
+On subsequent renders, if `a` and `b` haven't changed (by `Object.is`),
+React returns the cached value — skipping the computation.
+
+When to use:
+
+1. **Expensive computation** that you don't want to redo each render.
+2. **Stable reference for downstream memoized components or deps.**
+
+Example of #1:
+
+```jsx
+function TodoList({ todos, filter }) {
+  const visible = useMemo(
+    () => todos.filter((t) => filter === 'all' || t.status === filter),
+    [todos, filter]
+  );
+
+  return <ul>{visible.map((t) => <li key={t.id}>{t.text}</li>)}</ul>;
+}
+```
+
+If `todos` has 10,000 items, filtering on every render is wasteful.
+`useMemo` skips the work when only unrelated state changes.
+
+Example of #2:
+
+```jsx
+function Parent() {
+  const [count, setCount] = useState(0);
+  const config = useMemo(() => ({ url: '/api', timeout: 5000 }), []);
+
+  return <ExpensiveChild config={config} />;
+}
+```
+
+Without `useMemo`, `config` is a new object every render. If
+`ExpensiveChild` is wrapped in `React.memo`, the new reference would
+defeat the memo. `useMemo` keeps `config` stable.
+
+## `useCallback`
+
+```jsx
+const handler = useCallback((value) => {
+  doThing(a, value);
+}, [a]);
+```
+
+Identical to `useMemo(() => fn, deps)`. Just a sugar for memoizing
+functions specifically:
+
+```jsx
+useCallback(fn, deps);
+// equivalent to:
+useMemo(() => fn, deps);
+```
+
+When to use:
+
+1. **You pass a callback to a memoized child** (`React.memo`).
+2. **The callback is a dependency of another hook** (`useEffect`,
+   `useMemo`).
+
+Without `useCallback`, the function is a new reference each render,
+defeating memos and re-triggering effects.
+
+## When NOT to use them
+
+The mistake: applying `useMemo` and `useCallback` everywhere "for
+performance." They have cost:
+
+- Allocate the dep array each render.
+- Run the equality check.
+- Hold onto the cached value (memory).
+
+For trivial computations (`a + b`, simple `.map()`), the memoization
+overhead is *more* than the computation. You lose.
+
+The litmus test: "is this computation actually expensive, or is the
+result being passed somewhere that needs reference stability?" If
+neither, skip the memo.
+
+## Common useless `useCallback`s
+
+```jsx
+function Component() {
+  const onClick = useCallback(() => {
+    console.log('clicked');
+  }, []);
+
+  return <button onClick={onClick}>Click</button>;
+}
+```
+
+`<button>` is a DOM element. It doesn't care if `onClick` is a new
+reference each render. The `useCallback` adds overhead and clutter
+for no win.
+
+The same code without `useCallback`:
+
+```jsx
+function Component() {
+  return <button onClick={() => console.log('clicked')}>Click</button>;
+}
+```
+
+Shorter, faster, identical behavior.
+
+## React.memo
+
+The memoization-aware component wrapper:
+
+```jsx
+const ExpensiveChild = React.memo(function ExpensiveChild({ value }) {
+  return <div>{heavyComputation(value)}</div>;
+});
+```
+
+If `ExpensiveChild`'s props don't change (by `Object.is` per prop),
+React skips the render. Useful for:
+
+- Components with expensive rendering.
+- Components in long lists where most props are stable.
+
+`React.memo` is most useful when paired with `useMemo`/`useCallback`
+in the parent — to ensure props *can* stay reference-stable.
+
+```jsx
+function Parent({ items }) {
+  const onSelect = useCallback((id) => select(id), []);
+  return items.map((item) => (
+    <Item key={item.id} item={item} onSelect={onSelect} />
+  ));
+}
+
+const Item = React.memo(function Item({ item, onSelect }) {
+  return <button onClick={() => onSelect(item.id)}>{item.name}</button>;
+});
+```
+
+`onSelect` is stable (deps `[]`). `item` only re-renders the row it
+belongs to (since list items are keyed). Each `<Item>` re-renders
+only when its specific item changes.
+
+## React Compiler
+
+React's experimental compiler (Babel plugin) automates this — it
+analyzes your component, figures out what could be memoized, and
+inserts the equivalent of `useMemo`/`useCallback`/`React.memo` calls.
+
+In a world with the compiler, the rule becomes:
+
+- Write the dumb-simple version (no manual memos).
+- Let the compiler optimize.
+
+It's not stable everywhere yet, but the direction is "you don't have
+to think about memoization anymore." If you adopt the compiler, you
+likely won't need `useMemo`/`useCallback` at all.
+
+For now, in compiler-free codebases, the discipline is to use them
+**only when measurably beneficial** — for genuinely expensive
+computations or for stabilizing references that downstream code
+depends on.
+
+## Equality comparison
+
+Both hooks compare deps with `Object.is`:
+
+```js
+Object.is(0, 0);          // true
+Object.is(NaN, NaN);      // true
+Object.is(0, -0);         // false (unlike ===)
+Object.is({ x: 1 }, { x: 1 });   // false — different refs
+```
+
+For arrays/objects in deps, equality is by reference. New literal
+`{}` or `[]` in deps means "always changed." That's why you
+sometimes need to wrap inputs to `useMemo` in another `useMemo`:
+
+```jsx
+function Component({ rawConfig }) {
+  // BAD — rawConfig is potentially a new object each render
+  const result = useMemo(() => process(rawConfig), [rawConfig]);
+}
+```
+
+If the parent passes `<Component rawConfig={{ url: '/api' }} />`
+inline, every render generates a fresh object. The `useMemo` runs
+every render. Either accept it, or stabilize at the parent:
+
+```jsx
+const config = useMemo(() => ({ url: '/api' }), []);
+<Component rawConfig={config} />
+```
+
+## Custom equality
+
+`React.memo` accepts a custom equality function:
+
+```jsx
+const Item = React.memo(function Item({ item }) {
+  ...
+}, (prev, next) => prev.item.id === next.item.id);
+```
+
+Returns `true` if you want React to *skip* re-render. The default is
+shallow prop comparison.
+
+Use cautiously — wrong equality means stale UI. The default's usually
+right.
+
+## Common pitfalls
+
+### Memoizing what isn't expensive
+
+```jsx
+const sum = useMemo(() => a + b, [a, b]);
+```
+
+`a + b` is microseconds. The `useMemo` overhead is microseconds. You
+gained nothing; you obscured the code.
+
+### Forgetting deps
+
+```jsx
+const result = useMemo(() => transform(data), []);
+```
+
+`data` is missing. The first computation is cached forever; new
+`data` doesn't trigger re-compute. The lint rule
+`react-hooks/exhaustive-deps` catches this.
+
+### Using a memoized callback's stale state
+
+```jsx
+function Component() {
+  const [count, setCount] = useState(0);
+
+  const handler = useCallback(() => {
+    console.log(count);
+  }, []);     // BAD — count missing
+
+  return <button onClick={handler}>Click ({count})</button>;
+}
+```
+
+`handler` captures `count = 0` and never updates. Clicks log 0
+forever.
+
+Fix: include `count` in deps (new handler per change) or use the
+functional form / a ref:
+
+```jsx
+const handler = useCallback(() => {
+  console.log(countRef.current);
+}, []);
+```
+
+### `useCallback` inline in props
+
+```jsx
+<Child onClick={useCallback(() => fn(), [])} />
+```
+
+You can't call hooks inside JSX expressions. The hook would need to
+be on a separate line.
+
+## When `useMemo` for objects is genuinely useful
+
+Three concrete scenarios:
+
+1. **Stable context value** — to prevent every consumer from
+   re-rendering on unrelated state changes.
+
+```jsx
+const value = useMemo(() => ({ user, setUser }), [user]);
+<UserContext.Provider value={value}>...
+```
+
+2. **Stable dep for `useEffect`** — to prevent the effect from
+   re-running unnecessarily.
+
+```jsx
+const options = useMemo(() => ({ timeout: 5000 }), []);
+useEffect(() => fetchWith(options), [options]);   // never re-runs
+```
+
+3. **Stable prop for memoized child** — covered above.
+
+In all three, the goal is **reference stability**, not "skip
+computation."
+
+## The mental model
+
+`useMemo` and `useCallback` are caches keyed by deps. They're
+performance tools, not correctness tools. If removing them changes
+behavior, you have a bug — the dep array is wrong, or you're relying
+on stale closures.
+
+When in doubt, **don't memoize**. Write simple code. Profile if it's
+slow. Memoize the parts that show up in the profile. Better yet,
+adopt the React compiler when it stabilizes — and stop thinking
+about manual memoization entirely.

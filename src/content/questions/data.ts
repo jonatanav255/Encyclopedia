@@ -74,5 +74,19 @@ export const bank: QuestionBank = {
       answer:
         'Almost always one of two things:\n\n1. **The pool size scaled but the rate-limit store didn\'t.** Each Node process talks to the same Redis, which is good — limits should still be correct. If they\'re wrong, check that all processes are pointing at the same Redis (and same key prefix).\n2. **`trust proxy` is misconfigured.** `req.ip` is the proxy IP, not the client IP — so all requests share a key, the limit applies collectively, and you under-throttle individual abusers. Set `app.set("trust proxy", N)` correctly.\n\nLess likely but worth checking: time drift between Node and Redis (window calculations are off), or a key collision with another service sharing the Redis.',
     },
+
+    // --- staff ---
+    {
+      level: 'staff',
+      question: 'Your Postgres p99 query latency spikes from 5ms to 800ms once a week. How do you diagnose it?',
+      answer:
+        '**Look at lock waits first** — `pg_stat_activity` filtered by `wait_event_type = \'Lock\'` during the spike. Long transactions blocking others are the most common cause; a weekly batch job that takes locks for minutes will manifest exactly this way.\n\n**Check `pg_stat_statements`** for top queries by total time over the spike window — sometimes one query suddenly chooses a bad plan after a stats update.\n\n**Autovacuum lag**: if a table is heavily updated and vacuum is behind, indexes bloat → planner falls back to seq scans. `pg_stat_user_tables` shows last vacuum time and dead tuple counts.\n\n**Connection pool saturation**: if every connection is busy waiting on the locked transaction, new queries pile up. The latency *looks* like Postgres slowed down; really it\'s queuing on the application side.\n\n**Network / IO**: check host metrics during the spike. Could be a backup, disk-bound scan, or a noisy neighbor on shared infra (RDS).\n\n**Fix path**: kill the long transaction (`pg_terminate_backend`), find the source via `application_name` and the query in `pg_stat_activity`, refactor to smaller transactions or schedule the batch off-peak. Long-term: set `statement_timeout` and `idle_in_transaction_session_timeout` to bound the blast radius.',
+    },
+    {
+      level: 'staff',
+      question: 'Design a cache layer for a high-traffic read-heavy API.',
+      answer:
+        '**Workload analysis first** — what\'s read 10–100× more than written? Cache those. Don\'t cache uniformly.\n\n**Topology**: Redis cluster in front of the DB, sized for the working set (LFU eviction). Application checks Redis first, falls back to DB on miss, writes back to Redis with a TTL. For very hot keys, a per-process in-memory cache (LRU, 1–10s TTL) cuts Redis round trips.\n\n**Invalidation**: the hard problem. Two patterns:\n- **TTL + best-effort invalidation**: short TTLs (30s–5min). On write, delete the cache key. Tolerates briefly stale reads. Works for "user profile" type data.\n- **Versioned keys**: cache key includes a version (`user:42:v17`). On write, bump the version. Old key remains in cache to expire naturally; readers see fresh data on the new key immediately.\n\n**Stampede prevention**: when a hot key expires, 1000 requests would all rebuild it. Mitigate via probabilistic early refresh (refresh at 80% of TTL with small chance), or single-flight (a Redis lock; one rebuilds, others wait and read).\n\n**Negative caching**: cache "not found" with a shorter TTL to prevent repeated DB hits for bad IDs.\n\n**Observability**: hit ratio per cache layer, latency, evictions, memory pressure. Hit ratio < 95% means you\'re probably caching the wrong things.\n\n**Failure mode**: if Redis is down, fall back to DB and serve directly. Bound concurrency to the DB so a cache outage doesn\'t cause a cascade.',
+    },
   ],
 };

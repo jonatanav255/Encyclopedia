@@ -1,0 +1,327 @@
+export const level = 'senior';
+
+# Branded types (nominal typing in TS)
+
+TypeScript uses **structural typing** — two types are compatible if
+their shapes match. That's usually great, but sometimes you want
+**nominal** behavior: a `UserId` and `PostId` are both strings, but
+you don't want to pass one where the other is expected.
+
+Branded types are the idiomatic workaround.
+
+## The problem
+
+```ts
+type UserId = string;
+type PostId = string;
+
+function getUser(id: UserId): User { ... }
+
+const post: PostId = '42';
+getUser(post);   // no error — both are just `string`
+```
+
+A type alias for a primitive is just a label. TS treats them as
+interchangeable.
+
+## The brand pattern
+
+```ts
+type UserId = string & { __brand: 'UserId' };
+type PostId = string & { __brand: 'PostId' };
+
+const u: UserId = '42';                // error — missing __brand
+const u: UserId = '42' as UserId;       // ok — assertion
+```
+
+The intersection adds a phantom property that no real string has.
+Two branded types are now structurally distinct.
+
+`getUser(post)` now errors because `PostId` doesn't have `__brand:
+'UserId'`.
+
+## Constructor functions
+
+Casting `as UserId` everywhere is noisy. Wrap it:
+
+```ts
+function userId(s: string): UserId {
+  return s as UserId;
+}
+
+const id = userId('42');         // typed UserId
+const id2 = userId(123 as any);  // still UserId — runtime not checked
+```
+
+The function can validate too:
+
+```ts
+function userId(s: string): UserId {
+  if (!/^\d+$/.test(s)) throw new Error('bad id');
+  return s as UserId;
+}
+```
+
+Now the only way to create a `UserId` is to go through `userId()`. If
+the function validates, every `UserId` in your code is known-valid.
+
+## Generic brand utility
+
+```ts
+type Brand<T, B extends string> = T & { __brand: B };
+
+type UserId = Brand<string, 'UserId'>;
+type PostId = Brand<string, 'PostId'>;
+type Email = Brand<string, 'Email'>;
+type PositiveNumber = Brand<number, 'Positive'>;
+```
+
+Common to extract into a shared utility. `type-fest` exports
+`Opaque<T, B>` for the same purpose.
+
+## Branded number types
+
+```ts
+type Price = Brand<number, 'Price'>;
+type Quantity = Brand<number, 'Quantity'>;
+
+function total(p: Price, q: Quantity): Price {
+  return (p * q) as Price;
+}
+```
+
+Prevents mixing units. Especially valuable in financial code where
+"how many cents" vs "how many dollars" vs "how many shares" all need
+to stay distinct.
+
+## More elaborate brands
+
+The simple `__brand` field is enough, but you sometimes see:
+
+```ts
+declare const userIdBrand: unique symbol;
+type UserId = string & { readonly [userIdBrand]: never };
+```
+
+Using a `unique symbol` makes the brand unforgeable — you can't write
+the brand by hand. Slightly more verbose, slightly safer. In practice
+both forms work.
+
+## When you'd use them
+
+### Validated values
+
+```ts
+type ValidatedEmail = Brand<string, 'Email'>;
+type ValidatedURL = Brand<string, 'URL'>;
+
+function validateEmail(s: string): ValidatedEmail {
+  if (!/^.+@.+\..+$/.test(s)) throw new Error('bad email');
+  return s as ValidatedEmail;
+}
+
+function sendEmail(to: ValidatedEmail, body: string) { ... }
+
+sendEmail('not-an-email', 'hi');         // error
+sendEmail(validateEmail('a@b.com'), 'hi'); // ok
+```
+
+The type system tracks "this string has been validated." You can't
+skip validation — the function signature won't let you.
+
+### Distinct IDs across entities
+
+```ts
+type UserId = Brand<string, 'UserId'>;
+type OrderId = Brand<string, 'OrderId'>;
+
+function getOrders(uid: UserId): Order[] { ... }
+function cancelOrder(oid: OrderId): void { ... }
+
+getOrders('123' as OrderId);  // error — wrong brand
+```
+
+### Numeric units
+
+```ts
+type Cents = Brand<number, 'Cents'>;
+type Dollars = Brand<number, 'Dollars'>;
+
+function display(c: Cents): string { return `$${c / 100}`; }
+
+display(100 as Dollars);   // error
+display(100 as Cents);     // "$1"
+```
+
+### "Trusted" strings
+
+```ts
+type SafeHtml = Brand<string, 'SafeHtml'>;
+type DangerousHtml = string;   // raw, unvalidated
+
+function escape(input: DangerousHtml): SafeHtml { ... }
+function render(html: SafeHtml): void { ... }
+```
+
+XSS prevention by type. You can only `render` something that's been
+through `escape`.
+
+## Limits
+
+### Runtime invisibility
+
+```ts
+type UserId = Brand<string, 'UserId'>;
+const u: UserId = userId('42');
+
+typeof u;   // "string"
+u + 1;       // "421" — still a string at runtime
+```
+
+Brands are erased at compile time. The runtime sees a plain string.
+Useful for serialization (just stringify) but useless for runtime
+type checks.
+
+If you need runtime distinction, use a class with a private field —
+true nominal typing.
+
+```ts
+class UserId {
+  private __brand: never;
+  constructor(public readonly value: string) {}
+}
+```
+
+Now `instanceof UserId` works. Heavier than a brand; useful when you
+need the runtime guarantee.
+
+### Manual assertion required to create
+
+```ts
+const u: UserId = 'banana' as UserId;
+```
+
+The brand only blocks accidents. A motivated programmer can always
+`as Brand` their way through.
+
+The discipline: make brand constructors the only way to create them
+(don't expose `as`), and have them validate.
+
+### Bracketed types and intersections
+
+```ts
+type WeirdBrand = Brand<{ x: number }, 'Foo'>;
+// { x: number } & { __brand: 'Foo' }
+// works, but the object now has a "__brand" field
+```
+
+The brand field shows up in autocomplete on objects (less so on
+primitives because primitives don't really have properties at the
+syntax level). Not a big deal, but ugly.
+
+## Comparison with classes
+
+```ts
+class UserId {
+  constructor(public readonly value: string) {
+    if (!/^\d+$/.test(value)) throw new Error('bad');
+  }
+}
+
+function getUser(id: UserId): User { ... }
+
+getUser(new UserId('42'));    // ok
+getUser('42');                  // error
+getUser({ value: '42' });       // error — duck typing wouldn't suffice
+```
+
+Pros of class:
+
+- Runtime check possible (`instanceof`).
+- Constructor enforces validation.
+- Serialization needs explicit handling — could be a feature.
+
+Pros of brand:
+
+- Zero runtime cost — same as a plain string.
+- JSON serialization is automatic.
+- No `.value` unwrap.
+
+For pure compile-time distinction, brands. For runtime nominal
+behavior, classes.
+
+## Zod and branded types
+
+Zod (and similar libraries) supports brands natively:
+
+```ts
+import { z } from 'zod';
+
+const UserId = z.string().regex(/^\d+$/).brand<'UserId'>();
+type UserId = z.infer<typeof UserId>;
+
+const id = UserId.parse('42');   // typed UserId, validated
+```
+
+Best of both worlds: runtime validation + compile-time brand. The
+brand is `__brand: 'UserId'` under the hood — same pattern.
+
+## Pitfalls
+
+### Forgetting to brand
+
+```ts
+function getUser(id: UserId): User { ... }
+const id = '42';   // plain string
+getUser(id);       // error — but maybe you wanted this to work
+```
+
+If you use brands everywhere, every call site must brand its input.
+That's the point — but it's friction in tests, fixtures, and adapter
+code. Provide a constructor or factory.
+
+### Brand erasure on operations
+
+```ts
+const id: UserId = userId('42');
+const upper = id.toUpperCase();   // string, not UserId
+```
+
+Methods on strings return plain strings. The brand is lost. Wrap or
+re-brand if needed.
+
+```ts
+const upper = userId(id.toUpperCase());
+```
+
+### Broad utilities
+
+```ts
+function log<T>(value: T): T { return value; }
+
+const id: UserId = userId('42');
+const same = log(id);   // typed UserId — generic preserves it
+```
+
+Generic functions preserve brands. Non-generic functions that take
+`string` lose them:
+
+```ts
+function trim(s: string): string { return s.trim(); }
+const x = trim(id);   // string, not UserId
+```
+
+## The discipline
+
+- Brand at the boundary (validation, deserialization, ID generation).
+- Provide constructor functions; don't sprinkle `as Brand` casts.
+- Use `Brand<T, B>` as a shared utility.
+- Combine with Zod for runtime-checked brands.
+- Class-based nominal typing when you need runtime checks.
+
+For most app code, plain types are fine. Reach for brands when:
+
+- IDs of different entities get mixed up.
+- Numeric units (cents/dollars, meters/feet) get mixed up.
+- Trust boundaries matter (validated/escaped/safe vs raw).
+- You want the compiler to remind you to validate.

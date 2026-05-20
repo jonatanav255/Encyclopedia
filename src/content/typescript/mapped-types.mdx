@@ -1,0 +1,271 @@
+export const level = 'mid';
+
+# Mapped types
+
+Mapped types transform one type into another by iterating its keys.
+They're how the built-in utilities (`Partial`, `Readonly`, `Pick`)
+are defined and how you write similar utilities yourself.
+
+## The syntax
+
+```ts
+type MyReadonly<T> = {
+  readonly [K in keyof T]: T[K];
+};
+
+type User = { id: number; name: string };
+type Locked = MyReadonly<User>;
+// { readonly id: number; readonly name: string }
+```
+
+Anatomy:
+
+- `[K in keyof T]` — iterate K over each key of T.
+- `T[K]` — the value type at that key.
+- Modifiers (`readonly`, `?`) — apply per key.
+
+## Built-in utility types (using mapped)
+
+```ts
+type Partial<T> = { [K in keyof T]?: T[K] };
+type Required<T> = { [K in keyof T]-?: T[K] };
+type Readonly<T> = { readonly [K in keyof T]: T[K] };
+type Pick<T, K extends keyof T> = { [P in K]: T[P] };
+```
+
+The `-?` removes the optionality (`undefined` from value, `?` from
+the property). The minus modifier also removes `readonly`:
+
+```ts
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+```
+
+## Filtering keys
+
+The `as` clause (TS 4.1+) lets you transform or filter keys:
+
+```ts
+type StringOnly<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
+
+type Mixed = { id: number; name: string; email: string };
+type Strings = StringOnly<Mixed>;
+// { name: string; email: string }
+```
+
+Mapping a key to `never` removes it from the result. This is the
+canonical way to filter.
+
+### Filtering by name
+
+```ts
+type WithoutKeys<T, K extends keyof T> = {
+  [P in keyof T as P extends K ? never : P]: T[P];
+};
+
+type T = WithoutKeys<User, 'id'>;
+// { name: string; email: string }
+```
+
+(`Omit<T, K>` does this — it's built in.)
+
+### Renaming keys
+
+```ts
+type Capitalize<T> = {
+  [K in keyof T as `get${Capitalize<K & string>}`]: () => T[K];
+};
+
+type User = { id: number; name: string };
+type UserGetters = Capitalize<User>;
+// { getId: () => number; getName: () => string }
+```
+
+This uses **template literal types** (see that page) to build new
+key names.
+
+## Mapping over unions
+
+```ts
+type Methods<T extends string> = {
+  [K in T]: (input: string) => K;
+};
+
+type R = Methods<'get' | 'post' | 'put'>;
+// {
+//   get: (input: string) => 'get';
+//   post: (input: string) => 'post';
+//   put: (input: string) => 'put';
+// }
+```
+
+You don't need a `keyof T`; you can map over any union.
+
+## Common patterns
+
+### `Nullable<T>` — all fields nullable
+
+```ts
+type Nullable<T> = { [K in keyof T]: T[K] | null };
+
+type User = { id: number; name: string };
+type NullableUser = Nullable<User>;
+// { id: number | null; name: string | null }
+```
+
+### `Stringify<T>` — convert all values to strings
+
+```ts
+type Stringify<T> = { [K in keyof T]: string };
+
+type R = Stringify<User>;
+// { id: string; name: string }
+```
+
+Useful when typing form data or URL query params.
+
+### `Promised<T>` — wrap each method's return in a Promise
+
+```ts
+type Promised<T> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R
+    ? (...args: A) => Promise<R>
+    : T[K];
+};
+
+interface Sync {
+  greet(name: string): string;
+  age: number;
+}
+
+type Async = Promised<Sync>;
+// { greet: (name: string) => Promise<string>; age: number }
+```
+
+Common pattern in API client generators.
+
+### `Selectable<T>` — only the fields whose values are primitives
+
+```ts
+type Selectable<T> = {
+  [K in keyof T as T[K] extends string | number | boolean ? K : never]: T[K];
+};
+```
+
+### `Branded<T, B>` — apply a brand to all string fields
+
+```ts
+type Branded<T, B extends string> = {
+  [K in keyof T]: T[K] extends string ? T[K] & { __brand: B } : T[K];
+};
+```
+
+## Deep transformations
+
+Recursive mapped types apply at every level:
+
+```ts
+type DeepReadonly<T> = {
+  readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];
+};
+
+type Config = {
+  db: { host: string; port: number };
+  cache: { ttl: number };
+};
+
+type LockedConfig = DeepReadonly<Config>;
+// readonly all the way down
+```
+
+Care: `object` matches functions, arrays, maps — anything that isn't
+a primitive. For really deep transformations on specific structures,
+use distributed conditionals to narrow.
+
+`DeepPartial`, `DeepRequired` follow the same pattern. They're useful
+but watch out for inputs with cycles or `unknown` — the compiler can
+get sluggish.
+
+## Combining with conditional types
+
+Mapped types compose with conditionals (`extends ... ? ... :`). This
+is where the real expressive power lives.
+
+```ts
+type Functions<T> = {
+  [K in keyof T as T[K] extends Function ? K : never]: T[K];
+};
+
+class Service {
+  url = '/api';
+  get() { return 1; }
+  post() { return 2; }
+}
+
+type ServiceFns = Functions<Service>;
+// { get: () => number; post: () => number }
+```
+
+The `as` filter + the conditional select methods only.
+
+## Limitations
+
+### No mapping arrays directly
+
+Mapped types work on object types. For arrays/tuples you need a
+helper:
+
+```ts
+type MapArray<T> = T extends readonly (infer U)[] ? U[] : never;
+```
+
+Or, for tuple-element transformation, recursive types:
+
+```ts
+type Tuples<T extends readonly unknown[]> = {
+  [I in keyof T]: T[I] extends infer U ? U[] : never;
+};
+
+type R = Tuples<[number, string]>;   // [number[], string[]]
+```
+
+### Performance
+
+Mapped types over large objects can be slow to type-check. If a
+mapped type takes seconds to resolve, consider:
+
+- Caching with a type alias.
+- Restricting the input type.
+- Using a simpler shape.
+
+For libraries with deeply mapped types, expect typecheck times to
+balloon — there's an inherent cost.
+
+## A mental model
+
+A mapped type is a `for` loop at the type level:
+
+```ts
+for (const K of keys(T)) {
+  result[K_or_renamed] = transform(T[K]);
+}
+```
+
+The `[K in keyof T as ...]` says "iterate keys, optionally rename;"
+the `: T[K]` says "the value at that key, optionally transformed."
+The optional modifiers (`readonly`, `?`, `-?`, `-readonly`) apply
+per key.
+
+Most utility types fall out of this. Once mapped types are
+comfortable, the door opens to conditional types and template literal
+types, where most of the "wow, TypeScript can do that?" code lives.
+
+## The discipline
+
+- Use built-in utilities first (`Partial`, `Pick`, `Record`,
+  `Omit`). Most needs are covered.
+- Reach for custom mapped types when you need to filter or rename.
+- Use template literal types for key transformations.
+- Combine with `infer` for advanced transformations.
+- Watch typecheck performance on large deeply-mapped types.

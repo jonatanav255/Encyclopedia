@@ -1,0 +1,302 @@
+export const level = 'senior';
+
+# Project references
+
+For large codebases — typically monorepos with multiple packages —
+compiling everything as one `tsconfig.json` becomes slow and hard
+to manage. **Project references** let TypeScript treat your code as
+a graph of separate sub-projects that depend on each other, each
+with its own `tsconfig.json`.
+
+## Why bother
+
+In a monorepo:
+
+```
+packages/
+  app/        — main application
+  shared/     — shared types and utilities
+  api-client/ — HTTP client
+  validation/ — Zod schemas
+```
+
+Without references, you typically pick one of:
+
+- One big tsconfig that compiles everything → slow, no incremental
+  builds.
+- Per-package tsconfigs that don't know about each other → manual
+  ordering, "package not found" errors.
+- A bundler that resolves paths → works for bundling, breaks for
+  editor type-checking.
+
+Project references give you incremental builds, accurate cross-package
+typings, and per-package compilation.
+
+## The minimal setup
+
+```
+project-root/
+  tsconfig.json         — solution file, lists references
+  packages/
+    shared/
+      tsconfig.json
+      src/index.ts
+    app/
+      tsconfig.json
+      src/main.ts
+```
+
+`tsconfig.json` at the root:
+
+```json
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/app" }
+  ]
+}
+```
+
+This is a "solution file" — no compilation of its own, just a list
+of sub-projects. `pnpm exec tsc --build` builds them in order.
+
+`packages/shared/tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src/**/*"]
+}
+```
+
+`packages/app/tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../shared" }
+  ]
+}
+```
+
+The `references` array tells the compiler that `app` depends on
+`shared`. The compiler:
+
+1. Builds `shared` first (if outputs are out of date).
+2. Treats `import { foo } from 'shared'` as resolving to the
+   built declarations.
+3. Builds `app` against those declarations.
+
+## Required flags
+
+For a project to be referenced, set:
+
+- **`composite: true`** — enables the features needed for
+  references (forces `declaration`, restricts `include`).
+- **`declaration: true`** — referenced projects must publish their
+  types so consumers can see them. `composite` implies this.
+- **`declarationMap: true`** — recommended. Lets editors jump from
+  consumer to source.
+
+## How imports resolve
+
+```ts
+// packages/app/src/main.ts
+import { fetchUser } from 'shared';
+```
+
+Two cases:
+
+1. **As a consumer running the app** — bundler / Node resolves
+   `'shared'` to `packages/shared/dist/index.js`.
+2. **For type checking** — TS resolves to
+   `packages/shared/dist/index.d.ts` (the built declarations).
+
+You almost always need a `package.json` in each package:
+
+```json
+// packages/shared/package.json
+{
+  "name": "shared",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  }
+}
+```
+
+With pnpm workspaces, you'd add it to the workspace and let pnpm
+hard-link it:
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "packages/*"
+```
+
+(Project notes: this project deliberately doesn't have a
+`pnpm-workspace.yaml`. If pnpm writes a stub, delete it.)
+
+## Building
+
+```bash
+pnpm exec tsc --build           # build entire graph
+pnpm exec tsc --build --watch   # incremental, watching
+pnpm exec tsc --build --clean   # remove all outputs
+pnpm exec tsc --build --force   # rebuild everything from scratch
+```
+
+The `--build` flag (often `-b`) enables project-references mode. The
+compiler tracks file timestamps and `.tsbuildinfo` to skip unchanged
+projects.
+
+## `.tsbuildinfo`
+
+Each composite project emits a `.tsbuildinfo` file (next to the
+output) with hashes and timestamps. The compiler reads it to decide
+"is this project up to date?"
+
+Should be gitignored.
+
+## When references actually help
+
+- **Monorepos with N packages.** Building one package's types in
+  isolation is faster than the whole tree.
+- **Apps with clear layer boundaries.** "Common" types separate
+  from "app" code; references enforce direction (no cycles).
+- **Faster IDE response.** The TS server can load one project at a
+  time.
+
+## When they don't
+
+- **Single-package projects.** Pure overhead. One tsconfig works.
+- **Lots of cross-references.** If half your code is in shared
+  packages, references add structure without speeding up much.
+- **Builds that already complete in seconds.** The setup cost
+  isn't worth it for small projects.
+
+## Common pitfalls
+
+### Forgetting `composite`
+
+```
+error TS6306: Referenced project must have setting "composite": true.
+```
+
+Every referenced project needs `composite: true`. Forget once,
+nothing builds.
+
+### Circular references
+
+```
+A references B; B references A.
+```
+
+Forbidden. Refactor to extract a third package both depend on.
+
+### `rootDir` matters
+
+```json
+{ "rootDir": "./src", "outDir": "./dist" }
+```
+
+`composite` is stricter about `rootDir`. If any file is outside
+`rootDir`, you get an error. Don't reference files in other packages
+directly — go through their built outputs (and `package.json` `main`).
+
+### `tsbuildinfo` getting stale
+
+Sometimes builds get into an inconsistent state. `tsc --build --force`
+rebuilds everything. `tsc --build --clean` removes outputs;
+`--force` is usually enough.
+
+### Bundlers don't know about references
+
+Vite, Webpack, esbuild don't automatically follow TS references. They
+do their own resolution. For runtime correctness, ensure each
+package's `package.json` exports work for the bundler.
+
+For editor type-checking, references give you accurate types without
+needing a bundler.
+
+### Editor delays after a change
+
+The TS server picks up changes via `.tsbuildinfo` updates. If you
+edit `shared/src/foo.ts` but don't rebuild, `app/` won't see the
+changes. Run `tsc --build --watch` in the background, or use a script
+that rebuilds on save.
+
+## Alternative: a single tsconfig with paths
+
+For smaller monorepos, you can skip references and use paths:
+
+```json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "shared/*": ["./packages/shared/src/*"],
+      "app/*": ["./packages/app/src/*"]
+    }
+  },
+  "include": ["packages/*/src/**/*"]
+}
+```
+
+One tsconfig sees everything. Cross-package imports work. Build
+times are linear in total source size; no incremental gains.
+
+Workable for small projects. Doesn't scale to 30 packages.
+
+## Mixing references and paths
+
+For local dev: paths (direct source-to-source resolution, faster
+edits).
+
+For production builds: references (precompiled `.d.ts` consumed by
+downstream consumers).
+
+Some monorepo tools (Nx, Turborepo) automate this — paths in dev,
+references in CI.
+
+## The discipline
+
+- Use references when monorepo size makes single-tsconfig builds
+  slow.
+- Every referenced project: `composite: true`, proper `rootDir`,
+  emits `.d.ts`.
+- Track `.tsbuildinfo` in `.gitignore`.
+- Use `pnpm exec tsc --build` for everything; never `--watch` per
+  package.
+- Document the dependency graph somewhere; circular references will
+  bite.
+- For small projects, skip the complexity — paths or a single
+  tsconfig.
+
+The payoff is large for big codebases, marginal for small ones.
+Adopt when you have a real reason — slow builds, IDE lag, or a
+genuinely modular architecture.

@@ -1,0 +1,353 @@
+export const level = 'mid';
+
+# `useEffect`
+
+`useEffect` runs **side effects** after a render commits to the DOM.
+Synchronizing React state with anything outside React — subscriptions,
+timers, manual DOM, network — happens here.
+
+It's the most-misunderstood hook. Most "useEffect bugs" come from
+using it for things that aren't actually effects.
+
+## The shape
+
+```jsx
+useEffect(() => {
+  // setup — runs after render commits
+  const id = setInterval(tick, 1000);
+
+  return () => {
+    // cleanup — runs before next setup, or on unmount
+    clearInterval(id);
+  };
+}, [dep1, dep2]);
+```
+
+Three pieces:
+
+1. **Setup function** — runs after the render commits.
+2. **Cleanup function** (optional return) — runs before the next
+   setup runs *or* when the component unmounts.
+3. **Dependency array** — controls when the effect re-runs.
+
+## The dependency array
+
+```jsx
+useEffect(() => { ... });               // every render
+useEffect(() => { ... }, []);            // once, on mount
+useEffect(() => { ... }, [count]);       // whenever count changes
+useEffect(() => { ... }, [a, b]);        // whenever a or b changes
+```
+
+React compares the array element-by-element with `Object.is`. If
+anything changed, the cleanup runs, then the new setup runs.
+
+**Empty deps `[]`** means "only on mount." Listed deps mean "on
+mount, and whenever a listed dep changes." No array at all means
+"every render" — usually a bug.
+
+## What goes in deps
+
+Every value from the component that the effect uses:
+
+```jsx
+useEffect(() => {
+  fetch(`/api/users/${id}`).then(setUser);
+}, [id]);    // id is used inside, so it's a dep
+```
+
+The eslint rule `react-hooks/exhaustive-deps` enforces this. Turn it
+on and listen to it. Most "useEffect bugs I can't figure out" are
+missing deps.
+
+If something never changes (a setter from `useState`, a ref's
+`.current`), you can leave it out — React guarantees stable
+identity. Otherwise: in the deps.
+
+## When to use it
+
+The right cases:
+
+- **Subscribing to external data sources** — WebSocket, EventSource,
+  store from outside React.
+- **Synchronizing DOM** — focus management, scroll position,
+  third-party widgets (`new Chart(canvasRef.current)`).
+- **Setting up timers** — intervals, timeouts that need cleanup.
+- **Listening to global events** — `window.addEventListener`.
+
+The wrong cases (modern React deliberately discourages these):
+
+- **Data fetching** — use a query library (TanStack Query, SWR) or
+  a framework (Next.js, Remix). They handle caching, race conditions,
+  stale data, retries.
+- **Transforming data for display** — just compute it during render.
+- **Resetting state when a prop changes** — use `key` instead of
+  effects.
+- **Notifying the parent of changes** — handle it in the event
+  handler that caused the change.
+
+The React docs' "You Might Not Need an Effect" essay is the
+canonical guide. Read it.
+
+## Common patterns
+
+### Subscribe and unsubscribe
+
+```jsx
+useEffect(() => {
+  const handler = (e) => setOnline(e.online);
+  socket.addEventListener('status', handler);
+  return () => socket.removeEventListener('status', handler);
+}, []);
+```
+
+The cleanup function removes the subscription. Without it, the
+listener leaks — and if the component remounts (e.g., key change),
+you get duplicate listeners.
+
+### Fetch on prop change
+
+```jsx
+useEffect(() => {
+  let cancelled = false;
+  fetch(`/api/users/${id}`).then(res => res.json()).then(data => {
+    if (!cancelled) setUser(data);
+  });
+  return () => { cancelled = true; };
+}, [id]);
+```
+
+The `cancelled` flag prevents the response from a stale fetch
+clobbering newer data when `id` changes quickly.
+
+This pattern is why data libraries exist. They handle:
+
+- Cancellation properly (`AbortSignal`).
+- Caching by key.
+- Loading and error states.
+- Refetching on focus/reconnect.
+- Deduplication.
+
+Don't roll your own fetcher unless the case is one-off.
+
+### Timer
+
+```jsx
+useEffect(() => {
+  const id = setInterval(() => setTick((t) => t + 1), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+The functional setter (`(t) => t + 1`) avoids needing `tick` as a
+dep. If you used `setTick(tick + 1)`, you'd need `tick` in deps,
+which would re-create the interval every tick.
+
+### Window event
+
+```jsx
+useEffect(() => {
+  function onResize() { setWidth(window.innerWidth); }
+  window.addEventListener('resize', onResize);
+  return () => window.removeEventListener('resize', onResize);
+}, []);
+```
+
+Standard subscribe + cleanup.
+
+## Strict mode and double-mounting
+
+In React 18+ with `<StrictMode>`, every component mounts, unmounts,
+and mounts again in development. Effects run twice.
+
+This isn't a bug — it surfaces effects that aren't reusable. If your
+effect adds a listener without cleanup, the second mount adds a
+*second* listener.
+
+```jsx
+useEffect(() => {
+  socket.connect();
+  return () => socket.disconnect();
+}, []);
+```
+
+This is correct: connect on mount, disconnect on cleanup, connect
+again on second mount. In production (no strict mode), mount happens
+once. Cleanup runs at unmount.
+
+Don't disable strict mode to "fix" double effects. Make the effect
+properly cleanable.
+
+## Cleanup timing
+
+```jsx
+useEffect(() => {
+  console.log('setup', count);
+  return () => console.log('cleanup', count);
+}, [count]);
+```
+
+When `count` changes from 1 to 2:
+
+1. React renders with `count = 2`.
+2. React commits the new DOM.
+3. **Cleanup runs with `count = 1`** (the old closure).
+4. **Setup runs with `count = 2`**.
+
+Cleanup uses the closure from when the setup ran. This is usually
+what you want — clean up what you set up.
+
+## `useEffect` vs `useLayoutEffect`
+
+```jsx
+useLayoutEffect(() => { ... }, []);
+```
+
+Runs **synchronously** after the DOM mutates but **before** the
+browser paints. `useEffect` runs after paint.
+
+Use `useLayoutEffect` for:
+
+- Measuring layout (`ref.current.getBoundingClientRect()`) and
+  setting state based on it — without it, the user sees a flash of
+  unmeasured content.
+- Synchronously fixing flickers in animations.
+
+`useEffect` is the default. Reach for `useLayoutEffect` only when
+you see visual glitches that would happen between commit and paint.
+
+Server-side rendering: `useLayoutEffect` warns because there's no
+DOM. Wrap in `useEffect` if you're SSR, or use the conditional form
+from libraries.
+
+## Common pitfalls
+
+### Missing deps
+
+```jsx
+useEffect(() => {
+  fetch(`/api/users/${id}`).then(...);
+}, []);   // BUG — id not in deps
+```
+
+The effect captures `id` at mount and never re-fetches. Add `id` to
+deps. Use the lint rule.
+
+### Stale closures
+
+```jsx
+useEffect(() => {
+  const id = setInterval(() => {
+    setCount(count + 1);   // captures stale count
+  }, 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+`count` is captured at mount (0). The interval always sets count to 1.
+
+Fix with functional setter:
+
+```jsx
+setCount((c) => c + 1);
+```
+
+Or include `count` in deps (resetting the interval each tick — wasteful).
+
+### Doing things in effects that should be event handlers
+
+```jsx
+useEffect(() => {
+  if (formSubmitted) {
+    trackEvent('form_submit');
+  }
+}, [formSubmitted]);
+```
+
+`trackEvent` should happen in the submit handler, not in a separate
+effect. Effects are for "synchronize with external systems," not
+"react to user actions."
+
+```jsx
+function handleSubmit() {
+  trackEvent('form_submit');
+  setFormSubmitted(true);
+}
+```
+
+### Updating state in an effect that depends on it
+
+```jsx
+useEffect(() => {
+  if (count > 10) setShowModal(true);
+}, [count]);
+```
+
+`showModal` is *derived* — compute it during render:
+
+```jsx
+const showModal = count > 10;
+```
+
+Or set it in the event that changes count.
+
+### Fetching without cleanup
+
+```jsx
+useEffect(() => {
+  fetch(`/api/${id}`).then(setData);
+}, [id]);
+```
+
+If `id` changes from "a" to "b" before "a"'s response arrives, you
+get a race: "a"'s data overwrites "b"'s. Fix with the `cancelled`
+flag pattern above, or use `AbortController`:
+
+```jsx
+useEffect(() => {
+  const ac = new AbortController();
+  fetch(`/api/${id}`, { signal: ac.signal })
+    .then(res => res.json())
+    .then(setData)
+    .catch(err => { if (err.name !== 'AbortError') throw err; });
+  return () => ac.abort();
+}, [id]);
+```
+
+### Running setup on every render
+
+```jsx
+useEffect(() => { ... });   // no deps array — runs every render
+```
+
+Almost always a bug. Add an empty array (mount only) or list the
+real dependencies.
+
+## When you've got nothing to clean up
+
+The cleanup return is optional:
+
+```jsx
+useEffect(() => {
+  document.title = title;
+}, [title]);
+```
+
+No cleanup needed — next setup overwrites the title anyway. Fine.
+
+## The mental model
+
+`useEffect` is for **synchronizing** React state with the outside
+world. The dep array tells React "if any of these changed, the
+synchronization is out of date — clean up the old and set up the
+new."
+
+The wrong instinct is "I want to do X *after* render, so I'll use
+useEffect." Often the right place is the event handler, or the
+component body (for pure computation), or a state setter callback,
+or a derived value.
+
+When in doubt: ask "what does this synchronize?" If the answer is
+"another piece of React state" or "a value I could just compute,"
+it doesn't belong in `useEffect`. If it's "a WebSocket, a chart
+library, a window listener" — you're in the right place.

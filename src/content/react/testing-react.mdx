@@ -1,0 +1,328 @@
+export const level = 'senior';
+
+# Testing React
+
+Three layers of React testing, from broadest to narrowest:
+
+1. **End-to-end** — Playwright, Cypress. Run the real browser.
+2. **Component tests** — React Testing Library + Vitest/Jest. Render
+   components in jsdom, assert on the DOM.
+3. **Unit tests** — pure functions, hooks, reducers.
+
+For React-specific testing, layers 2 and 3 are where most of the
+value is.
+
+## React Testing Library
+
+The de-facto standard for component tests. The philosophy: **test
+the way users use the app**, not implementation details.
+
+```jsx
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+test('counter increments', async () => {
+  render(<Counter />);
+
+  const button = screen.getByRole('button', { name: /increment/i });
+  await userEvent.click(button);
+
+  expect(screen.getByText('Count: 1')).toBeInTheDocument();
+});
+```
+
+Notice what's not here:
+
+- No referring to component internals (`wrapper.state()`, `instance().method()`).
+- No checking implementation details (which hooks were called, in
+  what order).
+- Queries by what's visible (role, text, label), not by class or
+  internal ID.
+
+If a refactor doesn't change the behavior, the test stays green.
+
+## Queries
+
+`screen.getBy...` finds an element (throws if not found).
+`screen.queryBy...` returns the element or null (no throw).
+`screen.findBy...` is async (waits for the element to appear).
+
+By priority:
+
+```jsx
+// Accessible name / role (preferred)
+screen.getByRole('button', { name: 'Submit' });
+screen.getByLabelText('Email');
+
+// Text content
+screen.getByText('Hello, world');
+
+// Form field placeholder
+screen.getByPlaceholderText('Type here');
+
+// Last resort
+screen.getByTestId('my-element');
+```
+
+Prefer queries near the top — they match what a user (or assistive
+tech) would find. `data-testid` is the fallback when nothing else
+works.
+
+## Interactions
+
+```jsx
+import userEvent from '@testing-library/user-event';
+
+const user = userEvent.setup();
+
+await user.click(button);
+await user.type(input, 'hello');
+await user.selectOptions(select, 'option1');
+await user.upload(input, file);
+await user.keyboard('{Enter}');
+```
+
+`userEvent` simulates **real user interactions** — typing fires
+keydown/keyup/input events in the right order. Old `fireEvent.click(...)`
+fires only one event and is less realistic.
+
+Always `await` user events.
+
+## Async assertions
+
+```jsx
+test('shows result after fetch', async () => {
+  render(<UserProfile id={1} />);
+  expect(await screen.findByText('Jon Doe')).toBeInTheDocument();
+});
+```
+
+`findBy*` returns a promise that resolves when the element appears
+(or rejects after a timeout). Use it for anything that requires a
+re-render.
+
+Alternative: `waitFor`:
+
+```jsx
+await waitFor(() => {
+  expect(screen.getByText('Loading')).not.toBeInTheDocument();
+});
+```
+
+## Mocking the network
+
+Best option: **Mock Service Worker (MSW)**:
+
+```jsx
+import { setupServer } from 'msw/node';
+import { http, HttpResponse } from 'msw';
+
+const server = setupServer(
+  http.get('/api/users/:id', ({ params }) => {
+    return HttpResponse.json({ id: params.id, name: 'Jon' });
+  })
+);
+
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+test('shows user', async () => {
+  render(<UserProfile id={1} />);
+  expect(await screen.findByText('Jon')).toBeInTheDocument();
+});
+```
+
+MSW intercepts fetch/xhr requests at the network layer — no mocking
+of `fetch` itself. Same handlers can run in Storybook and the
+browser, so you write the mocks once.
+
+Alternative: jest manual mocks (`jest.mock('./api')`). Easier
+setup, more coupling to implementation.
+
+## Testing hooks
+
+```jsx
+import { renderHook, act } from '@testing-library/react';
+
+test('useCounter increments', () => {
+  const { result } = renderHook(() => useCounter());
+
+  expect(result.current.count).toBe(0);
+
+  act(() => {
+    result.current.inc();
+  });
+
+  expect(result.current.count).toBe(1);
+});
+```
+
+`renderHook` mounts a tiny test component that calls the hook.
+`act` wraps state updates. `result.current` exposes the hook's
+return value.
+
+Use `renderHook` when:
+
+- The hook is exported separately.
+- You want to test edge cases without setting up a real consumer.
+
+When the hook is only used in one component, just test the
+component.
+
+## Testing forms
+
+```jsx
+test('submits valid form', async () => {
+  const onSubmit = vi.fn();
+  const user = userEvent.setup();
+
+  render(<MyForm onSubmit={onSubmit} />);
+
+  await user.type(screen.getByLabelText('Email'), 'a@b.com');
+  await user.type(screen.getByLabelText('Password'), 'secret');
+  await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+  expect(onSubmit).toHaveBeenCalledWith({ email: 'a@b.com', password: 'secret' });
+});
+```
+
+Fill, click, assert. The user doesn't care that you used
+`react-hook-form` or `useState`; they care that the submit
+fires with the right data.
+
+## Snapshot testing
+
+```jsx
+test('renders correctly', () => {
+  const { container } = render(<Component />);
+  expect(container).toMatchSnapshot();
+});
+```
+
+Useful for catching unintended visual diffs. But:
+
+- Easy to commit broken snapshots without realizing.
+- Failing snapshots are usually fine — running `vitest -u` updates
+  them blindly.
+- Hard to read in diffs.
+
+Use sparingly. Prefer specific assertions ("the button is enabled,"
+"the heading says X") over whole-tree snapshots.
+
+## End-to-end (Playwright)
+
+```javascript
+import { test, expect } from '@playwright/test';
+
+test('signup flow', async ({ page }) => {
+  await page.goto('/signup');
+  await page.getByLabel('Email').fill('a@b.com');
+  await page.getByLabel('Password').fill('secret123');
+  await page.getByRole('button', { name: 'Sign up' }).click();
+  await expect(page).toHaveURL('/welcome');
+});
+```
+
+Plays the role of a real user in a real browser. Slow to run, but
+catches integration bugs that unit tests can't.
+
+A good test ratio: many unit tests, several component tests, a few
+e2e tests covering the critical paths (signup, checkout, etc.).
+
+## What not to test
+
+- **Implementation details** — don't assert "useState was called
+  with X." That's coupled to internals; refactor breaks the test.
+- **Library code** — if `useState` works, you don't need to verify
+  it.
+- **Trivial markup** — testing that a `<button>` renders `<button>`
+  is noise.
+- **Style** — visual regression tests (Percy, Chromatic) catch
+  styling, not Jest assertions.
+
+## Strict mode in tests
+
+If your app uses StrictMode in development, tests usually don't —
+double-rendering complicates assertions. Verify your test setup
+respects whatever mode you actually want.
+
+## Common pitfalls
+
+### `act()` warnings
+
+```
+Warning: An update to Component inside a test was not wrapped in act(...)
+```
+
+Means a state update happened that the test didn't await. Either:
+
+- `await userEvent.click(...)` (handles act automatically).
+- Wrap manual state changes in `await act(async () => { ... })`.
+- `await waitFor(() => expect(...).toBe(...))` to wait for the
+  update.
+
+Usually a sign of missing async handling.
+
+### Testing `useEffect` separately
+
+```jsx
+test('effect runs', () => {
+  render(<Component />);
+  // ... assert on effect's side effect
+});
+```
+
+Test the *observable behavior* the effect causes (e.g., the data
+appears on screen), not "the effect ran." Inside-out tests are
+fragile.
+
+### Mocking everything
+
+```jsx
+jest.mock('./api');
+jest.mock('./auth');
+jest.mock('./utils');
+```
+
+When every module is mocked, your test is testing your mocks, not
+your code. Prefer MSW for network and real implementations for the
+rest.
+
+### Slow tests
+
+A handful of slow tests are fine. Hundreds of slow tests means
+something is wrong:
+
+- DOM-level tests that should be unit tests.
+- Network calls instead of MSW.
+- Whole-app renders for what could be component-level.
+
+Faster tests run more often. Make them fast.
+
+### `getByText` for everything
+
+```jsx
+screen.getByText('Submit')
+```
+
+`<button>Submit</button>` and `<div>Submit</div>` both match. Use
+`getByRole('button', { name: 'Submit' })` to be specific. Roles
+encode semantics that users (and screen readers) care about.
+
+## The mental model
+
+Test what the user sees and does, not how your code is structured.
+
+- **Render** the component with realistic props.
+- **Interact** the way a user would (`userEvent.click`,
+  `userEvent.type`).
+- **Assert** on what's visible (`screen.getByRole`, text content).
+
+That's the whole loop. Hooks, state, refs, effects — all invisible
+from the test's perspective. If the user-visible behavior is right,
+the test passes; if it's wrong, the test fails. Refactor the
+implementation freely.
+
+For data, mock at the network boundary (MSW). For unit logic, keep
+small pure functions outside components and test them directly.

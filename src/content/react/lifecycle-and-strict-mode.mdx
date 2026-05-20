@@ -1,0 +1,288 @@
+export const level = 'mid';
+
+# Component lifecycle and strict mode
+
+In a function component, the "lifecycle" is just the sequence of
+calls React makes: mount, render, update, unmount. `useEffect` and
+`useLayoutEffect` are the hooks that hook into these phases.
+
+This page is about how to think about that lifecycle, and how
+**strict mode** changes what you see in development.
+
+## The phases
+
+For a function component:
+
+1. **Mount** — React calls the component for the first time. Render
+   commits to the DOM. Effects (with `[]` or with deps including
+   first-render values) run.
+
+2. **Update** — Props or state change. React re-calls the component.
+   The new JSX diffs against the previous. The DOM updates. Effects
+   whose dependencies changed re-run.
+
+3. **Unmount** — Component is removed from the tree. Effect cleanups
+   run.
+
+That's the whole lifecycle. There's no `componentDidMount` or
+`componentWillUnmount` in function components — just effects with
+appropriate dependencies and cleanup functions.
+
+## Order of operations
+
+For a single render:
+
+```
+1. Component function runs (your logic + JSX)
+2. React reconciles the tree
+3. React commits to the DOM
+4. useLayoutEffect callbacks run synchronously (before paint)
+5. Browser paints
+6. useEffect callbacks run asynchronously (after paint)
+```
+
+For an unmount:
+
+```
+1. React decides to remove the component
+2. useEffect cleanup functions run
+3. useLayoutEffect cleanup functions run
+4. React removes from DOM
+```
+
+For a re-render where deps changed:
+
+```
+1. Component re-runs
+2. React commits new DOM
+3. Cleanup of previous effects (whose deps changed) runs
+4. New effects run with new deps
+```
+
+## What "lifecycle" means in practice
+
+You almost never need to think about phases explicitly. Pick the
+right hook for the job:
+
+- **Computation** → inline in render body.
+- **Side effect** (DOM, subscription, timer) → `useEffect`.
+- **Layout measurement** (read DOM, set state before paint) →
+  `useLayoutEffect`.
+- **Imperative reference** (DOM node, persistent value) → `useRef`.
+- **Setup that survives renders** → declare outside the component,
+  or `useState`/`useReducer`.
+
+## Strict mode
+
+```jsx
+import { StrictMode } from 'react';
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+```
+
+In strict mode (development only), React does extra checks:
+
+- **Double-invokes component bodies, hooks, and effects** to surface
+  bugs from impure code.
+- **Warns about deprecated APIs**.
+- **Warns about side effects** in unexpected places.
+
+In production, `StrictMode` is a no-op — it adds no overhead.
+
+## What double-invocation looks like
+
+```jsx
+function Counter() {
+  console.log('rendering');
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+```
+
+In strict mode dev, you see "rendering" twice. React called your
+component twice on purpose. The output should be identical.
+
+For effects:
+
+```jsx
+function Component() {
+  useEffect(() => {
+    console.log('mount');
+    return () => console.log('unmount');
+  }, []);
+
+  return null;
+}
+```
+
+In strict mode, on the initial mount, you see:
+
+```
+mount
+unmount
+mount
+```
+
+React mounted, unmounted, and re-mounted on purpose. The cleanup
+function ran in between. This simulates "what happens if my component
+is removed and added again."
+
+## Why React does this
+
+Strict mode catches code that's accidentally relying on:
+
+- **Mounting once** — code that sets up something without cleanup
+  fails on the second mount.
+- **Renders being unique** — code that mutates external state during
+  render gets called twice.
+
+The fixes:
+
+- **Effects should always be cleanable** — set up and tear down
+  cleanly.
+- **Renders should be pure** — no mutation of outside state, no
+  fetches, no DOM access.
+
+Both are good engineering. Strict mode just makes you confront them.
+
+## Common things that break in strict mode
+
+### Effect without cleanup
+
+```jsx
+useEffect(() => {
+  socket.connect();         // BAD — connects twice in strict mode
+}, []);
+```
+
+Add cleanup:
+
+```jsx
+useEffect(() => {
+  socket.connect();
+  return () => socket.disconnect();
+}, []);
+```
+
+Now strict mode correctly: connect → disconnect → connect. Production
+gets: connect (mount) → disconnect (unmount).
+
+### Fetching in an effect without cancellation
+
+```jsx
+useEffect(() => {
+  fetch('/api').then(setData);
+}, []);
+```
+
+In strict mode, you fire two fetches. They both resolve. Whichever
+finishes last wins. Same race exists in production if anything
+re-mounts.
+
+```jsx
+useEffect(() => {
+  const ac = new AbortController();
+  fetch('/api', { signal: ac.signal })
+    .then((res) => res.json())
+    .then(setData)
+    .catch(err => { if (err.name !== 'AbortError') throw err; });
+  return () => ac.abort();
+}, []);
+```
+
+### Side effect in render
+
+```jsx
+function Component({ count }) {
+  if (count > 10) trackEvent('too_many');   // BAD — fires twice in strict
+  return <p>{count}</p>;
+}
+```
+
+Move to an effect or an event handler:
+
+```jsx
+useEffect(() => {
+  if (count > 10) trackEvent('too_many');
+}, [count]);
+```
+
+### Initializing state from external sources during render
+
+```jsx
+function Component() {
+  const [user, setUser] = useState(loadUserFromStorage());
+  // loadUserFromStorage runs twice in strict mode — fine if pure
+}
+```
+
+If `loadUserFromStorage` is side-effect-free, no problem. If it
+mutates anything (writes to storage, calls an analytics), use lazy
+init:
+
+```jsx
+const [user, setUser] = useState(() => loadUserFromStorage());
+```
+
+The lazy form runs once, even in strict mode.
+
+## Don't disable strict mode
+
+When you see double-effects, the fix is to **make the effect
+properly cleanable**, not to remove strict mode. Strict mode is
+catching a real bug that would bite you in production any time the
+component remounts (e.g., after a `key` change).
+
+The React team has been clear: strict mode is the future. Disabling
+it means accepting fragile code.
+
+## Class component lifecycle (legacy)
+
+Class components have explicit lifecycle methods:
+
+- `componentDidMount` — runs once after first render.
+- `componentDidUpdate` — runs after re-renders.
+- `componentWillUnmount` — runs before removal.
+- `getDerivedStateFromProps`, `shouldComponentUpdate`, etc. (more
+  obscure).
+
+You'll see these in old codebases. New code uses function components
+and hooks exclusively. The mapping:
+
+- `componentDidMount` → `useEffect(() => { ... }, [])`.
+- `componentDidUpdate(prev)` → `useEffect(() => { ... }, [dep])`,
+  with `usePrevious` if needed.
+- `componentWillUnmount` → cleanup return of `useEffect`.
+
+## React 19 / "use" hook
+
+React 19 introduces some lifecycle-adjacent ideas:
+
+- **`use(promise)`** — read a promise's value during render
+  (suspending until resolved). Changes how data loading interacts
+  with lifecycle.
+- **Action functions** for forms — handle submission outside the
+  render cycle.
+
+These are advanced features. The basic mental model — mount, update,
+unmount, with effects synchronizing the outside world — still
+applies.
+
+## The mental model
+
+A component is **a function React calls when it needs to know what
+to render**. It runs on every render, top to bottom. State and hooks
+persist across calls via React's bookkeeping (call order matters).
+
+Effects are how you reach outside React — DOM, subscriptions, timers.
+They run after the commit; they clean up before the next run or on
+unmount. Strict mode rehearses the "set up, tear down, set up
+again" cycle in development to surface uncleanable effects.
+
+Hooks have rules. Effects have cleanup. Strict mode enforces both.
+Follow them and your components survive remounts, refactors, and
+ribbons of state changes.

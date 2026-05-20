@@ -1,0 +1,233 @@
+export const level = 'mid';
+
+# Dates and time
+
+`Date` is JavaScript's built-in date type. It's old, awkward, and
+mostly works — but full of gotchas. For non-trivial date work,
+libraries (`date-fns`, `luxon`, `dayjs`) and the upcoming `Temporal`
+proposal are better.
+
+## What `Date` actually is
+
+A `Date` is internally an integer: **milliseconds since the Unix epoch
+(1970-01-01T00:00:00Z UTC)**. Everything else is formatting.
+
+```js
+const now = new Date();
+now.getTime();        // 1747780000000 (example) — ms since epoch
++now;                  // same thing — implicit conversion
+Date.now();           // 1747780000000 — without constructing a Date object
+```
+
+`Date.now()` is the fast path when you just need the timestamp.
+
+## Creating dates
+
+```js
+new Date();                   // now
+new Date(1747780000000);      // from ms timestamp
+new Date('2026-05-20');       // from ISO string (UTC if date-only)
+new Date('2026-05-20T12:30:00'); // local time (no Z)
+new Date('2026-05-20T12:30:00Z'); // UTC
+new Date(2026, 4, 20);        // year, month (0-indexed!), day
+new Date(2026, 4, 20, 12, 30); // ... hours, minutes
+```
+
+The month-is-0-indexed thing trips up everyone. `new Date(2026, 4, 20)`
+is **May 20** (May is month 4). Day is 1-indexed, normal.
+
+ISO string parsing: `YYYY-MM-DD` (no time) is parsed as UTC.
+`YYYY-MM-DDTHH:MM:SS` (no Z) is parsed as **local time**. With Z, it's
+UTC. This local-vs-UTC distinction is a frequent bug.
+
+## Getters
+
+```js
+const d = new Date('2026-05-20T12:30:00Z');
+
+d.getUTCFullYear();    // 2026
+d.getUTCMonth();       // 4 — May (0-indexed!)
+d.getUTCDate();        // 20
+d.getUTCHours();       // 12
+d.getUTCMinutes();     // 30
+
+d.getFullYear();       // local
+d.getMonth();          // local
+d.getDate();           // local
+d.getDay();            // 0-6 — day of week, Sunday=0
+d.getTimezoneOffset(); // minutes from UTC (negative for east of UTC)
+```
+
+Always pick UTC or local consistently. Mixing is where bugs come from.
+
+## Formatting
+
+Native `Date` formatting is poor:
+
+```js
+d.toString();         // "Wed May 20 2026 14:30:00 GMT+0200..." — locale-dependent
+d.toISOString();      // "2026-05-20T12:30:00.000Z"
+d.toJSON();           // same as toISOString
+d.toLocaleString();   // user locale
+```
+
+For real formatting, use `Intl.DateTimeFormat`:
+
+```js
+new Intl.DateTimeFormat('en-US', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+}).format(d);          // "May 20, 2026"
+
+new Intl.DateTimeFormat('de-DE', { dateStyle: 'short' }).format(d);
+// "20.05.26"
+```
+
+`Intl` handles locale, timezone, and complex formats correctly. Use
+it instead of building strings by hand.
+
+## Math
+
+```js
+const a = new Date('2026-05-20T00:00:00Z');
+const b = new Date('2026-05-25T00:00:00Z');
+const diffMs = b - a;          // numeric subtraction — works
+const days = diffMs / 86_400_000;  // 5
+
+const inOneDay = new Date(a.getTime() + 86_400_000);
+```
+
+Native math is millisecond-based. For "add a month" or "subtract a
+week," reach for a library — manual addition breaks at month
+boundaries and daylight saving transitions:
+
+```js
+// BROKEN — month boundaries
+new Date('2026-01-31').setMonth(1);  // 1 = Feb. Feb 31 doesn't exist → Mar 3
+```
+
+`date-fns` does it right: `addMonths(d, 1)` → 2026-02-28.
+
+## Time zones
+
+The eternally hard part.
+
+A `Date` doesn't store a time zone. It stores a UTC instant.
+`getHours()` returns the hour **in the runtime's local time zone**.
+
+That means:
+
+- Two Node servers in different time zones running the same code can
+  print different hours for the same Date.
+- A date sent over JSON (`toISOString` → UTC) is unambiguous; a date
+  parsed from `'2026-05-20'` is not.
+
+```js
+process.env.TZ = 'America/New_York';
+// now all `getHours()`-style methods are in NY time
+```
+
+For server code, set `TZ=UTC` and never use local-time methods. Format
+to user time only at the rendering edge.
+
+`Intl.DateTimeFormat` accepts a `timeZone` option:
+
+```js
+new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles',
+  hour: 'numeric', minute: 'numeric',
+}).format(new Date());     // "8:30 AM"
+```
+
+That's the right way to render a UTC instant in a specific zone.
+
+## Common bugs
+
+### Month off by one
+
+```js
+new Date(2026, 5, 1);   // June 1, not May 1
+```
+
+Always: `Date.UTC(year, month-1, day)` if writing this manually, or
+use an ISO string.
+
+### "Today" depends on time zone
+
+```js
+const today = new Date().toISOString().slice(0, 10);
+```
+
+This returns UTC's "today." If your server is in UTC and your user is
+in Tokyo, "today" for the user can be tomorrow.
+
+For user-local "today," format with the user's zone:
+
+```js
+new Intl.DateTimeFormat('en-CA', { timeZone: userTz }).format(new Date());
+```
+
+### Comparing dates
+
+```js
+new Date('2026-05-20') === new Date('2026-05-20');  // false — different objects
++new Date('2026-05-20') === +new Date('2026-05-20'); // true — same ms
+```
+
+Convert to numbers (or `getTime()`) before comparing.
+
+### Daylight saving time
+
+```js
+new Date('2026-03-08T01:30:00');  // exists in NY local time
+new Date('2026-03-08T02:30:00');  // does NOT exist (clock skipped 2-3 AM)
+```
+
+Adding a day = adding 24 hours? Not always. On a DST transition day, a
+"24-hour" jump moves you 23 or 25 hours. Use a library that does
+calendar math.
+
+### Persisting dates
+
+In databases, use:
+
+- **Unix timestamp (integer ms)** — simple, no time zone confusion.
+- **UTC ISO string** — readable, sortable, unambiguous.
+- **`TIMESTAMP WITH TIME ZONE`** (Postgres) — stores instant, not
+  wall clock.
+
+Avoid `TIMESTAMP WITHOUT TIME ZONE` — it's a wall clock with no zone,
+which is what you almost never want.
+
+## `Temporal` (the future)
+
+ECMAScript's `Temporal` proposal (stage 3, partial implementations
+landing in Node and browsers) replaces `Date` with a saner API:
+
+```js
+const now = Temporal.Now.zonedDateTimeISO();
+const tomorrow = now.add({ days: 1 });
+const inLA = now.withTimeZone('America/Los_Angeles');
+const isoDate = Temporal.PlainDate.from('2026-05-20');
+```
+
+It separates instant (`Instant`), local-wall-time (`PlainDateTime`),
+zoned (`ZonedDateTime`), date-only (`PlainDate`), time-only
+(`PlainTime`), durations, and time zones into distinct types — which
+is what date math actually needs.
+
+Once `Temporal` is broadly available, native `Date` will mostly be
+a compatibility shim. Until then, libraries cover the gap.
+
+## The pragmatic stack
+
+- **`Date.now()`** — fast timestamp for performance measurement.
+- **`Date` + `Intl.DateTimeFormat`** — render UTC instants in user
+  zones.
+- **`date-fns` or `luxon`** — add days/months, format ranges, parse
+  weird strings.
+- **`Temporal`** — when it's broadly supported. Eventually replaces
+  most of the above.
+- **Set `TZ=UTC` on servers.** Always. Render to local time at the
+  edge.

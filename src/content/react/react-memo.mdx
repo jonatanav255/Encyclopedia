@@ -1,0 +1,245 @@
+export const level = 'senior';
+
+# `React.memo` and avoiding wasted renders
+
+When a component re-renders, React calls the function and diffs the
+output. For most components this is cheap. For some — heavy
+calculations, large lists, complex trees — it's worth skipping
+re-renders that wouldn't change anything.
+
+`React.memo` is the wrapper that adds "skip if props didn't change"
+to a component.
+
+## The basics
+
+```jsx
+const Item = React.memo(function Item({ name, age }) {
+  return <div>{name} ({age})</div>;
+});
+```
+
+Now `<Item name="jon" age={30} />` only re-renders when `name` or
+`age` changes. Same props as last time? Render is skipped.
+
+The comparison is **shallow** — `Object.is` per prop. New value or
+new reference means "changed."
+
+## When it helps
+
+The classic case: a list where each item is expensive to render.
+
+```jsx
+function List({ items, selectedId, onSelect }) {
+  return items.map((item) => (
+    <Item
+      key={item.id}
+      item={item}
+      isSelected={item.id === selectedId}
+      onSelect={onSelect}
+    />
+  ));
+}
+
+const Item = React.memo(function Item({ item, isSelected, onSelect }) {
+  return (
+    <div onClick={() => onSelect(item.id)}>
+      {item.name} {isSelected && '✓'}
+    </div>
+  );
+});
+```
+
+When `selectedId` changes from item 3 to item 4, only items 3 and 4
+re-render. The other 100 items skip — their `item` and `isSelected`
+are unchanged.
+
+Without `React.memo`, all 100 re-render. For trivial items, it's
+fine. For items with their own state, animations, or heavy markup,
+it matters.
+
+## When it hurts
+
+```jsx
+const Trivial = React.memo(function Trivial({ value }) {
+  return <span>{value}</span>;
+});
+```
+
+`React.memo` adds:
+
+- A wrapper component (slight tree depth).
+- A shallow comparison per render.
+- Memory to hold the cached output.
+
+For a trivial component the cost outweighs the savings — re-rendering
+`<span>{value}</span>` is microseconds, and the memo check is
+microseconds. You lose net.
+
+**Don't memoize everything.** Memo when:
+
+- Profiling shows the component is a bottleneck.
+- The component has expensive rendering or many children.
+- Props are stable in the common case.
+
+## The reference equality trap
+
+```jsx
+function Parent({ items }) {
+  return items.map((item) => (
+    <Item
+      key={item.id}
+      item={item}
+      onSelect={() => select(item.id)}  // BAD — new function every render
+    />
+  ));
+}
+```
+
+Every `Parent` render creates new `onSelect` closures. `<Item>`'s
+`onSelect` prop is "different" each time. `React.memo` doesn't help.
+
+Fix with `useCallback`:
+
+```jsx
+function Parent({ items }) {
+  const handleSelect = useCallback((id) => select(id), []);
+
+  return items.map((item) => (
+    <Item key={item.id} item={item} onSelect={handleSelect} />
+  ));
+}
+```
+
+Now `handleSelect` is stable across renders. `<Item>` only re-renders
+when its `item` changes.
+
+Same issue with objects:
+
+```jsx
+<Item style={{ color: 'red' }} />   // new object every render
+```
+
+Either memoize the object or extract it as a constant outside the
+component.
+
+## Custom equality
+
+```jsx
+const Item = React.memo(
+  function Item({ user }) {
+    return <div>{user.name}</div>;
+  },
+  (prev, next) => prev.user.id === next.user.id
+);
+```
+
+The second argument is a custom equality function. Returns `true`
+when you want React to **skip the render** (props are "equal");
+`false` when you want it to render.
+
+Use when:
+
+- A "deep but cheap" check is right — e.g., comparing by ID.
+- The default shallow comparison is wrong for your data shape.
+
+The default's usually right; custom equality is a code smell when
+overused. If you need it often, your props are probably shaped wrong.
+
+## `React.memo` is not always free
+
+```jsx
+const Heavy = React.memo(function Heavy({ a, b }) {
+  return <ExpensiveComputation a={a} b={b} />;
+});
+
+// Used:
+<Heavy a={a} b={b} />
+```
+
+If `a` and `b` change every render anyway, the memo check runs and
+fails, then the component re-renders. You added cost without saving
+anything.
+
+Profile with React DevTools' Profiler. The "Why did this render?"
+feature tells you exactly what changed each render.
+
+## The new React compiler
+
+React's experimental compiler (Babel plugin) auto-memoizes:
+
+- Components — like `React.memo` but applied as appropriate.
+- Hooks results — like `useMemo`/`useCallback` where beneficial.
+
+In a compiler-using project, you write plain code and the compiler
+inserts the memos.
+
+Until it's stable, manual memoization is the tool. After it
+stabilizes, the discipline shifts to "write naturally; trust the
+compiler."
+
+## Common pitfalls
+
+### Forgetting that `children` is a prop
+
+```jsx
+const Memoed = React.memo(function Memoed({ children }) {
+  return <div>{children}</div>;
+});
+
+<Memoed>
+  <p>Hello</p>
+</Memoed>
+```
+
+`<p>Hello</p>` is a new React element each render. Reference changes.
+Memo doesn't help.
+
+Either memoize the children at the parent or accept that this
+component will re-render.
+
+### Memoizing a tree that needs to re-render
+
+```jsx
+const Memo = React.memo(function Memo() {
+  const time = new Date().toLocaleTimeString();
+  return <p>{time}</p>;
+});
+```
+
+The component reads `new Date()` — but never re-renders, so it never
+updates. Memo here just freezes the output. Use state or a key prop
+if you need updates.
+
+### Memoizing context consumers
+
+```jsx
+const Consumer = React.memo(function Consumer() {
+  const value = useContext(SomeContext);
+  return <div>{value}</div>;
+});
+```
+
+`React.memo` only checks props, not context. If `SomeContext`
+changes, the memoed component still re-renders (because context
+updates bypass the prop check).
+
+This is usually fine — context consumers should re-render on
+context changes. Just don't expect memo to prevent it.
+
+## The mental model
+
+`React.memo` says "if props didn't change, the output won't change —
+skip the work." Useful when:
+
+- The render is expensive.
+- Props are mostly stable.
+- The component is rendered often in larger lists.
+
+It's not a magic speed-up. It's a cache that needs:
+
+- Stable references on the consumer side (`useCallback`, `useMemo`).
+- Expensive-enough rendering on the producer side to justify the
+  check.
+
+Profile first. Memoize the actual bottlenecks. Don't sprinkle
+`React.memo` across your codebase out of habit.

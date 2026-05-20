@@ -1,0 +1,366 @@
+export const level = 'mid';
+
+# Custom hooks
+
+A custom hook is just a JavaScript function whose name starts with
+`use` and that calls other hooks. They let you extract and reuse
+component logic — state, effects, refs — without changing the
+component tree.
+
+```jsx
+function useCounter(initial = 0) {
+  const [count, setCount] = useState(initial);
+  const inc = () => setCount((c) => c + 1);
+  const reset = () => setCount(initial);
+  return { count, inc, reset };
+}
+
+function Counter() {
+  const { count, inc, reset } = useCounter();
+  return (
+    <>
+      <p>{count}</p>
+      <button onClick={inc}>+</button>
+      <button onClick={reset}>Reset</button>
+    </>
+  );
+}
+```
+
+The `useCounter` hook is reusable across components. Each component
+that calls it gets its own state.
+
+## Why custom hooks beat components for logic reuse
+
+Old React used "higher-order components" (HOCs) and "render props"
+to share logic. Both added wrapping components, which:
+
+- Polluted the tree.
+- Made debugging stack traces uglier.
+- Required wrapping by name (renaming `<Container>` to `<MyContainer>`).
+
+Custom hooks share logic without changing the tree. They feel like
+regular JS — a function call.
+
+## When to extract a custom hook
+
+The clear cases:
+
+- **Same hook combination in 3+ components** — e.g., loading +
+  data + error states for an API call.
+- **A complex piece of logic** worth a name — debounced value,
+  window size, form validation.
+- **Cross-cutting concerns** — analytics, feature flags,
+  authentication.
+- **External API integration** — wrapping a third-party library's
+  imperative API into hook form.
+
+The grey area:
+
+- **Logic used in one place** — extracting just for "cleanliness"
+  adds indirection without payoff. Inline is fine.
+- **One-line wrappers** — `useState` is already short enough.
+
+## Common custom hooks
+
+### `usePrevious`
+
+```jsx
+function usePrevious(value) {
+  const ref = useRef();
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref.current;
+}
+```
+
+Returns the value from the previous render. Useful for "did this
+prop change?" or "what was the count before?"
+
+### `useDebounce`
+
+```jsx
+function useDebounce(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+function SearchBox() {
+  const [query, setQuery] = useState('');
+  const debounced = useDebounce(query, 300);
+
+  useEffect(() => {
+    if (debounced) search(debounced);
+  }, [debounced]);
+
+  return <input value={query} onChange={(e) => setQuery(e.target.value)} />;
+}
+```
+
+The user types fast → state updates fast → debounced value lags
+by `delay` → search only fires for stable input.
+
+### `useToggle`
+
+```jsx
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() => setOn((v) => !v), []);
+  return [on, toggle];
+}
+```
+
+Returns `[value, toggleFn]`. Trivial but used constantly.
+
+### `useLocalStorage`
+
+```jsx
+function useLocalStorage(key, initial) {
+  const [value, setValue] = useState(() => {
+    const stored = localStorage.getItem(key);
+    return stored ? JSON.parse(stored) : initial;
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue];
+}
+```
+
+Persists state across reloads. The lazy `useState` init reads once
+on mount.
+
+### `useFetch` (or just use a query library)
+
+```jsx
+function useFetch(url) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    setLoading(true);
+    fetch(url, { signal: ac.signal })
+      .then((res) => res.json())
+      .then(setData)
+      .catch((err) => { if (err.name !== 'AbortError') setError(err); })
+      .finally(() => setLoading(false));
+    return () => ac.abort();
+  }, [url]);
+
+  return { data, error, loading };
+}
+```
+
+This works for the basics. For real apps use TanStack Query or SWR —
+they handle caching, retries, refocus refetching, deduplication,
+stale-while-revalidate. Custom `useFetch` is fine for learning;
+don't roll it in production.
+
+### `useEventListener`
+
+```jsx
+function useEventListener(event, handler, target = window) {
+  const ref = useRef(handler);
+  useEffect(() => { ref.current = handler; }, [handler]);
+
+  useEffect(() => {
+    const listener = (e) => ref.current(e);
+    target.addEventListener(event, listener);
+    return () => target.removeEventListener(event, listener);
+  }, [event, target]);
+}
+
+function Component() {
+  useEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
+}
+```
+
+The ref pattern keeps the handler fresh without re-subscribing —
+useful when the handler captures changing state.
+
+## The "rules of hooks" — quick recap
+
+1. **Only call hooks at the top level.** Not inside loops, conditions,
+   or nested functions. Hooks rely on call order being consistent
+   across renders.
+
+2. **Only call hooks from React functions** — components or other
+   custom hooks. Not from regular helpers or event handlers.
+
+3. **Custom hooks must start with `use`.** Linters and React's
+   compiler use this to enforce rule 1.
+
+Breaking rule 1 breaks React in subtle ways — state from one render
+shows up under the wrong hook in the next render. The lint rule
+`react-hooks/rules-of-hooks` catches it.
+
+## Composition
+
+Custom hooks compose like any function:
+
+```jsx
+function useLoggedInUser() {
+  const { user } = useAuth();
+  if (!user) throw new Error('user required');
+  return user;
+}
+
+function useUserAvatar() {
+  const user = useLoggedInUser();
+  return `/avatars/${user.id}.png`;
+}
+```
+
+`useUserAvatar` uses `useLoggedInUser` which uses `useAuth`. Each
+layer is a hook, each composes.
+
+This is the power: small, focused hooks compose into bigger ones,
+which compose into components.
+
+## Custom hooks with side effects
+
+Hooks can encapsulate effects:
+
+```jsx
+function useDocumentTitle(title) {
+  useEffect(() => {
+    const prev = document.title;
+    document.title = title;
+    return () => { document.title = prev; };
+  }, [title]);
+}
+
+function ProfilePage({ user }) {
+  useDocumentTitle(`${user.name} — Profile`);
+  return ...;
+}
+```
+
+The component doesn't write `useEffect` for this — the hook does.
+Cleaner intent ("set the document title to...").
+
+## TypeScript
+
+```tsx
+function useCounter(initial = 0) {
+  const [count, setCount] = useState(initial);
+  const inc = useCallback(() => setCount((c) => c + 1), []);
+  return { count, inc };
+}
+
+// Inferred return: { count: number; inc: () => void }
+```
+
+TypeScript infers return types automatically. Annotate explicitly
+when the hook is exported and the contract should be stable:
+
+```tsx
+type Counter = { count: number; inc: () => void };
+function useCounter(initial = 0): Counter { ... }
+```
+
+For generic hooks (works for any value type):
+
+```tsx
+function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
+  // ...
+}
+
+const [user, setUser] = useLocalStorage<User>('user', defaultUser);
+```
+
+## Common pitfalls
+
+### Calling a hook conditionally
+
+```jsx
+function Component({ enabled }) {
+  if (enabled) {
+    const [x, setX] = useState(0);   // BREAKS rule of hooks
+  }
+}
+```
+
+The lint rule catches this. Restructure:
+
+```jsx
+function Component({ enabled }) {
+  const [x, setX] = useState(0);
+  if (!enabled) return null;
+  // use x here
+}
+```
+
+### Returning unstable references
+
+```jsx
+function useFoo() {
+  const obj = { x: 1 };
+  return obj;          // new reference every render
+}
+```
+
+If consumers use the result in deps or pass it to memoized children,
+each render breaks memoization. Wrap with `useMemo`:
+
+```jsx
+function useFoo() {
+  return useMemo(() => ({ x: 1 }), []);
+}
+```
+
+### Hooks that look like API calls
+
+```jsx
+function useUser(id) {
+  return fetchUser(id);   // wrong — calls the API synchronously
+}
+```
+
+A hook is a way to use React features (state, effects, refs). It's
+not a way to call APIs. Wrap in `useEffect` or a query library.
+
+### Over-extraction
+
+```jsx
+function useShouldShowBadge(user) {
+  return user.role === 'admin' && user.notifications.length > 0;
+}
+```
+
+This isn't a hook — it's a derived value. Just compute it inline.
+Hooks earn their keep when they encapsulate state, effects, or
+refs.
+
+## The mental model
+
+A custom hook is a way to share **the use of React features**, not
+just any logic. If it doesn't call other hooks, it doesn't need to
+be a hook — a plain function suffices.
+
+When you do extract a hook, name it after what it does or what it
+returns: `useUser`, `useDebounce`, `useFormValidation`. The naming
+makes call sites readable.
+
+Two patterns most apps use over and over:
+
+- **Domain hooks** — `useCurrentUser`, `useShoppingCart`,
+  `useNotifications`. Encapsulate "the way this app handles X."
+- **Utility hooks** — `useDebounce`, `usePrevious`, `useLocalStorage`,
+  `useToggle`. Small reusable building blocks.
+
+Many libraries (`react-use`, `usehooks-ts`) export collections of
+these. Don't reinvent unless you need a specific behavior.

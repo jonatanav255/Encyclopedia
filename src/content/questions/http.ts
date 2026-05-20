@@ -74,5 +74,19 @@ export const bank: QuestionBank = {
       answer:
         'Cold first request: DNS resolution + TCP handshake + TLS handshake + first HTTP exchange. Each adds tens to hundreds of ms.\n\nFixes:\n\n- **DNS caching** with `cacheable-lookup` so the resolver only runs once per host.\n- **HTTP keep-alive pool** so the TCP+TLS handshake amortizes across many requests.\n- **TLS 1.3** instead of 1.2 (one round trip instead of two during handshake).\n- **0-RTT resumption** for repeat connections (only for idempotent calls).\n- **DNS prefetch** at app startup — pre-warm the resolver for known upstreams.\n\nA 200ms first-hit latency dropping to 20ms on subsequent ones is the textbook symptom. If you see it on every hit, your pool isn\'t keeping connections open — check `undici.Agent` config.',
     },
+
+    // --- staff ---
+    {
+      level: 'staff',
+      question: 'Design a global CDN caching strategy for an API that serves both public and personalized data.',
+      answer:
+        '**Split routes by cacheability.** Public, immutable: `/api/articles/:id`. Public, revalidating: `/api/feed`. Personalized: `/api/me/*`.\n\n**Public + immutable**: `Cache-Control: public, max-age=31536000, immutable` plus a hash in the URL or ETag. CDN caches forever; changes invalidate via path purge.\n\n**Public + revalidating**: `Cache-Control: public, max-age=60, stale-while-revalidate=600, stale-if-error=86400`. CDN serves cached, refreshes in background, falls back to stale on origin errors.\n\n**Personalized**: `Cache-Control: private, no-store` *or* `private, max-age=0` + `Vary: Authorization`. Don\'t let intermediaries cache user-specific data.\n\n**Cache key composition**: include `Vary: Accept-Encoding, Accept-Language` (often automatic); avoid `Vary: User-Agent` which fragments the cache massively. For tenanted APIs, encode tenant ID into the URL rather than relying on `Vary`.\n\n**Purge**: tag-based purging (Fastly, Cloudflare). On write, purge the relevant tags (e.g., `article:42`) rather than guessing the URL.\n\n**Observability**: hit ratio, origin RPS, p99 latency at edge vs origin. Below 90% hit ratio on public content means tuning is wrong.\n\n**Failure modes**: when origin is down, `stale-if-error` keeps the cache serving. Document the SLO: "we serve stale up to 24h on origin outage."',
+    },
+    {
+      level: 'staff',
+      question: 'You need to call an upstream HTTP API that\'s flaky and slow. Build the wrapper.',
+      answer:
+        '**Timeout** — every request needs one. `undici` `bodyTimeout`/`headersTimeout`, or `AbortController` with `setTimeout`. Default: 5–10s total. Set lower if it\'s a hot path.\n\n**Retries** — only for idempotent methods (GET/PUT/DELETE) or with idempotency keys (POST). Exponential backoff with jitter: `delay = base * 2^attempt + random(0, base)`. Cap retries at 3–5; cap delay at ~30s. Honor `Retry-After`.\n\n**Circuit breaker** — track recent failure rate; when above threshold, open the circuit and fail fast without calling. Half-open after a cooldown to test recovery. `opossum` is the standard Node library. Prevents cascading failure when the upstream is fully down.\n\n**Bulkhead / concurrency limit** — bound in-flight requests to the upstream so one slow downstream doesn\'t consume all your sockets.\n\n**Connection pooling** — `undici.Pool` or `Agent` with `keepAlive`. Avoid the per-request TCP+TLS handshake.\n\n**Caching** — for read-heavy data, cache responses with `stale-while-revalidate` semantics. The fastest call is the one you don\'t make.\n\n**Observability** — per-request: status, latency, attempt count. Per-window: success rate, p99 latency, circuit state. Alert on success rate dropping below SLO.\n\n**Hygiene**: distinct user-agent identifying your service; client request ID propagated for trace correlation; verbose errors logged with enough context to reproduce.',
+    },
   ],
 };

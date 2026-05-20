@@ -1,0 +1,307 @@
+export const level = 'senior';
+
+# Memory and garbage collection
+
+JavaScript runtimes manage memory for you — you allocate by creating
+objects, and the garbage collector (GC) reclaims them when nothing
+references them anymore. Most code works fine without thinking about
+this. When you have leaks or memory pressure, knowing the model is
+essential.
+
+## How GC decides what's reachable
+
+Every JS engine uses **reachability** as the rule:
+
+1. Start from a set of **roots** — the global object, the current
+   call stack, registered callbacks, currently-running coroutines.
+2. Mark everything they reference.
+3. Mark everything those reference, transitively.
+4. Sweep (reclaim) anything that wasn't marked.
+
+So an object is "alive" only as long as something reachable from a
+root points to it.
+
+```js
+let user = { name: 'jon' };   // alive — reachable via `user`
+user = null;                   // unreachable now — GC will reclaim
+```
+
+If only the variable `user` referenced the object, setting it to
+`null` (or letting it go out of scope) drops the last reference and
+the object becomes garbage.
+
+## V8's generational collector
+
+V8 (and similar engines) split the heap into generations:
+
+- **Young generation (new space)** — small. New objects start here.
+  Most die young; the collector scans young space frequently and
+  evacuates survivors to the old generation.
+- **Old generation (old space)** — large. Objects that survived the
+  young generation. Scanned less often (mark-sweep + incremental
+  marking).
+
+This is the "generational hypothesis" — most objects die young, so
+collecting young space cheaply gets you most of the wins.
+
+The practical impact: short-lived allocations are very cheap. Pushing
+them out of fast paths matters less than you'd think, unless you're
+creating millions per second.
+
+## Common leak patterns
+
+A "leak" in JS isn't quite the same as in C — you can't leak memory
+literally. But you can keep references alive that you forgot about,
+preventing GC. Same outcome: memory grows.
+
+### Closures holding large data
+
+```js
+function loadData() {
+  const huge = readFileSync('/large.bin');
+  return function getName() { return 'jon'; };
+}
+
+const fn = loadData();
+// `huge` may still be reachable through the closure, even though unused
+```
+
+Engines try to be smart about not capturing unused variables, but
+historically this caused leaks. Set captured locals to `null` if
+you're worried:
+
+```js
+function loadData() {
+  let huge = readFileSync('/large.bin');
+  const result = process(huge);
+  huge = null;        // explicitly drop
+  return result;
+}
+```
+
+### Event listeners not removed
+
+```js
+function attach() {
+  const data = new BigThing();
+  window.addEventListener('resize', () => use(data));
+}
+```
+
+The listener captures `data`, and the listener is registered on a
+long-lived object (`window`). `data` stays alive forever.
+
+The fix: remove the listener when it's no longer needed. Or use
+`{ once: true }` for one-shot listeners.
+
+### Timers and intervals
+
+```js
+const data = loadHugeThing();
+setInterval(() => use(data), 1000);
+```
+
+`setInterval` keeps the callback alive forever. The callback closes
+over `data`. Leaked.
+
+Always clear: `const id = setInterval(...); clearInterval(id);`
+
+### Caches without eviction
+
+```js
+const cache = new Map();
+
+function get(id) {
+  if (!cache.has(id)) cache.set(id, expensiveLoad(id));
+  return cache.get(id);
+}
+```
+
+Cache grows unbounded. For a real cache, use an LRU library or
+manually evict. For weak associations, `WeakMap`/`WeakSet`.
+
+### DOM detached subtrees
+
+```js
+const el = document.getElementById('thing');
+document.body.removeChild(el);     // DOM removes it
+// but JS variable `el` still holds it
+// any data attached to it (via dataset, listeners, references) is alive
+```
+
+The browser's GC can collect detached DOM nodes only if no JS
+reference holds them. Set the variable to `null` after removing.
+
+## `WeakMap` and `WeakSet`
+
+References that don't prevent GC of the key:
+
+```js
+const cache = new WeakMap();
+cache.set(user, expensiveData);
+
+// when `user` is no longer referenced elsewhere, the entry is
+// automatically removed from the WeakMap
+```
+
+Use when you want to "attach" data to objects you don't own:
+
+- Memoization keyed on objects.
+- Marking DOM nodes with metadata.
+- Tracking instances of a class for cleanup.
+
+Restrictions:
+
+- Keys must be objects (or symbols, in newer specs).
+- No iteration, no `size`. You can `get`, `set`, `has`, `delete`, and
+  that's it.
+
+`WeakSet` is the same idea — membership without holding references.
+
+## `WeakRef` and `FinalizationRegistry`
+
+Even weaker associations:
+
+```js
+const ref = new WeakRef(someObject);
+const obj = ref.deref();     // returns the object, or undefined if GC'd
+```
+
+```js
+const registry = new FinalizationRegistry((heldValue) => {
+  console.log('GC ran for', heldValue);
+});
+registry.register(someObject, 'metadata');
+```
+
+These give you reactive cleanup hooks. **The spec explicitly warns
+not to depend on them for correctness** — they may not fire, they may
+fire late, they may fire never (engines decide when to GC).
+
+Use cases:
+- Closing OS resources tied to JS objects (rare in pure JS code).
+- Caches that shouldn't hold onto their values.
+
+## Diagnosing leaks
+
+### Node
+
+```bash
+# Heap snapshot
+node --inspect=0.0.0.0:9229 app.js
+# Then open Chrome DevTools → Memory → Take heap snapshot
+```
+
+Compare two snapshots taken at different points in time. The
+"Comparison" view shows what was added between them — that's usually
+the leak.
+
+For automated detection:
+
+```js
+const v8 = require('node:v8');
+v8.writeHeapSnapshot();       // writes a .heapsnapshot file
+```
+
+Trigger in a memory-alerting handler. Load into DevTools to diagnose.
+
+### Browser
+
+Chrome DevTools → Memory tab. Same workflow. The "Performance Monitor"
+tab shows live JS heap size — watch it climb under normal use to spot
+leaks.
+
+### What to look for
+
+In a heap snapshot:
+
+- **Retainers** — what's keeping the object alive. Walk back to the
+  root.
+- **Detached HTMLElement** — DOM nodes removed but still referenced
+  in JS.
+- **Closures with large captured contexts** — usually appear as
+  context objects with many properties.
+- **Caches** — Maps or arrays that should be small but aren't.
+
+## Performance: hidden classes
+
+V8 (and other engines) optimize object access by giving each object a
+**hidden class** based on its property structure. Objects with the
+same shape share a class — accesses through them hit a fast inline
+cache.
+
+Adding properties in different orders creates different hidden
+classes:
+
+```js
+const a = {}; a.x = 1; a.y = 2;  // shape: x, then y
+const b = {}; b.y = 2; b.x = 1;  // shape: y, then x — different class
+```
+
+For hot code:
+
+- Initialize all properties at construction (constructor).
+- Don't add properties to objects after creation.
+- Don't delete properties (it converts to "dictionary mode" — slow).
+- Use the same property order across instances of the same role.
+
+This rarely matters for app code. It matters for tight loops over
+millions of objects, hot library internals, and game engines.
+
+## Tuning the GC
+
+Node lets you tune heap limits and GC behavior:
+
+```bash
+node --max-old-space-size=4096 app.js     # 4GB old generation
+node --expose-gc app.js                    # exposes global.gc()
+node --trace-gc app.js                     # log every GC
+```
+
+`--trace-gc` is useful for diagnosing GC pressure — if you see
+constant scavenges and old-space collections, you're allocating too
+much.
+
+`global.gc()` (with `--expose-gc`) forces GC. Don't ship code that
+calls it; it's for testing.
+
+## Common questions
+
+### Does setting a variable to `null` "free" memory?
+
+It drops one reference. The object is freed *when no references
+remain*. The GC runs on its own schedule; setting to `null` doesn't
+trigger collection, just allows it eventually.
+
+### Why doesn't memory drop after I clear my cache?
+
+GC is asynchronous. Heap usage often only drops on the next major
+collection, which can be seconds later. `process.memoryUsage()` shows
+the current state — it lags behind reality.
+
+### Are arrays and objects allocated differently?
+
+V8 has fast paths for "packed arrays" — arrays with consecutive
+integer keys and no holes. Sparse arrays drop to a slower
+representation. Avoid sparse arrays in hot paths.
+
+### Should I worry about closures everywhere?
+
+No. Closures are cheap. The pathological cases are: closures over
+*large* data, closures registered on long-lived event sources, or
+millions of closures created in a tight loop. Otherwise, write the
+code naturally.
+
+## The discipline
+
+- Profile before optimizing. Most apps never hit a memory wall.
+- Use heap snapshots for diagnosing — never guess.
+- `WeakMap`/`WeakSet` when you want associations that don't prevent
+  GC.
+- Remove event listeners, timers, intervals when their work is done.
+- Bounded caches, never unbounded.
+- Don't rely on `FinalizationRegistry` for correctness.
+
+For most code, none of this matters. For long-running services and
+heavy frontends, knowing it can be the difference between "scales
+fine" and "restarts every six hours."

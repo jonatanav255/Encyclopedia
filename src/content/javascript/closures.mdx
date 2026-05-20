@@ -1,0 +1,219 @@
+export const level = 'mid';
+
+# Closures
+
+A closure is a function bundled together with the variables from the
+scope where it was defined. The bundle lives as long as the function
+does — even after the enclosing function has returned.
+
+## The minimal example
+
+```js
+function counter() {
+  let n = 0;
+  return () => ++n;
+}
+
+const next = counter();
+next(); // 1
+next(); // 2
+next(); // 3
+```
+
+`counter` returns and its stack frame would normally disappear. But
+the inner arrow holds a reference to `n`, so the binding survives.
+Each call to `next` mutates the same `n`.
+
+Call `counter()` again and you get a fresh `n` — closures are
+per-invocation.
+
+```js
+const a = counter();
+const b = counter();
+a(); // 1
+a(); // 2
+b(); // 1   — independent
+```
+
+## What gets captured
+
+Closures capture **variable bindings**, not values. The function sees
+the current state of those bindings, not a snapshot.
+
+```js
+let x = 1;
+const read = () => x;
+read();         // 1
+x = 99;
+read();         // 99 — reads the updated binding
+```
+
+This is the source of the classic `var` loop bug:
+
+```js
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0);
+}
+// 3, 3, 3 — one `i`, all three closures see the same updated binding
+```
+
+`let` fixes it because each iteration gets a *fresh* binding:
+
+```js
+for (let i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0);
+}
+// 0, 1, 2
+```
+
+## What closures are good for
+
+### 1. Private state
+
+The variables the closure captures aren't reachable from outside —
+they're truly private.
+
+```js
+function makeBank(balance = 0) {
+  return {
+    deposit: (amount) => { balance += amount; },
+    withdraw: (amount) => {
+      if (amount > balance) throw new Error('insufficient');
+      balance -= amount;
+    },
+    balance: () => balance,
+  };
+}
+
+const acct = makeBank(100);
+acct.deposit(50);
+acct.balance();   // 150
+acct.balance = 9999; // doesn't affect the inner `balance`
+```
+
+Predates class private fields (`#balance`) but still useful when you
+want closure-based encapsulation without a class.
+
+### 2. Memoization
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return (arg) => {
+    if (!cache.has(arg)) cache.set(arg, fn(arg));
+    return cache.get(arg);
+  };
+}
+
+const slowSquare = (n) => { /* expensive */ return n * n; };
+const fastSquare = memoize(slowSquare);
+fastSquare(5); // computes
+fastSquare(5); // cached
+```
+
+The cache lives in the closure, not on the returned function as a
+property. Callers can't see or clear it accidentally.
+
+### 3. Currying / partial application
+
+```js
+const greet = (greeting) => (name) => `${greeting}, ${name}`;
+
+const hello = greet('hello');
+hello('jon'); // "hello, jon"
+hello('jen'); // "hello, jen"
+```
+
+`hello` is `(name) => 'hello, ${name}'` with `greeting` permanently
+captured.
+
+### 4. Event handler binding
+
+```js
+function bind(el, handler) {
+  el.addEventListener('click', handler);
+  return () => el.removeEventListener('click', handler);
+}
+
+const off = bind(button, () => console.log('clicked'));
+off();  // captures el + handler, removes them
+```
+
+The returned cleanup function closes over the very arguments that need
+to be passed to `removeEventListener`.
+
+## Common pitfalls
+
+### Holding onto large data
+
+Closures keep their entire enclosing scope alive — every variable in
+it. If you don't release the closure, the captured data can't be GC'd.
+
+```js
+function loadHugeData() {
+  const huge = new Array(1_000_000).fill('row');
+  return () => 'hi';   // doesn't use `huge`, but the engine may still retain it
+}
+
+const f = loadHugeData();
+// huge is unreachable for us, but the closure-engine relationship can prevent GC
+```
+
+Modern engines are smart about not capturing variables that aren't
+used inside the closure, but historically this caused subtle leaks.
+The safe fix: set captured variables to `null` when you no longer need
+them.
+
+### Capturing mutable state by accident
+
+```js
+function makeRow(items) {
+  return items.map((_, i) => () => items[i]);
+}
+
+const fns = makeRow(['a', 'b', 'c']);
+fns[0]();  // 'a' — fine, since `items` and `i` are stable bindings here
+```
+
+But if you mutate `items` after, all the closures see the new state.
+For snapshots, copy the value into a local: `const v = items[i]; return () => v;`.
+
+### "Closure-per-iteration" cost
+
+In tight loops with many created closures, each is a small allocation.
+Almost never a real problem, but if you profile and see GC pressure,
+hoist the closure outside the loop:
+
+```js
+// hot path
+for (const x of items) handler(x);   // pre-existing handler, no new closure
+
+// not this
+for (const x of items) (() => doWork(x))();
+```
+
+## Closures vs `this`
+
+`this` is determined at call time; closures are determined at
+definition time. That's why arrow functions — which use lexical
+`this` — feel "closure-like" for `this` too.
+
+```js
+class Timer {
+  count = 0;
+  start() {
+    setInterval(() => this.count++, 1000); // arrow closes over `this`
+  }
+}
+```
+
+## The mental model
+
+A function isn't just code — it's code *plus* a reference to the scope
+it was created in. When you call it, the engine looks up variables in
+its captured scope chain, not the caller's. That's closure.
+
+Once you internalize this, half the "tricky JS interview questions"
+become trivial: anything involving `setTimeout` in a loop, anything
+asking how a returned function remembers state, anything about
+"private" fields in pre-class code. All closures.

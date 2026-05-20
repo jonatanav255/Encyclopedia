@@ -1,0 +1,300 @@
+export const level = 'senior';
+
+# Async iteration
+
+`for await...of`, async generators, and the
+`Symbol.asyncIterator` protocol — the way JavaScript handles "values
+arrive over time."
+
+The synchronous iterator pattern (`Symbol.iterator`, `for...of`)
+expects every `next()` to return a value immediately. Async iteration
+lets each `next()` return a promise, so values can come from network,
+streams, timers, or anywhere else asynchronous.
+
+## The protocol
+
+An object is **async iterable** if it has a
+`[Symbol.asyncIterator]()` method returning an async iterator. An
+async iterator has a `next()` method returning a promise that
+resolves to `{ value, done }`:
+
+```js
+const asyncRange = {
+  from: 1,
+  to: 3,
+  [Symbol.asyncIterator]() {
+    let i = this.from;
+    const last = this.to;
+    return {
+      async next() {
+        if (i > last) return { value: undefined, done: true };
+        await new Promise(r => setTimeout(r, 100));
+        return { value: i++, done: false };
+      },
+    };
+  },
+};
+
+for await (const n of asyncRange) console.log(n);
+// 1 (after 100ms), 2 (200ms), 3 (300ms)
+```
+
+## Async generators
+
+Writing this by hand is verbose. `async function*` generators make it
+trivial:
+
+```js
+async function* asyncRange(from, to) {
+  for (let i = from; i <= to; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    yield i;
+  }
+}
+
+for await (const n of asyncRange(1, 3)) console.log(n);
+```
+
+Each `yield` becomes a `{ value, done: false }` resolution. The
+function ending (or `return`) becomes `{ value, done: true }`.
+
+## Where async iteration is built in
+
+### Node streams
+
+`Readable` streams are async iterable since Node 10:
+
+```js
+import { createReadStream } from 'node:fs';
+
+for await (const chunk of createReadStream('big.log')) {
+  process(chunk);
+}
+```
+
+Each chunk is a Buffer (or string in text mode). The loop respects
+backpressure — the stream pauses when your consumer is slow.
+
+### `fetch` response bodies
+
+The browser/Node fetch API returns a `ReadableStream` as the body:
+
+```js
+const res = await fetch('/stream');
+for await (const chunk of res.body) {
+  console.log(chunk);   // Uint8Array
+}
+```
+
+Useful for SSE, gradually arriving JSON, file downloads — anything
+where you want to start handling data before the whole response
+arrives.
+
+### Web `ReadableStream`
+
+```js
+const stream = new ReadableStream({
+  start(controller) {
+    controller.enqueue('a');
+    controller.enqueue('b');
+    controller.close();
+  },
+});
+
+for await (const chunk of stream) console.log(chunk); // "a", "b"
+```
+
+## Pagination
+
+The canonical async-generator use case:
+
+```js
+async function* fetchPages(url) {
+  let next = url;
+  while (next) {
+    const res = await fetch(next);
+    const page = await res.json();
+    yield page.items;
+    next = page.nextPage;     // null when done
+  }
+}
+
+for await (const items of fetchPages('/api/feed')) {
+  for (const item of items) handle(item);
+}
+```
+
+You can write the *consumer* without caring how many pages there are,
+how big they are, or how long each takes. The generator handles
+that.
+
+## Composing async iterables
+
+```js
+async function* map(iter, fn) {
+  for await (const x of iter) yield fn(x);
+}
+
+async function* filter(iter, pred) {
+  for await (const x of iter) if (pred(x)) yield x;
+}
+
+async function* take(iter, n) {
+  let i = 0;
+  for await (const x of iter) {
+    if (i++ >= n) return;
+    yield x;
+  }
+}
+
+const first5Even = take(filter(asyncRange(1, 1000), n => n % 2 === 0), 5);
+for await (const n of first5Even) console.log(n);
+```
+
+These are the same operators as `map`/`filter` for arrays — but lazy
+and async-aware. Iterator helpers (`Iterator.prototype.map`,
+`.filter`, etc.) are landing as standard in newer engines.
+
+## Cancellation
+
+Async generators can be terminated by the consumer:
+
+```js
+async function* gen() {
+  try {
+    while (true) yield Date.now();
+  } finally {
+    console.log('cleanup');
+  }
+}
+
+const g = gen();
+const first = (await g.next()).value;
+await g.return();   // signals "I'm done"
+// "cleanup" logs
+```
+
+`for await...of` calls `g.return()` on `break`, `throw`, or normal
+exit. So the generator's `finally` always runs — perfect for
+releasing resources (closing files, aborting in-flight requests).
+
+You can tie cancellation to an `AbortSignal`:
+
+```js
+async function* readStream(stream, signal) {
+  for await (const chunk of stream) {
+    if (signal.aborted) return;
+    yield chunk;
+  }
+}
+```
+
+## Parallel vs sequential
+
+`for await...of` is **sequential** — each iteration waits for the
+previous's promise. Awaiting many slow async iterables in parallel
+takes more setup:
+
+```js
+// sequential — total = sum of per-item time
+for await (const x of asyncIter) await process(x);
+```
+
+For parallel, kick the work off without awaiting in the loop:
+
+```js
+const ps = [];
+for await (const x of asyncIter) ps.push(process(x));
+await Promise.all(ps);
+```
+
+But careful — `asyncIter` might be infinite. For bounded parallelism,
+use a library like `p-map`:
+
+```js
+import pMap from 'p-map';
+await pMap(asyncIter, process, { concurrency: 5 });
+```
+
+## Backpressure
+
+The big win of async iteration: it pulls. The consumer asks for the
+next value; the producer waits until asked.
+
+```js
+async function* fastProducer() {
+  for (let i = 0; i < 1000000; i++) yield i;
+}
+
+for await (const n of fastProducer()) {
+  await slowProcess(n);   // producer pauses while we work
+}
+```
+
+No queue grows. No memory spike. This is what makes async iteration
+suitable for streaming large data.
+
+Compare with event emitters (`stream.on('data', cb)`) — push-based,
+fast producer can overwhelm a slow consumer. Async iteration is
+pull-based and naturally backpressured.
+
+## Common patterns
+
+### Wrapping an event emitter as async iterable
+
+```js
+import { on } from 'node:events';
+
+const iter = on(emitter, 'message');
+for await (const [msg] of iter) {
+  if (msg === 'done') break;
+  console.log(msg);
+}
+```
+
+`events.on(emitter, name)` is a Node helper that does this for you.
+Errors emitted by the source come out as throws in the loop.
+
+### Merge multiple async iterables
+
+```js
+async function* merge(...iters) {
+  const promises = iters.map(it => it.next().then(r => [it, r]));
+  while (promises.length) {
+    const [it, { value, done }] = await Promise.race(promises);
+    const idx = promises.findIndex(p => p === undefined || p === null);
+    // ... this gets complicated, use a library
+  }
+}
+```
+
+In practice use `it-merge` or similar. Hand-rolling correct merge is
+fussy.
+
+## When to use it
+
+- **Streaming responses** — server-sent events, long polling, large
+  downloads.
+- **Pagination** — clean separation between "fetch a page" and "loop
+  over items."
+- **Real-time event sources** — WebSocket messages, log tailing.
+- **Generators of computed values** that take time per element.
+
+## When NOT to use it
+
+- **Bounded collections** — just use an array.
+- **One async value** — that's a promise.
+- **Synchronous data** — use `for...of` / arrays.
+- **When you don't actually need backpressure** — event emitters are
+  simpler for fire-and-forget signals.
+
+## The mental model
+
+A regular iterator emits a value when asked: "next?" returns
+`{ value, done }`. An async iterator emits a *promise of a value*
+when asked: "next?" returns a promise resolving to `{ value, done }`.
+
+The consumer awaits each value before asking for the next. The
+producer can do whatever async work is needed before yielding.
+Everything else — `for await...of`, async generators, response
+bodies, streams — is sugar on top of this one rule.
