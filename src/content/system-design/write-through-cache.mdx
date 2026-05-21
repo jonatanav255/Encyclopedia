@@ -1,0 +1,332 @@
+export const level = 'mid';
+
+# Write-through cache
+
+In a write-through cache, every write goes to the cache **and**
+the database synchronously, in the same operation. The
+application doesn't return success until both succeed. Reads
+hit the cache directly because the cache always has the latest
+value.
+
+```
+   write flow:
+     app → cache.set + DB.update (both must succeed) → return
+
+   read flow:
+     app → cache (always populated for hot keys) → return
+```
+
+It's the pattern that solves cache-aside's classic race —
+"concurrent writer + reader writing stale value to cache." At
+the cost of: every write is at least as slow as the slowest of
+{cache, DB}, and writes fail if either side fails.
+
+## Why use it
+
+Write-through is the right pattern when:
+
+1. **Read-after-write consistency matters.** A user posts a
+   comment and immediately reloads the page; cache-aside might
+   return the pre-comment view. Write-through guarantees the
+   cache reflects the latest state.
+2. **Cache miss cost is high.** If a cache miss means an
+   expensive DB query or a slow downstream call, you want to
+   keep the cache populated proactively.
+3. **Reads dominate writes.** The extra cost on writes is
+   amortized across many subsequent reads that hit the cache.
+
+It's the wrong pattern when:
+
+- Writes are frequent and reads are sparse — you're caching
+  data that nobody reads.
+- Cache failure should be tolerated. Write-through ties writes
+  to cache availability.
+- Write latency is critical (high-throughput writes,
+  near-real-time systems).
+
+## The shape of the code
+
+```ts
+async function updateUser(id: string, changes: Partial<User>) {
+  const updated = { ...changes, id, updatedAt: new Date() };
+
+  // both must succeed; order matters
+  await db.users.update(updated);
+  await redis.set(`user:${id}`, JSON.stringify(updated), 'EX', 3600);
+
+  return updated;
+}
+
+async function getUser(id: string) {
+  const cached = await redis.get(`user:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  // cache miss is rare under write-through; usually only on
+  // cold start or explicit eviction
+  const user = await db.users.findOne({ id });
+  if (user) {
+    await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 3600);
+  }
+  return user;
+}
+```
+
+Two differences from cache-aside:
+
+- **Write**: cache.set, not cache.del. The new value goes
+  straight into the cache.
+- **Read**: the cache is expected to be populated. Misses
+  happen only when entries expire or get evicted.
+
+## The transactional dilemma
+
+Writing to two systems atomically is hard. If you write to the
+DB first and the cache write fails, the cache has stale data.
+If you write to the cache first and the DB write fails, the
+cache has data that doesn't exist in the source of truth.
+
+Three approaches, in increasing order of safety and cost:
+
+### Best-effort
+
+Write to DB, then write to cache. If cache write fails, log
+and continue. Reads will miss the cache and re-populate it
+from the DB.
+
+```ts
+await db.users.update(updated);
+try {
+  await redis.set(key, JSON.stringify(updated), 'EX', 3600);
+} catch (err) {
+  logger.warn('cache write failed; cache will refill on next read');
+}
+```
+
+Pros: simple, write doesn't fail because of cache.
+Cons: cache might be temporarily stale.
+
+Most apps use this — it's "write-through with a fallback to
+cache-aside on cache failure."
+
+### Strict (cache-fails-write)
+
+If the cache write fails, fail the whole operation.
+
+```ts
+await db.users.update(updated);
+await redis.set(key, JSON.stringify(updated), 'EX', 3600); // throws → bubble up
+```
+
+Pros: caller knows the system is in an inconsistent state and
+can retry.
+Cons: cache outage becomes a write outage. Writes fail
+during normal cache maintenance.
+
+Rarely the right choice. Couples write availability to cache
+availability.
+
+### Two-phase / outbox-style
+
+For true atomicity, write the update + a "cache update needed"
+event to the DB in one transaction. A separate worker reads
+the events and updates the cache. The cache eventually
+catches up.
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.users.update(updated);
+  await tx.cacheTasks.insert({ key: `user:${id}`, value: updated });
+});
+// worker tails cacheTasks → updates Redis
+```
+
+This is the outbox pattern. Stronger guarantees, more
+infrastructure. Worth it for systems where consistency is
+critical.
+
+## Order matters
+
+Should you write DB first or cache first?
+
+### DB first, then cache
+
+```
+1. update DB → succeed
+2. write cache → succeed
+```
+
+If step 2 fails, the cache is stale but the DB is correct.
+Reads serve stale data until TTL or until someone re-populates.
+**Safer**: source of truth is right.
+
+### Cache first, then DB
+
+```
+1. write cache → succeed
+2. update DB → fail
+```
+
+The cache now has data the DB doesn't. Other replicas read it
+and think it's real. Catastrophic for correctness.
+
+**Always DB first.** The cache is derivable from the DB; the
+DB is the source of truth.
+
+## Cold start: prepopulating the cache
+
+Write-through assumes the cache has every hot key. On a fresh
+deploy or after an eviction event, the cache is empty.
+
+Options:
+
+- **Lazy fill on miss**: treat misses like cache-aside —
+  fetch from DB, populate, return. Cache catches up over
+  time. Simple.
+- **Warm-up script**: at startup, the service pre-loads known
+  hot keys (top-N users, hot products). Reduces cold-start
+  latency.
+- **Replica preserving across restarts**: Redis persistence
+  (RDB or AOF) survives restart. Cache stays warm even
+  through redeploy.
+
+Most write-through systems combine all three: persistence so
+cache survives restart, warm-up for known-hot keys, lazy fill
+for the rest.
+
+## TTL still matters
+
+Write-through doesn't eliminate the TTL — it just makes it
+less load-bearing.
+
+Reasons to keep a TTL:
+
+- **Safety net**: if a write update slipped past cache
+  invalidation (bug, transient failure), TTL eventually
+  refreshes it.
+- **Eviction**: cold keys age out; cache memory is freed for
+  hot keys.
+- **Schema changes**: when you change the cached value's
+  format, old values eventually disappear without manual
+  flushing.
+
+A common write-through TTL is generous (hours or days) —
+the assumption is the cache stays current via writes.
+
+## Write-through vs cache-aside
+
+<Compare a="Write-through" b="Cache-aside">
+<>
+- Cache always populated for hot keys.
+- Reads always hit the cache (no miss penalty).
+- Writes pay double cost (DB + cache).
+- Read-after-write consistent.
+- No classic stale-read race.
+- Cache failure during write → either propagate or fall
+  back to cache-aside mid-operation.
+- Cache memory grows with **all writes**, not just
+  read-hot data.
+</>
+<>
+- Cache populated on demand.
+- Reads pay DB cost on miss.
+- Writes only update DB (cheaper).
+- Read-after-write subject to staleness window.
+- Cache memory holds only read-hot keys.
+- Cache failure is non-fatal; reads degrade gracefully.
+- Stale-read race exists in concurrent read+write.
+</>
+</Compare>
+
+Both are valid. The choice is:
+
+- **Defaulting to cache-aside** for general-purpose apps.
+- **Picking write-through** when consistency or cache-miss
+  cost forces it.
+
+## Multi-layer write-through
+
+If you have L1 (per-replica in-process) + L2 (Redis), what
+does write-through mean?
+
+- Write to L2 (Redis): straightforward.
+- Update L1 on every replica: requires pub/sub. Each replica
+  subscribes; on write, the publisher sends a "key updated"
+  message; subscribers invalidate or refresh L1.
+
+```
+write → L2.set
+     → pub.publish('user-updates', { id, value })
+                ↓
+   each replica's subscriber: invalidate L1 entry
+```
+
+Adds infrastructure (pub/sub) but keeps L1 fresh across
+replicas. Without it, L1 has its own staleness on top of
+whatever write-through is doing.
+
+## Common pitfalls
+
+### Treating write-through as transactional
+
+It isn't, unless you explicitly use the outbox pattern. Cache
+and DB can disagree in failure scenarios. Plan for the
+inconsistency window.
+
+### Writing to cache first
+
+Already covered. The cache becomes the source of truth for
+data that doesn't exist in the DB. Avoid.
+
+### Eager caching of write-only data
+
+A logging or audit system writes constantly but is read once
+in a blue moon. Write-through caches every entry, fills the
+cache with stale-the-moment-it's-written data. Use no cache,
+or cache-aside (which only caches what's read).
+
+### Caching the entire object after partial update
+
+If `updateUser` accepts `{ name: 'new' }`, then write-through
+must merge with the existing cached value before set. If you
+write just `{ name: 'new' }`, you've replaced the whole
+cached user with a one-field object. Always re-fetch or
+construct the complete value before writing to cache.
+
+```ts
+// wrong
+await redis.set(key, JSON.stringify(changes));
+
+// right
+const merged = await db.users.findOne({ id });
+await redis.set(key, JSON.stringify(merged));
+```
+
+### Cache TTL much shorter than usage frequency
+
+If TTL is 30 seconds and reads happen every 5 minutes, the
+cache is always expired. You're paying for write-through but
+getting cache-aside behavior. Tune TTL to ≫ read frequency.
+
+### Forgetting downstream caches
+
+Write-through to your Redis. But the CDN, the browser, and
+the user's app all have their own caches. Updating Redis
+doesn't invalidate them. Plan invalidation at every layer
+that caches.
+
+## In summary
+
+- Write-through: writes hit cache and DB synchronously in
+  the same operation.
+- Strong read-after-write consistency; no classic stale-read
+  race.
+- Costs: doubled write latency, cache coupled to write
+  availability.
+- Always write the DB first. The cache is derived; the DB is
+  authoritative.
+- Use it when reads dominate writes and consistency matters.
+- For multi-replica L1 caches, pair with pub/sub-based
+  invalidation.
+- Most "write-through" implementations are best-effort —
+  fail soft on cache errors, degrade to cache-aside on miss.
+- For atomic durability, layer the outbox pattern on top.

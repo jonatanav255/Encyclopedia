@@ -1,0 +1,303 @@
+export const level = 'senior';
+
+# API contracts and consumer-driven contracts
+
+If two services share an API, **someone must verify the contract**.
+Three options exist:
+
+1. Don't verify (hope and pray) — breaks at runtime.
+2. End-to-end integration tests — slow, flaky, false confidence.
+3. **Contract testing** — the API contract itself becomes an
+   artifact, tested independently on both sides.
+
+Newman's *Building Microservices* makes this central. The
+canonical tool is **Pact** (consumer-driven); **OpenAPI**, **gRPC
+.proto**, and **schema registries** provide the spec-driven version.
+
+## The problem
+
+In a monolith, the compiler verifies that callers match callees.
+In microservices, no compiler exists across the network. The
+producer ships a change; consumers find out at runtime.
+
+```
+Producer changes /v1/users response.
+↓
+Deploys to staging, prod.
+↓
+Consumer A's nightly job fails at 03:00.
+↓
+Page. Find the change. Fix or revert.
+```
+
+Repeated weekly across many services, this is operational chaos.
+Contract testing makes the failure happen at PR time, not 3 AM.
+
+## Two flavors
+
+<Compare a="Producer-driven (spec-first)" b="Consumer-driven (CDC)">
+<>
+**The producer publishes a spec.** Consumers conform to it.
+
+Mechanisms: OpenAPI, gRPC `.proto`, JSON Schema. Producer's CI
+validates the spec; consumers generate clients from it.
+
+Pros: single source of truth. Easy to onboard new consumers.
+Cons: producer doesn't know which fields any specific consumer
+actually uses; breaking changes can ship if no consumer is asked.
+</>
+<>
+**Each consumer publishes its expectations.** Producer's CI tests
+against all consumer contracts.
+
+Mechanism: Pact (write contracts in consumer tests, broker stores
+them, producer CI verifies all of them).
+
+Pros: producer can't break a known consumer without CI failing.
+Detects which fields are actually used.
+Cons: more moving parts. Broker, contracts directory, multi-team
+coordination.
+</>
+</Compare>
+
+In practice the two are complements. Spec-first defines the public
+surface; CDC verifies real usage.
+
+## OpenAPI / spec-first
+
+The minimum viable contract is an **OpenAPI spec** (`openapi.yaml`
+or JSON) shipped with the service. CI validates it on every PR:
+
+```bash
+# pseudo: real tools include Spectral, Stoplight, Redocly
+spectral lint openapi.json
+openapi-diff main:openapi.json HEAD:openapi.json --fail-on=breaking
+```
+
+Then:
+
+- Consumers generate clients from it (`openapi-generator`).
+- The gateway routes from it (route per path).
+- Docs are rendered from it (Swagger UI, Redoc).
+- Contract breaks are caught by `openapi-diff` in PR review.
+
+For gRPC, the same role is played by `.proto` files plus tools like
+Buf (`buf breaking` flags backward-incompatible changes).
+
+This level alone catches **most** schema regressions. It doesn't
+catch "the field was technically optional but my consumer assumed
+it would always be present."
+
+## Consumer-driven contracts (Pact)
+
+Pact reverses the relationship. Each consumer writes a test that
+exercises its expectations against a mocked producer:
+
+```js
+import { PactV3, MatchersV3 } from '@pact-foundation/pact';
+
+const provider = new PactV3({
+  consumer: 'web-bff',
+  provider: 'orders-service',
+});
+
+provider
+  .uponReceiving('a request for orders by user')
+  .withRequest({
+    method: 'GET',
+    path: '/v1/orders',
+    query: { userId: '42' },
+  })
+  .willRespondWith({
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+    body: MatchersV3.eachLike({
+      id: MatchersV3.uuid(),
+      total: MatchersV3.decimal(),
+    }),
+  });
+
+await provider.executeTest(async (mock) => {
+  const orders = await fetchOrders('42', { baseUrl: mock.url });
+  expect(orders.length).toBeGreaterThan(0);
+});
+```
+
+The test generates a **pact file** — a JSON document describing the
+interaction. The pact file is uploaded to a **Pact Broker**. The
+producer's CI then plays back all of its consumers' pact files
+against the real implementation; if any fails, the producer's PR
+fails.
+
+Now the producer **cannot ship a change that breaks a known
+consumer** — its CI will fail.
+
+## What a contract test verifies
+
+A good contract test specifies:
+
+- The request shape: method, path, query, headers, body.
+- The response shape: status, headers, body structure.
+- **Structure, not values.** Use matchers (`uuid()`, `decimal()`,
+  `iso8601()`) for types; assert values only where the value
+  matters (e.g., specific status codes).
+
+What a contract test should NOT verify:
+
+- Specific business logic (that's the producer's unit tests).
+- Performance or rate limits.
+- Cross-resource invariants (that's integration tests).
+
+Contract tests are **shape checks**. Keep them shape-only.
+
+## CI integration
+
+The pipeline:
+
+```
+Consumer CI:
+  1. Run consumer tests; generate pact files.
+  2. Upload pacts to broker, tagged with the consumer version.
+
+Producer CI:
+  1. Fetch all pact files from the broker.
+  2. Spin up the producer locally.
+  3. Run each pact's requests against it; assert responses match.
+  4. Publish "verification results" back to the broker.
+
+Deploy gate:
+  - Producer can deploy only if all consumer pacts verify against
+    the producer's new version.
+  - Consumer can deploy only if its pact verifies against the
+    producer's currently-deployed version.
+```
+
+This is enough to **independently deploy** both sides without
+breaking each other — which is the whole reason microservices
+exist.
+
+## When to use which
+
+<Cheatsheet>
+| Situation | Use |
+|---|---|
+| Public API with unknown consumers | OpenAPI / spec-first. CDC isn't possible — you don't know who consumes. |
+| Internal API with a handful of known consumers | CDC. Producer's CI verifies each known consumer. |
+| API with both internal and external consumers | Both. OpenAPI for the world; CDC for internal partners. |
+| gRPC services | Buf breaking-change checks; optionally CDC on top. |
+| GraphQL | Per-query persistence + breaking-change detection; CDC for the most important queries. |
+</Cheatsheet>
+
+CDC is most valuable when **producer and consumer are different
+teams**. If they're the same team, you're testing yourself; speed up
+the loop in other ways.
+
+## Failure modes
+
+### Stale pacts
+
+A consumer team writes a pact, then refactors their code; the pact
+no longer reflects what the consumer actually does. Producer
+verifies an obsolete shape. Real failures slip through.
+
+Fix: regenerate pacts on every consumer CI run; tag with consumer
+version; expire old pacts.
+
+### Over-strict matchers
+
+Consumer asserts an exact field value that's incidental ("total":
+4200). Producer changes irrelevant detail; consumer's pact fails;
+team blames CDC. CDC becomes a hindrance.
+
+Fix: assert structure, not values. Use matchers (`like`, `decimal`)
+generously.
+
+### Under-strict matchers
+
+Consumer uses `eachLike` everywhere; pact passes when the producer
+returns garbage. CDC gives false confidence.
+
+Fix: balance. Verify the fields you actually use; verify types
+strictly; verify presence of required fields.
+
+### Broker bottleneck
+
+The Pact broker becomes a critical piece of infrastructure. If it's
+down, CI is blocked. If it's slow, deploys queue.
+
+Fix: run it as a real service with SLOs; consider self-hosted vs.
+PactFlow SaaS based on team size.
+
+### Coverage blind spots
+
+Pact only verifies what consumers tested. A field used in
+production but never exercised in a consumer test can break and
+nobody notices.
+
+Fix: production observability backstops contracts. Log unknown-
+field-access; alert when consumer code accesses fields the contract
+doesn't cover.
+
+### CDC for everything
+
+Some teams add CDC to every internal call, even within the same
+team. The maintenance cost dominates. CDC is for **cross-team API
+boundaries**.
+
+## The OpenAPI + CDC stack
+
+A working setup in 2026:
+
+```
+- Producer ships an OpenAPI spec.
+- OpenAPI diff in CI flags breaking spec changes.
+- Buf or openapi-diff configured to fail PR on breaking changes.
+- Pact files from internal consumer teams stored in a broker.
+- Producer's CI fetches and runs all pacts.
+- Deploy gate: producer can deploy only if pacts pass.
+- External consumers rely on OpenAPI + deprecation policy.
+```
+
+This catches schema regressions at PR time, prevents accidental
+breakage of internal partners, and keeps the public spec honest.
+
+## A reusable rollout
+
+For a new API:
+
+```
+1. Ship OpenAPI / proto. Lint it in CI.
+2. Add breaking-change detection (openapi-diff, buf breaking).
+3. Generate consumer SDKs from the spec.
+4. Identify the top 3 internal consumers; add Pact CDC for them.
+5. Wire deploy gates: producer can't deploy if Pact fails.
+6. Publish OpenAPI as docs (Swagger UI / Redoc).
+7. Externalize the spec for partners; treat changes as a versioned
+   artifact.
+```
+
+Steps 1–3 alone catch most regressions. Steps 4–5 stop the
+remaining ones. Step 7 is what scales the policy to outside teams.
+
+<Callout variant="info">
+The win isn't that you "have contract tests." The win is that
+producer and consumer teams can deploy independently, confident
+that they won't break each other. CDC is the mechanism; team
+autonomy is the goal.
+</Callout>
+
+## In summary
+
+- An API needs a verified contract. End-to-end integration tests
+  aren't enough — slow and false-confident.
+- Spec-first (OpenAPI, .proto) defines the surface. CI tools
+  (openapi-diff, buf) catch breaking changes at PR time.
+- Consumer-driven contracts (Pact) verify each known consumer's
+  actual expectations. Producer's CI runs them; can't deploy a
+  break.
+- Use OpenAPI for public APIs; CDC for cross-team internal APIs;
+  both at boundaries with both audiences.
+- Keep matchers structural — assert types and presence, not
+  incidental values.
+- Treat the Pact broker as critical infrastructure. Run with SLOs.
+- The goal is independent deployability; CDC is the mechanism.

@@ -1,0 +1,173 @@
+export const level = 'senior';
+
+# How to choose: push vs pull
+
+Who initiates the data transfer? The producer (push) or the
+consumer (pull)?
+
+The answer determines latency, backpressure, scaling, and
+which side has to be smart about failures.
+
+## Push
+
+Producer initiates. As soon as data is available, send it to
+the consumer.
+
+```
+producer → consumer (sends when ready)
+```
+
+Examples: WebSockets, server-sent events, Kafka consumer groups
+(broker pushes to consumers), webhooks, SNS topic
+notifications, Pusher / Pubnub.
+
+### Push wins when
+
+- **Freshness matters.** Real-time UI updates, trading prices,
+  game state.
+- **Producer rate is bursty and unpredictable.** Pull would
+  either over-poll or miss events.
+- **Many idle consumers.** Polling 1000 idle consumers every
+  second is wasteful.
+- **Producer-controlled fan-out.** Producer decides who gets
+  what; consumers just subscribe.
+
+### Push fails at
+
+- **Consumer overload.** Producer pushes faster than consumer
+  can handle. Need backpressure or buffering.
+- **Consumer offline.** Push has nowhere to go; need
+  store-and-forward (which becomes a broker).
+- **Many bad consumers.** Producer hitting 1M endpoints all
+  with their own latency.
+
+## Pull
+
+Consumer initiates. Periodically asks "got anything new?"
+
+```
+consumer → producer (asks every N seconds)
+```
+
+Examples: Kafka consumer.poll(), Prometheus scrape, REST API
+polling, RSS feed readers, GitHub Actions polling for jobs.
+
+### Pull wins when
+
+- **Consumer controls its rate.** Slow consumer asks slowly;
+  natural backpressure.
+- **Producer doesn't know who's interested.** New consumers
+  appear; they just start polling.
+- **Network is unreliable.** Consumer retries naturally; no
+  delivery infrastructure needed.
+- **Caching at the producer.** Many consumers can fetch the
+  same data; producer serves from cache.
+
+### Pull fails at
+
+- **Latency.** Polling interval = max staleness. Frequent
+  polling = wasted bandwidth.
+- **Idle consumers.** A consumer polling every second is
+  spending money on nothing.
+- **High fan-out.** 10K consumers polling = 10K QPS at the
+  producer.
+
+## Hybrid: long polling
+
+Consumer issues a request; producer holds it open until data
+is available (or timeout). Then consumer immediately reissues.
+
+```
+consumer GET /events?since=42
+   (producer holds connection open)
+   (5s later, new event)
+producer returns { events: [...] }
+consumer GET /events?since=45
+```
+
+Combines pull's simplicity with push's freshness. Used by
+classic Comet apps, Kafka long-poll consumer, AWS SQS long
+poll. (See long-polling-vs-websockets-vs-sse.)
+
+## Hybrid: pub/sub
+
+Broker in between: producers push to broker; consumers pull
+(or subscribe) from broker. Producer doesn't see consumers;
+consumers don't see producer.
+
+```
+producer → broker → consumer (pulls)
+                  → consumer (pulls)
+                  → consumer (subscribed; broker pushes)
+```
+
+Kafka, RabbitMQ, NATS, Pub/Sub all do this. The broker
+absorbs producer bursts and lets consumers go at their pace.
+
+## Worked example: monitoring
+
+**Prometheus pulls** (scrapes its targets every 15s).
+- Targets are simple HTTP endpoints — no Prometheus client
+  logic.
+- Adding a new Prometheus server is trivial; just scrape.
+- Latency: up to 15s.
+
+**Push gateway** for short-lived jobs that finish before
+Prometheus can scrape — push the metric and disappear.
+
+**StatsD / Datadog Agent** pushes.
+- Per-event push (low aggregation latency).
+- Agent does pre-aggregation locally; sends in batches.
+
+Both models work; the "right" choice depends on your topology
+and freshness requirements.
+
+## Decision rubric
+
+<Cheatsheet>
+| Need | Push | Pull |
+|---|---|---|
+| Low latency | ✓ | (long-poll only) |
+| Many idle consumers | ✓ | ✗ (wasteful) |
+| Bursty producer | ✓ | ✗ (over/under-poll) |
+| Consumer-controlled rate | ✗ | ✓ |
+| No producer knowledge of consumers | (need pub/sub) | ✓ |
+| Unreliable network | ✗ (need broker) | ✓ |
+| Massive fan-out | (push via broker) | ✗ (DoS at producer) |
+</Cheatsheet>
+
+In practice, **pub/sub via a broker** combines the best of
+both: producer pushes once, consumers pull (or subscribe) at
+their own rate.
+
+## Common mistakes
+
+### Polling every second by default
+
+"Just poll every second" works for prototypes; it's expensive
+in production. Either use long polling (free latency improvement)
+or push (WebSocket / SSE).
+
+### Push without backpressure
+
+Producer pushes faster than consumer processes. Without
+backpressure, consumer OOMs. Need a bounded queue or explicit
+ack-based pacing.
+
+### Polling without etags / change tokens
+
+Consumer pulls full data every time; ignores `If-Modified-Since`
+or `ETag`. Bandwidth and CPU wasted on unchanged responses.
+
+## In summary
+
+- Push: producer initiates; great for low latency and idle
+  consumers; needs backpressure.
+- Pull: consumer initiates; great for consumer-controlled
+  rate and unreliable networks; wastes bandwidth when idle.
+- Long polling combines pull's simplicity with push's
+  freshness.
+- Pub/sub via broker combines push and pull: producer pushes
+  once, consumers pull at their own pace.
+- Pick based on freshness needs, consumer count, and rate
+  control.

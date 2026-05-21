@@ -1,0 +1,159 @@
+export const level = 'senior';
+
+# Serializability
+
+The gold standard for transaction isolation: any concurrent
+execution of transactions must be **equivalent to some serial
+execution** of those same transactions.
+
+You can run T1 and T2 in parallel, but the final state must be
+indistinguishable from running them one at a time in *some*
+order — the system picks which.
+
+Note: serializability doesn't require *real-time* ordering. If
+T1 starts and finishes before T2, the system can still pick an
+equivalent serial order where T2 ran first. That's why
+**strict serializable** = serializable + linearizable is the
+true gold standard.
+
+## What it prevents
+
+Every concurrency anomaly:
+
+<Cheatsheet>
+| Anomaly | Prevented |
+|---|---|
+| Dirty read | Yes |
+| Non-repeatable read | Yes |
+| Phantom read | Yes |
+| Lost update | Yes |
+| Write skew | Yes |
+| Read skew | Yes |
+</Cheatsheet>
+
+If you target serializability, you don't have to reason about
+anomalies. Your code can assume it runs alone.
+
+## Three implementation strategies
+
+### 1. Two-phase locking (2PL)
+
+Each row read takes a shared lock; each row written takes an
+exclusive lock. Locks held until commit. Conflicting
+transactions block.
+
+Strict 2PL prevents all anomalies. Used in MySQL InnoDB
+SERIALIZABLE, MS SQL Server, DB2.
+
+**Cost**: deadlocks (DB has to detect and abort one
+transaction), reduced throughput under contention.
+
+### 2. Serializable snapshot isolation (SSI)
+
+Run transactions under snapshot isolation, but track
+read-write dependencies between concurrent transactions. At
+commit time, abort one if the dependency graph would have
+required a different serial order.
+
+Used in PostgreSQL SERIALIZABLE, CockroachDB, FoundationDB,
+SAP HANA.
+
+**Cost**: extra bookkeeping memory, abort rate can be high
+under contention (the application must retry).
+
+### 3. Deterministic execution
+
+Order transactions globally upfront and execute deterministically
+(possibly in parallel where they don't conflict). Calvin and
+related research systems do this; FaunaDB productized it.
+
+**Cost**: latency to determine the global order; the model is
+harder to integrate with existing applications.
+
+## Serializable vs linearizable
+
+<Compare a="Serializable" b="Linearizable">
+<>
+About **transactions**. Says concurrent execution equivalent
+to some serial order. Doesn't enforce real-time ordering.
+</>
+<>
+About **single objects**. Says each op appears atomic at a
+real-time instant.
+</>
+</Compare>
+
+A serializable system can return "old" data for a transaction
+that started after another committed — as long as the result is
+some valid serial order. Most users don't expect this.
+
+**Strict serializable** = serializable + linearizable for
+single-key ops. Spanner and CockroachDB target it; this is
+what most production systems labeled "SERIALIZABLE" actually
+deliver in practice.
+
+## Cost in the real world
+
+- **MySQL `SERIALIZABLE`**: enables locking for `SELECT`.
+  Reads block writes, writes block reads, deadlocks under
+  contention. Usually avoided.
+- **Postgres `SERIALIZABLE`**: uses SSI. Cheap when contention
+  is low; serialization-failure errors get common at high
+  write contention.
+- **Spanner / CockroachDB**: strict serializable by default,
+  paid via consensus round-trips per transaction.
+
+In benchmarks, going from `READ COMMITTED` to `SERIALIZABLE`
+typically costs 2–10× throughput depending on workload.
+
+## When to use it
+
+- **Money.** Any transaction involving balance, ledger,
+  payments. Worth the cost.
+- **Inventory / booking.** Two users buy the last seat — you
+  need them to serialize.
+- **Multi-row invariants.** "Doctors on call ≥ 1" (the classic
+  write-skew case) — snapshot isolation isn't enough.
+- **Compliance / audit.** When the audit log must show a
+  globally consistent timeline.
+
+For everything else (analytics rollups, dashboards, user
+preferences), pick the weakest isolation that doesn't show
+visible bugs.
+
+## Application-level patterns
+
+Even with `SERIALIZABLE`, the application needs to handle
+**serialization failures** — the DB might abort your
+transaction and ask you to retry.
+
+```js
+async function runTx(work) {
+  for (let i = 0; i < 5; i++) {
+    try {
+      return await db.transaction(async tx => work(tx), { isolation: 'serializable' });
+    } catch (err) {
+      if (isSerializationFailure(err)) continue;
+      throw err;
+    }
+  }
+  throw new Error('serialization failed after retries');
+}
+```
+
+Library-level retry on serialization failures is the standard
+pattern; without it, `SERIALIZABLE` causes random user-facing
+500s.
+
+## In summary
+
+- Serializability: concurrent execution must be equivalent to
+  some serial order.
+- Prevents every concurrency anomaly.
+- Strict serializable = serializable + linearizable (the real
+  gold standard).
+- Three implementations: 2PL (locking), SSI (snapshot +
+  conflict tracking), deterministic ordering.
+- Application must handle serialization-failure retries.
+- Use for money, inventory, multi-row invariants; weaker is
+  cheaper for everything else.

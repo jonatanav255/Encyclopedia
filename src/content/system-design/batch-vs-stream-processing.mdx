@@ -1,0 +1,259 @@
+export const level = 'senior';
+
+# Batch vs stream processing
+
+Two ways to compute over data: **batch** runs over a bounded set
+(yesterday's logs, last quarter's transactions); **stream** runs
+over an unbounded set (every event as it arrives, forever).
+
+The historical divide is collapsing. Akidau's *Streaming
+Systems* and the Beam model showed that batch is a special case
+of stream — a stream where the window is the whole dataset. In
+practice, mature pipelines still end up running both.
+
+## The two models
+
+<Compare a="Batch processing" b="Stream processing">
+<>
+**Bounded data, periodic execution.**
+
+- Job runs on a schedule (hourly, daily).
+- Reads a snapshot of yesterday's data.
+- Produces a complete output: a report, an aggregate, a model
+  training set.
+- High throughput (entire dataset at once).
+- High latency (results arrive after the schedule).
+
+Frameworks: **Spark, Hadoop MapReduce, BigQuery, Snowflake,
+Airflow + SQL**.
+</>
+<>
+**Unbounded data, continuous execution.**
+
+- Process events as they arrive.
+- Maintains state incrementally (running totals, joins).
+- Produces a continuously updated output: a materialized view,
+  a real-time alert, a feature for ML inference.
+- Lower throughput per event (overhead per record).
+- Low latency (results within seconds of the source event).
+
+Frameworks: **Kafka Streams, Apache Flink, Spark Structured
+Streaming, ksqlDB, Materialize**.
+</>
+</Compare>
+
+## When to pick each
+
+### Pick batch when:
+
+- The result has a natural cadence: "month-end report," "daily
+  ML training run."
+- You need to **reprocess** older data (replay, backfill,
+  model retraining) — batch jobs are easier to re-run on
+  historical data.
+- The computation is too heavy for incremental: large joins
+  across the full dataset, complex aggregations, model
+  training on all-time data.
+- Cost is dominated by storage and you can amortize compute
+  over a single nightly run.
+- Latency requirements are minutes to days.
+
+### Pick stream when:
+
+- Results must be fresh in seconds: fraud detection, real-time
+  dashboards, ML feature serving.
+- The data is genuinely unbounded: clickstream, IoT, change
+  data capture.
+- The downstream is event-driven: triggering an alert, updating
+  a cache, recomputing a feed.
+- Incremental computation is cheaper than full recomputation
+  (most stream-friendly aggregations).
+- Latency requirements are sub-minute.
+
+## The "mature pipelines run both" reality
+
+Most production data systems are **lambda-like in practice**
+even if not in name:
+
+```
+events ──→ [stream] ──→ low-latency materialized view  (90% correct)
+       └─→ [batch nightly] ──→ ground-truth aggregates  (100% correct)
+                              compared / reconciled
+```
+
+Stream handles "right now"; batch reconciles inevitable drift,
+late data, schema migrations, and recomputation. See **Kappa vs
+Lambda architecture** for the design choice.
+
+Streaming-only (kappa) works for many use cases, but reaching
+full correctness on streams alone is genuinely hard — see
+**Watermarks** and **Exactly-once stream processing** for why.
+
+## Throughput vs latency
+
+There's a fundamental trade-off and it shapes the choice:
+
+```
+high throughput ↔ batched I/O ↔ high latency
+low latency     ↔ per-record  ↔ lower throughput
+```
+
+A batch reading 1 TB of S3 sequentially sustains ~GB/s. A stream
+processor handling 1 event at a time sustains ~tens of thousands
+of events/sec per node. The batch pipeline does more total work
+in absolute terms but produces nothing for an hour.
+
+Stream processors handle this with **micro-batching** — Spark
+Structured Streaming processes records in small time-window
+batches (200ms by default) to amortize overhead while keeping
+latency bounded. Flink in contrast is **true per-event**, which
+gives lower latency at higher per-event overhead.
+
+## Correctness boundaries
+
+Batch is easier to reason about correctness for:
+
+- **Input is bounded**. You know when the job started and
+  ended.
+- **Idempotent re-runs are easy**: read the same input range,
+  produce the same output.
+- **No event-time / processing-time confusion** (see
+  **Event time vs processing time**).
+- **Failure handling is "rerun the job."**
+
+Stream introduces:
+
+- **Watermarks** to define "this window is done."
+- **State management** across restarts.
+- **Late data handling** (events arriving after their window
+  closed).
+- **Exactly-once across multiple sinks**.
+
+Akidau's *Streaming Systems* spends most of its 400 pages on
+these problems. Streaming is harder, and the operational depth
+matters.
+
+## Examples
+
+### Daily aggregation: clearly batch
+
+"Compute per-user weekly active minutes, refreshed daily."
+
+- Input: 1 week of events from a data lake.
+- Output: a Snowflake table updated nightly.
+- Latency: 24-hour granularity acceptable.
+- Tools: SQL on a warehouse, Spark, dbt.
+
+Trying to do this as a stream is unnecessary complexity. A 1B-row
+nightly job in a warehouse is cheaper and simpler than
+maintaining stream state.
+
+### Real-time fraud scoring: clearly stream
+
+"Score every transaction within 100ms of arrival."
+
+- Input: live transaction events.
+- Output: a fraud score per transaction.
+- Latency: 100ms p99 required.
+- Tools: Flink, Kafka Streams, or stream-aware feature stores.
+
+A nightly batch would mean fraud is detected the next day, by
+which time the money is gone.
+
+### Hybrid: clickstream → feed ranking
+
+"User opens app; recommended posts ordered by recent
+engagement."
+
+- Stream side: tally per-post engagement counters as events
+  arrive (last 1 hour).
+- Batch side: nightly model training on last 30 days of
+  full history.
+- Serving: stream-computed counters + batch-trained model.
+
+Neither alone is enough. Both run, both are correct, and the
+serving layer joins them.
+
+## Stream as "batch with a different shape"
+
+The Beam / Akidau insight: a **bounded batch is a special case
+of an unbounded stream**, where the "window" is "the entire
+dataset" and the "watermark" arrives at the end. Same primitives;
+same windowing; same triggers.
+
+This is the foundation of unified frameworks like Apache Beam,
+where one pipeline definition runs on either a batch or a
+streaming engine. Practically:
+
+```js
+// Pseudocode in the Beam style — runs on either runner
+pipeline
+  .from(source)              // bounded or unbounded
+  .windowInto(fixedWindows(Duration.hours(1)))
+  .groupBy('userId')
+  .aggregate(sumOf('amount'))
+  .to(sink);
+```
+
+Useful for code reuse. In practice most teams pick a single
+shape per pipeline because the operational model and tuning
+differs.
+
+## Cost shape
+
+<Cheatsheet>
+| Cost dimension | Batch | Stream |
+|---|---|---|
+| Compute pricing | Pay for job duration | Pay 24/7 |
+| Idle waste | Zero (job runs, then stops) | High if traffic is bursty |
+| Engineering complexity | Lower | Higher (state, watermarks, EOS) |
+| Operational toil | Periodic failures, alert + rerun | Continuous monitoring, lag, hot keys |
+| Backfill / reprocess | Trivial (rerun) | Harder (replay stream) |
+| Schema evolution | Easy at run boundary | Live migration during run |
+</Cheatsheet>
+
+Batch is cheaper in compute for bursty/periodic workloads.
+Stream is cheaper in latency.
+
+## Common pitfalls
+
+<Callout variant="warning">
+**Using stream for everything because "it's modern."** A daily
+aggregate doesn't need a Flink cluster. The operational tax of
+a stream processor for a job that runs once a day is enormous
+for no benefit.
+</Callout>
+
+<Callout variant="warning">
+**Using batch for everything because "it's simpler."** Sub-
+minute latency is genuinely impossible in batch unless you
+crank the schedule so high that you're effectively running a
+stream poorly.
+</Callout>
+
+<Callout variant="warning">
+**Conflating event time and processing time in a batch job
+ported to stream.** A batch query "users active yesterday" is
+unambiguous; the stream version requires watermarks and
+windowing. See **Event time vs processing time**.
+</Callout>
+
+<Callout variant="warning">
+**Streaming without backpressure or replay.** A stream
+processor that can't replay history is one bug away from
+permanent data loss.
+</Callout>
+
+## In summary
+
+- **Batch = bounded data, periodic, high throughput, high
+  latency.** Right for nightly reports, ML training, heavy
+  joins.
+- **Stream = unbounded data, continuous, lower throughput,
+  low latency.** Right for fresh dashboards, real-time
+  alerting, feature serving.
+- **Most mature pipelines run both** — stream for "right now,"
+  batch to reconcile.
+- **Throughput-latency trade-off** is the underlying physics.
+- **Stream is harder operationally**; only pay the cost when
+  latency demands it.

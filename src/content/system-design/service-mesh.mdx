@@ -1,0 +1,232 @@
+export const level = 'senior';
+
+# Service mesh
+
+A service mesh moves cross-cutting service-to-service concerns —
+mTLS, retries, timeouts, traffic shifting, telemetry — **out of
+application code** and into a sidecar proxy that lives next to every
+service. Istio, Linkerd, Consul Connect, and AWS App Mesh are the
+common implementations.
+
+It's powerful and operationally heavy. Most teams adopt it too early.
+
+## What it actually is
+
+Every service pod gets a sidecar (typically **Envoy** or
+**linkerd-proxy**) that intercepts all inbound and outbound traffic.
+The application talks to localhost; the sidecar handles the network.
+
+```
+[app] ↔ [sidecar] ─── network ─── [sidecar] ↔ [app]
+            ↑                          ↑
+            └── control plane (policy, certs, config) ──┘
+```
+
+The **data plane** is the fleet of sidecars. The **control plane** is
+the operator's brain: pushes config, rotates certs, collects telemetry.
+
+## What it gives you
+
+Things the mesh handles uniformly so app code doesn't:
+
+<Cheatsheet>
+| Concern | Without mesh | With mesh |
+|---|---|---|
+| mTLS between services | Per-language TLS code, cert rotation in app. | Automatic, identity-based, rotated by control plane. |
+| Retries with backoff | Per-language client lib, often inconsistent. | Declarative policy per route. |
+| Timeouts | Per-call code; easy to forget. | Enforced at the proxy. |
+| Circuit breaking | Library per language. | Outlier detection by the mesh. |
+| Traffic splitting (canary, blue/green) | Custom routing logic. | Weighted routes, header-based, percent rollouts. |
+| L7 metrics (RED) | Per-language instrumentation. | Free, uniform Prometheus metrics. |
+| Distributed tracing | Per-language SDK with manual propagation. | Automatic for HTTP/gRPC; app still needs to propagate context. |
+| Authz policy | Custom middleware. | Declarative — "only frontend can call billing." |
+</Cheatsheet>
+
+The strongest argument is **uniformity**. A polyglot fleet (Go, Node,
+Python, Java) gets the same retry/timeout/mTLS behavior without a
+per-language library and without trusting every team to configure it
+right.
+
+## What it costs
+
+Real costs, from the SRE Workbook and production reports:
+
+- **Latency per hop**: sidecar adds 1–5 ms p50 and more at tail.
+  Fine for most services; matters for low-latency hot paths.
+- **CPU and memory**: each sidecar is a real process. At scale, 5–20%
+  of cluster resources go to the mesh.
+- **Operational complexity**: Istio is, by general consensus, a
+  full-time job to operate. Linkerd is lighter; still non-trivial.
+- **Debug surface area**: when traffic breaks, "is it the app or the
+  sidecar?" is a new question on every page.
+- **Upgrade pain**: sidecar version drift across the fleet is
+  inevitable; control-plane upgrades touch every pod.
+
+If your team can't justify these costs against a specific problem,
+don't adopt a mesh.
+
+## When the complexity pays off
+
+A few situations where a mesh is a clear win:
+
+<Steps>
+<Step n={1} title="Polyglot fleet at scale.">
+You have ≥4 languages and ≥20 services. Per-language client libs for
+mTLS/retries/timeouts diverge and rot. A mesh standardizes them.
+</Step>
+<Step n={2} title="Zero-trust networking requirement.">
+You need mTLS between every pair of services and rotating identities,
+and you can't trust application code to do it right. A mesh makes it
+declarative and uniform.
+</Step>
+<Step n={3} title="Progressive delivery at scale.">
+Canary rollouts, header-based routing, traffic mirroring — without a
+mesh you build this in your gateway or in code. With a mesh it's a
+manifest.
+</Step>
+<Step n={4} title="Compliance pressure for fleet-wide policy.">
+You need to prove that only the right services can talk to billing,
+that all traffic is encrypted, and to produce audit logs. The mesh
+gives you a policy plane and a single place to audit.
+</Step>
+</Steps>
+
+If none of these apply, you're paying for a feature you don't need.
+
+## Mesh vs. alternatives
+
+A mesh is one point in a design space. Cheaper alternatives often
+suffice:
+
+<Compare a="Service mesh" b="Library-based">
+<>
+Cross-cutting concerns in a sidecar, uniform across languages,
+controlled by a policy plane. High operational cost; high control.
+Examples: Istio, Linkerd.
+</>
+<>
+Cross-cutting concerns in a per-language SDK (Finagle, gRPC
+interceptors, Hystrix). Low ops cost, requires uniform library
+adoption. Google ran on this for years; Finagle was Twitter's spine.
+</>
+</Compare>
+
+<Compare a="Service mesh" b="API gateway only">
+<>
+mTLS, retries, telemetry between every pair of services in the
+fleet. East-west traffic. Internal-policy plane.
+</>
+<>
+Auth, rate-limiting, routing at the edge only. North-south traffic.
+Internal services talk plain HTTP/gRPC. Far cheaper; misses the
+east-west uniformity.
+</>
+</Compare>
+
+For most teams with one or two languages, a well-configured gRPC or
+HTTP client library + a good gateway gets you 80% of the value at
+20% of the cost.
+
+## Istio vs Linkerd in one paragraph
+
+- **Istio**: Envoy-based data plane, the most features, the most
+  knobs, the most complexity. Standard at very large organizations
+  that have a platform team.
+- **Linkerd**: own Rust-based proxy (`linkerd-proxy`), opinionated,
+  far simpler to operate, fewer features. Standard for "we want
+  mesh benefits without owning Istio."
+- **Cilium / eBPF-based meshes**: emerging; replace some sidecars
+  with kernel-level interception for less overhead. Less battle-
+  tested.
+
+If your team is asking "do we need a mesh," the answer for most teams
+is "Linkerd or nothing."
+
+## What the mesh does NOT do
+
+Common misconceptions:
+
+```
+- It does not magically make a distributed monolith into microservices.
+  Coupling is in the calls; the wire is fine.
+- It does not give you observability for free. You still need traces,
+  logs, dashboards, and SLOs. The mesh emits raw RED metrics; it
+  doesn't decide what to alert on.
+- It does not replace API design. Retries at the sidecar can hide bad
+  endpoints — and double-spend idempotency-key-less calls.
+- It does not provide application-level idempotency. The mesh retries;
+  your endpoint must be idempotent. See "Idempotency keys."
+- It is not the security boundary. It enforces mTLS and policy; your
+  authn/authz logic still lives in the app.
+```
+
+## Failure modes
+
+A mesh introduces a class of issues that don't exist without one:
+
+### Sidecar startup race
+
+The app starts and tries to call out before the sidecar is ready —
+all calls fail. Fix with `holdApplicationUntilProxyStarts` (Istio)
+or readiness gating. Boring once known, devastating on first deploy.
+
+### Per-route policy explosion
+
+Every team adds a few retry/timeout rules. Three months later, the
+configuration is unreadable and conflicts. Centralize ownership of
+mesh policy on a platform team.
+
+### Duplicate retries
+
+The app retries. The sidecar retries. The gateway retries. Total
+request multiplier: 27. Pick one layer for retries — usually the
+sidecar — and disable retries in the others.
+
+### "Why is the request slow?"
+
+p99 latency is up 30 ms. Is it the app, the sidecar, the network,
+the control plane? Without good per-hop tracing, the mesh becomes a
+black box. Run tracing from day one.
+
+### Upgrade lockstep
+
+The control plane version constrains the data plane version. A major
+control-plane upgrade requires rolling every pod in the fleet. Plan
+upgrades as projects, not maintenance windows.
+
+## How adoption usually goes
+
+A common arc, from the SRE workbook and platform-team blog posts:
+
+```
+1. Adopt for mTLS and traffic shifting on a few critical services.
+2. Get bitten by upgrade pain; build platform tooling around it.
+3. Expand to most of the fleet; centralize policy.
+4. Eventually: 30% of platform engineering time is mesh.
+5. Either: (a) it pays off because the org is large enough, or
+          (b) you regret it and scope it back.
+```
+
+The honest version: a mesh is a platform-team commitment, not a
+deployment. Don't adopt one unless you have, or will have, a platform
+team to own it.
+
+<Callout variant="info">
+"Do we need a service mesh?" is the wrong question. The right one
+is "what specific problem are we paying this much to solve, and is
+there a cheaper option?"
+</Callout>
+
+## In summary
+
+- A service mesh moves mTLS, retries, timeouts, telemetry, and
+  traffic policy into sidecar proxies, out of app code.
+- The killer feature is **uniformity** across a polyglot fleet at
+  scale.
+- Costs are real: latency, resources, ops complexity, debug surface.
+  Treat the mesh as a platform-team commitment.
+- For most teams, a good HTTP/gRPC library plus a well-run gateway
+  is cheaper and sufficient.
+- Linkerd is the default for "mesh without becoming an Istio shop."
+- A mesh does not replace API design, idempotency, observability, or
+  good service boundaries — it complements them.

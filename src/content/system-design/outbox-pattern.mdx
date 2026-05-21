@@ -1,0 +1,304 @@
+export const level = 'senior';
+
+# Transactional outbox
+
+The outbox pattern is the standard fix for **dual-write
+inconsistency** — the bug that happens whenever you write to your
+database and then publish a message about it, and one of the two
+operations fails.
+
+It's not glamorous. It's the single most important pattern for
+event-driven services that don't want to corrupt themselves.
+
+## The dual-write problem
+
+```js
+// Looks fine, isn't
+await db.orders.insert({ id, ... });
+await broker.publish('orders.created', { id, ... });
+```
+
+Failure modes:
+
+- DB write succeeds, broker publish fails → consumers never hear
+  about the order.
+- Broker publish succeeds, DB commit fails → consumers process an
+  order that doesn't exist.
+- Broker publish succeeds, **service crashes between the two
+  lines** → DB write rolled back, consumers see a phantom order.
+
+These aren't theoretical. Network blips and process crashes are
+the steady state of distributed systems. The pattern fails
+constantly at scale.
+
+Reversing the order doesn't fix it — now you risk publishing
+without DB persistence. Wrapping both in a try/catch doesn't fix
+it — you have no atomicity guarantee.
+
+The root cause: **two systems, no shared transaction**.
+
+## The outbox
+
+Move the message into the same database, in the same
+transaction:
+
+```js
+await db.transaction(async (tx) => {
+  await tx.orders.insert({ id, ... });
+  await tx.outbox.insert({
+    id: uuid(),
+    type: 'order.created',
+    payload: { id, ... },
+    createdAt: new Date(),
+  });
+});
+```
+
+Now both rows commit together or roll back together. There is no
+intermediate state where the event exists but the order doesn't,
+or vice versa.
+
+A separate **publisher** process tails the outbox table and sends
+each row to the broker, marking it sent (or deleting it) after
+the broker acknowledges.
+
+```
+┌──────────────────────────────────────┐
+│  application transaction             │
+│  ┌──────────┐    ┌──────────────┐    │
+│  │  orders  │    │   outbox     │    │
+│  └──────────┘    └──────────────┘    │
+└──────────────────────────────────────┘
+                          │
+                          ↓
+                    publisher worker
+                          │
+                          ↓
+                       broker
+```
+
+The publisher is the only place where dual-write semantics
+remain, and that's tolerable because it's **the publisher's
+only job** — it can retry indefinitely, idempotently, until the
+broker acknowledges.
+
+## Schema
+
+A minimal table:
+
+```js
+// SQL — shown as JS template for fence rules
+const create = `
+  CREATE TABLE outbox (
+    id           UUID PRIMARY KEY,
+    aggregate_id TEXT NOT NULL,
+    type         TEXT NOT NULL,
+    payload      JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at      TIMESTAMPTZ
+  );
+  CREATE INDEX outbox_unsent_idx
+    ON outbox (created_at)
+    WHERE sent_at IS NULL;
+`;
+```
+
+Important choices:
+
+- **`id` is the message ID** consumers use for dedup. UUIDv7 is
+  ideal — sortable + unique.
+- **`aggregate_id`** lets you route to a partition key (e.g., the
+  order ID), preserving per-entity ordering.
+- **`sent_at`** is the marker. Don't delete sent rows for at
+  least a retention window — replay relies on them.
+- **Partial index** on unsent rows makes the publisher's poll
+  cheap.
+
+## Two publisher styles
+
+### Polling
+
+The publisher loops:
+
+```js
+async function loop() {
+  while (true) {
+    const batch = await db.outbox
+      .where('sent_at IS NULL')
+      .orderBy('created_at')
+      .limit(100)
+      .forUpdateSkipLocked();   // critical for multi-instance
+
+    for (const row of batch) {
+      try {
+        await producer.send({
+          topic: row.type,
+          messages: [{ key: row.aggregate_id, value: serialize(row) }],
+        });
+        await db.outbox.update({ id: row.id, sent_at: new Date() });
+      } catch (err) {
+        // leave sent_at null; retry next loop
+        log.warn({ row, err }, 'outbox publish failed');
+      }
+    }
+
+    if (batch.length === 0) await sleep(100);
+  }
+}
+```
+
+The `FOR UPDATE SKIP LOCKED` lets you run **multiple publisher
+instances** without two of them grabbing the same row. Postgres
+ignores rows already locked by another transaction.
+
+**Polling pros**: simple, no extra infrastructure.
+**Polling cons**: latency floor of poll interval. Heavy on the
+DB if the polling loop is tight.
+
+### CDC tailing
+
+Use Debezium (or Postgres logical replication) to tail the
+`outbox` table directly. Each insert produces a Kafka event with
+sub-second latency. No polling.
+
+```
+[Postgres outbox table] → [Debezium] → [Kafka topic per event type]
+```
+
+**CDC pros**: lower latency, less DB load, replayable.
+**CDC cons**: extra infrastructure (Debezium, Kafka Connect),
+operational complexity.
+
+Confluent and many vendor blogs call this the **"outbox event
+router"**, and it's the production path for organizations already
+running Kafka Connect.
+
+## Why this is so important
+
+Eventual consistency between services is fine. **Eventual
+agreement on whether an event happened** is not. The outbox
+pattern is the difference between:
+
+- "Customer X's order eventually shows up in analytics." (fine)
+- "Customer X has an order in our DB, but billing never charged
+  them and shipping never knew." (existential)
+
+Stopford's *Designing Event-Driven Systems* and Bellemare's
+*Building Event-Driven Microservices* both put the outbox near
+the top of the pattern list for exactly this reason.
+
+## Delivery semantics
+
+The outbox gives **at-least-once** delivery:
+
+- The publisher might publish, then crash before marking sent.
+- On restart, it publishes again.
+- Consumers must be idempotent (see Idempotent consumer / inbox
+  pattern).
+
+Combined with consumer-side dedup keyed on the outbox row ID,
+you get **effectively-once** end-to-end. The outbox provides the
+durable message ID; the inbox consumes it.
+
+## Ordering
+
+Within one outbox table, polling preserves order (`ORDER BY
+created_at, id`). When publishing to a partitioned broker, use
+`aggregate_id` as the partition key so per-entity order is
+preserved on the broker side too.
+
+If you parallelize publishing, **don't process out-of-order rows
+for the same aggregate**. A common mistake is `SKIP LOCKED` with
+many workers and no aggregate locking — two workers process two
+events for the same order, the second one publishes first.
+
+Fix: lock by aggregate.
+
+```js
+// Take the next unsent event per aggregate, locking the aggregate
+const row = await db.queryRaw(`
+  WITH next AS (
+    SELECT DISTINCT ON (aggregate_id) *
+    FROM outbox
+    WHERE sent_at IS NULL
+    ORDER BY aggregate_id, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 100
+  )
+  SELECT * FROM next ORDER BY created_at;
+`);
+```
+
+Or use one publisher worker for ordered domains. Throughput is
+usually fine since the work is "publish to broker," which is
+microseconds.
+
+## Cleanup
+
+The outbox grows forever if you don't prune. Two strategies:
+
+- **Soft-delete with retention**: keep sent rows for N days
+  (replay/audit), then delete. Easy.
+- **Hard-delete on send**: delete the row after broker ack. No
+  replay. Smaller table.
+
+Most teams keep ~7 days. Combined with a CDC consumer that's
+caught up, that's plenty for debugging.
+
+```js
+// Daily cleanup
+await db.outbox
+  .where('sent_at < NOW() - INTERVAL "7 days"')
+  .delete();
+```
+
+## When you don't need an outbox
+
+- **Single-database, no broker**: just write to the DB.
+- **Read-your-write semantics only**: in-process eventing is
+  enough.
+- **You can tolerate occasional lost events** (analytics-only,
+  with reconciliation jobs).
+
+When in doubt, add the outbox. The cost is one table and one
+worker. The upside is "your services don't lie to each other."
+
+## Pitfalls
+
+<Callout variant="warning">
+**Doing the broker call inside the DB transaction.** Killing the
+whole point — now the DB tx hangs on broker latency, and a slow
+broker stalls every write. Always defer publishing to a separate
+worker.
+</Callout>
+
+<Callout variant="warning">
+**Forgetting the index on unsent rows.** Without
+`WHERE sent_at IS NULL` partial index, the publisher's poll
+scans the whole table after a few weeks. Slow.
+</Callout>
+
+<Callout variant="warning">
+**Same broker connection for outbox publishing and main
+traffic.** When the broker hiccups, both stall. Give the
+publisher its own connection pool with its own retry policy.
+</Callout>
+
+<Callout variant="warning">
+**Publishing the entire row including internal columns.**
+Consumers shouldn't depend on your DB schema. Wrap the payload
+in a versioned event envelope.
+</Callout>
+
+## In summary
+
+- **Dual-write is broken.** DB + broker without atomicity will
+  drift apart under crash.
+- **Outbox = write the event in the same DB transaction**, then
+  publish from a separate worker.
+- **Polling or CDC** — both work; CDC is lower latency at higher
+  ops cost.
+- **Combine with idempotent consumers** for effectively-once
+  end-to-end.
+- **Index unsent rows, partition-key on aggregate, prune
+  regularly.**

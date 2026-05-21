@@ -1,0 +1,180 @@
+export const level = 'mid';
+
+# Compression trade-offs
+
+Compression trades CPU for bandwidth and storage. The right
+choice depends on three things: where you're compressing
+(hot path vs storage), how often the data is read, and what
+algorithm fits the data shape.
+
+## The candidates
+
+<Cheatsheet>
+| Algorithm | Ratio | Compress speed | Decompress speed | Use case |
+|---|---|---|---|---|
+| Snappy / LZ4 | ~2x | ~250 MB/s | ~2 GB/s | Hot-path (Kafka, RocksDB) |
+| zstd | ~3x | ~150 MB/s | ~600 MB/s | Modern default |
+| gzip (zlib) | ~3.5x | ~50 MB/s | ~300 MB/s | HTTP, legacy |
+| brotli | ~4x | ~25 MB/s | ~300 MB/s | Static assets |
+| xz / lzma | ~5x | ~5 MB/s | ~70 MB/s | Cold storage, archives |
+</Cheatsheet>
+
+Numbers are approximate; vary by data shape.
+
+## Choosing for the hot path
+
+For request-time compression (Kafka producer, RPC, in-line
+streams):
+
+- **LZ4 or Snappy** — fast enough not to bottleneck.
+- **zstd level 1-3** — slightly slower, better ratio. The
+  current default for most new workloads.
+
+You're CPU-bound at write; favor speed over ratio. Bandwidth
+saved must exceed CPU spent.
+
+## Choosing for storage
+
+Data written once, read many times:
+
+- **zstd level 9-19** — slow compress, fast decompress, great
+  ratio.
+- **brotli** for text-heavy data.
+- **xz** for archival of rarely-read data.
+
+You can afford to spend a lot of CPU at write time — it's a
+one-time cost. Decompress speed and ratio dominate.
+
+## Choosing for HTTP responses
+
+- **gzip** — universal client support. Safe default.
+- **brotli** — better ratio for HTML/CSS/JS. Modern browsers
+  support it; fall back to gzip for old clients.
+- **zstd** — emerging support; not yet universal.
+
+Servers usually negotiate via `Accept-Encoding`:
+
+```
+Accept-Encoding: br, gzip
+Content-Encoding: br
+```
+
+## Per-domain notes
+
+### Logs
+
+Heavily compressible (lots of repetition). zstd at level 3-5
+is the sweet spot for streaming log compressor.
+
+### Metrics time-series
+
+Specialized encodings (Gorilla, delta-of-delta) crush
+generic compression. Use a TSDB; don't roll your own.
+
+### JSON / API payloads
+
+gzip works fine; brotli is incrementally better. Skip
+compression for tiny payloads (under 1 KB) — the CPU isn't worth
+the few bytes saved.
+
+### Images / video
+
+Already compressed. Don't re-compress; you'll waste CPU and
+make output bigger.
+
+### Database rows / pages
+
+InnoDB has page compression (zlib or LZ4). Postgres has TOAST
+compression on large values (LZ4 or pglz). Snappy is common
+in Cassandra and RocksDB.
+
+For columnar storage (Parquet, ORC, ClickHouse), per-column
+compression with dictionary encoding and run-length encoding
+crushes 5-10× because of column homogeneity.
+
+## When not to compress
+
+- **Small payloads** (under 1 KB).  Overhead exceeds savings.
+- **Already-compressed data**. Images, videos, gzipped
+  archives.
+- **Latency-critical paths** where the CPU spend would push
+  past your budget.
+- **Hot CPU paths under saturation**. Compression makes the
+  CPU bottleneck worse, not better.
+
+## Compression-related security: BREACH
+
+Compressing HTTPS response bodies can leak secrets via
+**compression-ratio side channels**. The BREACH attack uses
+this to extract CSRF tokens from a response.
+
+Mitigations:
+
+- Don't include secrets in compressible response bodies.
+- Mask secrets with random padding.
+- Use response-length normalization.
+
+Mostly a concern for web app responses; obscure for
+service-to-service traffic over private networks.
+
+## Dictionary compression
+
+For repetitive small messages (RPC of similar shape, log
+lines from the same template), training a **dictionary**
+lets zstd compress 2-5× better than dictionary-less:
+
+```js
+const dict = zstd.trainDict(sampleMessages);
+const compressed = zstd.compressWithDict(message, dict);
+```
+
+The dictionary lives once at sender + receiver. Each message
+compresses better than naive zstd.
+
+Used heavily by Kafka, some RPC frameworks, log aggregators.
+
+## Multi-stage pipelines
+
+Compress at the boundary, not at every hop. Kafka topics
+compressed end-to-end (producer → broker → consumer); the
+broker doesn't decompress + recompress.
+
+Similarly: object storage uploads compressed once, served
+compressed to clients that support it.
+
+Re-compression burns CPU without saving bandwidth.
+
+## Benchmarking your data
+
+The numbers above are typical. Your data might compress
+better or worse. Always benchmark:
+
+```bash
+# zstd at multiple levels
+$ for L in 1 3 6 12 19; do
+    echo -n "level $L: "
+    zstd -$L --ratio < data > /dev/null
+  done
+
+# Compare with other algorithms
+$ gzip --best < data | wc -c
+$ brotli -q 11 < data | wc -c
+```
+
+For your specific data and read/write rates, pick the
+algorithm and level that gives the best
+bandwidth-vs-CPU trade-off.
+
+## In summary
+
+- Compression: trade CPU for bandwidth or storage.
+- Hot path: LZ4 / Snappy / zstd-low. Speed dominates.
+- Storage: zstd-high / brotli / xz. Ratio dominates;
+  read-side decompression speed matters.
+- HTTP: gzip universal; brotli when supported.
+- Skip for: small payloads, already-compressed media,
+  saturated CPUs.
+- Watch for BREACH on web compression; security risk with
+  secrets in response.
+- Dictionary compression for small repetitive messages.
+- Always benchmark on your real data shape.

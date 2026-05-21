@@ -1,0 +1,270 @@
+export const level = 'senior';
+
+# Backpressure
+
+Backpressure is the **signal a slow consumer sends upstream so the
+producer slows down instead of overwhelming it**. Without it, the
+fast side fills the slow side's buffers until something breaks —
+memory exhaustion, dropped data, cascading failure. With it, the
+system gracefully degrades to the speed of its slowest component.
+
+The phrase comes from plumbing. The mental model is exactly
+plumbing.
+
+## What goes wrong without it
+
+A pipeline has a fast producer (say, 50 000 messages/sec) and a
+slow consumer (say, 5 000 messages/sec). Without backpressure,
+there are three possible outcomes, all bad:
+
+1. **Unbounded buffer**: the broker (or in-memory queue) keeps
+   growing. Eventually OOM, and the entire pipeline dies.
+2. **Dropped messages**: the buffer hits a fixed cap and new
+   messages are silently discarded. Data loss.
+3. **Latency blows up**: the buffer is bounded by RAM but message
+   handling now takes seconds because each one waits behind 10
+   minutes of backlog.
+
+```
+producer 50k/s ──→ [buffer ████████████ (full)] ──→ consumer 5k/s
+                                                ↘ dropped 45k/s
+```
+
+Backpressure replaces "the fast side keeps shoving" with "the
+fast side asks how much you can take and waits."
+
+```
+producer ──→ [bounded buffer] ──→ consumer
+       ←──── "I have room for N more" ────
+```
+
+## The four strategies
+
+Every backpressure scheme ends up being one of these:
+
+<Cheatsheet>
+| Strategy | Mechanism | Cost |
+|---|---|---|
+| **Block / pull** | Producer waits until consumer requests | Lower throughput; producer thread blocked |
+| **Buffer with limit** | Bounded queue; producer blocks or errors when full | Bounded memory; tail latency |
+| **Drop** | Discard messages above some rate (sample, oldest, newest) | Data loss; sometimes acceptable |
+| **Reroute** | Spill to slower-but-bigger storage (disk, S3) | Higher latency; recovery complexity |
+</Cheatsheet>
+
+The first two are the common ones for backend services. Drop is
+for metrics and ephemeral signals. Reroute is for high-volume
+pipelines (Kafka tiered storage, log spilling).
+
+## Reactive Streams in plain language
+
+The Reactive Streams specification (since 2015, now part of
+JDK 9+ as `java.util.concurrent.Flow`, and widely implemented in
+RxJS / Reactor / Akka / RSocket) formalized backpressure as a
+**pull-based protocol**:
+
+```
+publisher ──→ subscriber
+     onSubscribe(s)
+     onNext(x)        ↑ s.request(n)
+     onNext(y)        ↑ s.request(n)
+     onComplete()
+```
+
+The subscriber explicitly **requests N items**. The publisher is
+not allowed to send more than that. When the subscriber is
+ready, it requests more. The producer can never overwhelm the
+consumer because **the consumer controls the flow**.
+
+This is "pull semantics on top of a push API." The publisher
+pushes, but only as much as the subscriber has asked for.
+
+In a Node service, you rarely write Reactive Streams by hand.
+But the concept appears everywhere:
+
+- **Node streams** with `highWaterMark` and `pause()/resume()`.
+- **HTTP/2 flow control** with window updates.
+- **gRPC streaming** with client-side flow control.
+- **Kafka consumer** with `pause()/resume()` and `max.poll.records`.
+- **TCP** itself (the original backpressure mechanism — the
+  receive window).
+
+## Node streams: the canonical example
+
+```js
+const readable = fs.createReadStream('big.csv');
+const writable = createUploader();
+
+readable.pipe(writable);  // handles backpressure automatically
+```
+
+Why this works:
+
+1. `readable` emits chunks.
+2. `writable.write(chunk)` returns `false` if its internal buffer
+   is full (above `highWaterMark`, default 16 KB).
+3. `pipe` sees the `false` and calls `readable.pause()`.
+4. `writable` emits `'drain'` when its buffer falls below the
+   high-water mark.
+5. `pipe` resumes the readable.
+
+That's a complete backpressure loop in a dozen lines of stdlib.
+Skipping `pipe` and doing manual `write` ignores the return
+value is the #1 way to introduce memory leaks in a Node service.
+
+```js
+// Bug: ignores backpressure
+readable.on('data', (chunk) => {
+  writable.write(chunk);  // returns false but we don't pause
+});
+```
+
+The same bug at the HTTP layer: streaming a huge response without
+checking `res.write` return value. Eventually `process.memoryUsage()`
+grows without bound.
+
+## Backpressure in Kafka consumers
+
+Kafka has no producer-to-consumer backpressure (the producer
+writes to the broker, the broker buffers persistently). The
+"backpressure" is on **the consumer side**: how fast does it
+poll, and how does it handle being slow?
+
+Tools:
+
+- `max.poll.records`: how many records per poll. Smaller =
+  shorter handler windows, more polls.
+- `pause()/resume()`: pause polling specific partitions while
+  doing slow work.
+- **Consumer lag**: the metric that tells you the consumer is
+  the bottleneck. Alert at 1 minute, page at 5.
+
+```js
+// Pause a partition while the worker pool is full
+if (workerPool.busy()) {
+  await consumer.pause([{ topic: 't', partitions: [partition] }]);
+}
+```
+
+In this model, the **broker is the buffer**. Disk-backed,
+retention-bounded. If the consumer is hours behind, the broker
+just holds messages until retention expires. The "backpressure"
+is operational: "this consumer is too slow, scale it or kill the
+producer."
+
+## Backpressure in HTTP/gRPC
+
+### HTTP/2 flow control
+
+HTTP/2 has per-stream and per-connection flow-control windows.
+The receiver advertises how many bytes it can accept; the sender
+won't transmit more until the window is replenished. Same idea
+as TCP's receive window, but per logical stream.
+
+For most app developers this is invisible. Frameworks (Node's
+`http2`, nginx, Envoy) handle it. The visible knob is
+`http2.constants.NGHTTP2_INITIAL_WINDOW_SIZE` — usually fine at
+default 64 KB.
+
+### gRPC streaming
+
+```js
+const call = client.bigStream();
+call.on('data', (chunk) => {
+  if (!process(chunk)) {
+    call.pause();      // <-- backpressure
+    setTimeout(() => call.resume(), 100);
+  }
+});
+```
+
+`pause()` stops the stream from emitting `data`. The library
+stops reading from the socket; HTTP/2 stops sending; the server
+sees the flow-control window close.
+
+## Backpressure as a system property
+
+Backpressure is **end-to-end** or it's nothing. A pipeline of
+five stages with backpressure on four and a queue without it on
+stage three is bounded by the unbounded queue.
+
+```
+producer → [bp] → service A → [bp] → service B → [queue] → service C → [bp] → sink
+                                              ↑ unbounded; whole pipeline at risk
+```
+
+Designing for it:
+
+1. **Bounded queues everywhere.** Set a maximum length. When
+   full, either block, reject, or drop. Don't OOM.
+2. **Backpressure signals propagate.** A slow downstream causes
+   the immediate upstream to slow, which causes its upstream to
+   slow, until you reach the source.
+3. **The source must have somewhere to go.** Either it blocks
+   (sync caller), rejects (HTTP 503), or drops (telemetry). Hope
+   is not a strategy.
+
+## Load shedding vs backpressure
+
+Related but different:
+
+- **Backpressure**: tell upstream to slow down.
+- **Load shedding**: refuse some requests entirely so the rest
+  succeed.
+
+A service under heavy load uses both. Backpressure where you
+control both sides (an internal queue), load shedding where you
+don't (an inbound HTTP API).
+
+```js
+// Load shedding via probabilistic 503
+app.use(async (req, res, next) => {
+  const load = getCpuUtilization();
+  if (load > 0.9 && Math.random() < (load - 0.9) * 10) {
+    return res.status(503).send('overloaded');
+  }
+  next();
+});
+```
+
+The mature service has **circuit breakers**, **bulkheads**, and
+**adaptive concurrency** (TCP-Vegas-style: probe higher, back
+off on errors) tuning load and backpressure together.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Unbounded in-memory queues for "absorbing bursts."** They
+absorb until they don't. Always set a maximum.
+</Callout>
+
+<Callout variant="warning">
+**Ignoring write() return value.** The single most common Node
+mistake. Use `pipe`, or check the return and listen for `drain`.
+</Callout>
+
+<Callout variant="warning">
+**Backpressure that turns into deadlock.** Service A waits for
+B, B waits for C, C waits for A (cycle). Bounded queues in a
+cycle deadlock. Break the cycle with a buffer, a timeout, or a
+shed.
+</Callout>
+
+<Callout variant="warning">
+**Treating Kafka broker as infinite capacity.** It's not. Slow
+consumers fall off the retention horizon and lose data. Monitor
+lag and have a "kill the producer" lever.
+</Callout>
+
+## In summary
+
+- **Backpressure = signal upstream to slow down.** Without it,
+  fast producers crush slow consumers.
+- **Four strategies: block, buffer-with-limit, drop, reroute.**
+  Pick per stage.
+- **Reactive Streams is pull-on-top-of-push** — subscriber asks
+  for N, publisher cannot exceed.
+- **Node streams, HTTP/2, gRPC, TCP, Kafka pause/resume** all
+  implement the same pattern at different layers.
+- **End-to-end or nothing**: one unbounded queue makes the rest
+  pointless.
+- **Combine with load shedding** at edges you don't control.

@@ -1,0 +1,306 @@
+export const level = 'mid';
+
+# Block vs file vs object storage
+
+Three different storage abstractions, each with different
+mental models, access patterns, consistency guarantees, and
+prices. Picking the wrong one is one of the more expensive
+mistakes — moving a TB of data between abstractions takes weeks.
+
+The TL;DR:
+
+- **Block**: raw disk. Used by databases, filesystems, virtual
+  machines.
+- **File**: filesystem with hierarchical paths and POSIX
+  semantics. Used by shared-mount applications.
+- **Object**: key→blob with HTTP API. Used for everything else
+  at scale.
+
+## Block storage
+
+The lowest-level abstraction: a fixed-size array of bytes that a
+single host owns and addresses by **offset**. Looks like a local
+disk.
+
+```
+mount: /dev/xvdf  →  formatted as ext4 or xfs  →  /mnt/data
+```
+
+- **AWS EBS**, **GCP Persistent Disk**, **Azure Managed Disks**.
+- Attached to **one VM at a time** (mostly). Some EBS modes
+  allow multi-attach, but the application has to coordinate.
+- Block-level operations: read N bytes at offset X, write N
+  bytes at offset Y.
+- **Latency**: ~1ms (SSD-backed), much less for NVMe local.
+- **Throughput**: hundreds of MB/s to GBs/s.
+
+Used for:
+
+- Database storage (Postgres, MySQL, MongoDB data files).
+- VM root disks.
+- Filesystem mounts where you need POSIX semantics.
+
+You format and mount a block volume; the OS provides a
+filesystem on top. The volume itself is dumb.
+
+**Pros**: lowest latency, highest IOPS, full filesystem
+semantics.
+**Cons**: single-attach (mostly), tied to one VM/AZ, fixed size
+(must explicitly resize), expensive per GB.
+
+## File storage
+
+A hierarchical filesystem accessed over the network with POSIX
+semantics: directories, file modes, links, locks.
+
+```
+mount: nfs://nfs-server/exports/data → /mnt/shared
+```
+
+- **AWS EFS**, **GCP Filestore**, **Azure Files**, plain **NFS**,
+  **CIFS/SMB**.
+- **Multi-attach**: many VMs read/write the same files
+  concurrently.
+- POSIX-ish semantics: depends on the protocol. NFSv4 has
+  reasonable locking; older versions had infamous "stale file
+  handle" issues.
+- **Latency**: 5-20ms typical (network round-trip).
+- **Throughput**: scales with the service tier; managed
+  services like EFS scale automatically.
+
+Used for:
+
+- Shared application data across many web servers (legacy
+  pattern; mostly displaced by object storage).
+- Build caches.
+- Home directories.
+- Container persistent volumes where the workload expects a
+  filesystem.
+
+**Pros**: shared access, POSIX semantics, easy to drop existing
+apps onto.
+**Cons**: latency higher than block, throughput per-file caps,
+expensive at scale, complex consistency under concurrent writes.
+
+## Object storage
+
+A key-value store of immutable blobs accessed by HTTP API. Most
+of the modern internet's storage by volume.
+
+```js
+// AWS SDK
+await s3.putObject({
+  Bucket: 'my-bucket',
+  Key: 'reports/2026-05-20.parquet',
+  Body: data,
+});
+
+const obj = await s3.getObject({
+  Bucket: 'my-bucket',
+  Key: 'reports/2026-05-20.parquet',
+});
+```
+
+- **AWS S3**, **GCS**, **Azure Blob**, **Cloudflare R2**,
+  **MinIO**.
+- No filesystem hierarchy in the strict sense — keys can look
+  hierarchical (`a/b/c.json`) but the structure is flat.
+- **Eventual or strong consistency** depending on era/provider:
+  S3 has been strongly consistent since 2020 (read-after-write
+  for all operations).
+- **Latency**: 10-100ms for small objects; throughput scales
+  by parallelism.
+- **Throughput**: virtually unlimited via parallelism; single
+  PUT is ~5 GB/s in the best case.
+- **Durability**: 11 nines (10⁻¹¹ per object per year) — the
+  highest of any common storage.
+
+Used for:
+
+- Static assets (images, video, JS bundles, HTML).
+- Backups and snapshots.
+- Data lake (Parquet, ORC files).
+- Stream archives and tiered storage.
+- ML model artifacts.
+- Big-blob anything (logs, traces, video uploads).
+
+**Pros**: cheap (¢ per GB), massively durable, scales without
+limit, parallel access.
+**Cons**: per-object overhead (latency), no in-place edits,
+no filesystem semantics, costs add up via per-request fees.
+
+## Comparison
+
+<Cheatsheet>
+| Property | Block | File | Object |
+|---|---|---|---|
+| Access pattern | byte offsets | path + fd | key + HTTP |
+| Multi-host | One (mostly) | Many | Many (read/write) |
+| Mutability | Random R/W | Random R/W | Replace whole object |
+| Latency | < 1ms | 5-20ms | 10-100ms |
+| Throughput | High per host | High shared | Highest via parallelism |
+| Durability | Per provider, typically 99.999% | 99.999% | 99.999999999% (11 9s) |
+| Capacity unit | TB to ~100TB per vol | TB to PB | Petabyte+, no limit |
+| Cost ($/GB/mo) | $0.08-$0.12 | $0.30-$1.00 | $0.005-$0.025 |
+| Best for | DB storage, VM disks | Shared FS | Static assets, backups, lakes |
+</Cheatsheet>
+
+Numbers are rough order-of-magnitude (AWS 2025 pricing for the
+common tiers); always check current pricing.
+
+## Common stack patterns
+
+### Web app
+
+```
+- Postgres on EBS (block) — primary data
+- S3 (object) — user-uploaded images, static assets
+- (No file storage)
+```
+
+The 2026 default. EBS for the DB, S3 for blobs. Skip file
+storage entirely.
+
+### Data lake / lakehouse
+
+```
+- S3 (object) — Parquet/ORC files holding tabular data
+- Query engine (Athena, Trino, Spark) reading directly from S3
+- (No DB, no file storage)
+```
+
+The "lakehouse" pattern: object storage is the warehouse. Cheap,
+durable, scales. Slightly higher latency than a DB.
+
+### ML training pipeline
+
+```
+- S3 (object) — training data, model artifacts
+- EFS (file) — shared scratch for distributed training
+- Local NVMe (block) — fast scratch on each training node
+```
+
+All three used for what they're good at. File storage exists
+because distributed training frameworks expect POSIX semantics
+for shared checkpoints.
+
+### Legacy multi-mount web app
+
+```
+- EFS / NFS (file) — shared application files, uploaded media
+- Block — VM disks
+```
+
+The pre-2010 pattern. Mostly replaced by "uploads go to S3, app
+servers are stateless." If you see this today, it's tech debt.
+
+## Consistency
+
+Three different consistency models:
+
+### Block storage
+
+A single host writes; reads of just-written data are immediately
+consistent. Block storage is just a disk; the abstraction is
+trivial.
+
+For multi-attach scenarios, the **application** must coordinate.
+Two VMs writing the same disk simultaneously is undefined
+behavior unless the filesystem is cluster-aware.
+
+### File storage
+
+POSIX-ish. Reads of just-written files are consistent. **Locks
+are weak** in distributed FS implementations — `flock()` over
+NFS has known races. Don't trust it for critical mutual
+exclusion.
+
+### Object storage
+
+S3 was eventually-consistent for years; that changed in
+December 2020 — S3 is now strongly consistent for read-after-
+write, including LIST. GCS has been strongly consistent for
+longer. Cloudflare R2 advertises strong consistency.
+
+But: **objects are immutable**. Concurrent PUTs to the same key
+race; the "last write wins" — but which write was last is
+defined by the service, not by request order. For mutating
+shared data, use **conditional writes** (S3's `If-Match`
+ETag, or atomic operations).
+
+## Cost shape
+
+<Cheatsheet>
+| Cost lever | Block | File | Object |
+|---|---|---|---|
+| Storage $/GB-month | $0.08-0.12 | $0.30+ | $0.005-0.025 |
+| Per-request | Free | Free | $0.0004 per 1000 GETs |
+| Egress (out of region) | Network rate | Network rate | Network rate |
+| Hidden gotcha | IOPS budgets | Throughput tiers | Request fees for many small files |
+</Cheatsheet>
+
+Object storage looks cheap until you realize 1B GETs/month
+costs $400 in just request fees, separate from storage. For
+hot small-file workloads, object can be more expensive than
+expected.
+
+## Access pattern checklist
+
+<Steps>
+<Step n={1} title="Does this need POSIX semantics (random write, hierarchical paths, locks)?">
+Yes → block or file. No → consider object first.
+</Step>
+<Step n={2} title="Is it the storage for a database?">
+Yes → block. Postgres on S3 doesn't work; databases need block
+semantics.
+</Step>
+<Step n={3} title="Multiple servers need write access to the same data?">
+Yes → file (for legacy POSIX expectations) or object (for new
+designs).
+</Step>
+<Step n={4} title="Read-heavy, large blobs, parallelism wanted?">
+Object. Static assets, backups, archives, video.
+</Step>
+<Step n={5} title="Mutating shared state with strong consistency?">
+Use a database, not raw storage. Object isn't the right place
+for "current state."
+</Step>
+</Steps>
+
+## Pitfalls
+
+<Callout variant="warning">
+**Database on object storage.** S3-as-DB doesn't work for OLTP.
+Latency is too high; semantics are wrong. Analytics workloads
+(Athena, Trino) over S3 do work — different beast.
+</Callout>
+
+<Callout variant="warning">
+**Many tiny objects in S3.** Per-request fees plus per-object
+metadata costs make this expensive. Batch into Parquet files,
+tarballs, or zip archives for "many small files."
+</Callout>
+
+<Callout variant="warning">
+**NFS for high-frequency app writes.** Latency is much higher
+than local block. Application code expecting "fast filesystem
+ops" suddenly takes 10x as long.
+</Callout>
+
+<Callout variant="warning">
+**Treating S3 prefixes as a directory.** S3 has no directories.
+A "folder" is purely a UI fiction. LIST operations scan keys
+matching a prefix; deep hierarchies are slow.
+</Callout>
+
+## In summary
+
+- **Block** = raw disk, one host, low latency. For DBs and VMs.
+- **File** = networked filesystem, POSIX semantics. For shared
+  mounts in legacy apps.
+- **Object** = key→blob over HTTP, eleven 9s durability, scales
+  forever, mostly immutable. For static assets, backups, lakes.
+- **Modern default**: object for blobs, block for DBs. File only
+  when forced.
+- **Watch costs**: block at $0.10/GB, file at $0.50, object at
+  $0.02 — but object has per-request fees.

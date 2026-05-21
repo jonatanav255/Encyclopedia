@@ -1,0 +1,295 @@
+export const level = 'senior';
+
+# Design WhatsApp / chat
+
+A messaging service: users send 1:1 and group messages, with
+delivery and read receipts, presence (online/last-seen), and
+real-time delivery to multiple devices. Optional: end-to-end
+encryption.
+
+The interesting parts: long-lived connections at billion-user
+scale, message fanout to groups, message ordering, and offline
+delivery.
+
+## 1. Clarify the scope
+
+- 1:1 and group chat (groups up to ~1024 members).
+- Delivery receipts (sent / delivered / read).
+- Presence (online / last seen).
+- Media (image, video) attachments.
+- E2E encryption: in scope (Signal protocol shape).
+- Voice/video calls, payments, business API: out of scope.
+- Multi-device per user.
+
+## 2. Estimate scale
+
+```
+DAU                    = 2B
+Messages/user/day      = 50
+Total messages/day     = 100B  → ~1.2M msgs/sec avg, ~5M peak
+Concurrent connections = 1B (mostly mobile, persistent WS or push)
+Avg msg size           = 200 B (text)
+Media uploads/day      = 5B  → enormous separate problem
+
+Storage:
+  text messages 200 B × 100B = 20 TB/day raw
+  retention: 30 days hot, archived after
+  E2E means we mostly transport ciphertext; servers store little
+```
+
+Two firm forcing functions: 1B concurrent connections (way past
+any single fleet) and 5M msgs/sec.
+
+## 3. API
+
+```bash
+# Send
+POST /v1/messages
+  Body: { conversationId, ciphertext, clientMessageId, recipientKeys[] }
+  Resp: { serverMessageId, ts }
+
+# Receive (over a persistent connection, not a polling endpoint)
+WS  /v1/connect          -- bi-directional; server pushes incoming events
+
+GET  /v1/conversations/:id/messages?cursor=&limit=50  -- history/backfill
+
+POST /v1/receipts        { conversationId, lastDeliveredId, lastReadId }
+
+# Media
+POST /v1/media           -- signed URL to object storage
+POST /v1/messages { ..., mediaIds: [...] }
+```
+
+## 4. High-level design
+
+```
+Mobile clients
+   │  (persistent connection: WebSocket / XMPP / proprietary)
+   ↓
+[ Connection gateway fleet ]   -- 1B concurrent sockets, sharded
+   │
+   ↓
+[ Session router ]  ----→ map (userId → which gateway holds the socket)
+   │
+   ↓
+[ Message service ]
+   │
+   ├──→ [ Conversation store ]  (per-conversation message log, sharded)
+   ├──→ [ Outbox per recipient ]  (Redis: user's pending delivery list)
+   └──→ [ Push notifier ]         (APNs / FCM for offline users)
+
+Async:
+   message accepted → fanout to N recipients → write to per-recipient outbox
+   each recipient's gateway pulls from outbox → pushes over WS
+   delivery/read receipts flow same path, in reverse
+
+
+Media:
+   client → upload via signed URL → object storage → CDN URL in message
+```
+
+The split between **session router** (who owns this user's
+connection right now?) and **message store** is the key
+architectural insight. Routes change every reconnect; storage
+doesn't.
+
+## 5. Data model
+
+```
+conversations {
+  id              string PK
+  type            enum(direct, group)
+  member_ids      bigint[]  -- snapshot; group membership table elsewhere
+  created_at      timestamp
+}
+
+messages {
+  conversation_id string
+  message_id      snowflake   -- time-ordered within conversation
+  sender_id       bigint
+  ciphertext      bytes       -- E2E encrypted on the wire
+  client_id       string      -- for dedup
+  ts              timestamp
+  PRIMARY KEY (conversation_id, message_id)
+  INDEX (conversation_id, ts)
+}
+
+user_outbox  (Redis, per user)
+  key: "outbox:<userId>" → list of { conversationId, messageId, ts }
+  drained as user's gateway delivers
+
+user_sessions  (Redis)
+  key: "session:<userId>" → { gatewayId, deviceId, lastSeen }
+  TTL = ping interval (~30s)
+
+receipts {
+  conversation_id, user_id, last_delivered_id, last_read_id, updated_at
+}
+```
+
+`messages` sharded by `conversation_id`. For direct chats, that
+keeps a 1:1 stream on one shard. For groups, same.
+
+## 6. Deep dives
+
+### 6.1 Persistent connections at scale
+
+1B concurrent sockets / 50K-100K per server ≈ 10-20K servers.
+Implementation choices:
+
+- **Connection gateway** is purpose-built — small per-conn
+  memory, careful kernel tuning (`SO_REUSEPORT`, epoll, large
+  ephemeral port range).
+- Each gateway holds part of the population, sticky by user.
+- A **session router** (Redis hash or distributed KV) maps
+  `userId → gatewayId`. Updated on every (re)connect.
+- TLS terminates at the gateway; messages forwarded to message
+  service on a faster cluster connection.
+
+For users on flaky mobile networks, **don't keep the WS open
+forever** — fall back to push notifications (APNs/FCM) when
+disconnected; client reconnects on app-foreground.
+
+### 6.2 Message ordering
+
+Within a conversation, messages must have a stable order.
+**Server assigns the order** at acceptance time (snowflake ID +
+conversation), even though messages may arrive out of order from
+different senders.
+
+```
+ack:
+  serverMessageId = next snowflake for this conversation
+  ts              = serverTime
+sender sees its own message confirmed with serverMessageId
+recipients see messages in serverMessageId order
+```
+
+Clients de-duplicate on `clientMessageId` (assigned on the
+sender's device). This handles retries during network blips —
+the same message sent twice gets one server ID.
+
+### 6.3 Fanout and offline delivery
+
+```
+on accept:
+  insert into messages
+  for each recipient in conversation members:
+    if session(recipient) is online:
+        push directly to its gateway
+    write into user_outbox(recipient)   -- always; gateway will drain
+    schedule push-notification if offline
+```
+
+When a recipient comes online:
+
+- Gateway hands the connection to the user.
+- Drains their outbox: pulls everything pending and delivers.
+- After successful deliver, removes outbox entries.
+
+Outbox is **the durable buffer**. Without it, "offline for an
+hour" loses every message.
+
+Group of 1024: 1 send = 1024 outbox writes. Bandwidth and Redis
+throughput tax the gateway side; design groups as expensive,
+not free.
+
+### 6.4 E2E encryption
+
+End-to-end: the server can't read ciphertext.
+
+Signal-protocol style:
+
+- Each device has a **long-term identity key** + a queue of
+  short-term **prekeys** uploaded to the server.
+- Sender fetches recipient's prekey, derives a session key, and
+  encrypts the message under it.
+- Recipient decrypts; subsequent messages use a ratchet that
+  rotates keys on every exchange (perfect forward secrecy).
+
+Server impact:
+
+- Stores ciphertext + envelope metadata only.
+- Stores prekey bundles.
+- Cannot index messages (no server-side search).
+- Cannot serve "message search"; clients do it locally.
+
+Multi-device: sender encrypts separately for each of recipient's
+devices (or uses sender-keys protocol for groups). The
+fanout-per-device multiplies messages, but only for the
+specific session.
+
+### 6.5 Presence and last-seen
+
+Presence is a feature with surprising scale cost. Naïve
+"announce when online to all contacts" fans out to thousands of
+users per event for the popular user.
+
+Mitigations:
+
+- **Lazy fetch**: only show presence for the chat currently
+  open. Other contacts' presence not queried.
+- **Privacy default**: many users disable presence visibility,
+  cutting fanout dramatically.
+- **Per-user presence cache**: small TTL'd record (~minute);
+  push only on significant transitions, not every heartbeat.
+
+### 6.6 Media path
+
+A 10 MB video shouldn't traverse the message pipeline.
+
+```
+sender ↑
+  POST /v1/media  → server returns signed URL to object storage
+  PUT  <signed URL>   → uploads directly
+  sends message { ciphertext: encrypted-blob-key + URL hash }
+
+recipient ↓
+  pulls message → fetches encrypted media from CDN-fronted object store
+  decrypts with key from ciphertext
+```
+
+Media bytes never touch the message service. CDN at the front
+makes redelivery to many recipients cheap (each fetches from
+nearest PoP).
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 10B concurrent sockets | Gateway fleet | More gateways; better per-conn memory; geo-shard by user home |
+| 50M msg/sec | Fanout pipeline | More workers; back off non-active recipients; batch pushes |
+| Group of 100K | Per-message fanout | Channel-style "broadcast" with pull semantics for huge rooms |
+| Hot conversation | Per-shard write contention | Multi-leader per conversation; conflict-free message IDs |
+| Push-notification throttling | APNs/FCM caps | Coalesce notifications; deliver summary not per-message |
+| Outbox storage | Redis memory | Move cold outbox entries to durable KV |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Per-recipient outbox** over fanout-on-read: simpler delivery,
+  predictable latency, at the cost of fanout amplification.
+- **Server-assigned IDs** over Lamport timestamps: simpler total
+  order in a conversation; central coordination per conv shard.
+- **E2E encryption** over server-side search: privacy win,
+  feature limitations.
+- **Persistent WS + push fallback**: best of both — instant
+  delivery when connected, durable offline path otherwise.
+- **Media via signed URLs**: keep message path small; CDN
+  absorbs media bandwidth.
+
+## In summary
+
+- 1B concurrent connections forces a sharded gateway fleet plus
+  a session router for "who owns this user right now."
+- Server assigns message IDs at acceptance; clients de-dup with
+  their own client-ID.
+- Per-recipient outbox is the durable delivery buffer; offline
+  is just "outbox not yet drained."
+- Fanout cost is linear in group size; very large groups are a
+  separate problem.
+- E2E encryption pushes search and indexing to the client and
+  removes the server's ability to see content.
+- Media lives outside the message path — signed URLs to object
+  storage, CDN delivery.

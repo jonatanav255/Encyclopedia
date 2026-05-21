@@ -1,0 +1,309 @@
+export const level = 'senior';
+
+# Choosing a partition key
+
+The partition key — the field your data is sharded by — is the
+single most consequential decision in a distributed database.
+It determines what reads are cheap, what reads are catastrophic,
+how evenly traffic spreads, and how painful resharding will be.
+
+A bad partition key is not a tuning problem; it's a redesign.
+Get this one right.
+
+## What a partition key is
+
+A partition key is the field used by the shard function to map
+a row to a physical partition. In Cassandra and DynamoDB it's
+called a partition key explicitly; in sharded SQL it's the
+shard key; in Kafka it's the message key; in Postgres
+declarative partitioning it's the partition expression.
+
+The same logic applies everywhere:
+
+> Partitioning is **fast within a partition** and **slow across
+> partitions**.
+
+Choosing a partition key is choosing which queries are fast.
+
+## The three properties
+
+A good partition key has three properties:
+
+<Steps>
+<Step n={1} title="High cardinality.">
+Many distinct values. If you have 4 values, you have 4
+partitions max. Booleans, statuses, region codes — too few.
+You want millions of distinct values.
+</Step>
+<Step n={2} title="Uniform distribution.">
+Each value appears roughly equally often. A user_id where one
+customer is 60% of traffic destroys uniformity.
+</Step>
+<Step n={3} title="Aligned with access patterns.">
+The dominant queries should be by the partition key (or
+contain it in their WHERE clause). Cross-partition queries are
+the expensive ones.
+</Step>
+</Steps>
+
+These three pull against each other. Cardinality and uniformity
+are about **spreading load**; alignment is about **localizing
+queries**. You'll trade between them.
+
+## Common choices and their trade-offs
+
+### user_id
+
+The default for user-centric workloads.
+
+**Pros**: high cardinality, generally uniform across active
+users, every "show me my data" query carries the user_id.
+Reads and writes for one user stay on one partition — cheap
+and fast.
+
+**Cons**: cross-user queries (admin views, leaderboards,
+"top posts") fan out. Power users / celebrities create hot
+partitions if their activity dwarfs the median.
+
+Best for: per-user feeds, profiles, settings, history.
+
+### tenant_id (for multi-tenant SaaS)
+
+Each tenant's data lives on one (or a few) partitions.
+
+**Pros**: a tenant's data is co-located. Tenant-scoped queries
+are single-partition. Tenant isolation is natural — failures
+and noisy neighbors are bounded.
+
+**Cons**: **massive tenant skew is the norm**, not the
+exception. One enterprise customer is often 100× the size of
+a median customer. Without explicit sharding controls, that
+customer wedges into one partition.
+
+Mitigation: directory sharding or per-tenant micro-sharding
+(big tenants split across multiple partitions on a
+tenant+sub-key combination).
+
+Best for: multi-tenant SaaS where tenants are roughly
+comparable, with a plan for the whales.
+
+### Compound keys
+
+Cassandra and DynamoDB explicitly support compound partition
+keys (or partition key + sort key) so the partition can be
+fine-grained while keeping locality.
+
+```
+PARTITION KEY: (user_id, day)
+SORT KEY: (event_ts)
+```
+
+A user's events are split across daily partitions — bounds
+the partition size while keeping single-day queries cheap.
+
+The pattern: combine a **logical owner** (user_id) with a
+**time bucket** (day, hour) so partitions don't grow unbounded
+over years.
+
+### Random / UUID partition keys
+
+Maximum uniformity, zero locality.
+
+**Pros**: hot partition by construction is impossible.
+**Cons**: every query that doesn't include the UUID is a
+scatter-gather. Range queries are global. You've used the
+partition key for nothing but spreading writes.
+
+Useful for write-only workloads (event ingestion, telemetry)
+where the read pattern is "scan all" downstream — typically
+via CDC into an analytical store.
+
+## Anti-patterns
+
+The expensive mistakes. Each has bitten a known company.
+
+### 1. Timestamp as partition key
+
+```
+partition_key = date or hour or timestamp
+```
+
+Every write goes to "today's" partition. Writes pile on one
+node; older partitions sit idle. Hot partition by design.
+
+If time bucketing is needed, **time must be the sort key, not
+the partition key**. The partition key remains user_id or
+tenant_id; the sort key gives the per-partition order.
+
+DynamoDB's documentation calls this out explicitly: do not use
+a timestamp as a partition key.
+
+### 2. Low-cardinality partition key
+
+```
+partition_key = country
+partition_key = status ('pending', 'active', 'cancelled')
+partition_key = device_type
+```
+
+Three or five distinct values → three or five partitions max.
+You've split the load by an arbitrarily coarse axis.
+
+### 3. Monotonically increasing keys
+
+```
+partition_key = auto_increment_id
+partition_key = ULID / snowflake_id sorted by time
+```
+
+Sequential keys cluster on the latest partition (range
+sharding) or on a specific shard (hash sharding by ID with a
+hash function not designed for it). Auto-increment IDs in
+range-sharded systems are the canonical instance.
+
+Fix: hash the key (consistent hashing handles this naturally),
+or use a random ID that doesn't sort by time.
+
+### 4. The unbounded partition
+
+```
+partition_key = user_id, no time bucket
+table: messages (user_id, ts, body)
+```
+
+Power users with millions of messages create partitions in the
+gigabytes — slow scans, slow compactions, cache eviction.
+Cassandra explicitly warns about "wide partitions" beyond
+~100 MB.
+
+Fix: introduce a time bucket so each (user, month) is its own
+partition.
+
+### 5. Multi-attribute keys for "flexibility"
+
+```
+partition_key = (user_id, post_id)  -- to "support both queries"
+```
+
+A partition key works for **one** access pattern. Combining
+fields just means neither query is single-partition. Pick the
+dominant query; build a secondary index for the other.
+
+## A decision framework
+
+Work through these questions in order before picking.
+
+<Steps>
+<Step n={1} title="What's the dominant read pattern?">
+Look at the top 5 queries by frequency. What field do they
+filter or join by? That field is your candidate partition key.
+</Step>
+<Step n={2} title="What's the cardinality at year-3 scale?">
+If the candidate has fewer than ~10K distinct values, it's not
+viable — too few partitions to scale.
+</Step>
+<Step n={3} title="What does the distribution look like?">
+Plot the access histogram. If the top 1% accounts for >20% of
+load, plan explicit handling (salting, dedicated shards,
+caching).
+</Step>
+<Step n={4} title="Can partitions grow unbounded?">
+If yes, add a time or count bucket as part of the key. Wide
+partitions become operational disasters.
+</Step>
+<Step n={5} title="What secondary access patterns exist?">
+For each, decide: scatter-gather (acceptable for rare
+queries), denormalized read model (sharded by that field via
+CDC), or pre-aggregation.
+</Step>
+<Step n={6} title="Can the key change?">
+If the partition key is logically immutable (user_id, order_id),
+fine. If it can change (status, region), every change is a
+cross-partition move — usually a sign to pick a different key.
+</Step>
+</Steps>
+
+## Worked example: messaging app
+
+Naïve choice: `partition_key = message_id`.
+
+Result: writes are uniformly distributed (good), but "show
+me all messages in chat 42 in chronological order" is a
+scatter-gather across every partition.
+
+Better: `partition_key = chat_id`, `sort_key = ts`.
+
+Result: messages in one chat are on one partition, sorted by
+time. Per-chat reads are cheap. Writes distribute by chat_id —
+fine if no single chat dominates traffic.
+
+Risk: a hugely popular group chat could become a hot
+partition. Mitigation: bucket by `(chat_id, day)` so each
+chat-day is its own partition; very busy chats spread across
+partitions naturally.
+
+## Worked example: order history
+
+Naïve choice: `partition_key = order_id`.
+
+Result: every write distributes nicely; but "show me all of
+this user's orders" hits every partition.
+
+Better: `partition_key = user_id`, `sort_key = (order_ts,
+order_id)`.
+
+Result: a user's orders are co-located and sorted. Single-user
+reads are cheap.
+
+Risk: a heavily-used business account with millions of orders
+becomes a wide partition. Mitigation: `(user_id, year)` as
+partition key.
+
+## Worked example: time-series telemetry
+
+Naïve choice: `partition_key = ts` → catastrophic hot
+partition.
+
+Better: `partition_key = (device_id, day)`, `sort_key = ts`.
+
+Result: each device-day is its own partition, time-sorted.
+Writes distribute by device. Per-device range queries are
+cheap. Cross-device queries (rare in dashboards) fan out.
+
+## Changing your mind
+
+Partition keys are not free to change. Once data is in the
+shape, changing requires:
+
+1. Building a new table with the new partition key.
+2. Backfilling all data.
+3. Dual-writing during cutover.
+4. Verifying consistency.
+5. Cutting reads over.
+6. Dropping the old table.
+
+This is months on a serious system. Spend a week up front
+designing the partition key. It will save you a quarter of
+work in two years.
+
+<Callout variant="warning">
+"We'll change it later if needed" almost never happens.
+Either the key works and stays forever, or the cost of
+changing it becomes prohibitive and the team works around it
+for years. Treat the partition key as load-bearing
+architecture.
+</Callout>
+
+## In summary
+
+- A partition key needs **high cardinality**, **uniform
+  distribution**, and **alignment with the dominant access
+  pattern**.
+- user_id and tenant_id are common defaults; compound keys
+  with a time bucket handle unbounded growth.
+- Timestamps, low-cardinality fields, and monotonic IDs are
+  the classic anti-patterns.
+- Pick the key for the dominant query; build read models for
+  secondary queries.
+- Changing the partition key later is a multi-quarter
+  project. Get it right at design time.

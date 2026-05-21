@@ -1,0 +1,179 @@
+export const level = 'senior';
+
+# Compaction
+
+The background process that **merges, deduplicates, and
+reclaims space** in append-only storage systems. Particularly
+in LSM trees (RocksDB, Cassandra, LevelDB), Kafka, and modern
+columnar databases.
+
+Without compaction, append-only stores grow forever — old
+versions, deleted records (tombstones), and small fragmented
+files accumulate until reads and storage are unaffordable.
+
+## Why it exists
+
+LSM trees write each batch of changes as a new immutable
+sorted file (SSTable). Over time:
+
+- One key may have versions in 10 different SSTables.
+- A read must check all of them.
+- Deleted keys are marked with tombstones (still on disk).
+- Storage grows linearly with writes, not with the current
+  data size.
+
+Compaction merges multiple SSTables into one, keeping only
+the latest version of each key, dropping tombstones for
+fully-deleted keys.
+
+## The cost
+
+Compaction is **write amplification**. The same data may be
+rewritten many times as it moves through compaction levels.
+
+Typical LSM amplification: 10-20×. A logical 1 GB of writes
+might cause 10-20 GB of disk writes over time. This is the
+price of LSM's fast write path.
+
+## Strategies
+
+Different databases use different compaction strategies; the
+choice matters for performance and operational behavior.
+
+### Size-tiered compaction
+
+Group SSTables by size. When N similar-sized tables
+accumulate, merge them into one larger table.
+
+```
+Tier 0: 100MB, 100MB, 100MB, 100MB → merged into 400MB tier 1
+Tier 1: 400MB, 400MB, 400MB, 400MB → merged into 1.6GB tier 2
+```
+
+Pros: low write amplification, simple.
+Cons: temporarily doubles disk usage during compaction; read
+amplification can be high (must check multiple tiers).
+
+Used in Cassandra's STCS (default until recently).
+
+### Leveled compaction
+
+Each level holds SSTables with non-overlapping key ranges.
+Compactions move data from level N to level N+1 by merging
+overlapping ranges.
+
+```
+Level 0: overlapping ranges (most recent writes)
+Level 1: 10MB SSTables, non-overlapping, 100MB total
+Level 2: 10MB SSTables, non-overlapping, 1GB total
+Level 3: 10MB SSTables, non-overlapping, 10GB total
+...
+```
+
+Pros: bounded read amplification (check at most one SSTable
+per level); lower space amplification.
+Cons: higher write amplification (each level's writes are
+rewritten into the next).
+
+Used by RocksDB, Cassandra's LCS, BigTable.
+
+### Time-windowed compaction
+
+For time-series workloads, group SSTables by time window.
+Old windows compact rarely; recent windows compact often.
+
+Used by Cassandra TWCS, optimized for "write once, read by
+time-range, delete by TTL."
+
+## Kafka log compaction
+
+Different beast: Kafka's "log compaction" keeps the **latest
+value per key** in the log. Older versions of the same key
+are eventually purged.
+
+```
+Before: ..., key=A v1, key=B v1, key=A v2, key=C v1, key=A v3, ...
+After:  ..., key=B v1, key=C v1, key=A v3
+```
+
+The log no longer represents history; it represents the
+**latest value** for each key. Used by:
+
+- Compacted Kafka topics carrying "current state per entity"
+  (config, user profiles).
+- Kafka Connect for snapshotting connector offsets.
+- Source-of-truth topics for stream-table joins.
+
+## Compaction performance considerations
+
+### Throttling
+
+Compaction can saturate disk IO, starving foreground reads.
+Most LSM stores throttle compaction speed:
+
+- RocksDB: `max_background_compactions` + rate limit.
+- Cassandra: `compaction_throughput_mb_per_sec`.
+
+Tune so foreground latency stays acceptable while compaction
+keeps up.
+
+### Read amplification spikes
+
+Without compaction, reads slow as SSTables accumulate. During
+compaction, disk IO is hot. Either way, latency rises.
+
+Mitigation: time compaction during off-peak; throttle on
+peak.
+
+### Space amplification
+
+During compaction, both the old and new SSTables exist
+briefly. Leveled compaction usually 1.1× space; size-tiered
+can spike to 2×. Plan disk capacity with headroom.
+
+### Stuck compaction
+
+A bug or hardware issue can block compaction. SSTables pile
+up. Reads slow. Storage grows. Eventually disk fills.
+
+Monitor "pending compactions" and "SSTable count per
+level." Alert on growth.
+
+## Manual compaction
+
+Most LSM databases allow manual triggers:
+
+- RocksDB: `CompactRange()`.
+- Cassandra: `nodetool compact`.
+
+Use sparingly — manual compaction blocks normal operations
+and produces one giant file that's harder to manage.
+
+Better: let auto-compaction work; only manual on known-bad
+state.
+
+## Compaction in columnar warehouses
+
+ClickHouse, Druid, and Pinot use background merges that
+combine smaller parts into larger ones:
+
+- ClickHouse "parts" merge incrementally.
+- Druid segments compact periodically.
+- Pinot segments rolled up.
+
+Same idea: smaller pieces → fewer, larger pieces, with
+metadata indexes for fast lookups.
+
+## In summary
+
+- Compaction: merge SSTables / log segments to dedupe, drop
+  tombstones, reclaim space.
+- Necessary in any append-only LSM store; without it,
+  storage and reads decay.
+- Strategies: size-tiered (low write amp, high read amp),
+  leveled (high write amp, low read amp), time-windowed
+  (time-series), log-compaction (latest-per-key).
+- Throttle to balance foreground performance with progress.
+- Monitor pending compactions and SSTable counts; stuck
+  compaction is a classic outage.
+- Used in RocksDB, Cassandra, Kafka, ClickHouse, Druid.

@@ -1,0 +1,337 @@
+export const level = 'senior';
+
+# Design a notification system
+
+A platform service that sends notifications to users across
+channels (email, SMS, push, in-app). Other services in the
+company publish "event happened — notify user X"; the
+notification system handles templating, preferences, delivery,
+retries, throttling, and reporting.
+
+The interesting parts: fanout to channels, per-user preferences,
+rate limiting per-user-per-channel, idempotency, and the
+external-provider failure surface.
+
+## 1. Clarify the scope
+
+- Channels: email, SMS, mobile push (iOS/Android), in-app web
+  push, in-app message inbox.
+- Preferences per user per channel per category.
+- Throttle: per user, per template, per channel.
+- Templating: server-side, localized.
+- Reporting: deliveries, opens (where supported), errors.
+- Bulk announcements (marketing) and per-user transactional: yes.
+- Webhooks: yes, as another "channel."
+
+## 2. Estimate scale
+
+```
+DAU                = 200M
+Notifications/user/day = 5 → 1B notifications/day
+                          → ~12K/s avg, peak ~50K/s (event spikes)
+
+Mix:
+  email   = 40%   → 400M/day
+  push    = 50%   → 500M/day
+  SMS     = 5%    → 50M/day
+  in-app  = 5%    → 50M/day
+
+Storage:
+  per record (input + state) = 1 KB
+  retention 90 days hot, archived
+  daily volume = 1 TB/day
+```
+
+50K/s mixed across providers with very different per-provider
+throughput (APNs/FCM bulk fast, SMS per-second-limited, SMTP
+moderately fast). Per-provider queues and pacing are mandatory.
+
+## 3. API
+
+```bash
+# Producer-facing (internal)
+POST /v1/notifications
+  Idempotency-Key: <event-id>
+  Body:
+  {
+    userId: string,
+    templateId: string,
+    channelHints: ["push","email"]?,
+    data: {...},                     // template variables
+    category: "transactional"|"marketing"|"system",
+    priority: "high"|"normal"|"low",
+    scheduleAt?: timestamp
+  }
+
+# User-facing
+GET  /v1/preferences/:userId
+PUT  /v1/preferences/:userId
+  Body: { channels: { email: {marketing: false, transactional: true}, ... } }
+
+GET  /v1/inbox/:userId?cursor=
+POST /v1/inbox/:userId/:notificationId/read
+```
+
+Idempotency-Key prevents duplicate sends when producers retry —
+the most common source of "I got the same email 4 times."
+
+## 4. High-level design
+
+```
+[ producer services ] → [ Notification API ] → [ Idempotency check ]
+                                                       │
+                                                       ↓
+                                            [ Kafka: requests topic ]
+                                                       │
+                                                       ↓
+                                    [ Composer / preference filter ]
+                                                       │
+                              (per request, decide channels & templates)
+                                                       │
+            ┌──────────────┬───────────────────┬───────┴───────┐
+            ↓              ↓                   ↓               ↓
+       email queue    push queue          sms queue       inapp queue
+            │              │                   │               │
+            ↓              ↓                   ↓               ↓
+       email worker    push worker         sms worker     inapp worker
+            │              │                   │               │
+            ↓              ↓                   ↓               ↓
+       [ SES /        [ APNs /            [ Twilio /       [ DB +
+         SendGrid ]      FCM ]              Bandwidth ]     WS push ]
+            │              │                   │               │
+            └──────────────┴───────────────────┴───────────────┘
+                                    │
+                                    ↓
+                              [ Delivery events Kafka ]
+                                    │
+                          [ State DB + reporting ]
+```
+
+Per-channel queues let us pace each provider independently. Per-
+channel workers handle provider-specific quirks (rate limits,
+back-off codes, exponential retry semantics).
+
+## 5. Data model
+
+```
+notifications {
+  id              string PK
+  user_id         bigint
+  template_id     string
+  category        string
+  channels        string[]           -- resolved channels at compose time
+  data            json
+  status          enum(pending, sent_per_channel, partially_sent, failed)
+  created_at, updated_at
+}
+
+deliveries {
+  id              string PK
+  notification_id string
+  channel         string
+  provider        string
+  external_id     string
+  status          enum(queued, sent, delivered, failed, bounced)
+  attempts        int
+  last_error      string
+  updated_at      timestamp
+  INDEX (notification_id, channel)
+}
+
+preferences {
+  user_id         bigint
+  channel         string
+  category        string
+  enabled         bool
+  PRIMARY KEY (user_id, channel, category)
+}
+
+inbox_items  (for in-app channel)
+  user_id, notification_id, read_at, expires_at
+
+templates {
+  id              string PK
+  channel         string
+  locale          string
+  subject         string?
+  body            string             -- handlebars / mustache
+  PRIMARY KEY (id, channel, locale)
+}
+```
+
+`deliveries` is the per-channel record; one notification can
+have multiple deliveries (push + email + sms). Status is per
+channel.
+
+## 6. Deep dives
+
+### 6.1 Composer: from request to per-channel jobs
+
+For each incoming request:
+
+<Steps>
+<Step n={1} title="Idempotency check">
+Look up Idempotency-Key. If seen, return prior result.
+</Step>
+<Step n={2} title="Resolve user preferences">
+Fetch user prefs. Drop channels disabled for this category.
+Drop unsubscribed users entirely for marketing.
+</Step>
+<Step n={3} title="Resolve template per channel">
+By (templateId, channel, locale). Render with `data`. Hard
+failure if template missing.
+</Step>
+<Step n={4} title="Apply rate limits">
+Per-user-per-template-per-channel ("don't send same email twice
+in 1h"). Token bucket per dimension. Drop or defer if limited.
+</Step>
+<Step n={5} title="Enqueue per-channel jobs">
+One row per channel into the channel queue with delivery
+metadata.
+</Step>
+</Steps>
+
+This stage is **idempotent** and **deterministic** given the
+inputs — re-run produces the same channel jobs.
+
+### 6.2 Channel workers and provider integration
+
+Each channel has its own worker pool because the providers
+behave differently:
+
+- **APNs / FCM**: very high throughput, push protocols are
+  binary; long-lived connections; instant feedback codes.
+- **SMTP / SES**: moderate throughput; bounces arrive
+  asynchronously via callback hours later.
+- **SMS providers (Twilio, etc.)**: low absolute QPS per long-
+  code number; carrier rate limits; rich error code taxonomy.
+- **In-app**: writes to inbox DB + pushes to user's open WS if
+  any.
+
+Each worker:
+
+- Pulls a batch from its queue.
+- Talks to its provider (with `external_id` to correlate).
+- Writes delivery record + emits delivery event.
+- On retryable error, backs off and retries; on hard error,
+  marks failed.
+
+### 6.3 Retries and back-off
+
+Providers fail temporarily; we retry. Naïve "retry 5 times
+immediately" creates retry storms.
+
+Standard pattern:
+
+```
+attempt 1 → fail
+sleep 30s (with jitter)
+attempt 2 → fail
+sleep 2 min
+attempt 3 → fail
+sleep 10 min
+attempt 4 → fail
+sleep 1 h
+attempt 5 → fail
+→ move to dead-letter queue, alert operator
+```
+
+Exponential back-off with jitter; cap at ~24h for most
+notifications (anything older is irrelevant to the user
+anyway).
+
+### 6.4 Per-user / per-template throttling
+
+A common UX failure: a user clicks rapidly and gets 50 emails.
+Throttle by (user, template, channel):
+
+```
+key = "throt:<userId>:<templateId>:<channel>"
+INCR within a window (e.g. 1 hour)
+if count > limit (e.g. 1): drop or coalesce
+```
+
+Coalescing is often nicer than dropping: "5 new messages" instead
+of 5 separate notifications. For digest-style channels (email),
+coalesce by category over short windows.
+
+### 6.5 Quiet hours and timezones
+
+A timezone-aware system; "don't send pushes between 10 PM and
+8 AM local time."
+
+- Per-user `timezone` and `quiet_hours` configuration.
+- On send, check current local time; if quiet, schedule for
+  later (`scheduleAt = next allowed time`).
+- Some notifications bypass (security alerts, critical ops).
+
+The scheduling component is a delayed queue — Redis sorted set
+with score = unix timestamp, popped when due.
+
+### 6.6 Delivery callbacks
+
+Providers report status asynchronously. SMS delivery receipts
+arrive seconds-to-minutes later; email bounces hours later.
+
+```
+provider → webhook → [ Callback ingest ] → updates `deliveries.status`
+                                          → emits delivery event
+```
+
+Callbacks must be authenticated (signed by provider) and
+idempotent (provider may retry the callback).
+
+For analytics, the **delivery event** is the source of truth on
+"what reached the user," not the queue ack.
+
+### 6.7 Templates and localization
+
+Templates are versioned, per-channel, per-locale. A change is a
+new version; rollouts are gradual (1% → 10% → 100%).
+
+Renders happen at **compose time**, not at queue dequeue time —
+so the message body is locked once preferences are resolved and
+doesn't drift if the template is edited mid-flight.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 500K/s composer | Composer CPU | Horizontal autoscale; cache prefs aggressively |
+| Per-provider rate limit | SMS providers cap per-number | Use multiple sender pools; per-region routing |
+| Push spike (event broadcast) | Single APNs connection | Multiple connection pools; partition by deviceId hash |
+| Email bounces backlog | Callback ingest | Decouple via Kafka; parallel consumers |
+| Inbox storage | Per-user inbox list | Cap to N most recent; archive older |
+| Idempotency table size | Long retention | TTL aggressively (24-48h is enough) |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Per-channel queues** over single queue: pace each provider
+  independently; channel failure isolated.
+- **Compose-once, multiple deliveries** over per-channel
+  pipelines: dedup work, consistent UX across channels.
+- **Idempotency on input** over downstream: catches retries
+  before they enter the pipeline.
+- **Coalesce** over drop on throttle: nicer UX, slight
+  complexity.
+- **Schedule for quiet hours** over reject: respects timezone
+  with no caller burden.
+- **Async delivery status via callback** over synchronous: matches
+  provider semantics; analytics decoupled from send path.
+
+## In summary
+
+- Notification platform = idempotent input, preference filter,
+  per-channel queues, per-provider workers, async delivery
+  callbacks.
+- Per-channel queues let each provider be paced independently;
+  one slow provider doesn't block others.
+- Throttle and coalesce per (user, template, channel) to avoid
+  pestering users.
+- Render templates at compose, not at delivery; locks content.
+- Delivery callbacks are the source of truth for "did it
+  arrive"; queue ack is just "did we send."
+- Most failures here are external-provider failures — handle
+  them with backoff, DLQs, and observability.

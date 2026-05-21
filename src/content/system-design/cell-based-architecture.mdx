@@ -1,0 +1,199 @@
+export const level = 'staff';
+
+# Cell-based architecture
+
+Partition the entire stack — compute, storage, queues,
+caches — into **independent cells**, each capable of serving
+a subset of users end-to-end. A failure or bad deploy in one
+cell affects only its users.
+
+Used by AWS, Slack, Shopify, Netflix for blast-radius
+isolation at scale. The next level beyond multi-AZ and even
+multi-region in terms of fault isolation.
+
+## What a cell is
+
+A cell is a **self-contained slice** of the system:
+
+- Its own app instances.
+- Its own database (or shard).
+- Its own message queue.
+- Its own cache.
+- Its own load balancer.
+
+Cells share **nothing** in the hot path. A user's request
+hits exactly one cell from edge to backend to storage.
+
+```
+Edge router
+   ├── Cell 1: instances + DB + queue (serves 25% of users)
+   ├── Cell 2: instances + DB + queue (serves 25% of users)
+   ├── Cell 3: instances + DB + queue (serves 25% of users)
+   └── Cell 4: instances + DB + queue (serves 25% of users)
+```
+
+## Why this matters
+
+In a traditional shared-everything system:
+
+- A bad deploy goes to all instances → 100% outage.
+- A bad schema migration corrupts the DB → 100% outage.
+- A poison message in the shared queue → 100% outage.
+- A noisy tenant overloads the shared cache → 100% outage.
+
+In a cell-based system:
+
+- A bad deploy is rolled out to one cell at a time → 25%
+  outage at worst, often less.
+- A schema migration is run per-cell with verification → bad
+  schemas caught in the first cell.
+- A poison message poisons one cell → 25% impact.
+- A noisy tenant in one cell → 25% impact.
+
+The trade-off: **blast radius vs cost / complexity**. Each
+cell is a complete system, with its own ops burden.
+
+## How cells differ from shards
+
+A shard is a slice of data. Cells are slices of the
+**entire stack** — data is just one part.
+
+Shared resources between shards (the application code, the
+deploy pipeline, the queue) are still single-point-of-failure
+in a sharded-only architecture. Cells break those too.
+
+## Routing to cells
+
+A **cell router** at the edge decides which cell a request
+belongs to:
+
+```
+edge request → router → cell selector → cell N
+```
+
+Cell selectors are usually:
+
+- **Hash of user ID** → cell.
+- **Geographic** → cell (cells per region).
+- **Customer tier** (enterprise customers get isolated cells).
+- **Explicit assignment** stored in a global directory.
+
+The router itself must be highly available; it's the only
+shared component on the hot path.
+
+## Cell sizing
+
+Two extremes:
+
+- **Many small cells**: maximum isolation; high operational
+  overhead.
+- **Few large cells**: less ops; bigger blast radius per
+  cell.
+
+AWS reportedly aims for cells small enough that any single
+cell's failure doesn't materially impact total capacity.
+Typical: 5-20% of total load per cell.
+
+## Cell-aware deployments
+
+Deploys roll out cell-by-cell, not host-by-host:
+
+<Steps>
+<Step n={1} title="Deploy to canary cell.">
+A small cell with a few percent of traffic. Watch metrics.
+</Step>
+<Step n={2} title="Wait for soak.">
+24 hours or longer in canary. Catches slow-burn bugs.
+</Step>
+<Step n={3} title="Roll out to remaining cells.">
+One cell at a time, with bake time between each.
+</Step>
+<Step n={4} title="If a cell shows issues, halt and rollback that cell.">
+Other cells stay on the old version.
+</Step>
+</Steps>
+
+A bad deploy never reaches all cells; it stops at the first
+sign of regression.
+
+## Operational considerations
+
+### Cross-cell operations
+
+Sometimes you need to do something across cells (refund a
+customer, send a global broadcast). Patterns:
+
+- **Per-cell APIs that the router fans out to** (slow but
+  correct).
+- **A separate "control plane" cell** for cross-cutting
+  operations.
+- **CDC from each cell** to a unified analytics warehouse.
+
+Most operations stay in-cell; cross-cell is rare and
+explicitly designed.
+
+### Observability per cell
+
+Metrics, logs, traces all need per-cell tags. Otherwise you
+can't tell which cell is having issues.
+
+Dashboards should show **per-cell** SLOs in addition to
+global. A "global p99" can be 200ms while one cell is at
+2s — and your global view hides the problem.
+
+### Capacity headroom
+
+Each cell needs capacity for its share + failover capacity in
+case a peer cell fails and traffic must be redistributed.
+
+Some systems run "cold cells" — empty cells ready to absorb
+traffic from a failed peer.
+
+## Migration to cells
+
+Migrating an existing system to cells is hard. Common path:
+
+<Steps>
+<Step n={1} title="Identify the natural shard key.">
+Usually user_id or tenant_id.
+</Step>
+<Step n={2} title="Add a cell router in front, initially routing all to one cell.">
+The router is a no-op for now.
+</Step>
+<Step n={3} title="Stand up a second cell.">
+Migrate some users to it. The router knows which cell each
+user is in.
+</Step>
+<Step n={4} title="Migrate user data per cell.">
+Use CDC or staged migration; users move when their data is
+copied.
+</Step>
+<Step n={5} title="Scale up cell count over time.">
+Each cell is a clone of the previous; eventually the system
+has N cells of equal size.
+</Step>
+</Steps>
+
+Months to years for a real production system.
+
+## When cells are worth it
+
+- **Very high availability requirements** (99.99%+).
+- **Risk-averse customer base** (enterprise, financial).
+- **Bad deploys would be catastrophic.**
+- **You have the team to operate N copies of the stack.**
+
+For most products, cell-based is overkill. Multi-AZ +
+careful deploys + good observability suffices for 99.95%.
+
+## In summary
+
+- Cell-based architecture: full-stack partitioning into
+  independent cells, each serving a slice of users end-to-end.
+- Blast radius bounded to a single cell.
+- Deploys roll out cell-by-cell with bake time.
+- Each cell is a complete copy: compute, DB, queue, cache.
+- Router at the edge maps users → cells.
+- High operational cost; pays off only at large scale with
+  high availability requirements.
+- Migration from monolithic to cells takes months/years.

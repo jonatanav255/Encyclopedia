@@ -1,0 +1,336 @@
+export const level = 'mid';
+
+# Cache-aside (lazy loading)
+
+The most common cache pattern, and the default for almost
+every web app's Redis usage. The app reads the cache first;
+on a miss, reads from the database; populates the cache;
+returns the result.
+
+```
+   read flow:
+     app → cache (hit)            → return
+     app → cache (miss) → DB → cache.set → return
+
+   write flow:
+     app → DB.update → cache.del (or .set)
+```
+
+The cache is "aside" — outside the read path's must-be-true
+chain. If the cache is down, reads degrade to direct DB
+reads. Writes don't depend on the cache at all.
+
+This last point is the pattern's main strength and the
+source of its quirks.
+
+## The code
+
+```ts
+async function getUser(id: string) {
+  const cacheKey = `user:${id}`;
+
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  const user = await db.users.findOne({ id });
+  if (user) {
+    await redis.set(cacheKey, JSON.stringify(user), 'EX', 300);
+  }
+  return user;
+}
+
+async function updateUser(id: string, changes: Partial<User>) {
+  const updated = await db.users.update({ id, ...changes });
+  await redis.del(`user:${id}`); // invalidate
+  return updated;
+}
+```
+
+Two operations: read populates the cache on miss; write
+invalidates the cache. Simple, defensible, and the right
+default for 80% of cases.
+
+## Why it's the default
+
+Several properties:
+
+1. **Cache failure is non-fatal.** The DB is the source of
+   truth; the cache is an optimization. If Redis is down,
+   reads still work (slower).
+2. **The cache only stores hot data.** Cold data is never
+   loaded because no one asked. Cache memory is spent on
+   what's actually used.
+3. **No tight coupling.** Write paths don't have to know about
+   the cache's existence (except for invalidation). New
+   read patterns can add their own caching without touching
+   writes.
+4. **Easy to reason about.** Every entry is "DB value at the
+   time it was cached, with TTL." That's the whole model.
+
+## The consistency story
+
+The cache is **eventually consistent** with the DB:
+
+- Right after a write, the cache is stale until invalidated.
+- During the brief window between DB-write and cache-delete,
+  a concurrent read can re-populate the cache with the *new*
+  value (good) or the *old* value (bad — see below).
+
+This window is the cache-aside pattern's defining wart, and
+the source of most of its bugs.
+
+## The classic race
+
+```
+T0: client A reads user:42      → cache miss
+T0: client A queries DB         → gets v1
+T1: client B updates user:42    → DB now has v2
+T1: client B deletes cache key  → cache empty (was already)
+T2: client A writes cache       → cache now has v1 (STALE!)
+```
+
+A is now caching the old value. Until the TTL expires (or
+someone else updates), the cache returns v1 while the DB has
+v2.
+
+Mitigations:
+
+### Short TTL
+
+Bound the staleness window. If users tolerate a few seconds
+of staleness, set TTL to 30 s. The bug still happens; it
+auto-heals quickly. The simplest fix.
+
+### Delete after a small delay
+
+Some teams delete the cache key, write to the DB, then delete
+the cache key *again* after a short delay (~100 ms). This
+catches the race window. Adds a small piece of state
+(queued delete).
+
+### Versioned cache keys
+
+Each write increments a version (in DB or in a counter
+service). Cache keys include the version: `user:42:v17`.
+Stale writes write to `user:42:v16`, which nobody reads —
+they're now reading `user:42:v17` (still empty, miss, fresh
+read from DB).
+
+The classic ATSStudio / Facebook trick. More machinery, but
+robust.
+
+### Write-through instead
+
+If consistency matters more than write latency, switch to
+write-through (write cache and DB in the same flow). See
+write-through-cache. Eliminates the race at write-latency
+cost.
+
+## Cache-aside vs delete vs set on write
+
+Two options for the invalidation step on writes:
+
+### Delete-on-write (the default)
+
+```ts
+await db.users.update(...);
+await redis.del(`user:${id}`);
+```
+
+Pros:
+
+- Next reader re-fetches from DB → guaranteed fresh value.
+- No risk of writing a stale value to the cache.
+
+Cons:
+
+- The next read pays the DB cost (cache miss).
+- Under high contention for a hot key, every writer
+  invalidates and every reader re-populates → thundering
+  herd (see cache-stampede).
+
+### Set-on-write
+
+```ts
+const updated = await db.users.update(...);
+await redis.set(`user:${id}`, JSON.stringify(updated), 'EX', 300);
+```
+
+Pros:
+
+- Cache is immediately warm with the new value.
+- No miss penalty on subsequent reads.
+
+Cons:
+
+- Race condition: concurrent writes might land in arbitrary
+  order in the cache. The cache value can disagree with the
+  DB even after both writes complete.
+- If the write payload doesn't include all cached fields,
+  set-on-write writes an incomplete value.
+
+**Default: delete-on-write.** Pick set-on-write only when
+you're sure about ordering and completeness.
+
+## TTL choice
+
+TTL serves two purposes:
+
+1. **Bounds staleness** in case invalidation is missed.
+2. **Forces eviction** of entries no longer accessed.
+
+A short TTL (~seconds) gives strong staleness bounds but
+increases miss rate. A long TTL (~hours) gives high hit
+rate but allows long staleness if invalidation fails.
+
+A useful pattern: **two TTLs**.
+
+- **Hard TTL**: 5 minutes. After this, the entry is gone.
+- **Soft TTL**: 30 seconds. After this, return the stale
+  value *and* asynchronously refresh.
+
+The user gets the cached response instantly; the cache is
+re-populated in the background. Common in CDN configurations
+(`stale-while-revalidate`). See refresh-ahead-cache for a
+more aggressive variant.
+
+## Serialization choice
+
+What you store in the cache matters more than the algorithm.
+
+- **JSON**: human-readable, slow to parse for large objects.
+- **MessagePack / CBOR**: smaller and faster, binary.
+- **Protobuf / FlatBuffers**: schema-bound, fastest, but
+  requires schema management.
+
+For most apps: JSON until proven slow. Switch to MsgPack at
+~ 5 KB+ values or extreme throughput.
+
+## When cache-aside is the right pattern
+
+The right default for:
+
+- Read-heavy workloads with point lookups (user by ID,
+  config by key).
+- Tolerable staleness in the seconds-to-minutes range.
+- High cache miss cost (queries expensive enough that
+  caching matters).
+- App owns both the read and write paths (so invalidation is
+  feasible).
+
+When it's wrong:
+
+- **Strict consistency**: financial balances, inventory at
+  sale. Use write-through or skip caching.
+- **Very-write-heavy**: invalidation churn defeats the
+  cache's hit rate. Use write-back or no cache.
+- **Cache cold start can't be tolerated**: if a cold cache
+  causes outage, the source isn't sized correctly.
+
+## Multi-layer cache-aside
+
+A typical Node service with both L1 (in-process) and L2
+(Redis):
+
+```ts
+const l1 = new LRU<string, User>({ max: 10_000, ttl: 30_000 });
+
+async function getUser(id: string) {
+  // L1: in-process
+  const local = l1.get(id);
+  if (local) return local;
+
+  // L2: Redis
+  const remote = await redis.get(`user:${id}`);
+  if (remote) {
+    const user = JSON.parse(remote);
+    l1.set(id, user);
+    return user;
+  }
+
+  // L3: DB
+  const user = await db.users.findOne({ id });
+  if (user) {
+    await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 300);
+    l1.set(id, user);
+  }
+  return user;
+}
+```
+
+Invalidation propagation:
+
+- Write deletes Redis key.
+- L1 caches use a short TTL (30 s) so they self-heal soon
+  after.
+- For tighter consistency: use Redis Pub/Sub to notify all
+  replicas to invalidate L1 on writes.
+
+The L1 → L2 → L3 layering is the pattern that powers most
+high-traffic services. L1 cuts the Redis call cost; L2 cuts
+the DB cost.
+
+## Common pitfalls
+
+### No TTL
+
+Forgetting to set a TTL means stale data lingers forever.
+Always set one, even if it's long (24 hours). It's the
+safety net.
+
+### Caching the request, not the data
+
+Caching the entire HTTP response keyed by the URL works for
+public endpoints but fails for authenticated endpoints (each
+user has a unique view). Cache the underlying data (user
+record, computed list) and re-render per request.
+
+### Cache size unbounded
+
+Cache memory grows with active keys × value size. Without
+eviction, you OOM. Set a max size (Redis: `maxmemory` +
+eviction policy; Node `lru-cache`: `max`).
+
+### Reading stale cache after a known write
+
+If the *same client* just wrote, then reads, they probably
+want their own write reflected. Patterns:
+
+- Skip the cache read for the next request from this user.
+- Return the new value from the write call (don't re-read).
+- "Read your writes" tokens (see read-replicas-and-replication-
+  lag).
+
+### Cascading invalidation
+
+User table has `name`. UI shows `firstNameLastName`. A name
+update invalidates `user:42`, but the cached UI string
+`user:42:displayName` is still cached. Either invalidate all
+related keys (cascading) or cache only the raw data and
+re-derive on each read.
+
+### Cache miss storm during outages
+
+Redis goes down. Every request misses cache and hits DB. The
+DB melts under the new load. Mitigations: circuit-break to
+short-circuit cache requests, serve degraded data, or use
+local L1 cache so each replica handles its own load
+independently.
+
+## In summary
+
+- Cache-aside: app reads cache, falls back to DB on miss,
+  populates the cache. Writes update DB and invalidate the
+  cache.
+- The default pattern for most Redis usage. Simple,
+  defensible, cache-failure-tolerant.
+- The classic race (concurrent read + write writing stale
+  value to cache) is solved by short TTLs, versioned keys,
+  or switching to write-through.
+- Use delete-on-write by default; set-on-write only with
+  care about ordering.
+- Multi-layer (in-process L1 + Redis L2) cuts both Redis and
+  DB load. The L1 needs a short TTL or pub/sub-based
+  invalidation.
+- TTL is the safety net. Always set one. Pair it with explicit
+  invalidation on writes.

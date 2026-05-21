@@ -1,0 +1,257 @@
+export const level = 'senior';
+
+# Alerting design
+
+The point of alerting is to wake a human up when, and only
+when, a human is actually needed. Every wake-up that wasn't
+needed erodes the on-caller's attention; every wake-up not
+delivered when needed erodes user trust. Both failure modes
+compound — and the second is usually the consequence of the
+first.
+
+The SRE book and *Implementing Service Level Objectives* (Alex
+Hidalgo) converge on the same prescription: page on **symptoms
+that map to user pain**, with **burn-rate alerts** anchored to
+**SLOs**. Everything else is detail.
+
+## Symptom-based vs cause-based
+
+<Compare a="Symptom-based" b="Cause-based">
+<>
+"Users are seeing high latency on checkout for the last 5
+minutes."
+
+- Captures **user impact directly**.
+- Robust to architecture changes — the symptom is the same.
+- Page-worthy because by definition users are hurting.
+- One alert per critical user journey, not per microservice.
+</>
+<>
+"DB connection pool on payment-service is 95% full."
+
+- Captures **a possible cause**.
+- Fires whether or not users are affected.
+- Decays in value as architecture changes (the pool moves, the
+  threshold drifts).
+- Good for diagnosis runbooks, bad for paging.
+</>
+</Compare>
+
+The rule, from the SRE book: **page on symptoms, debug on
+causes**. The on-call alert tells you something users care
+about is broken. The diagnostic dashboards tell you why. Two
+different things, two different signals.
+
+The single most common alerting mistake is paging on causes
+("CPU > 80%"). At 4am, you wake up to a CPU number with no idea
+whether users care. Half the time they don't.
+
+## SLOs are the contract
+
+Every page should trace back to an SLO that's burning. If you
+can't say "this alert fires because we're going to miss our 99.9%
+availability SLO this quarter," the alert isn't earning its
+keep.
+
+An SLO is a target — 99.9% of requests succeed over 30 days.
+The **error budget** is what you can spend — 0.1% × total
+requests = the number of errors allowed. The **burn rate** is
+how fast you're spending it.
+
+See SLI / SLO / SLA for the full mechanics.
+
+## Burn-rate alerting
+
+The wrong way: "page if error rate > 1% for 5 minutes." Two
+problems — it always fires at low traffic (1% of 100 requests
+is 1 error, signal-less), and it under-alerts at high traffic
+(0.5% of 10M requests/hour is a burning budget but never trips
+the threshold).
+
+The right way: burn rate against the budget window.
+
+```
+budget burn rate = (errors observed) / (errors budgeted for this window)
+```
+
+If your SLO is 99.9% over 30 days and you've used 14× the
+allotted budget over the last hour, you'll burn the entire month's
+budget in just over a day. That's a page.
+
+A two-window strategy is standard:
+
+<Cheatsheet>
+| Severity | Threshold | Page? |
+|---|---|---|
+| Fast burn | 14.4× over 1h **and** 14.4× over 5m | Yes — immediate page |
+| Slow burn | 6× over 6h **and** 6× over 30m | Yes — page with lower urgency |
+| Trickle burn | 1× over 3d (concerning but slow) | Ticket, not page |
+
+</Cheatsheet>
+
+The "two windows" pattern (e.g., 1h AND 5m) keeps a slow
+sustained problem from triggering on a single bad minute and
+keeps a fast problem from waiting for the long window to fill.
+Both conditions must be true.
+
+Numbers cited in the SRE Workbook; pick the ones that match your
+SLO and incident tolerance.
+
+## Multi-window, multi-burn-rate
+
+The SRE Workbook's "alerting on SLOs" chapter goes further:
+three or four thresholds, each with a paired short+long window.
+The math is straightforward — pick the largest burn rate you'd
+tolerate (e.g., "burning 100% in 2 hours = 360× rate, page
+fast") and a slower rate (e.g., "5% in a day = 1.5× rate,
+ticket").
+
+The principle: **the size of the alert matches the size of the
+fire**. A 14× burn deserves a page. A 1.5× burn over a week
+deserves a Slack message you'll read on Monday.
+
+## What gets paged
+
+A short, opinionated list:
+
+<Cheatsheet>
+| Page-worthy | Not page-worthy |
+|---|---|
+| Customer-visible error rate burn fast | A single retry happening |
+| Customer-visible latency burn fast | A single slow request |
+| Total service unreachable | One pod restarting |
+| Data loss in progress | Disk at 60% |
+| Authentication/authorization broken | A code-coverage drop |
+| Payment / checkout broken | A non-critical job late by 5min |
+
+</Cheatsheet>
+
+If you have 50 alerts mapped to "pages," 45 of them are wrong.
+A healthy on-call rotation has a handful of distinct page
+reasons per service, all tied to SLOs.
+
+## The noisy-pager death spiral
+
+Once an on-caller starts getting paged for non-issues, three
+things happen:
+
+<Steps>
+<Step n={1} title="Attention erodes.">
+After three false pages this week, the fourth feels false too.
+The on-caller checks the dashboard slower; the real incident
+takes longer to find.
+</Step>
+<Step n={2} title="Trust in monitoring collapses.">
+Alerts get muted ("we know about that one"), filtered, or
+ignored. Some are muted for a real reason; some bleed into the
+quiet pile.
+</Step>
+<Step n={3} title="The on-call rotation breaks.">
+People skip rotations. New hires don't want it. Incidents that
+require institutional knowledge happen to the people who don't
+have it. Errors compound.
+</Step>
+</Steps>
+
+The cure isn't "be tougher about it." The cure is **alert
+hygiene** — every page is reviewed in the postmortem, and
+non-actionable pages get fixed within a week. This is the most
+important post-incident practice and the most consistently
+skipped one.
+
+## Paging vs ticketing
+
+Two distinct channels:
+
+- **Paging**: phone call / SMS / push notification that wakes
+  someone up. Reserved for things that need a response **right
+  now**. SLO-burn alerts, total outages, data loss.
+- **Ticketing / Slack**: a message that someone will see during
+  business hours. SSL cert expiring in 7 days, disk filling
+  slowly, a single dependency timing out and recovering.
+
+The cost of a page is roughly **the sleep of the human who
+gets it**. Don't spend that on anything but a real problem.
+
+The cost of a ticket is **eventual attention**. Use it for
+"someone should look at this, but not at 3am."
+
+## Where alerts live: the system view
+
+A good alert lives in one place:
+
+- **The alerting system** (Alertmanager, PagerDuty, Opsgenie,
+  Splunk OnCall) handles routing, schedules, escalations,
+  deduplication.
+- **The monitoring system** evaluates the conditions.
+- **The metrics store** holds the data.
+- **The runbook** describes what to do when the alert fires.
+
+A runbook is **mandatory for every paging alert**. "The page
+fires, you wake up — what do you do?" If the answer isn't
+written, the alert fails its first principle: it's not
+actionable. A page without a runbook is a hazard.
+
+## Things to monitor but never page on
+
+The diagnostic layer. Graph them; alert quietly if at all:
+
+- Resource utilization (CPU, memory, disk).
+- Per-component error rates (downstream service errors,
+  pool acquire timeouts).
+- Replication lag (if not yet user-visible).
+- Build failures, deploy failures.
+- Slow queries, individual slow requests.
+
+These tell you **why** when an SLO-symptom page fires. They
+**don't** page on their own.
+
+## Edge cases that need explicit handling
+
+- **Cron / batch jobs**. A nightly job that fails twice in a row
+  is page-worthy if it feeds an SLO; otherwise it's a ticket.
+- **Low traffic services**. SLO-percentage math breaks at low
+  volume (0% errors of 10 requests proves nothing). Use
+  absolute thresholds with care.
+- **Maintenance windows**. Either silence alerts during planned
+  windows or have a "deploy in progress" suppression so noisy
+  but expected behavior doesn't page.
+- **Cascading failures**. One root cause can trip 50 alerts.
+  Use grouping and alert correlation; one page per incident, not
+  per signal.
+
+<Callout variant="warning">
+"All cause-based alerts can be removed once symptom-based
+SLO alerts are in place." That's the SRE Workbook's bold claim.
+It's usually wrong in detail and right in spirit: aim that
+direction, even if you keep some cause-based for legacy.
+</Callout>
+
+## A starting set of alerts
+
+For a typical user-facing service, this is enough to start:
+
+- **Availability burn fast** — 14× over 1h+5m, page.
+- **Availability burn slow** — 6× over 6h+30m, page.
+- **Latency burn fast** — same shape, against latency SLO.
+- **Total outage** — request rate near zero during business
+  hours, page.
+- **Auth/payment specific** — burn alerts on the SLOs of the
+  critical user journeys.
+- **Trickle and ticket** — everything else.
+
+If that list is more than a dozen alerts, prune. Less is more
+when sleep is on the line.
+
+## In summary
+
+- Page on symptoms (user-visible pain), debug on causes.
+- Anchor every page to an SLO via burn-rate math.
+- Two-window burn-rate alerts beat naive threshold alerts.
+- A page without a runbook is broken.
+- Tickets and Slack are for "look at this eventually"; pages
+  are for "look at this now."
+- Alert hygiene is a postmortem discipline, not a one-time
+  tuning exercise.
+- Less is more — a handful of well-chosen pages beats a
+  hundred mediocre ones.

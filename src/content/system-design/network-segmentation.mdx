@@ -1,0 +1,247 @@
+export const level = 'senior';
+
+# Network segmentation
+
+Network segmentation is the practice of dividing a network into
+**smaller zones** with explicit policies for traffic between
+them. The unit of compromise becomes a zone, not the whole
+network. It's the most boring kind of security architecture
+work and the most consistently effective.
+
+The shift over the last decade is from **macro-segmentation**
+(big firewalled zones — DMZ, internal, prod) to
+**micro-segmentation** (per-workload policies, often
+identity-based). Both still apply.
+
+## Why it matters
+
+Without segmentation, a compromised pod on a single node can
+reach every service in your VPC. With segmentation, it can reach
+only what its policy allows — and the policy is enforced even
+inside the perimeter. The blast radius shrinks from "everything"
+to "the workloads this service is allowed to talk to."
+
+This is the network half of defense in depth. Zero trust
+operates at the identity layer; segmentation operates at the
+network layer. They're complementary, not alternatives.
+
+## The classic layered model
+
+The macro shape inherited from on-prem datacenters and faithfully
+reproduced in the cloud:
+
+```
++-----------------------------------------+
+|       Internet                          |
++--------------------+--------------------+
+                     | (CDN, WAF, LB)
++--------------------v--------------------+
+|       Public subnet  (LB, gateways)     |
+|       — accepts inbound from internet   |
++--------------------+--------------------+
+                     |
++--------------------v--------------------+
+|       Private subnet  (app, services)   |
+|       — no direct internet inbound      |
+|       — egress via NAT                  |
++--------------------+--------------------+
+                     |
++--------------------v--------------------+
+|       Data subnet   (DB, cache, queues) |
+|       — only app subnet may reach it    |
+|       — no internet at all              |
++-----------------------------------------+
+```
+
+The properties:
+
+<Cheatsheet>
+| Zone | Ingress | Egress | What lives here |
+|---|---|---|---|
+| Public | Internet (specific ports) | Internal only | Load balancers, gateways, CDN-fronted |
+| Private | Public subnet only | Internet via NAT | App services, workers |
+| Data | Private subnet only | None (or restricted updates) | Databases, caches, queues, secret stores |
+| Management | Bastion / SSO only | Internal only | CI runners, admin tools |
+
+</Cheatsheet>
+
+Compromising a load balancer doesn't reach the DB. Compromising
+an app server reaches the DB only through approved ports.
+Compromising a CI runner reaches what its IAM grants and not
+much else via the network.
+
+## VPCs, subnets, and security groups (AWS-flavored)
+
+Cloud providers' building blocks:
+
+- **VPC** — a top-level network. Multiple VPCs is a hard
+  segmentation (no implicit routing between).
+- **Subnet** — a CIDR block inside a VPC, attached to an
+  availability zone. Public vs private subnets differ by
+  default routing.
+- **Route tables** — what traffic goes where (default to
+  internet gateway = public; default to NAT gateway = private).
+- **Security groups** — stateful per-instance/per-ENI firewall
+  rules. The workhorse of east-west policy.
+- **Network ACLs** — stateless subnet-level firewall. Coarser
+  than SGs; less common day-to-day.
+- **VPC endpoints / PrivateLink** — direct routes to AWS
+  services without traversing the internet.
+
+The AWS-equivalent vocabulary repeats in GCP (VPC,
+Subnetworks, Firewall Rules) and Azure (VNet, Subnets, Network
+Security Groups).
+
+## Security groups: the right way
+
+Security groups are stateful — return traffic is implicit. Rules
+say "allow inbound from source X on port Y." The pattern that
+works:
+
+<Steps>
+<Step n={1} title="Default deny.">
+SG with no inbound rules denies everything. Start there.
+</Step>
+<Step n={2} title="Allow inbound by security group, not by CIDR.">
+"Allow port 5432 from `sg-app`" is precise and survives IP
+changes. "Allow port 5432 from `10.0.0.0/16`" is loose and
+breaks the moment another workload joins the VPC.
+</Step>
+<Step n={3} title="Per-service SGs.">
+`sg-postgres-prod` allows 5432 only from `sg-app-prod`.
+`sg-redis-prod` allows 6379 only from `sg-app-prod`. Compose
+narrowly.
+</Step>
+<Step n={4} title="Avoid the catch-all allow-all-from-VPC rule.">
+This is the macro-segmentation trap. Every workload can
+suddenly reach every other workload — segmentation in name only.
+</Step>
+</Steps>
+
+Security groups can reference other security groups — the
+identity-shaped firewall. Use that aggressively.
+
+## East-west traffic: the harder problem
+
+North-south traffic (in and out of the VPC) is easy — the
+internet gateway and the NAT gateway are clear choke points.
+**East-west** traffic (between workloads in the VPC) is the
+hard part and where compromised workloads do lateral movement.
+
+Defenses, in increasing strength:
+
+- **Security groups** for service-to-service rules at the
+  network layer (above).
+- **Service mesh authorization** at L7 — even if the network
+  allows the connection, the mesh denies the application call
+  unless the identity matches policy. See mTLS between services.
+- **Kubernetes NetworkPolicy** for in-cluster pod-to-pod rules
+  (CNI plugins like Cilium, Calico enforce them).
+- **eBPF-based enforcement** (Cilium) for fine-grained
+  application-layer policy including HTTP path / method-level
+  rules.
+
+These layers stack. A pod can be denied at the CNI layer, at the
+mesh layer, and at the security group layer. Each is a tripwire
+for misconfiguration of the others.
+
+## Micro-segmentation
+
+The fine-grained version: every workload has its own policy,
+expressed in terms of **identities and intents** ("orders may
+call payments on `/charge`"), enforced everywhere the workload
+runs.
+
+The shape:
+
+- Policy is declared per workload (annotations on a Pod, a Vault
+  policy, a Kubernetes NetworkPolicy).
+- The policy engine pushes the rules to enforcement points
+  (sidecar proxies, CNI plugins, eBPF programs).
+- The policy is re-evaluated on changes, on new workloads, on
+  intent changes.
+
+The goal: **default deny** with explicit allow paths. Listing
+"who's allowed" beats listing "who's denied" — the latter
+breaks the moment a new attacker exists.
+
+## Connecting environments and clouds
+
+Real systems span multiple networks. The plumbing:
+
+<Cheatsheet>
+| Connection | Use |
+|---|---|
+| VPN (site-to-site) | Office or remote network to a VPC over IPSec |
+| Direct Connect / Interconnect | Dedicated fiber to cloud; private, low-latency |
+| VPC peering | Two VPCs in same provider, private routing |
+| Transit gateway | Hub-and-spoke for many VPCs |
+| PrivateLink / Private endpoints | Reach a managed service privately |
+| Cross-region private networking | Inter-region traffic without the internet |
+
+</Cheatsheet>
+
+Each has security implications. A poorly-scoped VPC peering can
+turn two careful segmentation plans into one big network. Always
+audit transitive routing — "what can A reach via B?" is the
+question.
+
+## What segmentation can't do
+
+- **It doesn't authenticate.** A workload inside the right
+  subnet with the right SG can still be compromised. Layer with
+  identity-based controls.
+- **It doesn't help against application bugs.** SQL injection
+  in the app can read the DB despite perfect network
+  segmentation — because the app is allowed to reach the DB.
+- **It doesn't survive misconfiguration.** A `0.0.0.0/0` rule in
+  one place undoes a thousand careful policies.
+- **It doesn't replace WAFs and DDoS protection** — those live
+  at the perimeter, before traffic enters segmented zones.
+
+The lesson, from *Building Secure and Reliable Systems*:
+network segmentation is **one layer** of defense in depth, not
+the whole thing. See defense in depth at architecture level.
+
+## Operational discipline
+
+Network policies are infrastructure-as-code. Patterns that work:
+
+- **Terraform / Pulumi / Crossplane** for every SG, route, ACL.
+  No click-ops in the console.
+- **Reviewed PRs** for every policy change. Two-person rule for
+  prod.
+- **Drift detection** — alert when the live state diverges from
+  the declared state.
+- **Periodic audit** — list of "from any" / "0.0.0.0/0" /
+  cross-account rules. Justify each; remove the rest.
+- **Per-environment isolation** by default. Connect environments
+  with explicit, audited bridges, not transitively peered VPCs.
+
+The biggest segmentation wins come from culture: no one adds an
+"allow all from VPC" rule without a postmortem-quality
+justification.
+
+<Callout variant="note">
+"Flat network with very strict identity" (zero trust pure) and
+"deep network segmentation with permissive identity" are both
+defensible architectures. The strongest production stacks do
+**both** — they don't pick one. The cost of running both is
+real, but so is the prevention.
+</Callout>
+
+## In summary
+
+- Divide the network into zones with explicit ingress/egress
+  rules; default deny.
+- Macro segmentation: public/private/data subnets and per-zone
+  firewalls.
+- Micro segmentation: per-workload identity-based policy
+  enforced by mesh, CNI, eBPF.
+- Reference security groups by SG, not CIDR — survives IP
+  churn.
+- East-west traffic is where lateral movement happens; layer
+  network + identity policies there.
+- Segmentation is one layer of defense in depth, not the whole
+  thing.
+- Manage policy as code and audit "allow any" rules ruthlessly.

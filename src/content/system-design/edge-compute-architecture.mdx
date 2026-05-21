@@ -1,0 +1,200 @@
+export const level = 'senior';
+
+# Edge compute architecture
+
+Running application code at **hundreds of POPs near users**,
+not in a few central regions. Cloudflare Workers, Vercel Edge
+Functions, AWS Lambda@Edge, Fastly Compute@Edge, Deno Deploy.
+
+Edge compute is the natural extension of edge caching: from
+"cache content near the user" to "run code near the user."
+
+## What edge runtimes are
+
+Two technical foundations made edge compute practical:
+
+### V8 isolates
+
+Cloudflare Workers, Vercel Edge, Deno Deploy. Each tenant
+runs in a V8 isolate — a separate JavaScript context within
+one V8 process. Startup is near-zero (one V8 process serves
+thousands of tenants).
+
+Limitations: V8-only languages (JS, WebAssembly via JS shim);
+limited memory per request; restricted Node APIs.
+
+### WebAssembly
+
+Fastly Compute@Edge. Tenants compile to Wasm; runtime
+executes. Polyglot (Rust, Go, AssemblyScript), tight
+sandboxing, near-zero cold start.
+
+### Full containers
+
+AWS Lambda@Edge. A real Node.js / Python runtime, container
+per tenant. Real cold start (100s of ms). More capability but
+more cost.
+
+V8 isolates and Wasm are the modern "no cold start" approach.
+Containers are legacy at the edge.
+
+## What you can do
+
+The patterns that fit:
+
+- **Personalization** — read user identity, fetch a small
+  per-user JSON from edge KV, inject into HTML.
+- **A/B testing** — assign user to bucket; serve variant.
+- **Auth at the edge** — verify JWT, gate access before
+  reaching origin.
+- **Geographic routing** — route to the right origin region
+  based on user's POP.
+- **Header rewriting / security headers** — modify request /
+  response before origin.
+- **Bot mitigation** — challenge suspicious traffic.
+- **Image / asset transformation** — resize, format-convert,
+  watermark.
+- **AI inference** — small models running close to users.
+
+What you can't easily do:
+
+- **Heavy compute** — CPU budget is ~10-50ms per request.
+- **Long-running connections** — most edge runtimes are
+  request-scoped.
+- **Multi-tenant database access** — edge can't usually
+  connect to your origin DB directly (latency, security).
+- **Strong-consistency state** — edge data primitives are
+  eventually consistent.
+
+## Edge data primitives
+
+Each provider has a slightly different toolkit:
+
+- **Cloudflare Workers**: KV (eventually-consistent global),
+  Durable Objects (single-home strong consistency), R2
+  (S3-compatible), D1 (SQLite at edge).
+- **Vercel**: Edge Config (read-mostly), KV (Redis-backed).
+- **Fastly**: KV Store, Config Store.
+- **Lambda@Edge**: can call DynamoDB Global Tables for
+  cross-region replicated data.
+
+The pattern: read at the edge from an eventually-consistent
+distributed store; write back to a central region.
+
+## Cold start
+
+V8 isolates and Wasm: effectively zero (microseconds). The
+runtime is already up; each tenant is just a script.
+
+Lambda@Edge: 100s of milliseconds for first invocation on a
+cold POP. Mitigations: smaller bundles, layers, scheduled
+warm-up.
+
+For latency-sensitive paths (every user request), V8 isolates
+or Wasm win.
+
+## Limitations to design around
+
+### Per-request CPU budget
+
+Cloudflare: 10ms CPU per request (free), 50ms (paid). Wall
+clock can be longer (waiting on I/O) but CPU is hard-capped.
+
+If your handler spends 100ms on JSON parsing + sorting, you
+might run out.
+
+### Per-request memory
+
+Typically 128 MB per request. Larger payloads must stream.
+
+### No filesystem
+
+Edge runtimes don't have a persistent local FS. State is
+external (KV, S3) or in-memory-per-request.
+
+### Limited Node API surface
+
+`fs`, `child_process`, raw sockets — gone. Some Node APIs
+work via shims; others don't. Plan for "modern web platform,"
+not "full Node."
+
+## Cost model
+
+Edge compute pricing has two axes:
+
+- **Per request**: typically $0.30 - $0.50 per million.
+- **Per CPU millisecond**: typically $0.02 - $0.10 per
+  million CPU-ms.
+
+For a high-volume, cacheable workload, edge is cheaper than
+running an origin. For heavy compute (think ML inference,
+video transcoding), the origin is cheaper.
+
+Skip edge if your processing is consistently >50ms CPU per
+request.
+
+## Designing for the edge
+
+Three patterns:
+
+### Edge as a smart cache
+
+Most logic at origin. Edge does cache lookup, header
+manipulation, personalization injection. Easiest to adopt.
+
+### Edge as the primary handler
+
+API logic runs at edge, only touches origin for the database.
+Latency wins are largest. Requires edge-accessible DB
+(Cloudflare D1, Neon, PlanetScale via edge proxies).
+
+### Edge + Durable Objects
+
+State that needs strong consistency lives in Durable Objects.
+Each object has a single home POP; edge requests for that
+object hop to its home. Compromises on edge latency for some
+keys, but gives true strong consistency.
+
+## Common gotchas
+
+### Routing all logic to edge
+
+Putting everything at the edge looks great on the latency
+chart, then crashes on a "cold path" that needs a DB query
+to a region 200ms away. Now your edge logic is slower than
+origin logic.
+
+Fix: identify which paths benefit from edge (read-heavy,
+personalization, auth) vs which don't (DB-heavy, state-changing).
+
+### Forgetting eventual consistency
+
+Edge KV stores propagate updates over seconds. A "write here,
+read there" assumes consistency it doesn't have.
+
+Fix: write to a central region, read from edge KV with
+acceptance of staleness; or use Durable Objects / homed
+state.
+
+### Logging and observability
+
+Edge code runs in many POPs. Logs are spread out. Without
+the right telemetry pipeline, debugging is painful.
+
+Fix: providers expose log streams (Workers Trace Events,
+Vercel Speed Insights); pipe to a central observability
+backend.
+
+## In summary
+
+- Edge compute: code at hundreds of POPs near users.
+- V8 isolates and Wasm enable near-zero cold start; the
+  practical breakthrough.
+- Best for personalization, A/B, auth, header rewriting,
+  bot detection, lightweight transformation.
+- Limited by CPU budget, memory, no FS, limited Node APIs.
+- Pair edge with an eventually-consistent KV (read at edge,
+  write central) or Durable Objects (strong consistency
+  with one-home semantics).
+- Cost wins for cacheable + light-compute paths; lose for
+  heavy backends.

@@ -1,0 +1,349 @@
+export const level = 'senior';
+
+# Consistent hashing for routing
+
+Consistent hashing is the technique that makes most
+distributed caches and routing layers possible. With naive
+modulo hashing, adding or removing a node reshuffles nearly
+every key. With consistent hashing, adding or removing a node
+moves only **1/N** of the keys — and you choose which fraction
+is acceptable.
+
+The idea is from a 1997 paper by Karger et al. ("Consistent
+Hashing and Random Trees"). Every distributed system you've
+heard of since then uses some variant: Dynamo, Cassandra,
+DynamoDB, Memcached's client libraries, Akamai, Cloudflare,
+Discord, Redis Cluster, modern Envoy load balancers.
+
+## The problem with modulo hashing
+
+Suppose you have 4 backends and you route by `hash(key) % 4`:
+
+```
+hash("user-1") % 4 = 2 → backend 2
+hash("user-2") % 4 = 0 → backend 0
+hash("user-3") % 4 = 3 → backend 3
+hash("user-4") % 4 = 1 → backend 1
+```
+
+Now you add a 5th backend. `% 5` produces different results:
+
+```
+hash("user-1") % 5 = 4 → backend 4   (was 2)
+hash("user-2") % 5 = 2 → backend 2   (was 0)
+hash("user-3") % 5 = 1 → backend 1   (was 3)
+hash("user-4") % 5 = 4 → backend 4   (was 1)
+```
+
+Almost every key moved. For a cache, this is a disaster:
+adding one node invalidates ~80% of all cached entries. Every
+client misses the cache, the origin gets slammed, the new
+"helpful" node makes things temporarily much worse.
+
+## The consistent-hashing ring
+
+Imagine a circle of integers (say, 0 to 2³²–1). Each backend
+is hashed onto a point on the circle. Each key is hashed onto
+a point on the circle. To route a key, walk clockwise from
+the key's point until you hit a backend.
+
+```
+              [A]
+              ╱
+             ╱      key1 → walks → A
+            ╱
+   [D]─────[ring]─────[B]
+            ╲                key2 → walks → B
+             ╲
+              ╲
+              [C]   key3 → walks → C
+```
+
+When backend **B** is removed, only keys between **A** and
+**B** (going counter-clockwise) move — they now walk to
+**C** instead. Keys belonging to A, C, D are unaffected.
+
+When a new backend **E** is inserted, only keys in E's arc
+move — they used to go to whoever was next clockwise; now
+they stop at E.
+
+**Fraction of keys moved when adding or removing one node:
+1/N.**
+
+That's the property. The rest is engineering.
+
+## Why the basic ring isn't enough
+
+The basic ring has two problems:
+
+1. **Unbalanced load**. With N nodes placed uniformly at
+   random, the arcs aren't equal — some backends own bigger
+   arcs and serve more keys. Variance scales as O(log N).
+2. **Cold restart on node loss**. If backend B dies, all of
+   B's keys move to backend C in one burst. C's load
+   instantly doubles.
+
+The fix to both: **virtual nodes** (vnodes).
+
+## Virtual nodes
+
+Each physical backend places **many points** on the ring (say,
+100–256 vnodes per backend). Each vnode is responsible for its
+arc.
+
+```
+Backend A places vnodes A1, A2, A3, ..., A256 on the ring.
+Backend B places vnodes B1, B2, B3, ..., B256.
+```
+
+Now A's arcs are scattered all over the ring, not concentrated
+in one block. Load is much more even (variance shrinks as
+1/√V where V is the vnode count). When B is removed, B's keys
+distribute across all remaining backends, not just one.
+
+The vnode count is a tuning knob:
+
+- **More vnodes** = more even load, more ring lookups, more
+  metadata to manage.
+- **Fewer vnodes** = simpler, less even, more impact when one
+  node fails.
+
+100–256 vnodes per physical node is the typical range.
+
+## Bounded loads
+
+A subtle problem: even with vnodes, some keys are accessed far
+more than others (hot keys). Consistent hashing doesn't fix
+hot spots — it just spreads node arcs evenly.
+
+**Consistent hashing with bounded loads** (Google research,
+2017) adds a constraint: a backend won't accept more than
+`(1 + ε) × average_load` keys. Overflow keys walk further
+around the ring to the next available backend.
+
+This is used in Vimeo's load balancer, Google's front-end,
+and modern Envoy. It trades some locality (some keys go to
+"the wrong backend") for protection against hot spots.
+
+For pure caches, plain consistent hashing is fine. For load
+balancing where hot keys can saturate a node, bounded-load
+variants are worth the complexity.
+
+## Where consistent hashing is used
+
+### Distributed caches
+
+The killer app. Memcached's client libraries (libmemcached,
+mcrouter) consistent-hash keys to a cluster of Memcached
+nodes. Adding or removing a cache node moves only 1/N of
+entries. Without consistent hashing, every cache resize would
+empty the cache.
+
+Same pattern in Redis Cluster, Akamai's edge caches, CDN
+hierarchies.
+
+### Distributed data stores
+
+Cassandra and DynamoDB use consistent hashing (with vnodes) as
+the foundation of partitioning. The partition key hashes onto
+a ring; the owner of that ring position holds the data;
+replication factor N means the next N–1 nodes clockwise also
+hold copies.
+
+### Load balancers with cache locality
+
+Envoy, NGINX (with `hash` directive), HAProxy (with `balance
+url_param consistent`) can route requests by consistent hash
+on a chosen header or URL parameter. Same user always lands
+on the same backend → that backend's local cache stays warm.
+
+### Session stickiness without cookies
+
+Hash on the client's IP or auth token. Same client → same
+backend. Survives backend additions/removals with minimal
+disruption.
+
+### Sharded queues
+
+Hash on a key (user ID, conversation ID) to route messages
+to the same partition. Kafka's keyed partitioning is a
+consistent-hash variant.
+
+## A minimal implementation
+
+The data structure is a sorted map from `hash(vnode_name)` to
+`backend`:
+
+```ts
+class ConsistentHashRing {
+  private ring: Map<number, string> = new Map();
+  private sortedKeys: number[] = [];
+
+  constructor(backends: string[], private vnodes = 128) {
+    for (const b of backends) this.addBackend(b);
+  }
+
+  addBackend(name: string) {
+    for (let i = 0; i < this.vnodes; i++) {
+      const h = hash(`${name}#${i}`);
+      this.ring.set(h, name);
+    }
+    this.sortedKeys = [...this.ring.keys()].sort((a, b) => a - b);
+  }
+
+  removeBackend(name: string) {
+    for (let i = 0; i < this.vnodes; i++) {
+      this.ring.delete(hash(`${name}#${i}`));
+    }
+    this.sortedKeys = [...this.ring.keys()].sort((a, b) => a - b);
+  }
+
+  pick(key: string): string {
+    const h = hash(key);
+    // binary search for the first vnode >= h, wrap to first
+    let lo = 0, hi = this.sortedKeys.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.sortedKeys[mid] < h) lo = mid + 1; else hi = mid;
+    }
+    const idx = lo === this.sortedKeys.length ? 0 : lo;
+    return this.ring.get(this.sortedKeys[idx])!;
+  }
+}
+```
+
+`hash` is any well-distributed hash function — MurmurHash3 or
+xxHash for non-cryptographic work, SHA-1 truncated for
+historical compatibility with Dynamo / Cassandra.
+
+In practice you'd reuse a library (`hashring` in Node,
+`hash_ring` in Python, `groupcache` in Go, etc.) — the
+algorithm is small but the corner cases (rebuilding the sorted
+keys efficiently, handling concurrent adds) take care.
+
+## Replication on top
+
+For data stores, the natural extension: a key's owner is the
+**first N** vnodes clockwise (one per physical backend, to
+avoid putting two copies on the same machine).
+
+```
+Replication factor = 3
+key hashes at position 100
+First vnode at position 105 → backend A
+Next vnode (different backend) at 120 → backend C
+Next vnode (different backend) at 150 → backend D
+Replicas: A, C, D
+```
+
+Cassandra and Dynamo work exactly like this. The ring is the
+master document.
+
+## Maglev hashing
+
+An alternative to ring-based consistent hashing, developed at
+Google. It pre-computes a lookup table (typically of size
+65 537) where each slot maps to a backend. Lookups are O(1)
+via `table[hash(key) % table_size]`.
+
+Pros:
+
+- O(1) lookup (vs O(log N) for ring).
+- Very even distribution.
+- No vnode-count tuning.
+
+Cons:
+
+- Table rebuild cost on backend changes.
+- Slightly worse disruption properties than ring-based
+  (when a node is removed, more than 1/N keys move).
+
+Used in Google's Maglev (the LB behind Google Search) and in
+modern Envoy/Cilium configurations. Worth knowing about as
+"the other consistent hashing."
+
+## Rendezvous (Highest Random Weight) hashing
+
+A different scheme entirely. For each (key, backend) pair,
+compute a score (`hash(key, backend)`); pick the backend with
+the highest score.
+
+Pros:
+
+- Stateless — no ring to maintain.
+- Trivially uniform distribution.
+- Adding/removing a backend moves 1/N of keys (same as
+  consistent hashing).
+
+Cons:
+
+- O(N) per lookup (must compute N scores). Past ~100 backends
+  this gets slow.
+
+Rendezvous is used in some smaller-cluster scenarios. It's
+worth knowing as a backup vocabulary item.
+
+## Common pitfalls
+
+### Not using vnodes
+
+Hashing each backend to one ring position produces uneven
+load. With only N points on a ring of size 2³², variance is
+high. Always use vnodes (~100–256 per physical node).
+
+### Hashing the wrong key
+
+If you consistent-hash on session ID but the cache key is
+user ID, hits land on different backends than where they
+belong. The hash key must match the cache key for locality
+to work.
+
+### Treating hot keys as a hashing problem
+
+Consistent hashing distributes **keys** evenly. It doesn't
+distribute **load** evenly when keys have very different
+access rates. A single hot key still hammers one backend.
+
+For hot-key handling, you need a different layer: replication
+of hot entries, request collapsing, or sharding the hot key
+into sub-keys. See hot-keys-and-key-sharding.
+
+### Forgetting bounded loads
+
+Pure consistent hashing has no upper bound on how lopsided
+real load can get. If you care about tail latency under
+imbalance (typical for load balancers in front of services),
+use bounded-load consistent hashing.
+
+### Cross-region rings
+
+A single global ring spanning regions means keys can be
+assigned to a backend on another continent. Most production
+designs use a **per-region ring**; cross-region replication
+sits above. Don't mix routing and replication into one global
+ring.
+
+### Resharding inflight
+
+When you add a backend, keys that used to belong to its
+neighbors now belong to it. Until those keys are populated on
+the new backend, requests for them miss (or get stale data
+from the wrong backend). Plan a warm-up / migration: pre-load
+keys on the new backend, then add it to the ring.
+
+## In summary
+
+- Modulo hashing breaks horribly when backends change.
+  Consistent hashing moves only 1/N of keys.
+- Use a hash ring with virtual nodes (100–256 per backend)
+  for even distribution.
+- For load balancing, prefer **bounded-load consistent
+  hashing** to avoid hot-spot saturation.
+- Maglev (lookup table) and Rendezvous (max-score) are
+  alternatives with their own tradeoffs.
+- It's the underlying mechanism in Cassandra, DynamoDB,
+  Memcached clients, Redis Cluster, modern Envoy, and most
+  CDN edges.
+- Consistent hashing handles backend changes elegantly — it
+  doesn't fix hot keys or skewed access. Those need separate
+  solutions.

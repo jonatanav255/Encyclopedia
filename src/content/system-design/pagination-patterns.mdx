@@ -1,0 +1,300 @@
+export const level = 'mid';
+
+# Pagination patterns
+
+Offset pagination (`?page=42&size=20`) works for the first hundred
+pages and falls over after. Cursor (keyset) pagination scales. The
+choice has consequences for performance, UX, and consistency.
+
+Geewax's *API Design Patterns* and Designing Data-Intensive
+Applications both treat this seriously — it's a deeper topic than
+"how do I number my pages."
+
+## The four families
+
+<Cheatsheet>
+| Pattern | URL shape | Pros | Cons |
+|---|---|---|---|
+| Offset / limit | `?offset=400&limit=20` | Random access; familiar UX (page numbers). | O(offset) scan; data shifts cause skip/dupe. |
+| Keyset / cursor | `?after=<cursor>&limit=20` | O(1) per page; stable under inserts. | No jumping to page N. |
+| Seek (DB-native) | (under the hood; usually keyset) | Same as keyset. | Same as keyset. |
+| Snapshot / time-windowed | `?after=<cursor>&snapshot=<id>` | Consistent view; supports retries. | Requires server-side snapshot storage. |
+</Cheatsheet>
+
+In practice you choose between **offset** (small datasets, page-
+number UX) and **cursor** (everything else).
+
+## Why offset breaks
+
+Offset says "skip 400 rows, give me the next 20." The database must
+**scan and discard** the first 400 to return the next 20.
+
+```js
+// Equivalent SQL inside a Node DB client
+const rows = await db.query(`
+  SELECT * FROM events
+  ORDER BY created_at DESC
+  LIMIT 20 OFFSET 400
+`);
+```
+
+Cost:
+
+- Page 1: scan 20.
+- Page 21 (offset 400): scan 420, return 20.
+- Page 50 000 (offset 1 000 000): scan 1 000 020, return 20.
+
+For large tables, "go to page 50 000" is a query timeout. Worse: a
+typical feed sees most reads on page 1 and a long tail of deep
+queries, so the slowest queries dominate p99 latency.
+
+A second problem: **shifts**. If a new row arrives between two
+paginated reads, the offset moves. Reading page 5 then page 6 can
+yield duplicate or skipped rows because the data shifted under the
+offset.
+
+## Keyset pagination (the right default)
+
+Instead of "skip N rows," keyset says "give me rows **after this
+specific row**":
+
+```js
+// First page
+const firstPage = await db.query(`
+  SELECT id, created_at, payload FROM events
+  WHERE created_at < $1
+  ORDER BY created_at DESC, id DESC
+  LIMIT 20
+`, [now]);
+
+// Next page: use the last row's (created_at, id) as the cursor
+const lastRow = firstPage[firstPage.length - 1];
+const nextPage = await db.query(`
+  SELECT id, created_at, payload FROM events
+  WHERE (created_at, id) < ($1, $2)
+  ORDER BY created_at DESC, id DESC
+  LIMIT 20
+`, [lastRow.created_at, lastRow.id]);
+```
+
+The query is **O(20)** every page, regardless of depth — assuming
+the index supports `(created_at DESC, id DESC)`. Page 1 and page
+1 000 cost the same.
+
+### Why a composite cursor
+
+`created_at` alone is not unique (two rows can share a timestamp).
+Without `id` as the tiebreaker, two rows with the same `created_at`
+can produce a duplicate-or-skip on the page boundary. Always include
+a unique tiebreaker (usually the primary key).
+
+### The cursor on the wire
+
+You don't expose raw `(created_at, id)` to clients — encode the
+cursor as an opaque token:
+
+```js
+function encodeCursor({ createdAt, id }) {
+  return Buffer.from(JSON.stringify({ c: createdAt, i: id })).toString('base64url');
+}
+
+function decodeCursor(token) {
+  return JSON.parse(Buffer.from(token, 'base64url').toString());
+}
+```
+
+Why opaque:
+
+- You can change the cursor's shape later without a breaking change.
+- Clients can't construct cursors by hand and rely on internal IDs.
+- You can add signatures to prevent tampering.
+
+Don't return cursors that include primary-key information clients
+shouldn't see.
+
+## Response shape
+
+A common pattern:
+
+```js
+{
+  "data": [ /* 20 items */ ],
+  "pageInfo": {
+    "nextCursor": "eyJjIjoiMjAyNi0wNS0yMC4uLiJ9",
+    "hasNextPage": true
+  }
+}
+```
+
+Or the GraphQL Relay convention with `edges`, `cursor`, `pageInfo`.
+The key is:
+
+- Clients pass back exactly what they got.
+- `hasNextPage` is a separate boolean (cursor alone doesn't tell
+  you whether more data exists).
+- No `total` count by default — see below.
+
+## The total-count trap
+
+Every paginated API has someone asking for `total`. Computing total
+is **`SELECT COUNT(*)` over the full result set**, which for large
+tables is itself a slow query. For most use cases, total is not
+needed:
+
+- Infinite-scroll UIs: just need `hasNext`.
+- Feed-style UIs: total is meaningless ("87 234 posts" — and?).
+- Search results: an approximate count is fine.
+
+If you must:
+
+```
+- Cap the count at some maximum: "more than 10 000."
+- Maintain an approximate counter (eventual, cheap).
+- Compute on demand only when explicitly requested.
+```
+
+Don't return exact counts on every paginated request. The query is
+often the slowest part of the response.
+
+## Stability under inserts
+
+Even keyset has a subtlety: what if new rows arrive that fall
+**between** already-served pages?
+
+Two policies:
+
+```
+1. Stable cursor: the cursor anchors to a row that existed at first-
+   page time. New rows inserted in the past are visible only on
+   refresh.
+
+2. Live cursor: each page sees whatever rows are currently before
+   the cursor. New inserts may be seen on the next page or skipped
+   depending on direction.
+```
+
+For feed-like UIs, "live cursor" is usually what you want — clients
+expect new things to "appear at the top." For "export all items"
+flows, stable is better. Document which you do.
+
+For exports specifically, **snapshot pagination** is the right tool:
+the server captures the set of IDs at start and the cursor walks
+within that fixed set.
+
+## Forward and backward
+
+Keyset is naturally forward-only. For backward navigation:
+
+```
+?before=<cursor>&limit=20
+```
+
+Just flip the comparison and order:
+
+```
+WHERE (created_at, id) > ($1, $2)
+ORDER BY created_at ASC, id ASC
+LIMIT 20
+```
+
+Then **reverse the result** in app code so the user sees them in
+the expected display order. The query is symmetric; the framing is
+client-side.
+
+## Index requirements
+
+Keyset only works if the database can serve it cheaply, which means
+the index matches the sort:
+
+```js
+// SQL (Postgres):
+// CREATE INDEX events_created_at_id_desc
+//   ON events (created_at DESC, id DESC);
+```
+
+Without the matching index, keyset becomes a full table scan. Worst
+case: keyset with no index is slower than offset.
+
+For MongoDB / DynamoDB / etc., the same principle applies — the
+cursor must be a prefix of the sort key.
+
+## Jumping to a specific page
+
+Keyset doesn't naturally support "go to page 50." If that's a
+hard UX requirement:
+
+- Use offset (accept the cost) for shallow pages, fall back to
+  keyset beyond a threshold.
+- Render page numbers as approximate ("page 1, 2, 3 ... last"),
+  with no jump arbitrary-page option.
+- Provide a date-picker or filter instead of pages: "jump to events
+  from March 2024" is faster than "jump to page 4 712."
+
+Most modern UIs (infinite scroll, "load more") sidestep this entirely.
+
+## Cursor caveats
+
+A few things to watch:
+
+### Sortable, immutable fields
+
+The cursor must be over fields that don't change for a given row.
+Sorting by `updated_at` makes the cursor unstable — a row's
+`updated_at` changes, so its position changes, so the cursor's
+relative position shifts. Use immutable fields (created timestamp,
+primary key) or accept the instability.
+
+### Sort by non-unique field without tiebreaker
+
+Sorting purely by `priority` (an integer with many ties)? You'll
+need a `(priority DESC, id DESC)` cursor to be stable. Sort key
+must end with a unique tiebreaker.
+
+### Cursor TTL
+
+If a row referenced by a cursor is deleted, the next page query
+might still work (it's a `WHERE` not a `JOIN`) — but design tests
+to confirm. Some databases (with certain indexes) may behave oddly.
+
+### Cross-cluster cursor
+
+In a sharded system, a single page may span shards. The cursor
+becomes a per-shard cursor. Complicated; for some systems the right
+answer is to paginate per-shard and let the client interleave.
+
+## A reusable design
+
+For any new "list" endpoint:
+
+```
+- Default to keyset / cursor pagination.
+- Cursor is opaque (base64 of internal state).
+- Composite ordering: (sortable_immutable_field, primary_key).
+- Index matches the cursor.
+- Response: { data, pageInfo: { nextCursor, hasNextPage } }.
+- No `total` unless explicitly requested.
+- Sort direction is part of the request, not the cursor.
+- Document: is this a stable or live cursor?
+```
+
+<Callout variant="info">
+The signal that you got pagination wrong: p99 latency on your list
+endpoint grows with the dataset. The signal that you got it right:
+list latency is constant whether the user is on page 1 or page 1000.
+</Callout>
+
+## In summary
+
+- Offset pagination is O(offset) and shifts under inserts. It's fine
+  for small datasets and admin tools; wrong for the hot path.
+- Keyset / cursor pagination is O(page-size) and stable. The default
+  for any list that can grow large.
+- Use a composite cursor `(sortable_field, primary_key)`; ship it
+  as an opaque token.
+- Don't return `total` by default; it's often the slowest part of
+  the response.
+- The cursor must match the index; without a matching index,
+  keyset is worse than offset.
+- Modern UIs (infinite scroll, "load more") fit cursor naturally;
+  classic page numbers usually require offset with a cap or
+  workaround.

@@ -1,0 +1,349 @@
+export const level = 'senior';
+
+# Global load balancing
+
+Global load balancing routes users to the nearest (or
+best-performing, or only-available) region of a
+multi-region service. It is fundamentally different from
+intra-region balancing: a single LB can't see all the
+world's users, and a single backend pool can't serve them
+within latency budgets. The job is to direct users to one
+of several **regional** clusters, each of which then runs
+its own intra-region LBs.
+
+The mechanisms — anycast, GeoDNS, HTTP redirects, edge
+proxies — each make different trade-offs between latency,
+HA, control, and operational complexity.
+
+## What "global" means
+
+A global LB cares about three things:
+
+1. **Locality**: pick a region close to the user, so the
+   network round-trip is short. US-east to EU is ~100 ms;
+   US to Asia is ~150 ms. Cross-ocean RTT adds latency
+   on every request.
+2. **Health**: don't send users to a region that's down or
+   unhealthy. Failover to the next-best region.
+3. **Capacity / cost**: spread load across regions according
+   to capacity, business cost, or compliance.
+
+Local LBs (intra-region) optimize for utilization and tail
+latency. Global LBs optimize for geographic latency and
+regional availability.
+
+## Anycast
+
+A single IP address (or range) is announced from multiple
+data centers via BGP. The internet's routing fabric
+naturally delivers each user's packets to the *topologically
+closest* announcement.
+
+```
+   announcement: 1.2.3.0/24 (announced from 50 POPs worldwide)
+   user in Tokyo  → routed to Tokyo POP
+   user in Berlin → routed to Frankfurt POP
+   user in Sydney → routed to Sydney POP
+```
+
+Pros:
+
+- **Fast**. The client doesn't pick — the network does. No DNS
+  lookup needed for routing.
+- **Resilient**. If a POP withdraws its announcement (because
+  it's down), traffic re-routes automatically.
+- **Same IP everywhere**. Simplifies caching, configuration,
+  certificate management.
+
+Cons:
+
+- Requires **owning IP space** and BGP peering. Not feasible
+  for most companies — but trivial for cloud providers and
+  CDNs.
+- Routes can shift mid-connection (rare but happens),
+  breaking long-lived TCP. Usually mitigated with per-flow
+  affinity at the POP.
+
+Anycast underpins:
+
+- Cloudflare, Fastly, Akamai (CDNs).
+- AWS Global Accelerator, GCP Cloud Load Balancing's
+  premium tier, Cloudflare Workers.
+- DNS root servers.
+- Google Public DNS (8.8.8.8), Cloudflare DNS (1.1.1.1).
+
+For most application developers, you use anycast indirectly
+by putting your service behind a global LB or CDN that
+already does it.
+
+## GeoDNS
+
+The DNS server looks at the resolver's IP, infers the
+geography, and returns a region-specific IP.
+
+```
+   user in Tokyo asks DNS for api.example.com
+   DNS sees resolver from Asia → returns IP of asia-region LB
+   user in Berlin asks DNS for api.example.com
+   DNS sees resolver from EU → returns IP of eu-region LB
+```
+
+Pros:
+
+- Works with normal DNS — no BGP needed.
+- Cheap. Any DNS provider with geo features (Route 53,
+  Cloud DNS, NS1) does this.
+- Granular control: weight, latency-based, geo-based.
+
+Cons:
+
+- **Imprecise**. The DNS server sees the resolver's IP, not
+  the user's. Users behind corporate or ISP resolvers can
+  be routed to the wrong region.
+- **Cache TTL lag**. DNS results are cached for the TTL (and
+  often longer — many resolvers ignore TTLs). A region
+  failing doesn't propagate fast.
+- **Failover slowness**. Failover via DNS = wait for caches to
+  expire. ~5 minutes typical, much longer in practice.
+
+For coarse, latency-tolerant routing (region selection
+once, then long sessions), GeoDNS is fine. For HA failover,
+its caching properties make it slow.
+
+The standard mitigation: low DNS TTL (60 seconds) combined
+with health checks on the records. Even then, resolvers in
+the wild cache for longer than you tell them.
+
+## HTTP-level redirects
+
+A globally-anycasted "front door" sees the request, decides
+which region should serve it, and either:
+
+- **Redirects** (`Location: https://eu.example.com/...`), or
+- **Reverse-proxies** the request through to the chosen
+  region.
+
+```
+   user → front-door.example.com (anycast)
+        → front-door sees user is in EU
+        → returns 302 to eu.example.com  (or proxies)
+   user → eu.example.com (regional)
+```
+
+Pros:
+
+- Full control. The front door can apply auth, A/B routing,
+  rate limits before deciding the region.
+- Failover is per-request — if eu-region is unhealthy, route
+  to us-east on the next request.
+
+Cons:
+
+- Adds latency (the front door is a hop).
+- The front door itself must be highly available — it's a
+  global SPOF if not designed carefully.
+
+This is the pattern Google's GFE (Google Front-End) and
+Cloudflare Workers + Smart Routing implement. Modern cloud
+global LBs (GCP Global HTTP Load Balancing, AWS CloudFront
++ Lambda@Edge) do this style.
+
+## Combining the three
+
+A realistic global LB design uses all three:
+
+```
+   1. Anycast → user hits the nearest POP.
+   2. POP runs DNS or HTTP front-door logic → decides regional cluster.
+   3. Cluster receives the request → intra-region LB hands it to a backend.
+```
+
+The anycast layer absorbs the connection at minimum
+latency. The front-door layer applies routing intelligence.
+The regional cluster handles the actual application work.
+Each layer plays to its strength.
+
+## Health checks at the global layer
+
+Regional health is a coarser signal than per-backend
+health:
+
+- **Synthetic probes** from outside the region (multiple
+  external monitoring locations) → does the region respond?
+- **Internal aggregated health** → are >X% of backends in this
+  region healthy?
+- **Capacity signal** → is the region accepting new traffic?
+
+If a region fails the global health check, withdraw it from
+the routing pool. New connections go elsewhere; existing
+connections drain.
+
+A common gotcha: a region that's serving 50% errors is
+"alive" by simple health checks. Global LBs need outlier
+detection at the regional level — drop a region when its
+error rate spikes, even if the LB technically reaches it.
+
+## Failover latencies by mechanism
+
+<Cheatsheet>
+| Mechanism | Failover time | Notes |
+|---|---|---|
+| Anycast (BGP withdrawal) | < 30 seconds | The internet reconverges automatically |
+| GeoDNS with 60s TTL | 1–10 minutes | Resolvers often cache beyond TTL |
+| HTTP front-door rerouting | < 1 second | Per-request decisions |
+| DNS with health checks (Route 53) | 1–5 minutes | TTL-limited |
+| Client-driven failover (app retries to backup region) | < 1 second | Requires client awareness of regions |
+</Cheatsheet>
+
+For HA-critical services, anycast or front-door routing is
+the only practical choice. GeoDNS is a routing optimization,
+not a failover mechanism.
+
+## Locality vs cross-region complexity
+
+Each new region multiplies system complexity:
+
+- **Database replication topology**. Multi-region writes need
+  multi-leader, conflict resolution, or a globally-distributed
+  database (Spanner, CockroachDB, DynamoDB Global Tables).
+- **Cross-region call cost**. If a service in EU has to call
+  one in US for every request, the user pays 100+ ms even
+  when in the EU.
+- **Data sovereignty**. EU data must stay in EU; some users'
+  requests can't cross to other regions.
+
+Adding a region for "lower latency" sounds easy and isn't.
+Plan the data layer first; the routing layer is the
+easier half.
+
+## Two design patterns
+
+### Active-active
+
+All regions serve traffic concurrently. Global LB sends
+each user to the nearest. Database replication is multi-
+leader or globally-distributed.
+
+Pros: lowest latency for all users. Loss of one region
+just means others absorb load.
+Cons: data conflicts, multi-leader replication, complex
+schema-change rollouts.
+
+### Active-passive
+
+One region is primary; others are warm standby. Global LB
+sends everyone to the primary. Standby takes over on
+failover.
+
+Pros: simpler data layer (single-primary). No conflicts.
+Cons: users in non-primary regions pay cross-region
+latency. Failover is rare but disruptive.
+
+Most companies start active-passive (or "active in N
+regions for reads, passive for writes") and only move to
+active-active when the latency gains justify the
+complexity.
+
+## Cross-region traffic engineering
+
+Beyond simple "closest region," global LBs can do:
+
+- **Latency-based**: probe round-trip times from each POP
+  to each region and route accordingly. Smarter than
+  geography (the closest geographic region isn't always the
+  network-closest).
+- **Capacity-based**: keep each region at ≤ X% capacity;
+  spill to next region when full.
+- **Cost-based**: avoid expensive egress paths (cross-cloud,
+  cross-continent).
+- **Sticky to data location**: if user data lives in EU,
+  route the user to EU regardless of where they are.
+- **Compliance-based**: route healthcare or financial
+  traffic only to specific regions.
+
+These are layered policies; the global LB engine combines
+them into a decision per request.
+
+## Connection draining across regions
+
+When you take a region out of service, existing connections
+need to finish. Patterns:
+
+- **Drain via DNS / anycast**: stop new connections. Wait
+  for existing to close naturally. Typically minutes for
+  HTTP, hours for long-lived WebSocket.
+- **Forced cutover**: hard-stop the region (load shedding,
+  graceful 503s). Faster but client-visible.
+
+For maintenance, drain. For outages, you don't have a
+choice.
+
+## Client-side global LB
+
+A different model: the client itself knows the list of
+regional endpoints and picks one. Used by:
+
+- Mobile apps with embedded region lists.
+- gRPC clients with a service-mesh-aware library.
+- Distributed database clients (DynamoDB, Cassandra) — they
+  know all the regions and route based on partition key.
+
+Pros: no extra hop. Failover is instant (client retries
+another endpoint).
+Cons: clients need updates when region topology changes.
+Worse: harder to monitor and control centrally.
+
+Most apps don't do this; specialized clients do.
+
+## Common pitfalls
+
+### Relying on DNS for HA
+
+Already covered. DNS TTLs are not respected. Don't expect
+DNS failover to happen in less than several minutes. For
+faster failover, use anycast or front-door routing.
+
+### Ignoring data locality
+
+You set up a beautiful global LB. Users in EU get routed to
+the EU region. The EU region's database makes every read
+a 100 ms cross-region call to US. Net latency: worse than
+serving from US directly. Always co-locate compute and the
+data it reads.
+
+### Treating cross-region failover as cheap
+
+A failover moves users to a region that doesn't normally
+serve them. Cache miss rate spikes; replicas may not be
+warm; the secondary region may have less capacity. Plan
+for the cold-failover scenario and test it.
+
+### Not handling slow-region scenarios
+
+A region isn't down but is degraded — 500 ms p99 instead
+of 50 ms. Simple health checks miss this. Latency-aware
+global LBs (with outlier detection at the region level)
+catch it; simple ones don't.
+
+### One global LB instance
+
+A global LB is itself global infrastructure. Make sure your
+"global LB" is genuinely distributed (anycast or multi-POP).
+A single LB in one region defeating the point.
+
+## In summary
+
+- Global LBs route users to the nearest healthy region,
+  not to individual backends.
+- Three mechanisms: anycast (network-level, fastest),
+  GeoDNS (DNS-level, slow failover), HTTP front-door
+  (request-level, most flexible). Most production stacks
+  combine all three.
+- Anycast + HTTP front-door is the modern default for
+  serious global services.
+- GeoDNS alone is a routing optimization, not a failover
+  mechanism — DNS caching makes it slow.
+- The hard part of multi-region isn't routing; it's the
+  data layer. Plan that before you draw the LB.
+- Active-active is great when justified, painful to maintain.
+  Active-passive is simpler and good enough for most.

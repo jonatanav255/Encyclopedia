@@ -1,0 +1,203 @@
+export const level = 'senior';
+
+# Graceful degradation
+
+Designing the system so it **loses features** before it
+**loses availability**. When something breaks, the user sees
+less, not nothing.
+
+The opposite: brittle systems where one component failure
+cascades into a full outage.
+
+## Examples
+
+- **Search service down**: serve the page without search
+  recommendations.
+- **Payment provider slow**: queue the payment, show "your
+  order is confirmed; payment processing."
+- **Personalization service down**: serve generic
+  recommendations.
+- **Live inventory service down**: show last cached
+  availability with a "may be out of date" notice.
+- **Email service down**: queue the welcome email; user still
+  signs up successfully.
+
+In each case, the user has a usable experience instead of an
+error.
+
+## How to design for it
+
+<Steps>
+<Step n={1} title="Identify what's truly required vs what's nice.">
+The user can complete signup if email is delayed. They can't
+complete signup if the database is down. The first is
+degradable; the second is critical.
+</Step>
+<Step n={2} title="Mark each dependency as required or optional.">
+Required dependencies: app fails closed when they fail.
+Optional: app continues with a degraded path.
+</Step>
+<Step n={3} title="Pre-build fallback paths.">
+For each optional dependency, define what the system serves
+when it's gone. Empty recommendations? Cached data? A friendly
+"unavailable" message?
+</Step>
+<Step n={4} title="Test the fallback paths.">
+Chaos engineering injects failures regularly. If you've never
+seen the fallback fire, it probably doesn't work.
+</Step>
+</Steps>
+
+## Patterns
+
+### Optional joins
+
+Page composer fetches:
+
+- Required: the article body.
+- Optional: author bio (fallback: hide).
+- Optional: related articles (fallback: hide).
+- Optional: comments (fallback: hide, show "comments
+  unavailable").
+
+The article still loads if any optional fetch fails.
+
+### Cached fallback
+
+If the live service is down, serve the last known cached
+value with a marker:
+
+```js
+async function getRecommendations(userId) {
+  try {
+    return await live.getRecommendations(userId, { timeout: 500 });
+  } catch {
+    return await cache.getStaleRecommendations(userId);  // hours-old is OK
+  }
+}
+```
+
+The user gets *something*. Stale-but-relevant beats empty.
+
+### Read-only mode
+
+Database writes are failing. Reads still work. Switch the app
+to read-only:
+
+- Users can browse, search, view their data.
+- They can't post, edit, or delete.
+- Banner: "We're investigating an issue with saving changes.
+  Reads are working normally."
+
+Many systems benefit from a read-only mode that can be
+toggled on at the edge.
+
+### Default-value fallback
+
+Personalization service is down. The recommendation list is
+empty. Show **the most popular items globally** instead.
+
+```js
+async function recommendations(userId) {
+  try {
+    return await personalizer.recommend(userId);
+  } catch {
+    return await popularItems.global();  // not personalized but valid
+  }
+}
+```
+
+Not as good as personalized, but not a broken page.
+
+### Feature flags as kill switches
+
+Each optional feature has a flag. Bug detected? Flip the flag
+off. Service overloaded? Flip non-essential features off to
+shed load.
+
+```js
+if (featureFlag.enabled('show-recommendations')) {
+  // ...
+}
+```
+
+The cost: every code path has a flag check. The benefit:
+incident response is "flip the flag," not "deploy a fix."
+
+## Failure modes to plan for
+
+| Failure | Degradation |
+|---|---|
+| Search service down | Hide search bar; serve listing pages |
+| Email/SMS down | Queue and retry; show "we'll email shortly" |
+| Image CDN down | Use placeholder images |
+| Recommendation service down | Generic / popular items |
+| Auth service down (briefly) | Cache session, allow read-only access |
+| Payment provider slow | Queue payment, show "processing" |
+| Translation service down | Fall back to English |
+| Live data service down | Serve cached snapshot |
+| Background workers backed up | Continue accepting requests; show "delayed" |
+
+## Common antipatterns
+
+### "If anything fails, fail the request"
+
+A page request fetches 10 things. Any one of them throwing
+fails the entire page. The user sees an error because the
+"recently viewed" widget had a bug.
+
+Fix: wrap optional fetches in try/catch; render their
+fallback on failure.
+
+### Fallback to a broken state
+
+The recommendations fallback returns `null`. The frontend
+crashes trying to render null. The fallback caused the
+outage.
+
+Fix: fallbacks must produce **valid** values for the consumer.
+Empty array, default object, etc.
+
+### Untested fallbacks
+
+The fallback code path runs once a year, during an outage.
+It hasn't been touched in 3 years. It's broken. The outage
+becomes worse because the fallback adds its own errors.
+
+Fix: chaos engineering. Run failure injection in production
+regularly to keep fallbacks exercised.
+
+### Cascading "optional" failures
+
+5 optional services all fail simultaneously. Each fallback
+runs. The page now shows 5 "unavailable" widgets. User sees
+a graveyard.
+
+Fix: at some threshold of degraded features, surface a more
+honest "we're having issues" banner. Don't let a thousand
+yellow flags accumulate.
+
+## When degradation isn't graceful
+
+Some operations have no graceful version:
+
+- **Login.** Can't degrade authentication.
+- **Payment commit.** The order either happened or didn't.
+- **Initial signup.** Can't create a partial user.
+
+These need full availability. Invest in redundancy here;
+degrade everywhere else.
+
+## In summary
+
+- Graceful degradation: lose features before losing
+  availability.
+- Classify dependencies as required vs optional.
+- Patterns: optional joins, cached fallback, read-only mode,
+  default values, feature flags.
+- Test fallbacks regularly (chaos engineering); untested
+  fallbacks fail in production.
+- Some paths can't degrade (auth, payments) — invest in
+  redundancy for those.
+- Avoid: requiring every dependency, broken fallbacks,
+  silent cascades.

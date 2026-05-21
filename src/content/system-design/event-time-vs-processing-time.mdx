@@ -1,0 +1,261 @@
+export const level = 'senior';
+
+# Event time vs processing time
+
+Every event has two timestamps you can reason about:
+
+- **Event time**: when the event actually happened in the real
+  world. "User clicked at 10:14:31.123 PT."
+- **Processing time**: when the system observed the event.
+  "Backend received it at 10:14:33.847 PT."
+
+For a fast network in steady state, the two are within
+milliseconds. For a 4G phone in a subway, the gap can be hours.
+For a mobile app that batches events while offline and uploads
+on reconnect, the gap is **days**.
+
+Conflating these is the source of more silently-wrong dashboards
+than any other single bug in streaming systems. Akidau's
+*Streaming Systems* opens with this distinction precisely
+because it's load-bearing.
+
+## A worked example
+
+Imagine a "logins per minute" dashboard. At 10:15, the dashboard
+shows 102 logins in the 10:14 bucket.
+
+At 10:18, three events arrive from a phone whose user logged in
+at 10:14 but lost connectivity. The events have **event time
+10:14:15** and **processing time 10:18:22**.
+
+Question: should the 10:14 bucket on the dashboard now show 105
+or stay at 102?
+
+Two answers, both legitimate:
+
+- **By processing time**: 102. The 10:14 bucket was the events
+  we *saw* in that real-time window. Late arrivals go in their
+  arrival bucket.
+- **By event time**: 105. The 10:14 bucket counts events that
+  *happened* then, no matter when they arrived.
+
+Most dashboards lie because they're built one way but
+interpreted the other way.
+
+## Which one you want depends on the question
+
+<Cheatsheet>
+| Question | Use |
+|---|---|
+| "How many logins happened in business hours?" | Event time |
+| "How loaded was our system at 10:14?" | Processing time |
+| "Daily active users per timezone" | Event time (in user's tz) |
+| "Throughput we sustained in the last hour" | Processing time |
+| "Did we exceed the rate limit in the 1-minute window?" | Event time (the user's actions) |
+| "Did our cluster fall behind during the deploy?" | Processing time |
+| "Sessionize a user's activity" | Event time |
+| "Worker queue lag" | Processing time |
+
+</Cheatsheet>
+
+Almost every **business question** is about event time. Almost
+every **operational question** is about processing time. They're
+not interchangeable.
+
+## Why streaming makes this harder than batch
+
+In batch, you usually have all the data and can sort by event
+time before computing anything. The notion of "late data" is
+meaningless — the data was either in the input or it wasn't.
+
+In streaming, you process records as they arrive. To compute "how
+many events happened in event-time bucket [10:14, 10:15)?" you
+have to **decide when the bucket is closed**. If you close it
+too early, late arrivals are dropped or rebucketed. If you keep
+it open forever, you can never emit a final answer.
+
+This is exactly what **watermarks** are for (see Watermarks): an
+explicit statement of "we believe event time has progressed past
+T; no more data is expected for buckets ending before T."
+
+## Common ways teams get this wrong
+
+### Treating processing time as event time
+
+The producer attaches no event timestamp. The stream processor
+stamps records on receipt and groups by that. The dashboard says
+"events at 10:14" but means "events received at 10:14."
+
+When the producer has a hiccup and queues 30s of data, the
+dashboard shows a spike at the wrong time and a dip at the
+right one. The data is intact; the labeling is wrong.
+
+**Fix**: every event carries an event timestamp from the producer.
+The processor uses that for windowing.
+
+### Drop-late policy with no late-data handling
+
+"Bucket 10:14 closes at 10:15. Drop anything later." A naive
+windowing setup will do this silently.
+
+In practice, ~1% of events arrive minutes late from mobile
+clients. Your "daily active users" undercounts by 1% every day,
+unnoticed until someone audits.
+
+**Fix**: allowed lateness + late-data trigger. Beam's model:
+emit the window at watermark, then re-emit (refinement) when
+late events arrive within the allowed lateness window. Or write
+late data to a side output for batch reconciliation.
+
+### Clock skew on producers
+
+Producers are different machines with different clocks. Some are
+seconds ahead or behind. Mobile clients can be **hours** off
+(set wrong by the user, time-zone confusion, deliberate
+manipulation).
+
+Events with event_time in the future or in the deep past need
+to be sanitized:
+
+```js
+const evtTime = Math.min(
+  Math.max(client.eventTime, server.now - MAX_LATENESS),
+  server.now,
+);
+```
+
+Or use **server-stamped event time**: the gateway timestamps the
+event on first contact. Trades absolute accuracy for clock
+sanity.
+
+### Joining streams with different time semantics
+
+Stream A is server-side events (event time ≈ processing time).
+Stream B is mobile-uploaded events (event time may be hours
+before processing time). Naive join on event time: B's late
+records arrive after A's window closed.
+
+**Fix**: align watermarks. The slower stream's watermark
+dominates. Join waits until both streams have advanced past T.
+See **Stream-table duality** and **Materialized views** for
+join semantics.
+
+## How frameworks handle this
+
+<Cheatsheet>
+| System | Default | Configurable |
+|---|---|---|
+| Kafka Streams | Event-time windowing | `WallclockTimestampExtractor` for processing time |
+| Flink | Event-time with watermarks | Processing-time also supported |
+| Spark Structured Streaming | Event-time with watermark | Processing-time available |
+| ksqlDB | Event-time from record timestamp | Supports custom extractor |
+| Beam | Both; you choose | Most flexible |
+
+</Cheatsheet>
+
+Default-event-time is the right default. Operational dashboards
+that want processing time are usually a separate pipeline.
+
+## Choosing the right time for each pipeline
+
+<Steps>
+<Step n={1} title="Identify what business question the pipeline answers.">
+Almost always: event time.
+</Step>
+<Step n={2} title="Decide on allowed lateness.">
+1 minute? 1 hour? 1 day? Pick from the worst-case producer
+delay (mobile offline window for consumer apps; backfill
+window for internal pipelines).
+</Step>
+<Step n={3} title="Pick a watermark strategy.">
+Periodic from observed timestamps with bounded out-of-order is
+the most common; see Watermarks for variants.
+</Step>
+<Step n={4} title="Decide what to do with truly late data.">
+Drop, side-output, or refine the closed window. Each has
+trade-offs.
+</Step>
+<Step n={5} title="Run a parallel batch reconciliation if correctness matters.">
+The streaming view is approximate; the nightly batch is
+authoritative. Most real systems run both.
+</Step>
+</Steps>
+
+## Concrete code shape
+
+Most modern streaming SQL/DSLs look like:
+
+```js
+// Kafka Streams flavor
+builder.stream('orders')
+  .selectKey((_, v) => v.userId)
+  .groupByKey()
+  .windowedBy(TimeWindows.ofSizeAndGrace(
+    Duration.ofMinutes(5),       // window size (event time)
+    Duration.ofMinutes(10),      // allowed lateness
+  ))
+  .count()
+  .toStream();
+```
+
+The `windowedBy` is event-time. `grace` defines how late an
+event can arrive and still update its window. After grace
+expires, late records are dropped.
+
+The same pipeline configured for processing time would look
+different — usually using a `WallclockTimestampExtractor` rather
+than the embedded event timestamp.
+
+## The dashboard tax
+
+Once you mix event time and processing time, every dashboard
+needs to say which it shows. Naming conventions help:
+
+- `events_observed_per_minute` — processing time
+- `events_occurred_per_minute` — event time
+
+When stakeholders ask "why is the 10:14 number different than
+yesterday?", the answer is almost always "we re-bucketed late
+data" — and only the event-time chart can say that. Processing
+time can't change retroactively because it's defined by the
+clock at observation.
+
+## Pitfalls
+
+<Callout variant="warning">
+**"Use server time for everything."** Loses event time
+information forever. The 10:14 bucket may include events that
+actually happened at 9:30 — you can't tell.
+</Callout>
+
+<Callout variant="warning">
+**"Trust client time."** Trusts every phone's clock. Some are
+weeks off. Always clamp into a sane range or use
+server-stamped-on-receipt.
+</Callout>
+
+<Callout variant="warning">
+**No allowed lateness.** Drops 1% of data silently. Common in
+naive Kafka Streams + windowing setups. Always set grace > 0
+unless you've decided drop-late is the right policy.
+</Callout>
+
+<Callout variant="warning">
+**Mixing in one chart.** A line chart with "events" labeled
+implicitly mixes both. Pick one for each chart; label it
+explicitly.
+</Callout>
+
+## In summary
+
+- **Event time** = when it happened. **Processing time** = when
+  the system saw it.
+- **Business questions** want event time; **operational
+  questions** want processing time.
+- **Streaming forces an explicit choice** because data arrives
+  out of order; batch hides this.
+- **Use watermarks + allowed lateness** to close event-time
+  windows in streams.
+- **Clamp client clocks**; mobile and IoT timestamps are
+  often wrong.
+- **Label every dashboard** with which time it shows.

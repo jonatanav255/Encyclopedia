@@ -1,0 +1,185 @@
+export const level = 'senior';
+
+# Hedged requests
+
+When latency tails matter, **send the same request to a
+second replica after the p95 has elapsed**, and use whichever
+response arrives first. Cuts tail latency dramatically at the
+cost of a small percentage of extra load.
+
+The technique is from Jeff Dean's "Tail at Scale" paper. It's
+why systems like BigTable and Spanner serve consistent
+sub-100ms p99.
+
+## Why latency tails are evil
+
+A single user request often fans out to N backend calls. The
+slowest of N determines the user's experience.
+
+```
+N=10 backends, each with p99 = 100ms
+Probability all 10 succeed under 100ms = 0.99^10 ≈ 0.90
+So 10% of user requests are slower than the per-call p99
+```
+
+User-facing p99 latency is much worse than per-call p99
+because of fan-out. Hedging fights this.
+
+## The mechanism
+
+```js
+async function hedgedGet(replicas, key) {
+  const a = fetchFromReplica(replicas[0], key);
+  await delay(p95LatencyOfA);  // wait until 95% would have responded
+  const b = fetchFromReplica(replicas[1], key);
+  
+  return Promise.any([a, b]);
+}
+```
+
+Most requests don't need the hedge — they finish in time. The
+5% that would have been slow get a second chance from another
+replica.
+
+## The cost
+
+Extra load on the cluster:
+
+```
+extra calls = (probability that p95 elapsed) × N
+            = 0.05 × N
+            = 5% extra load
+```
+
+For 5% extra load, you cut tail latency dramatically. Usually
+worth it for any user-facing latency-critical path.
+
+## When hedging works
+
+- **Reads from replicas.** Multiple replicas, any can answer.
+- **Idempotent reads in general.** Calling twice is harmless.
+- **Latency-bound, not throughput-bound.** If you're saturated,
+  hedging adds load without helping latency.
+
+## When it doesn't
+
+- **Writes.** Sending the same write twice is a duplicate;
+  needs idempotency keys.
+- **Stateful operations**. Acquiring a lock, claiming a
+  resource — hedging double-claims.
+- **Already-saturated systems.** Hedging adds 5% load. If you
+  were at 95% utilization, you're now at 100% and slower.
+
+## Variants
+
+### Tied requests
+
+Send to both replicas simultaneously, but each request tells
+the other "I'm going to start in 50ms." If the first one
+finishes early, it cancels the second.
+
+```js
+const t = uuid();
+const a = fetchWithToken(replicas[0], key, t);
+const b = fetchWithToken(replicas[1], key, t);
+return Promise.any([a, b]);
+// server-side: if another replica wins, this one cancels its work
+```
+
+Used in Google's published designs. Requires cooperative
+replicas — they communicate about the tied token.
+
+### Speculative execution
+
+The server itself, on a slow operation, may delegate to a
+peer in parallel. The peer is "hedging" on the server's
+behalf. Common in MapReduce: a slow mapper triggers a
+speculative copy on another worker.
+
+### Cross-region hedging
+
+For multi-region reads, hedge to a far-away region. Most of
+the time, local responds fine. Occasionally local is slow;
+the far-away copy saves the user.
+
+Costs more in network bandwidth but can save UX during a
+regional brownout.
+
+## How to pick the hedge delay
+
+The hedge should fire when:
+
+- **High probability the first request is in trouble.**
+  Around p95 is the common choice.
+- **Low probability the first will respond before the
+  hedge.** Otherwise you're hedging too early and amplifying
+  load.
+
+Adaptive hedging: continuously measure p95; adjust the
+delay. Static p95 falls out of date as load shifts.
+
+```js
+const adaptiveP95 = new RollingHistogram({ size: 1000, percentile: 0.95 });
+// updates as requests complete
+const hedgeDelay = adaptiveP95.value();
+```
+
+## Implementing safely
+
+### Always handle the loser
+
+When the hedge fires and one wins, the other is still
+in-flight. Cancel it if possible:
+
+```js
+const controller = new AbortController();
+const a = fetch(url, { signal: controller.signal });
+await delay(hedgeDelay);
+const b = fetch(url, { signal: controller.signal });
+const winner = await Promise.any([a, b]);
+controller.abort();  // cancel the loser
+return winner;
+```
+
+If cancellation isn't supported, the duplicate just finishes
+and is discarded; the work is wasted but the user is
+happy.
+
+### Idempotency at the receiver
+
+Both calls reach the server. Both might write to a log, send
+a notification, or update state. Hedging is read-safe by
+default; for writes, every callee must be idempotent
+(idempotency key per logical operation, not per call).
+
+### Bounded hedging
+
+Don't hedge more than once or twice. A 4-way hedge cuts more
+tail latency but adds 4× the load — usually not worth it.
+
+```
+single hedge: ~5% extra load, ~10× tail latency reduction
+two hedges:   ~10% extra load, marginal additional benefit
+```
+
+## Where hedging shows up in production
+
+- **BigTable, Spanner, Bigtable** read paths.
+- **Wikipedia / Wikimedia** Database query path.
+- **DNS resolvers** querying multiple authoritative servers.
+- **Anycast networks** with multiple closest POPs.
+- **gRPC** client-side load balancing with retry budgets that
+  resemble hedging.
+
+## In summary
+
+- Hedged requests: send to a second replica after p95
+  elapsed; take whichever wins.
+- Cuts tail latency dramatically (~10×) for small extra load
+  (~5%).
+- Safe for idempotent reads; needs care for writes (use
+  idempotency keys).
+- Adaptive hedge delay (track rolling p95) beats static.
+- Always cancel the loser if possible.
+- Don't hedge under saturation — it makes things worse.
+- The standard tool when user-facing latency tails matter.

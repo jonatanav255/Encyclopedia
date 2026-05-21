@@ -1,0 +1,230 @@
+export const level = 'senior';
+
+# Design a metrics / monitoring system
+
+A system like Prometheus, Datadog, or InfluxDB. Collects
+time-series data (CPU, latency, request counts, custom
+business metrics) from thousands of sources, stores it
+efficiently, serves queries for dashboards and alerting.
+
+## 1. Clarify the scope
+
+- Scale: 10K hosts, each emitting 1K metrics every 10 seconds?
+- Retention: 30 days hot + 1 year cold?
+- Query patterns: real-time dashboards, alerting, ad-hoc
+  exploration?
+- Push (agents report up) or pull (server scrapes)?
+
+Default: 10K hosts × 1K metrics × 10s interval = 1M points/sec
+ingest. 30-day hot retention. Both push and pull APIs.
+
+## 2. Estimate scale
+
+```
+1M points/sec ingest
+Each point: timestamp (8B) + value (8B) + tags (50B avg) = 66B
+Daily raw: 1M × 86400 × 66B = ~5.7 TB/day
+30 days raw: 170 TB
+With 10x compression (columnar + delta encoding): 17 TB hot
+```
+
+## 3. API
+
+```bash
+POST /api/v1/write
+  Body: prometheus-style text or protobuf
+
+GET /api/v1/query?q=<promql>&time=<rfc3339>
+  Returns: { result: [...] }
+
+GET /api/v1/query_range?q=<promql>&start=...&end=...&step=30s
+  Returns: { result: [{ metric, values: [[ts, v], ...] }] }
+
+POST /api/v1/alerts
+  Body: { rules: [...] }
+```
+
+## 4. High-level design
+
+```
+agents (Prometheus exporters, statsd, OpenTelemetry)
+        │
+        ▼
+ingest layer (load-balanced, stateless)
+        ▼
+write-ahead log (Kafka)
+        ▼
+storage tier (sharded TSDB)
+   ├── hot tier: SSD, last N days
+   └── cold tier: object storage, parquet/columnar
+        ▲
+query engine ─── alerting engine
+        ▲
+dashboards / alerts
+```
+
+## 5. Data model
+
+A time series = (metric_name + label set) → ordered points.
+
+```
+http_requests_total{service="api", status="200"}
+  → [(ts=1000, v=100), (ts=1010, v=105), (ts=1020, v=110), ...]
+```
+
+Each unique label combination = a separate time series.
+**Cardinality** of label values matters — see deep dive.
+
+Storage layout (columnar):
+
+```
+For one series:
+  timestamps: [1000, 1010, 1020, ...] — delta-encoded
+  values:     [100, 105, 110, ...] — gorilla compression
+```
+
+## 6. Deep dives
+
+### Ingest path
+
+The ingest tier is stateless. It:
+
+1. Parses the incoming metric format.
+2. Computes the series ID (hash of metric + labels).
+3. Routes to the correct storage shard (by series ID).
+4. Returns success after the write hits the WAL.
+
+Stateless makes scaling trivial: add more ingest pods.
+
+### Cardinality is the silent killer
+
+Each unique `(metric, labels)` combination is a separate time
+series. A naive `request_count{user_id="..."}` explodes
+cardinality:
+
+- 1M unique users × 100 metrics = 100M series per metric.
+- Each series has memory overhead (~few KB) and storage cost.
+- Queries that scan all series for one metric become
+  unaffordable.
+
+Mitigations:
+
+- **Pre-aggregate high-cardinality labels** (group by region,
+  not by user_id).
+- **Cap labels** to a known small set.
+- **Use histograms / summaries** instead of per-event labels.
+- **Sample / drop** noisy series.
+
+Cardinality bombs are the most common metrics outage.
+
+### Storage: TSDB
+
+Time-series databases like Prometheus, Cortex, M3DB, InfluxDB,
+and TimescaleDB share a common pattern:
+
+- **WAL** for durability of in-memory writes.
+- **In-memory chunks** per series, sorted by time.
+- **Periodic flush** to immutable disk blocks (every 2h in
+  Prometheus).
+- **Compaction** merges small blocks into bigger ones.
+- **Indexes**: posting lists from label → series IDs for fast
+  query.
+
+### Compression
+
+Time-series is highly compressible:
+
+- **Delta-of-delta** on timestamps: regular intervals collapse
+  to tiny values.
+- **Gorilla XOR encoding** on float values: consecutive
+  floats often differ in only a few bits.
+- **Bit-packing** for integer values.
+
+Typical compression: 1–2 bytes per point on average. Without
+this, every TSDB is 10× larger.
+
+### Query language
+
+PromQL is the de facto standard:
+
+```
+rate(http_requests_total[5m])
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_bucket[5m])))
+```
+
+Query engine:
+
+1. Parse PromQL.
+2. Resolve label matchers to series IDs (via the inverted
+   index).
+3. Read time ranges from storage (hot or cold).
+4. Execute the function pipeline (rate, sum, histogram_quantile, etc.).
+5. Return results.
+
+### Cold tier with downsampling
+
+After N days, raw data is too expensive to keep in hot storage.
+**Downsample**: aggregate raw points into 5-minute or 1-hour
+rollups, keep the rollups in cold storage.
+
+```
+0 - 7 days:   raw (10s resolution)   — hot
+7 - 30 days:  5m rollups              — warm
+30 days+:     1h rollups, top-K only  — cold (object storage)
+```
+
+Query engine transparently picks the right tier based on the
+query's time range.
+
+### Alerting
+
+Periodic query of alert rules: "for each rule, evaluate;
+if true for N consecutive evals, fire."
+
+```js
+// Pseudo-rule
+{
+  alert: "HighErrorRate",
+  expr: "rate(errors[5m]) / rate(requests[5m]) > 0.05",
+  for: "10m",
+  annotations: { ... }
+}
+```
+
+Evaluated every 30s typically. Firing alerts dedupe and route
+to PagerDuty / Slack via an alertmanager.
+
+## 7. Bottlenecks and scale-ups
+
+- **Cardinality**: cap labels; pre-aggregate; sample.
+- **Ingest bottleneck**: more stateless pods + more Kafka
+  partitions.
+- **Storage shard hot key**: shard by series hash; rebalance
+  when one shard hits limits.
+- **Query latency on long ranges**: pre-aggregate into rollups;
+  hit cold tier with parquet scans.
+
+## 8. Tradeoffs called out
+
+- **Push vs pull**: support both. Push works for ephemeral
+  workloads (functions, batch jobs); pull works for long-lived
+  services.
+- **Columnar storage + gorilla encoding**: chose for
+  compression and scan speed; cost is no point-update.
+- **Downsample old data**: chose for cost; lose fidelity for
+  ad-hoc exploration of old time ranges.
+- **PromQL as query language**: chose standard; lose
+  flexibility of SQL-style joins.
+
+## In summary
+
+- Metrics system = ingest + WAL + sharded TSDB + columnar
+  storage + query engine.
+- Cardinality is the silent killer; pre-aggregate
+  high-cardinality labels.
+- Time-series compression (delta + gorilla) brings storage
+  cost down by ~10×.
+- Hot tier (raw, SSD) + cold tier (rollups, object storage)
+  is the standard pattern.
+- Alerts evaluate periodic queries; an alertmanager dedupes
+  and routes.

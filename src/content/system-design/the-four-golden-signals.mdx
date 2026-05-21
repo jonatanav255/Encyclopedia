@@ -1,0 +1,226 @@
+export const level = 'mid';
+
+# Four golden signals
+
+Google's SRE book gives the most cited monitoring starter kit:
+**latency, traffic, errors, saturation**. Four numbers per
+service. If you only graph four things for a user-facing system,
+graph these four. Everything else is detail.
+
+It overlaps heavily with RED — same first three, plus
+saturation. The addition matters: saturation catches the
+"resource is full, latency hasn't blown up yet" state that pure
+RED misses.
+
+## The four
+
+<Cheatsheet>
+| Signal | Definition | Failure it catches |
+|---|---|---|
+| Latency | Time to serve a request, split by success vs fail | Slowdowns |
+| Traffic | Demand on the system (RPS, MB/s, sessions, …) | Sudden drops or spikes |
+| Errors | Rate of failed requests | Broken paths |
+| Saturation | How "full" the most-constrained resource is | Capacity exhaustion *before* it tips over |
+
+</Cheatsheet>
+
+The order is the order you read them on the dashboard. Traffic
+provides context; latency and errors describe user pain;
+saturation tells you how much headroom is left.
+
+## Latency
+
+Split into **successful** latency and **failed** latency, always.
+
+A failing endpoint that returns a 500 in 3ms inflates p99 in the
+wrong direction — it actually looks better as 5xx rate rises.
+Graphing only "all requests" hides this. Two series:
+
+```js
+// Successful
+histogram_quantile(0.99,
+  sum by (le) (rate(http_duration_seconds_bucket{status!~"5.."}[5m])))
+
+// Failed
+histogram_quantile(0.99,
+  sum by (le) (rate(http_duration_seconds_bucket{status=~"5.."}[5m])))
+```
+
+Percentiles to graph: p50, p90, p99. p99 is the standard SLO
+target. p99.9 only matters if you're operating at a scale where
+0.1% is millions of users — otherwise the math is too noisy to
+alert on.
+
+## Traffic
+
+The unit depends on the workload:
+
+<Cheatsheet>
+| System | Traffic metric |
+|---|---|
+| HTTP service | Requests per second |
+| Database | Queries per second, plus bytes read/written |
+| Stream processor | Records consumed per second |
+| Storage system | GET/PUT operations per second |
+| Streaming media | Concurrent sessions, bytes egressed |
+| WebSocket gateway | Active connections, messages per second |
+
+</Cheatsheet>
+
+Traffic isn't an error indicator — it's a **context** indicator.
+You can't tell whether a latency spike is alarming without
+knowing whether traffic also changed.
+
+A trick: graph traffic vs **a comparison series** — same metric
+1 hour ago, 1 day ago, 1 week ago. Most user-facing systems have
+seasonality (day-night cycle, weekly cycle). A 30% drop at noon
+on Monday is alarming; the same drop at 3am isn't.
+
+## Errors
+
+Both the rate and the **rate as a fraction of traffic**.
+
+- Absolute error rate: catches a sudden spike at high traffic.
+- Error fraction: catches a small absolute number that's a high
+  fraction of low traffic.
+
+```js
+// Rate
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+
+// Fraction
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+```
+
+What counts as an error is the same definitional question as in
+RED — server faults yes, client mistakes usually no, "200 with
+error in body" depends on your protocol. Pick a rule and apply
+it everywhere.
+
+## Saturation
+
+The signal RED drops and that the SRE book keeps. Saturation is
+**how close to capacity** the most-constrained resource is.
+
+Examples:
+
+- **CPU saturation**: run queue length / number of CPUs.
+- **Memory saturation**: working set / available memory; swap
+  rate as proxy.
+- **Connection-pool saturation**: in-use / pool size.
+- **Queue saturation**: pending / max capacity.
+- **Disk saturation**: average queue depth or % busy.
+
+Saturation is forward-looking. Latency tells you the queue is
+already painful; saturation tells you the queue is forming.
+
+<Callout variant="info">
+The SRE book defines saturation as "how 'full' the service is, a
+measure of system fraction emphasizing resources most
+constrained." The exact metric varies by resource. The discipline
+is **pick one per resource and stick with it**.
+</Callout>
+
+## Where the four golden signals diverge from RED
+
+<Compare a="RED" b="Four golden signals">
+<>
+- **Three signals**: rate, errors, duration.
+- Origin: Tom Wilkie at Weaveworks, 2015.
+- Drops saturation because most service teams can't measure it
+  meaningfully without going below the application layer.
+- Pitch: simpler, fits microservices well, three-row dashboard
+  per service.
+</>
+<>
+- **Four signals**: latency, traffic, errors, saturation.
+- Origin: Google's SRE book (Beyer et al., 2016).
+- Includes saturation because Google operates at the layer
+  where they have full host visibility and saturation is
+  meaningful.
+- Pitch: more complete, catches incidents in flight, requires
+  more host-level instrumentation.
+</>
+</Compare>
+
+In practice many teams use both labels for the same dashboard:
+the three RED rows plus a saturation row when measurable.
+
+## A starter dashboard
+
+For an HTTP service, four panels:
+
+```
++------------------------+------------------------+
+|   Traffic (RPS)        |   Errors %             |
+|   per route            |   per route            |
++------------------------+------------------------+
+|   Latency (p50/p99)    |   Saturation           |
+|   per route            |   (pool, queue, CPU)   |
++------------------------+------------------------+
+```
+
+Wire alerts only to the things you'd page on:
+
+- Latency p99 over SLO threshold for 5+ minutes → page.
+- Error rate burn rate > 10× → page.
+- Saturation > 90% sustained → page or ticket depending on
+  context.
+- Traffic drop > 50% from comparable period → page.
+
+Don't alert on every panel.
+
+## Symptom vs cause again
+
+The four golden signals are **symptom-based** by design. They
+measure what users experience (latency, errors) and what
+constrains the system (saturation, traffic). They don't tell you
+**why**.
+
+Cause-based metrics — "this specific DB query is slow," "this
+specific deployment changed" — are diagnostic. They go in the
+investigation runbook, not the on-call alert.
+
+This split is the whole point of alerting design: page on
+symptoms; debug on causes. The four golden signals are the
+symptom layer.
+
+## Adapting to non-HTTP workloads
+
+The signals generalize. Examples:
+
+<Cheatsheet>
+| System | Latency | Traffic | Errors | Saturation |
+|---|---|---|---|---|
+| Kafka consumer | Process time per record | Records/sec | Failed records, retries | Consumer lag |
+| Batch ETL | Job duration | Rows/files processed | Failed jobs | Resource queue depth, runtime vs budget |
+| Object store | Time to GET/PUT | Operations/sec | 4xx/5xx | Request concurrency limit |
+| Database | Query time | Queries/sec, bytes | Failed queries | Active sessions, replication lag |
+
+</Cheatsheet>
+
+The discipline: name your four and graph them everywhere. New
+services without a four-signal dashboard are unmaintainable in
+production.
+
+## Common mistakes
+
+- **Mixing success and failure latency**. A 5xx returns fast; it
+  drops p99 misleadingly.
+- **No traffic comparison series**. You'll get woken at 3am for
+  normal off-peak load.
+- **Saturation as "%-busy"**. Per-CPU "% busy" isn't saturation;
+  it's utilization. Track run queue or waiters.
+- **Alerting on every signal**. Page on the two or three that
+  correlate with user pain. The rest are diagnostic.
+
+## In summary
+
+- Four numbers per service: latency, traffic, errors, saturation.
+- Split successful vs failed latency.
+- Always graph traffic against a comparable historical period.
+- Saturation is the signal RED drops — pick a metric per
+  resource and stick with it.
+- Page on symptoms; debug on causes.
+- Adapt the four names; the shape of the dashboard transfers.

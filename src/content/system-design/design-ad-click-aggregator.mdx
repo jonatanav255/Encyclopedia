@@ -1,0 +1,222 @@
+export const level = 'staff';
+
+# Design an ad click aggregator
+
+A system that counts ad impressions and clicks at internet
+scale, attributes them to campaigns and budgets, and produces
+near-real-time aggregate stats — all while resisting fraud
+and double-counting.
+
+## 1. Clarify the scope
+
+- Volume: 100B impressions/day, 1B clicks/day?
+- Latency: dashboard within minutes, billing within hours?
+- Granularity: per-campaign, per-ad, per-creative, per-geo,
+  per-hour?
+- Fraud detection inline or async?
+- Exact counts or approximate?
+
+Default: 100B/day, 1-minute dashboard freshness, multi-axis
+granularity, exact counts for billing.
+
+## 2. Estimate scale
+
+```
+100B impressions/day = ~1.2M/sec average; 5M/sec peak
+1B clicks/day = ~12K/sec; 50K/sec peak
+Storage per event: 200 B raw, 50 B aggregated
+Daily raw: 100B × 200 B = ~20 TB/day
+After aggregation: ~1 TB/day in pre-rolled dimensions
+```
+
+## 3. API
+
+External (advertiser):
+
+```bash
+GET /stats?campaign=42&start=...&end=...&group_by=hour,geo
+  Returns: rolled-up metrics
+```
+
+Internal:
+
+```bash
+POST /event
+  Body: { type: "click"|"impression", ad_id, campaign_id,
+          user_id, geo, ts, fingerprint, ... }
+  Returns: 200 (ack from kafka)
+```
+
+## 4. High-level design
+
+```
+ad serving infra → event emitters
+        ▼
+   Kafka (raw events, partitioned by ad_id or campaign_id)
+        ▼
+   ┌────────┴───────────┐
+   ▼                    ▼
+fraud filter      stream aggregator (Flink/ksqlDB)
+   ▼                    ▼
+filtered events    real-time aggregates (Redis / Druid / ClickHouse)
+                        ▼
+              dashboard / billing
+                        ▲
+            batch reconciliation (Spark) ─── source-of-truth warehouse
+```
+
+Two pipelines: **realtime** for dashboards (eventual exact),
+**batch** for billing (provably exact).
+
+## 5. Data model
+
+Raw event:
+
+```
+{
+  type: "click",
+  campaign_id: 42,
+  ad_id: 1234,
+  user_id: "...",
+  ts: 1730000000000,
+  geo: "US-CA",
+  device: "mobile",
+  fingerprint: "...",
+  request_id: "uuid-..."
+}
+```
+
+Aggregates indexed by (time bucket × dimensions):
+
+```
+(2026-05-21T10:00, campaign=42, geo=US-CA, device=mobile) → 1234 clicks
+```
+
+A handful of dimensions × 1-hour buckets × 1B unique ads = a
+few billion aggregate rows. Columnar storage (Druid, ClickHouse,
+Pinot) compresses this well and queries fast.
+
+## 6. Deep dives
+
+### Dedup / exactly-once
+
+Same click could be reported twice (network retry, browser
+reload). At billing scale, double-counting equals overcharging
+the advertiser.
+
+Each event carries a `request_id` (UUID generated at the
+client). The aggregator dedupes by `request_id` over a sliding
+window:
+
+```js
+if (await dedupCache.set(request_id, '1', { NX: true, EX: 86400 })) {
+  aggregate(event);
+}
+```
+
+Window must be long enough to cover the longest retry. 24h is
+typical.
+
+### Idempotent aggregation
+
+The aggregator must be safe to run on the same input twice
+(redelivery from Kafka happens). Idempotent operations:
+
+- Use `request_id` as a key in dedup, not the aggregator state.
+- Aggregator writes are batch upserts to a database.
+
+OR:
+
+- Use exactly-once-stream-processing (Kafka transactions +
+  Flink checkpoints). The window state is part of the
+  checkpoint; on replay, no double-count.
+
+### Stream + batch reconciliation (Lambda or Kappa)
+
+(See kappa-vs-lambda-architecture.) Classic ad systems use
+Lambda: realtime stream for dashboards (eventual exact);
+batch (Spark / EMR) re-aggregates from raw events daily for
+billing.
+
+The batch result is **the truth**. If realtime drifted, the
+batch corrects it. Advertisers are billed off batch numbers.
+
+Modern systems lean toward Kappa: a single stream pipeline
+with very strong exactly-once. Skips the reconciliation step
+but only works if you trust the stream.
+
+### Fraud detection
+
+Fraudulent clicks (bots, click farms, accidentally-double-click)
+are filtered before they're billed:
+
+- **Inline rules**: per-IP / per-fingerprint rate limits, known
+  bot UAs, ASNs flagged as datacenter.
+- **ML model on stream**: scores each click; high-score-suspicious
+  events are flagged and excluded from billing.
+- **Post-hoc audit**: weekly batch job re-scores with newer
+  models; credits advertisers if fraud is found later.
+
+Fraud filtering is the difference between an honest ad system
+and an unbilled one.
+
+### Late events
+
+Networks drop. A click from yesterday arrives today. Two
+strategies:
+
+- **Tumbling window with grace period**: keep window state for
+  N hours after the window closes; late events update the
+  window then.
+- **Lambda batch**: the batch job processes raw events from
+  the last N days, so any late event eventually shows up
+  correctly.
+
+### Cardinality and storage
+
+A naive store with all dimensions (campaign × ad × user_id ×
+geo × device × time) explodes. Use **roll-up tables** at
+multiple grains:
+
+- (campaign, hour) — fast top-level dashboards.
+- (campaign, ad, day, geo) — daily reports.
+- (campaign, ad, hour, geo, device) — drill-down on demand.
+
+Pre-roll the common queries; do ad-hoc queries on raw events
+(slower).
+
+## 7. Bottlenecks and scale-ups
+
+- **Hot campaign**: a viral ad gets 1M clicks/sec. Use
+  per-campaign sharded counters (see design-distributed-counter).
+- **Dedup cache too large**: bloom filter for hot path; KV
+  store as backstop.
+- **Late events overload windows**: cap grace period; old
+  events go to batch only.
+- **Storage cost**: ttl raw events (90 days); keep only
+  aggregates long-term.
+
+## 8. Tradeoffs called out
+
+- **Lambda architecture**: chose stream + batch for billing
+  correctness; cost is operating two pipelines.
+- **Sharded counters for hot campaigns**: chose write
+  scalability; cost is read fan-out.
+- **Dedup window = 24h**: balances retry tolerance vs
+  cache size.
+- **Pre-rolled tables + raw fallback**: chose for query
+  latency; cost is some storage duplication.
+
+## In summary
+
+- Ad click aggregator = stream pipeline for dashboards + batch
+  pipeline for billing.
+- Dedup by client-generated `request_id` over a sliding
+  window.
+- Fraud filtering before aggregation; post-hoc audit catches
+  what inline misses.
+- Roll-up tables at multiple grains; columnar OLAP store.
+- Late events handled via window grace + nightly batch
+  reconciliation.
+- Exactly-once is a property of the *pipeline* (Kafka tx +
+  checkpoint + idempotent sink), not any single component.

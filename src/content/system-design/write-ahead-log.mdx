@@ -1,0 +1,175 @@
+export const level = 'senior';
+
+# Write-ahead log (WAL)
+
+Before modifying the database's actual data pages, write the
+intended change to a **log** first. If the system crashes
+mid-write, recover by replaying the log.
+
+The foundation of crash safety in essentially every serious
+database: Postgres, MySQL InnoDB, SQLite, MongoDB, Oracle,
+SQL Server, Cassandra. Without a WAL, you cannot have
+durable updates without sacrificing performance.
+
+## The protocol
+
+<Steps>
+<Step n={1} title="Write the intended change to the WAL.">
+Append a record describing the change (transaction ID,
+table, page, before/after values).
+</Step>
+<Step n={2} title="Flush the WAL to durable storage.">
+fsync. The change is now persisted, even if the system
+crashes immediately after.
+</Step>
+<Step n={3} title="Apply the change to the data pages.">
+This can happen lazily — in memory now, on disk later.
+</Step>
+<Step n={4} title="Acknowledge to the client.">
+The transaction is committed. The client has been told it
+succeeded.
+</Step>
+</Steps>
+
+If the system crashes between steps 3 and 4 of any
+transaction, recovery reads the WAL on restart, replays
+unapplied changes to the data pages. Durability preserved.
+
+## Why this is fast
+
+Without WAL, every modification would require:
+
+- Find the relevant data page.
+- Update it.
+- Write it to disk.
+- fsync.
+
+Random writes at random places, fsync per change. Painfully
+slow.
+
+With WAL:
+
+- Append the change to the log (sequential).
+- fsync the log.
+- Update in-memory page; flush later, batched.
+
+The hot path is one sequential write + one fsync. Sequential
+writes are ~30,000× faster than random on SSDs. (See
+append-only-logs.)
+
+## Concrete shape: Postgres WAL
+
+Postgres writes WAL records to `pg_wal/`. Each record is a
+small struct describing the change:
+
+```
+WAL record
+  - record ID (lsn)
+  - transaction ID
+  - record type (insert / update / delete / commit / ...)
+  - target page
+  - data (before image / after image / full page)
+```
+
+Records are appended sequentially. A wal-writer background
+process fsyncs frequently.
+
+A wal-checkpoint periodically writes the in-memory dirty
+pages to disk in batches, then truncates the WAL up to the
+checkpoint position.
+
+## Recovery
+
+On startup:
+
+1. Find the last checkpoint in the WAL.
+2. Replay every WAL record from that point onward.
+3. Resume.
+
+Replay is idempotent (each record describes a specific change
+at a specific position). Recovery is fast — proportional to
+the time since the last checkpoint, not the entire database
+size.
+
+## WAL and replication
+
+WAL records can be shipped to **replica** nodes. The replica
+applies the same records — its data is a faithful copy.
+
+- **Postgres streaming replication**: WAL records streamed
+  over TCP to standby servers.
+- **MySQL binlog**: similar idea, different format.
+- **MongoDB oplog**: a per-replica-set log of operations.
+
+The WAL is the replication protocol. The leader writes the
+log; followers stream and replay.
+
+## Synchronous vs async commit
+
+The fsync after WAL write is the gating cost.
+
+- **Synchronous commit**: client doesn't see "success" until
+  WAL fsync completes. Slower; durable.
+- **Async commit**: client sees "success" after WAL write to
+  OS buffer; fsync happens later. Faster; might lose recent
+  transactions on crash.
+
+Postgres tunable via `synchronous_commit`. Some workloads
+explicitly accept the loss risk for the speed.
+
+## The cost of WAL
+
+- **Disk space**: WAL accumulates between checkpoints.
+  Long-running transactions or slow replicas can hold back
+  WAL truncation.
+- **fsync latency**: every commit needs at least one fsync.
+  On fast SSDs that's ~50µs; on slow disks ~5ms. Multiplied
+  by your transaction rate.
+- **Replication lag**: synchronous replication adds the
+  replica's fsync to the commit path.
+
+## Group commit
+
+If 100 transactions commit simultaneously, do you need 100
+fsyncs? No — you can fsync once and acknowledge all 100.
+
+**Group commit**: collect concurrent commits for a brief
+window; one fsync covers them all. Increases p99 latency
+slightly but multiplies throughput.
+
+Every modern database does this automatically.
+
+## Force vs no-force
+
+Two recovery strategies:
+
+- **Force**: write the data page to disk before commit. Adds
+  random writes; not used by modern systems.
+- **No-force**: leave the data page in memory; rely on WAL +
+  recovery. Standard.
+
+The "no-force" choice is why WALs exist.
+
+## When WAL is not enough
+
+- **Total data loss**: if disk fails entirely, WAL goes with
+  it. Need replication or backups.
+- **Logical corruption**: a bug in the application wrote
+  bad data; the WAL faithfully records the bad data.
+  Application-level recovery needed (point-in-time recovery
+  using WAL + base backup).
+- **Catastrophic durability needs**: if losing 100ms of
+  recent commits is unacceptable, you need synchronous
+  replication on top of WAL.
+
+## In summary
+
+- WAL: append every change to a durable log before applying
+  it to data pages.
+- Foundation of crash safety in every serious database.
+- Sequential writes + lazy page flushes = fast hot path.
+- Recovery replays WAL from last checkpoint.
+- WAL is also the replication protocol.
+- Group commit batches fsyncs for throughput.
+- Doesn't protect against disk failure (need replication) or
+  application-level bugs (need point-in-time recovery).

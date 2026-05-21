@@ -1,0 +1,209 @@
+export const level = 'senior';
+
+# Design a leaderboard
+
+A real-time ranked list. Top N players globally, or "friends
+leaderboard," or "top 100 stocks today." The trick is that
+every score update changes a rank, and you need ranking
+queries fast.
+
+## 1. Clarify the scope
+
+- Number of entities: 1M players? 100M?
+- Update frequency: per-game, per-event, per-second?
+- Query patterns: top-K, my-rank, range-around-me, friends-only?
+- Time windows: all-time, weekly, monthly?
+- Tie-breaking rules?
+
+Default: 50M players, frequent updates, top-K + my-rank +
+range-around-me queries, weekly + all-time windows.
+
+## 2. Estimate scale
+
+```
+Players = 50M
+Updates/player/day = 20 → 1B updates/day → ~12K writes/sec average
+Queries: 200M DAU × 5 reads = 1B reads/day → ~12K reads/sec average
+Peak (during events): 10x → 120K reads/sec
+```
+
+## 3. API
+
+```bash
+POST /leaderboard/<key>/score
+  Body: { user_id, score }
+  Returns: { rank, score }
+
+GET /leaderboard/<key>/top?limit=100
+  Returns: [{ user_id, score, rank }, ...]
+
+GET /leaderboard/<key>/rank/<user_id>
+  Returns: { rank, score }
+
+GET /leaderboard/<key>/around/<user_id>?n=10
+  Returns: [{ user_id, score, rank }, ...]  (10 above + 10 below)
+```
+
+## 4. High-level design
+
+```
+client → write API
+            ▼
+       leaderboard service
+            ▼
+       Redis sorted set (primary store)
+            ▼
+       persistent storage (Postgres or DynamoDB)
+            ▼
+       periodic snapshot / time-window rotation
+```
+
+The core data structure is a **Redis sorted set** (ZSET).
+ZSETs do exactly what we need:
+
+- `ZADD key score member` — O(log N) update
+- `ZREVRANGE key 0 99 WITHSCORES` — O(log N + K) top K
+- `ZRANK key member` / `ZREVRANK key member` — O(log N) rank
+- `ZRANGEBYSCORE` — range queries
+
+## 5. Data model
+
+```
+leaderboard:global:all_time → ZSET
+   member: user_id
+   score:  player score (or compound score, see below)
+
+leaderboard:global:week:2026-W21 → ZSET (rotates weekly)
+
+leaderboard:friends:<user_id> → ZSET (smaller, per-user)
+```
+
+For tie-breaking, encode tiebreakers in the score itself.
+ZSET scores are doubles (~15 decimal digits of precision):
+
+```
+score = primary * 10^8 + (max_ts - update_ts) / max_ts * 10^7
+```
+
+Higher primary score wins; among ties, earlier-update wins
+(more "stable" rank).
+
+## 6. Deep dives
+
+### Single-shard limits
+
+A Redis sorted set lives on one shard. For 50M entries, the
+ZSET takes ~5 GB of RAM. That's fine in one Redis instance.
+At 500M entries, it's a problem.
+
+If you must shard:
+
+- **Bucket by score range**: scores 0–1000 on shard A, 1000–10000
+  on B, etc. Top-K still hits ~1 shard; rank requires looking
+  at lower-score shards.
+- **Bucket by region or league**: a "100 leaderboards instead
+  of one" approach. Most games naturally split this way.
+
+For most leaderboards, a single shard is enough — you just
+don't need 500M players in one rank.
+
+### Time-window rotation
+
+Weekly / monthly leaderboards: a new ZSET per window. Roll
+over at the boundary; archive the old one to cold storage.
+
+```js
+const weekKey = `leaderboard:global:week:${currentWeek()}`;
+await redis.zadd(weekKey, score, userId);
+```
+
+For consistency across the rollover boundary, have writes
+update both old and new ZSETs in the last few hours of the
+window.
+
+### Friends leaderboard
+
+A per-user ZSET of just the user's friends. On every score
+update, fan-out the update to all friends' ZSETs:
+
+```js
+async function onScoreUpdate(userId, score) {
+  await redis.zadd('leaderboard:global', score, userId);
+  const friends = await getFriends(userId);
+  for (const fid of friends) {
+    await redis.zadd(`leaderboard:friends:${fid}`, score, userId);
+  }
+}
+```
+
+For users with 1000+ friends, this fan-out is expensive.
+Mitigation: maintain `leaderboard:friends:<user_id>` only on
+read (lazy build); accept stale reads with a small refresh
+budget.
+
+### my-rank query
+
+`ZREVRANK key member` is O(log N) — fine for typical sizes.
+For very large ZSETs and rank queries on niche users,
+approximate rank from a histogram of score buckets:
+
+```js
+// Coarse bucketing: how many players have score > X?
+const myScore = await redis.zscore(key, userId);
+const aboveCount = await redis.zcount(key, '(' + myScore, '+inf');
+const myRank = aboveCount + 1;
+```
+
+For approximate "you're in the top 5%" queries, even coarser
+buckets work.
+
+### Realtime updates → low latency dashboard
+
+For a live event leaderboard updating multiple times per
+second, use Redis pub/sub to push updates to connected clients
+via WebSocket. The frontend renders deltas without polling.
+
+### Persistence
+
+Redis is the hot path; Postgres / DynamoDB is the source of
+truth. Mirror every write to both:
+
+```js
+await Promise.all([
+  redis.zadd(key, score, userId),
+  db.upsert({ leaderboard: key, user: userId, score }),
+]);
+```
+
+On Redis loss, rebuild ZSETs from Postgres.
+
+## 7. Bottlenecks and scale-ups
+
+- **Single-shard size**: bucket by score range or split by
+  region.
+- **Fan-out for friends**: lazy-build on read.
+- **Score precision exhausted by encoding**: split tiebreaker
+  into a separate field, do secondary sort in app.
+- **Real-time push for live events**: pub/sub + WebSocket.
+
+## 8. Tradeoffs called out
+
+- **Redis ZSET as primary**: chose for O(log N) on every
+  needed op. Cost: single-shard limit.
+- **Per-user friends ZSET**: chose lazy-build to avoid
+  expensive fan-out on every score update.
+- **Encoded tiebreaker in score**: chose simplicity; cost is
+  limited tiebreak headroom.
+- **Postgres mirror for durability**: chose log-as-truth so
+  Redis crash doesn't lose data.
+
+## In summary
+
+- Leaderboard = sorted set. Redis ZSET is the textbook
+  primitive.
+- Top-K, my-rank, range-around-me all O(log N + K) on ZSET.
+- Encode tiebreakers in the score for stable ordering.
+- Rotate keys for time-windowed leaderboards.
+- Per-friend leaderboards via per-user ZSETs; lazy-build to
+  avoid fan-out.
+- Persist to a durable store; Redis is the hot path.

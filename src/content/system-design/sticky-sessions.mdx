@@ -1,0 +1,276 @@
+export const level = 'mid';
+
+# Sticky sessions (session affinity)
+
+A sticky session pins a user to a specific backend. Once
+routed to backend B, every subsequent request from that user
+goes to B, until the cookie or session expires (or B dies).
+
+The intent is to reuse per-backend state — cached data,
+in-memory session, an open WebSocket. The cost is that
+"stateless and interchangeable" — the whole reason horizontal
+scaling works — partially breaks. Sticky sessions are useful in
+specific cases and overused everywhere else.
+
+## How stickiness is implemented
+
+Three common mechanisms:
+
+### Cookie-based (LB-issued)
+
+The LB chooses a backend on the first request, then sets a
+cookie identifying that backend. Subsequent requests carry the
+cookie; the LB routes by it.
+
+```
+   first request → LB picks backend B → Set-Cookie: AWSALB=B...
+   later requests with cookie → LB routes to B directly
+```
+
+Used by AWS ALB, GCP HTTPS LB, NGINX `sticky cookie`. Pros:
+no client work. Cons: cookies can be cleared, expired, or
+disabled.
+
+### Cookie-based (app-issued)
+
+The app sets a session cookie that includes (or implies) a
+backend identifier. The LB reads it and routes accordingly.
+
+Pros: app controls the lifetime. Cons: requires LB-app
+coordination.
+
+### IP / consistent-hash-based
+
+The LB hashes the client IP (or some 5-tuple) and routes the
+same hash to the same backend.
+
+```
+hash(client_ip) → backend B
+```
+
+Pros: stateless on the LB (no cookie store). Cons: NAT and
+mobile carriers collapse many users to one IP. Bad
+distribution.
+
+Consistent hashing is a better variant of this (see
+consistent-hashing-for-load-balancing) — fewer reshuffles when
+backends change.
+
+## Why teams reach for sticky sessions
+
+The original motivations, in roughly the order they appear:
+
+1. **In-memory session storage.** Pre-2010s default — store
+   the session in process memory; obviously need stickiness so
+   the next request finds it.
+2. **WebSocket connections.** Once the connection is
+   established, all messages on that socket land on the
+   serving backend by definition.
+3. **In-memory caches.** Per-user data cached in the backend's
+   heap; stickiness keeps the cache warm for that user.
+4. **Long-running uploads.** Multi-part upload state lives on
+   one backend; stickiness keeps consecutive parts on the
+   same one.
+
+For each: there's usually a better alternative.
+
+## Why they're problematic
+
+<Compare a="Sticky sessions" b="Stateless replicas">
+<>
+**Failure modes**:
+- Backend dies → user's session/state lost.
+- Deploy → user's pinned backend cycles → user logged out.
+- Scale-in → some users' backends evicted.
+- Load gets uneven — heavy users crush their pinned backend.
+- Cross-region failover is hard (the pin is per-region).
+- LB features (path routing, header rewriting) interact
+  badly with stickiness.
+</>
+<>
+- Backend dies → user retries, lands on another → no
+  visible impact.
+- Deploy → traffic shifts gradually with zero disruption.
+- Scale-in → traffic drains, no per-user impact.
+- Load distributes naturally.
+- Failover is straightforward.
+- LB features compose freely.
+</>
+</Compare>
+
+The fundamental problem: sticky sessions are a **hidden
+dependency** on a specific backend. Every other scaling and
+resilience pattern assumes backends are interchangeable.
+Stickiness defeats that.
+
+## When sticky sessions are actually right
+
+A short list of genuine use cases:
+
+### Long-lived sockets (WebSockets, SSE, gRPC streams)
+
+A WebSocket is a single TCP connection to one backend.
+Messages on that socket inherently land on that backend —
+there's no choice. So "stickiness" here is just a description
+of how connection-oriented protocols work, not a deliberate
+design choice.
+
+The question becomes how to **route messages to that
+connection from other backends**. The answer is a pub/sub
+layer (Redis Pub/Sub, NATS, Kafka): any backend can publish a
+message destined for user X, and whichever backend holds X's
+socket subscribes and receives it.
+
+So: stickiness at the socket layer, statelessness at the
+business-logic layer.
+
+### Real-time game servers
+
+A game room has shared in-memory state across all players in
+the room. The room is pinned to a server. Players connect to
+that server.
+
+This is genuinely stateful — moving the room mid-game is
+expensive. Stickiness (or its equivalent, room-specific
+routing) is appropriate. But this is also a niche use case.
+
+### Multi-step wizards with per-step heavy state
+
+If step 3 of a 5-step flow has 50 MB of computed state in
+memory, you'd rather keep the user on the same backend than
+recompute it. Stickiness helps.
+
+The better fix: persist the heavy state to Redis or S3 (with
+a TTL) so any backend can resume. But sometimes the cost of
+serialization is worse than the cost of stickiness.
+
+### Cache warmth as a perf optimization
+
+Per-user data cached in backend memory is hot for that user.
+Stickiness keeps them hitting the warm cache.
+
+Often the cleaner fix is **consistent hashing on user ID** —
+gives you the same cache locality without the "pin to a
+specific instance" semantics. When backends are added or
+removed, only 1/N of users move, not all of them.
+
+## Sticky sessions vs central session store
+
+The biggest motivation for stickiness in the 2000s — in-memory
+sessions — disappeared once Redis became cheap. Centralize the
+session in Redis (or signed JWT cookies), and *every* backend
+can serve every user. Stickiness becomes unnecessary.
+
+See session-management-at-scale for the comparison.
+
+If your reason for stickiness is "we store sessions in
+memory," the right fix is to externalize sessions, not to
+introduce affinity.
+
+## Sticky sessions and deploys
+
+Deploys are where stickiness hurts most. A rolling deploy
+gradually replaces backends. Each replaced backend evicts its
+sticky users:
+
+```
+Time 0:  10 backends, 1000 users pinned (~100 each)
+Time 1:  replace backend 1 → 100 users get re-pinned to others
+Time 2:  replace backend 2 → 100 users get re-pinned to others
+...
+```
+
+For HTTP services with externalized sessions, this is invisible
+— the new backend reads the same Redis session and the user
+doesn't notice.
+
+For sticky in-memory sessions, every re-pin = "user logged
+out at 3 AM." Multiply by every deploy you do. Your deploy
+frequency is now visibly user-affecting.
+
+## Stickiness duration
+
+If you must use stickiness, keep it short:
+
+- **Cookie lifetime ~1 hour**, not 1 week. After an hour the
+  cache value is probably stale anyway; force re-pinning to
+  rebalance load.
+- **Sliding refresh on activity**, so active users stay sticky
+  but idle ones are released.
+
+Long-lived stickiness amplifies all the problems above.
+
+## Common pitfalls
+
+### Sticky sessions on backends with local rate limiters
+
+The rate limiter sees only this backend's traffic for this
+user. With stickiness, that's correct. Without stickiness, it
+sees a fraction. Combining the two without thought leads to
+wildly inconsistent rate-limit behavior.
+
+### Sticky sessions to mask broken statefulness
+
+The team can't or won't move state out of process. Stickiness
+papers over the problem. Now deploys are scary, scaling is
+restricted, and the team is locked into a fragile setup.
+
+### Sticky sessions and autoscaling
+
+Scale-in destroys backends. Users pinned to destroyed backends
+lose their session. If you autoscale aggressively with sticky
+sessions, you'll log users out constantly. Either stop
+autoscaling, or stop being sticky.
+
+### Sticky based on client IP
+
+Looks reasonable on a developer's laptop. Disasters in
+production: corporate NATs put thousands of users behind one
+IP, mobile carrier NATs are even worse. Use cookies or
+consistent-hashing, not raw IPs.
+
+### Stickiness applied to all endpoints
+
+`/login` and `/upload` benefit from stickiness; `/healthcheck`
+and `/static/*` don't. If your LB pins everything, you've
+constrained features that have no reason to be sticky.
+Path-based stickiness (only on routes that need it) is
+better.
+
+## The "session affinity" alternative: routing by content
+
+If you want a user's data on the same backend without
+brittleness, **consistent-hash on the user ID** at the LB.
+
+```
+hash(user_id from JWT) → backend
+```
+
+Same user → same backend (until backend set changes). 1/N
+disruption on backend changes (vs ~all on naive cookie
+stickiness during scale events).
+
+This gives you cache locality without the pin-to-specific-
+instance semantics. Backend failure just reshuffles 1/N of
+users; remaining backends keep going.
+
+This is what modern systems usually mean by "session affinity"
+— consistent-hash routing, not LB-issued cookies.
+
+## In summary
+
+- Sticky sessions pin a user to a backend. Useful for
+  connection-oriented protocols and a few niche cases.
+  Harmful for almost everything else.
+- They break under deploys, scale-in, autoscaling, and
+  failover.
+- The 2000s reason for sticky sessions — in-memory sessions —
+  is solved by central session stores or signed cookies.
+- Consistent hashing on user ID gives you cache locality
+  without the brittleness of LB-issued affinity cookies.
+- For WebSockets, stickiness is implicit (one connection, one
+  backend); make the business logic stateless via pub/sub.
+- If your design depends on stickiness for *correctness*, you
+  have a stateful service. Treat it like one. If it depends on
+  stickiness for *performance only*, use consistent hashing
+  instead.

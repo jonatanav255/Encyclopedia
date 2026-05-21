@@ -1,0 +1,266 @@
+export const level = 'mid';
+
+# Durability vs availability
+
+These are not the same property and they require different
+solutions. A system can be **highly available** but **lose data**
+(in-memory cache). A system can be **highly durable** but
+**occasionally unreachable** (cold storage in another region).
+The two are independent dials and conflating them is one of the
+most expensive mistakes in storage design.
+
+## Definitions
+
+<Compare a="Availability" b="Durability">
+<>
+**Can I reach the data right now?**
+
+Measured in nines of uptime. Lost when the service fronting the
+data is down, the network is partitioned, or the cluster is
+overloaded. Restored by failover, retries, scaling out, or
+waiting.
+</>
+<>
+**Will the data still exist later?**
+
+Measured in nines of "no data loss per year." Lost when the
+storage media fails, a region is destroyed, a bug deletes the
+wrong rows, or replication is misconfigured. Restored from
+backups (or not at all).
+</>
+</Compare>
+
+A useful mnemonic: **availability is now; durability is forever.**
+Losing availability is recoverable by waiting. Losing durability
+is, by definition, not.
+
+## Why they need different mechanisms
+
+Availability is achieved by **redundancy with hot failover**.
+Multiple replicas, load balancers, automatic re-routing on
+failure. The goal: when one component dies, another answers
+within seconds.
+
+Durability is achieved by **redundancy with persistence
+guarantees**. Multiple copies on independent failure domains
+(different disks, different racks, different regions), verified
+by checksums, regularly tested by restore drills. The goal: when
+one component dies, no bytes are lost.
+
+The mechanisms overlap (both use replication) but the
+requirements are different:
+
+- **Availability replicas** need to be **fast** (synchronous if
+  in front of writes, async if behind reads). Same region is fine.
+- **Durability copies** need to be **independent** (different
+  AZ, different region, different cloud, different tape). They
+  don't need to be hot or queryable.
+
+## The S3 example
+
+S3 famously promises **11 nines of durability** and **3-4 nines
+of availability** depending on storage class. Why the gap?
+
+- **Durability** = byte-loss probability. S3 erasure-codes objects
+  across many AZs in a region. The probability of losing a byte
+  is ~10⁻¹¹/year.
+- **Availability** = response success rate. S3's frontend
+  occasionally has elevated 503 rates, regional incidents, or
+  brief partitions. ~99.9-99.99% depending on class.
+
+So you might be **unable to read** an object for a few minutes
+during an incident — but the object is **not gone**. Different
+problems, different SLAs.
+
+<Callout variant="info">
+"My data is in S3" answers the durability question, not the
+availability question. If a regional S3 incident takes down
+your reads, your *availability* is what's bad — but no bytes
+were lost.
+</Callout>
+
+## RPO and RTO — the operational vocabulary
+
+Two numbers belong in every storage design.
+
+<Cheatsheet>
+| Term | Meaning | Affects |
+|---|---|---|
+| RPO (Recovery Point Objective) | How much data you can lose | Durability strategy |
+| RTO (Recovery Time Objective) | How long you can be down | Availability strategy |
+</Cheatsheet>
+
+RPO answers: when the worst happens, how far back does our
+recovery point go? Zero RPO requires synchronous replication.
+"One hour" RPO is fine with hourly snapshots.
+
+RTO answers: how fast must we recover from outage? Zero RTO
+requires hot failover. "Two hours" RTO allows manual recovery
+from backups.
+
+A regulatory wallet might be (RPO=0, RTO=60s) — no data loss,
+recover in a minute. A nightly analytics warehouse might be
+(RPO=24h, RTO=12h) — losing a day is fine, recovery overnight is
+fine. Same word ("backup") covers fundamentally different
+problems.
+
+## Replication factor and how it maps
+
+<Steps>
+<Step n={1} title="N=1 (no replication)">
+Single copy. **Durability: terrible** (disk failure = data loss).
+**Availability: terrible** (host down = read fails). Suitable
+for caches and scratch data only.
+</Step>
+<Step n={2} title="N=2 (one replica)">
+Two copies. Durability and availability both improve, but a
+single correlated failure (rack power, AZ outage) loses both.
+Common as the *minimum* for managed databases.
+</Step>
+<Step n={3} title="N=3 across different failure domains">
+Three copies on different disks, racks, or AZs. Survives the
+loss of any one. **Durability: ~5-6 nines**. **Availability:
+3-4 nines** depending on failover speed.
+</Step>
+<Step n={4} title="N=3 across regions">
+Cross-region replication. Adds protection against region-wide
+disasters. **Durability: 9-11 nines**. Availability depends on
+whether reads can serve from any region (then it's high) or
+only the primary (then it doesn't help much).
+</Step>
+</Steps>
+
+For most stateful services, the answer is N=3 same-region for
+availability+durability, plus async cross-region copies for
+disaster recovery.
+
+## Synchronous vs asynchronous replication
+
+<Compare a="Synchronous (sync) replication" b="Asynchronous (async) replication">
+<>
+Writer waits for N replicas to ack before returning success.
+
+**RPO = 0** (no data loss possible on single node failure).
+
+**Cost**: latency = max of replica RTTs. Cross-region sync
+replication is ~100 ms on writes.
+
+Used where data loss is unacceptable: wallets, ledgers,
+single-leader quorums.
+</>
+<>
+Writer returns after local write; replicas catch up later.
+
+**RPO > 0** — the un-replicated tail is lost if the primary
+dies.
+
+**Cost**: replication lag, monitoring required. Cheap on
+writes.
+
+Used where last-N-seconds loss is tolerable: most user content,
+cross-region DR copies, read replicas for analytics.
+</>
+</Compare>
+
+A common architecture: **synchronous replication for in-region
+availability** (3 copies same region), **asynchronous replication
+to a remote region for disaster recovery**. Sub-millisecond extra
+write latency, plus a multi-second DR lag.
+
+## Backups are not durability
+
+A common mistake: "we have nightly backups, our data is durable."
+Backups address **operator error** (someone runs DROP TABLE) and
+**catastrophic loss** (region destroyed). They are slow and
+coarse-grained.
+
+Durability via replication addresses **media failure**. Both are
+needed; neither replaces the other.
+
+<Cheatsheet>
+| Threat | Protection |
+|---|---|
+| Disk failure | Replication factor ≥ 2 |
+| Rack power loss | Replicas across racks |
+| AZ outage | Replicas across AZs |
+| Region disaster | Cross-region replication |
+| Operator error (DROP TABLE) | Point-in-time backups, soft delete |
+| Software bug corrupts data | Versioned backups, snapshots |
+| Ransomware / malicious actor | Immutable / offline / multi-account backups |
+</Cheatsheet>
+
+Each threat needs its own answer. "Replication" doesn't cover
+"someone deleted everything" — replication propagated the
+deletion to all copies in milliseconds.
+
+## Test the restore
+
+Untested backups are not backups. They're files with implausible
+hopes attached. Backup restore drills should be:
+
+- **Regular** (monthly, at minimum, for important data).
+- **Full** (restore to a fresh environment from scratch).
+- **Measured** (record actual time; that's your real RTO).
+- **Audited** (someone other than the team that runs them).
+
+Many teams discover during their first real incident that
+restoring from backup takes 18 hours, not the 2 hours they
+planned.
+
+## Common architectural shapes
+
+### Append-only event store
+
+Events are immutable; replication factor = 3 same-region;
+cross-region async copy; weekly snapshots; never deletes. RPO
+near zero; RTO seconds.
+
+### Mutable user data (Postgres-class)
+
+Primary with synchronous replica same AZ; another AZ async; WAL
+shipped to object storage continuously; nightly logical backup;
+point-in-time recovery for 30 days. RPO ≤ 5 s typical; RTO ≤ 60 s
+with hot standby.
+
+### Cache (Redis-class)
+
+Replicas exist for **availability**; data is treated as
+disposable. RPO not applicable; on data loss, repopulate from
+the source of truth.
+
+### Object storage (S3-class)
+
+Erasure-coded; durability ~11 nines built in; cross-region
+replication enabled for important buckets; versioning + delete
+protection for operator error.
+
+## Failure modes that conflate the two
+
+The most common misanalysis:
+
+> "Postgres replication keeps me safe."
+
+Not from `DROP TABLE`. Not from a bad migration. Not from
+ransomware. Replication makes you available *and* durable
+against **hardware failure**. Operator and software threats need
+backups + immutability + versioning.
+
+> "We're in the cloud, we're fine."
+
+Cloud providers give you durability primitives, not durability
+configuration. EBS volumes can be deleted; S3 buckets can be
+emptied; AWS accounts can be compromised. You still need:
+versioning, MFA-delete, cross-account backups, and tested
+restores.
+
+## In summary
+
+- Availability = "can I reach the data now"; durability = "does
+  the data still exist."
+- Both need redundancy, but different redundancy: hot failover
+  for availability, independent durable copies for durability.
+- RPO answers "how much can we lose"; RTO answers "how long can
+  we be down." Quantify both per dataset.
+- Replication ≠ backup. Replication protects against media
+  failure; backup protects against operator error and bugs.
+- An untested restore is not a backup. Drill regularly.

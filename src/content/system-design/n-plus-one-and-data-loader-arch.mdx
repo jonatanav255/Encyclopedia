@@ -1,0 +1,221 @@
+export const level = 'mid';
+
+# N+1 queries and DataLoader (architecture)
+
+The N+1 query problem at scale: fetching a list of N parent
+records and then **one separate query per child** = N+1 total
+queries. Cheap in dev with 10 records; catastrophic in
+production with 10,000.
+
+The classic fix is the DataLoader pattern: **collect requests,
+batch them, return individually**. It's universal across
+GraphQL, REST, and service-to-service calls.
+
+## The N+1 pattern
+
+```js
+async function ordersWithUsers() {
+  const orders = await db.orders.findAll();        // 1 query
+  for (const order of orders) {
+    order.user = await db.users.findById(order.user_id);  // N queries
+  }
+  return orders;
+}
+```
+
+For 1000 orders: 1001 queries. Each query has overhead
+(round-trip, planning, parse, fetch). At 5ms per query, that's
+5 seconds for a page load.
+
+The bug isn't slow; it's *latent slow*. It hides until
+production traffic shape changes.
+
+## The fix: batch + return mapped
+
+```js
+async function ordersWithUsers() {
+  const orders = await db.orders.findAll();           // 1 query
+  const userIds = [...new Set(orders.map(o => o.user_id))];
+  const users = await db.users.where('id', 'in', userIds);  // 1 query
+  const byId = new Map(users.map(u => [u.id, u]));
+  for (const order of orders) {
+    order.user = byId.get(order.user_id);
+  }
+  return orders;
+}
+```
+
+2 queries instead of 1001. The pattern is universal: collect
+the keys you need, do one batch query, hash and return.
+
+## DataLoader pattern
+
+For environments where the calling code is decoupled from
+batching (GraphQL resolvers, deep nested service calls), use
+**DataLoader**:
+
+```js
+const userLoader = new DataLoader(async (ids) => {
+  const users = await db.users.where('id', 'in', ids);
+  return ids.map(id => users.find(u => u.id === id));
+});
+
+// Anywhere in the code:
+await userLoader.load(42);  // queued
+await userLoader.load(43);  // queued
+await userLoader.load(42);  // already queued, dedupe
+
+// At the end of the event-loop tick:
+// → ONE db query for ids [42, 43]
+```
+
+The loader collects requests during a single event-loop tick
+(or short async window), then flushes them as one batch.
+
+## Where it matters
+
+### GraphQL resolvers
+
+A common GraphQL pattern: every field has its own resolver,
+called independently for every parent.
+
+```graphql
+query {
+  orders {
+    user {
+      name
+      email
+    }
+  }
+}
+```
+
+Without DataLoader, each `order.user` triggers a separate DB
+query. With it, all `user` resolvers across the page collect
+into one query.
+
+### REST API aggregation
+
+A REST endpoint that returns "orders with users" might
+internally call 100 services for 100 orders. Same N+1; same
+fix.
+
+### Microservice boundaries
+
+Service A calls service B for each item in a list. B receives
+N HTTP requests. The fix: B exposes a batch endpoint; A uses
+it.
+
+```bash
+# Bad: N HTTP calls
+GET /users/1
+GET /users/2
+...
+
+# Good: 1 batched call
+POST /users/batch
+{ "ids": [1, 2, 3, ...] }
+```
+
+## DataLoader specifics
+
+### Per-request, not global
+
+Create one DataLoader per request (or per HTTP request scope).
+Otherwise:
+
+- Caching across requests leaks data between users.
+- Long-lived loaders accumulate stale results.
+
+In Express:
+
+```js
+app.use((req, res, next) => {
+  req.loaders = {
+    user: new DataLoader(userBatchFn),
+    order: new DataLoader(orderBatchFn),
+  };
+  next();
+});
+```
+
+### Batch function must respect input order
+
+Critical detail: if asked for `[5, 3, 8]`, return
+`[user_5, user_3, user_8]` — same order. DataLoader pairs
+inputs to outputs positionally.
+
+If a key has no matching row, return `null` at that position
+(don't omit).
+
+### Caching
+
+DataLoader caches within its lifetime. Two `load(42)` calls
+return the same result. For mutations, clear:
+
+```js
+await db.users.update({ id: 42 }, { name: 'New' });
+userLoader.clear(42);  // remove from cache
+```
+
+### Maximum batch size
+
+For huge lists, you want to chunk:
+
+```js
+new DataLoader(batchFn, { maxBatchSize: 100 });
+```
+
+Otherwise a batch of 10,000 might be too large for one DB
+query.
+
+## Beyond DataLoader: data graph patterns
+
+For large graphs (a feed page with orders → users → companies
+→ logos), nest DataLoaders. Each level batches independently.
+Total queries = depth of the graph, not number of leaves.
+
+For analytic queries that traverse millions of joins, batch
+in a different way: write a single SQL query with joins.
+Don't use DataLoader for that — it's for **lazy data fetch**,
+not bulk ETL.
+
+## Detection in production
+
+How to find N+1s you didn't know you had:
+
+- **Query log analysis**: many similar queries in close
+  succession from one request.
+- **Tracing**: a single user request spans 100s of DB queries
+  in the trace.
+- **APM tools** (Datadog, New Relic): N+1 detection is built
+  in for ORMs.
+- **Tests with assert-no-N+1 plugins** (e.g.,
+  `bullet` for Rails).
+
+Catch them in development, not in incidents.
+
+## Per-domain patterns
+
+| Domain | Fix |
+|---|---|
+| Relational DB | `WHERE IN (...)`, joins where appropriate |
+| Document DB | `$in` operator (MongoDB) |
+| HTTP service | Batch endpoint or aggregator service |
+| gRPC | Stream of requests + responses; or batch RPC |
+| External API | Limit batch size by API contract; queue and retry |
+| GraphQL | DataLoader at every resolver |
+| Cache | MGET (Redis); BatchGetItem (DynamoDB) |
+
+## In summary
+
+- N+1: fetching parents then querying per child = catastrophe
+  at scale.
+- Fix: batch the lookups, hash the results, distribute.
+- DataLoader: per-request batching + caching at boundary
+  points.
+- Critical: respect input order in batch functions, clear
+  cache on mutation, bound batch size.
+- Detect via query logs, tracing, APM, dev-time linting.
+- Universal: every database, every service call, every
+  GraphQL resolver, every REST aggregation.

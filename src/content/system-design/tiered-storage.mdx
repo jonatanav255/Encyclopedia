@@ -1,0 +1,190 @@
+export const level = 'senior';
+
+# Tiered storage
+
+Decouple compute from storage by pushing **cold data to cheap
+object storage** (S3, GCS) while keeping **hot data on local
+SSD**. Storage cost drops 10-100×; compute resources stay
+where they are.
+
+Used by modern Kafka, Apache Pinot, ClickHouse, Druid, data
+warehouses, and many cloud-native databases.
+
+## The tiers
+
+<Cheatsheet>
+| Tier | Medium | Cost/GB/month | Latency | Throughput |
+|---|---|---|---|---|
+| Memory | RAM | ~$5 | nanoseconds | very high |
+| Local SSD (NVMe) | Local disk | ~$0.10 | µs | high |
+| Network SSD (EBS gp3) | Block storage | ~$0.08 | low ms | medium |
+| Object storage hot (S3 Standard) | Object | ~$0.023 | ~50ms | scales with parallelism |
+| Object storage cold (S3 IA, Glacier) | Object | ~$0.001-0.01 | minutes | low |
+</Cheatsheet>
+
+Multi-tier means the **right data on the right tier**, with
+data flowing between tiers as access patterns change.
+
+## The pattern
+
+```
+write (hot path)
+   ▼
+in-memory write buffer
+   ▼
+local SSD segment / SSTable
+   ▼  (background tiering)
+object storage cold tier
+
+read (varies):
+   - cache hot in memory
+   - read from local SSD if available
+   - fall back to object storage
+```
+
+A key insight: object storage is **massively parallel**.
+Reading 100 small files from S3 in parallel can match local
+SSD throughput, at a fraction of the cost.
+
+## Why this works now
+
+A few things made tiered storage practical recently:
+
+- **S3 became fast enough**. Strong read-after-write
+  consistency (since 2020), low single-digit-ms first-byte
+  latency on hot objects.
+- **Network is cheap inside a cloud region**. Reading from S3
+  to compute in the same AZ is free (egress applies to
+  cross-region or out of cloud).
+- **Compute is more expensive than storage**. Decoupling
+  means scaling each independently.
+
+## Kafka tiered storage
+
+Kafka 3.6+ supports moving older log segments to S3
+automatically. Producers and consumers don't notice — the
+broker fetches from S3 transparently.
+
+Benefits:
+
+- **Effectively unlimited retention** for cheap.
+- **Smaller broker instances** — only hot data on local disk.
+- **Cheaper failover**: a new broker can serve cold data
+  immediately from S3, instead of waiting for replication.
+
+## Pinot tiered storage
+
+Apache Pinot supports "deep store" (S3) for cold segments
+while keeping the most recent on local disk. Configurable
+per-table policies.
+
+The query engine knows the location of every segment; if it's
+on S3, fetch on demand.
+
+## ClickHouse tiered storage
+
+`storage_policies` in ClickHouse: per-table rules for where
+new parts go and how old parts migrate.
+
+```
+volumes:
+  hot: local SSD
+  cold: S3 mounted as disk type
+
+policy:
+  default: write to hot
+  after 7d: move to cold
+```
+
+Background mergetree merges respect tier placement.
+
+## Trade-offs
+
+### Read latency
+
+A cold-tier read pays object-storage latency (~50ms for first
+byte, throughput then high). For an analytics query
+scanning a 10 GB cold object, this is fine. For a transactional
+read of 1 KB, it's painful.
+
+Match access pattern to tier.
+
+### Caching reduces this
+
+Most tiered systems cache recently-read cold blocks on local
+disk. A "frequently accessed cold" object effectively
+promotes itself.
+
+### Compute can't always wait
+
+A real-time dashboard querying "last 5 minutes" should always
+hit local SSD. A reporting query over "last 90 days" can hit
+S3.
+
+Design queries to be tier-aware where possible.
+
+## Cost arithmetic
+
+For 1 PB of data:
+
+- All on local NVMe: ~$100,000/month.
+- All on EBS gp3: ~$80,000/month.
+- All on S3 Standard: ~$23,000/month.
+- All on S3 IA: ~$12,500/month.
+
+Tiered: hot 100 TB on NVMe, cold 900 TB on S3 IA →
+$10,000 + $11,250 = ~$21,000/month. 80% cost reduction vs
+all-NVMe with no real performance loss for typical
+read-pattern.
+
+## Other patterns
+
+### Cross-region tiering
+
+Hot tier in the primary region; cold tier in cheaper region or
+S3 Glacier. Eventual access requires cross-region transfer
+fees + latency.
+
+### Compaction during tier movement
+
+When moving from hot to cold, recompact / re-compress with
+aggressive settings (zstd-19, larger blocks). The data is
+read rarely; spend CPU once at tier transition for tighter
+storage.
+
+### Read-through cache
+
+Some systems present "looks like a single tier" to queries
+but lazily fetch from cold tier on miss; result populates a
+hot tier cache.
+
+This is just object-store-backed caching, but it's how many
+new "data lake query engine" (Trino, Athena) implementations
+work behind the scenes.
+
+## When tiered storage doesn't help
+
+- **Workload is uniform across all data.** No "hot vs cold"
+  distinction; everything's hot. Tiering wastes the cold-tier
+  bandwidth pumping data back to hot.
+- **Latency budget is microseconds.** Cold-tier first-byte
+  latency is incompatible.
+- **Tiny dataset.** Not enough data to amortize the
+  complexity.
+
+For most large-scale OLAP and event-storage systems, tiered
+storage is a 5-10× cost win for negligible perf trade-off on
+the cold path.
+
+## In summary
+
+- Tiered storage: hot data on fast local; cold on cheap
+  object storage.
+- Decouples compute from storage; scale each independently.
+- 5-10× cost win for large datasets with skewed access.
+- Used by modern Kafka, ClickHouse, Druid, Pinot, cloud
+  warehouses.
+- Trade-off: cold-tier latency is much higher; design queries
+  / caching for tier-awareness.
+- Compact + recompress at tier transition for maximum storage
+  efficiency.

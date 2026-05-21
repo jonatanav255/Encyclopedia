@@ -1,0 +1,238 @@
+export const level = 'senior';
+
+# Trace sampling strategies
+
+Keeping every trace at any reasonable scale is unaffordable. A
+service at 50K QPS producing 10 KB of span data per request is
+~500 MB/s of trace storage — petabytes a month. **Sampling** is
+the practice of choosing which traces to keep so cost stays
+bounded without losing the interesting ones.
+
+The trick is "interesting." Errors and slow tail traces are
+worth orders of magnitude more than routine successes — but you
+can't always tell ahead of time. Strategies differ in **when**
+they decide, and **what** they bias toward.
+
+## The decision: head vs tail
+
+<Compare a="Head sampling" b="Tail sampling">
+<>
+Decide **at trace start** whether to record this trace. The
+decision propagates down the call tree via the `sampled` flag
+on `traceparent`.
+
+- **Cheap**: a coin flip per trace; no buffering.
+- **Composable**: every service obeys the upstream decision.
+- **Blind**: you don't know yet if the trace will error or be
+  slow. You may drop the very traces you wanted.
+</>
+<>
+Decide **after the trace completes** based on what actually
+happened — error status, total duration, presence of specific
+attributes.
+
+- **Smart**: keeps all errors, all slow traces.
+- **Expensive**: must buffer all spans of a trace until it
+  completes, then decide.
+- **Stateful**: requires a collector that groups spans by trace
+  ID and waits for the whole trace.
+</>
+</Compare>
+
+In practice, head sampling is the **floor** (kept simple, scales
+linearly), tail sampling is the **ceiling** (smart but stateful
+and resource-hungry). Many systems use both: head sampling
+with a low rate for routine traffic plus tail sampling that
+keeps anything interesting that head sampling missed.
+
+## Head sampling shapes
+
+The simplest is **probabilistic**: keep p% of traces.
+
+```ts
+const sampler = new TraceIdRatioBasedSampler(0.01); // 1%
+```
+
+The hash of the trace ID is consistent across services, so all
+spans of one trace agree on the sample decision. No drift, no
+gaps.
+
+Other head shapes:
+
+- **Per-route rate**: keep 100% of `/checkout`, 1% of
+  `/healthcheck`. Encode as multiple samplers chained.
+- **Per-tenant rate**: keep 100% for free tier (low volume, full
+  detail) and 0.1% for enterprise (high volume).
+- **Always-on for tagged**: a debug header forces sampling for
+  developer-initiated requests.
+- **Rate-limited**: keep up to N traces/sec, drop the rest.
+  Bounds cost regardless of upstream rate.
+
+The composition rule: the **most permissive** sampler that
+matches wins. A debug header should keep the trace even if the
+default sampler rolled "drop."
+
+## Tail sampling shapes
+
+The collector groups spans by trace ID, waits N seconds for
+late-arriving spans, then runs **decision policies** in
+priority order:
+
+<Cheatsheet>
+| Policy | Keeps |
+|---|---|
+| Status | Traces with any span in `ERROR` status |
+| Latency | Traces with total duration > threshold |
+| Attribute | Traces with a specific attribute value (e.g. `customer.tier = enterprise`) |
+| Rare endpoint | Traces hitting low-traffic routes (helps with diversity) |
+| Probabilistic | Random p% of the remainder |
+
+</Cheatsheet>
+
+The first matching policy keeps the trace; if none match, it's
+dropped (or sent at a low base rate). The result is a curated
+sample: every error, every slow request, plus diversity from
+random sampling.
+
+The cost is real. A tail-sampling collector must:
+
+- Buffer all spans of in-flight traces (memory).
+- Wait long enough for late spans to arrive (latency).
+- Cope with traces that never complete (eviction policy).
+- Decide before storage backpressure piles up (throughput).
+
+OpenTelemetry's `tail_sampling` processor implements this; Refinery
+(by Honeycomb) is a popular standalone tail sampler.
+
+## Dynamic and adaptive
+
+The frontier. Sampling rate **changes based on observed
+behavior**:
+
+- **Adaptive rate**: target a fixed number of traces/sec
+  per service. Sampling rate floats up at low traffic and down
+  at high.
+- **Error-biased**: keep error traces at a higher rate than
+  successes regardless of overall load.
+- **Cardinality-aware**: sample more from rare combinations
+  (uncommon routes, rare error codes) and less from common ones.
+- **Reservoir sampling**: maintain a fixed-size reservoir per
+  category; replace older traces probabilistically.
+
+Honeycomb's "Refinery" supports dynamic rates per-key (e.g.,
+sample customer A at 1%, customer B at 100% during an
+incident). The cost is the operator overhead of tuning the
+policy.
+
+## What "sampled" propagates as
+
+The W3C traceparent flag bit signals the decision:
+
+```
+00-7c3b...-4f8a...-01
+                     ^^
+                     01 = sampled; 00 = not sampled
+```
+
+`01` means "downstream should record." `00` means "downstream
+may skip recording entirely." The flag is **propagated**, not
+re-decided. This consistency is what makes head sampling work
+across services.
+
+Tail sampling complicates this: every span must be **emitted to
+the collector** even if it might be dropped later, because the
+collector decides per-trace. So tail sampling doesn't save
+agent-to-collector bandwidth; it saves backend storage and
+indexing.
+
+## Cost arithmetic
+
+A rough back-of-envelope:
+
+```
+QPS = 50,000
+Average spans/trace = 12
+Average span size = 1 KB
+Raw trace data = 50,000 × 12 × 1 KB ≈ 600 MB/s = 1.5 PB/month
+
+At 1% head sampling      → 15 TB/month
+At 10% tail sampling     → 150 TB/month
+At "errors + 1% rest"    → ~30 TB/month (depends on error rate)
+```
+
+Storage at $0.10/GB-month — pick a backend's number — gives:
+
+- 1% head: $1.5K/month
+- 10% tail: $15K/month
+- "errors + 1%": $3K/month with much higher signal
+
+The "errors + 1%" curve is why almost everyone runs tail
+sampling once they exceed a few thousand QPS.
+
+## Caveats and pitfalls
+
+- **Aggregates derived from sampled traces lie**. A "rate of
+  errors per second" computed by counting error-tagged spans is
+  inflated when error traces are oversampled. Reconstructing
+  aggregates from samples requires knowing the sampling rate
+  per category — and even then, it's noisy.
+- **Sampling decisions made by a downstream lose context**. If
+  service A says "not sampled" and service B decides anyway,
+  the trace is partial. Either everyone respects the inbound
+  decision or no one does.
+- **Tail sampling collectors are stateful**. They need memory,
+  good eviction, and clear timeout policies. Running them at the
+  edge of every service is expensive; centralizing them adds
+  network hops.
+- **Adaptive samplers can hide signal**. A bug that suddenly
+  doubles error traffic appears as fewer error traces because
+  the adaptive sampler "rebalanced." Always have a separate
+  error-rate metric.
+
+<Callout variant="warning">
+**Always use metrics for rates and errors, not span counts.**
+Metrics are pre-aggregated and full-fidelity. Spans are sampled
+and lie about volume.
+</Callout>
+
+## A practical default
+
+For most teams the right starting policy is:
+
+<Steps>
+<Step n={1} title="Head sample at the edge.">
+1–5% probabilistic. Cheap, predictable cost. Bounds total
+trace volume.
+</Step>
+<Step n={2} title="Tail sample in the collector.">
+Keep 100% of error traces, 100% of traces over latency budget,
+plus a small probabilistic floor of successful traces.
+</Step>
+<Step n={3} title="Always-on for debug.">
+A header (`x-debug-trace: 1`) forces sampling, regardless of
+either layer. Developers and on-call use this during
+investigation.
+</Step>
+<Step n={4} title="Per-customer overrides during incidents.">
+The collector supports rules like "sample tenant X at 100% for
+the next hour." Use during active investigation.
+</Step>
+</Steps>
+
+This composition keeps cost predictable, never drops errors,
+and gives operators a knob for the unusual case.
+
+## In summary
+
+- You cannot keep 100% of traces past a few thousand QPS.
+- Head sampling: cheap and consistent; biased toward routine.
+- Tail sampling: smart and stateful; keeps errors and slow
+  traces.
+- Most production systems run both — head for cost ceiling, tail
+  for signal.
+- The `traceparent` sampled flag carries the head decision; tail
+  needs span buffering in the collector.
+- Aggregates derived from sampled spans lie. Always use
+  metrics for rates.
+- Provide always-on debug overrides for developers and
+  incidents.

@@ -1,0 +1,243 @@
+export const level = 'mid';
+
+# RED method (rate, errors, duration)
+
+The RED method is the default dashboard for any **request-driven**
+service. Three signals — Rate, Errors, Duration — per endpoint
+or operation. Tom Wilkie at Weaveworks popularized it as a
+simplification of Google's four golden signals, dropping
+"saturation" because most service teams can't measure it
+meaningfully and the other three catch the same incidents.
+
+If a service handles requests and you only get one dashboard for
+it, this is the one.
+
+## The three signals
+
+<Cheatsheet>
+| Signal | What | Why |
+|---|---|---|
+| Rate | Requests per second | Detects sudden drops or spikes |
+| Errors | Failed requests per second (or % of rate) | Detects breakage |
+| Duration | Latency distribution — p50, p90, p99 | Detects degradation before users complain |
+
+</Cheatsheet>
+
+Two things make these the right three: they're all **measurable
+at the request boundary** (you don't need internal hooks), and
+together they correlate with **every** common failure mode of a
+request-handling service.
+
+## Why these three are enough
+
+Consider what each catches:
+
+<Steps>
+<Step n={1} title="Service is down — rate drops to zero.">
+Rate is the most direct check that "anything is happening."
+Zero rate during business hours = the service is unreachable
+or the upstream caller is broken.
+</Step>
+<Step n={2} title="Service is broken — error rate climbs.">
+Requests are arriving but failing. Could be a bad deploy, a
+downstream dependency, a config issue. Error % over rate is
+the right ratio; absolute errors mislead at low traffic.
+</Step>
+<Step n={3} title="Service is slow — duration p99 climbs.">
+Requests succeed but late. Resource exhaustion, hot keys, GC
+pauses, downstream slowness. p99 catches what p50 misses —
+most users see the median, but the 1% who hit the tail are
+disproportionately upset.
+</Step>
+</Steps>
+
+A spike in rate without errors or duration change is a load
+event — interesting, not urgent. A drop in rate at constant
+hour-of-day is a caller problem. Error spike with stable rate
+and duration is a code regression. Duration spike at stable rate
+and errors is contention. The dashboard tells you which
+**category** of incident before you know which **incident**.
+
+## How to instrument it
+
+For an HTTP service, one counter and one histogram per route.
+
+```js
+const httpRequests = new Counter({
+  name: 'http_requests_total',
+  labelNames: ['route', 'method', 'status'],
+});
+
+const httpDuration = new Histogram({
+  name: 'http_duration_seconds',
+  labelNames: ['route', 'method'],
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    const labels = {
+      route: req.route?.path ?? 'other',
+      method: req.method,
+      status: String(res.statusCode),
+    };
+    httpRequests.inc(labels);
+    httpDuration.observe(
+      { route: labels.route, method: labels.method },
+      seconds,
+    );
+  });
+  next();
+});
+```
+
+Two metrics, one middleware. Every dashboard derives from those.
+
+## The PromQL behind a RED dashboard
+
+```js
+// Rate
+sum by (route) (rate(http_requests_total[5m]))
+
+// Errors per second
+sum by (route) (rate(http_requests_total{status=~"5.."}[5m]))
+
+// Error %
+sum by (route) (rate(http_requests_total{status=~"5.."}[5m]))
+  / sum by (route) (rate(http_requests_total[5m]))
+
+// Duration p99
+histogram_quantile(0.99,
+  sum by (route, le) (rate(http_duration_seconds_bucket[5m])))
+```
+
+These four queries are the dashboard. One row per route. That's
+the whole RED method.
+
+## Labels: low cardinality
+
+The single most common mistake. Tagging the metric with
+`user_id` or `request_id` is fatal — every unique value
+explodes the time-series count.
+
+<Compare a="Safe labels" b="Cardinality bombs">
+<>
+- `route` — bounded by your routing table (~100s).
+- `method` — `GET`, `POST`, `PUT`, etc. (~7).
+- `status` — `2xx`, `4xx`, `5xx` or specific codes (~50).
+- `service`, `env` — small bounded sets.
+</>
+<>
+- `user_id` — millions of values.
+- `request_id` — unbounded.
+- `query_string` — unbounded.
+- `error_message` — usually unbounded and includes IDs.
+- `customer_name` — strings from external input.
+
+These belong in **logs or traces**, not metrics.
+</>
+</Compare>
+
+A million-cardinality metric will silently OOM your TSDB or
+silently get dropped by the agent. Either way, the dashboard
+breaks at the worst moment.
+
+## What "error" means is a choice
+
+A request that returns 5xx is obviously an error. What about:
+
+- A 4xx — client error, not service error. Usually excluded.
+- A 200 with a JSON body containing `{"error":"..."}`. Service
+  technically responded; the user got an error. Depends.
+- A timeout from the caller's perspective, but the server still
+  finished. Server says 200; user saw 504 from a load balancer.
+- A 200 that returned stale data because the cache was down. The
+  HTTP layer succeeded; the product semantics failed.
+
+Pick a definition and apply it consistently. The simplest is
+**status >= 500**, and many teams add specific 4xx codes that
+indicate the service's fault (`429` rate-limit from yourself).
+
+## Per-endpoint, not per-service
+
+A service-wide error rate hides per-route problems. If
+`/healthcheck` is 90% of traffic and 100% successful, a 50%
+error rate on `/checkout` looks like a 5% error rate at the
+service level. RED dashboards have **one row per important
+route**.
+
+The grouping should match user journeys. `GET /users/:id` is
+one row. `POST /orders` is another. `GET /admin/*` might collapse
+to one if you don't care to split.
+
+## RED + SLOs
+
+A RED dashboard is the raw input to SLOs. Once you know your
+rate, errors, and duration distributions, you can:
+
+- Set an **availability SLO**: 99.9% of requests not in 5xx over
+  30 days.
+- Set a **latency SLO**: 99% of requests under 500ms over 30
+  days.
+
+The burn-rate alert reads from the same metrics that feed the
+RED dashboard. Build the dashboard first; the SLO follows.
+
+See SLI / SLO / SLA in the devops section.
+
+## RED vs USE
+
+RED is for **services** — things that take requests. USE
+(utilization, saturation, errors) is for **resources** — CPU,
+disk, queues. They're complementary. RED tells you the request
+is slow; USE tells you which resource is exhausted.
+
+Most real incidents need both. A spike in p99 (RED) at the
+service correlates with high IO saturation (USE) on the DB.
+
+## When RED isn't enough
+
+RED assumes request-driven. It doesn't fit:
+
+- **Stream processors** (consumers of Kafka, etc.). Use **lag**
+  and **throughput** instead.
+- **Batch jobs**. Use **success/failure rate**, **runtime**, and
+  **freshness** of output.
+- **Long-running sessions** (WebSockets). Use **connection
+  count**, **message rate**, and **disconnect rate**.
+
+For each of those you can construct a 3-metric analog. The shape
+"rate, errors, duration" is the pattern; the specific metrics
+shift.
+
+<Callout variant="info">
+RED is deliberately under-specified. There's no rule about
+percentiles, bucket choice, or window size. The discipline is
+**graph all three, per important operation, every time**.
+</Callout>
+
+## Common mistakes
+
+- **Tracking averages, not percentiles**. p50 latency is fine;
+  alone, it hides the long tail. Always graph p99 alongside.
+- **Histograms with bad buckets**. Default buckets (e.g., 5ms to
+  10s in big jumps) often miss the resolution where your real
+  latency lives. Set buckets to match your SLO.
+- **One global series**. Hiding per-route problems behind a
+  service average.
+- **Missing the `5xx`-vs-`4xx` distinction**. A bot scanning your
+  API for vulnerable paths shouldn't inflate your "error rate."
+
+## In summary
+
+- Three signals per service: rate, errors, duration.
+- One counter + one histogram per route is enough.
+- Labels stay low-cardinality. High-cardinality goes in
+  logs/traces.
+- Per-route graphs catch what service-wide averages hide.
+- The same metrics feed your SLOs and burn-rate alerts.
+- For non-request workloads, the **shape** transfers; the
+  specific metrics shift to lag/throughput, success/runtime, or
+  connection count.

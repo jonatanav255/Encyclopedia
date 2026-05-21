@@ -1,0 +1,288 @@
+export const level = 'staff';
+
+# Watermarks
+
+A watermark is the stream's claim that **event time has
+progressed past timestamp T**, so any window ending at or before
+T can be closed. It's the mechanism that lets unbounded streams
+emit finite results.
+
+The concept was formalized in Google's MillWheel paper (2013)
+and made central by the Beam / Dataflow model (Akidau et al.,
+2015). Every modern stream processor implements some variant.
+
+Without watermarks, an event-time window has no way to know "are
+more events coming for this window?" — and an unbounded stream
+can't answer that question with certainty. Watermarks are the
+**explicit guess** that lets the system proceed anyway.
+
+## What a watermark is
+
+A watermark is a single timestamp `W(t)` attached to the stream
+at processing time `t`. The contract is:
+
+> No future event will have event-time < W(t).
+
+If the stream emits a watermark `W = 10:14:00`, the system asserts
+that no event with event-time before 10:14:00 will arrive (or, if
+it does, it's considered "late").
+
+Watermarks advance over time:
+
+```
+processing time:  10:14:00  10:14:30  10:15:00  10:15:30
+watermark:        10:13:50  10:14:25  10:14:55  10:15:25
+```
+
+The lag between processing time and watermark = how much
+out-of-order data the system tolerates.
+
+## How watermarks are generated
+
+Three common strategies, each with different guarantees.
+
+### Periodic watermarks from observed timestamps
+
+The most common. Every N seconds, look at the max event-time
+seen and emit `watermark = max_event_time - allowed_lateness`.
+
+```js
+// Flink-style
+WatermarkStrategy
+  .forBoundedOutOfOrderness(Duration.ofSeconds(30))
+  .withTimestampAssigner((event, _) => event.eventTime);
+```
+
+The "bounded out-of-orderness" constant is the bet: "I claim
+events are at most 30 seconds out of order." If that's true,
+windows close correctly; if not, late events are dropped.
+
+Easy to implement, statistical guarantee only. Most production
+pipelines use this.
+
+### Punctuated watermarks
+
+The stream itself contains explicit watermark markers — events
+that say "watermark = T." Used when the producer knows when a
+batch is done (end-of-file, end-of-day marker, deliberate
+heartbeat).
+
+```js
+// In your source
+emit(event);
+if (event.kind === 'EOF_PARTITION_2025-05-19') {
+  emitWatermark(2025-05-19T23:59:59);
+}
+```
+
+Stronger semantics; requires producer cooperation. Common in
+ingestion from batch sources (file replay, daily uploads).
+
+### Source-emitted watermarks
+
+The source itself knows when no more data is coming. Kafka
+brokers, for example, can emit watermarks based on
+partition-end markers. The processor reads watermarks from the
+source rather than deriving them.
+
+This is what gives the best correctness — the source knows the
+ground truth.
+
+## Watermark propagation through operators
+
+In a pipeline, each operator has its own watermark:
+
+```
+source → [map] → [keyBy] → [window] → [sink]
+   W           W         W         W
+```
+
+When a watermark advances at the source, it propagates downstream.
+For operators with **multiple inputs** (joins, unions), the
+output watermark is the **minimum** of the input watermarks:
+
+```
+source A: watermark = 10:15
+source B: watermark = 10:12
+joined:   watermark = 10:12   (limited by slowest)
+```
+
+This is why a slow upstream stream **stalls the whole pipeline**.
+A bug-frozen producer that stops emitting events also stops
+emitting watermarks — and every downstream window is waiting for
+a watermark that never comes. Tools provide **idle source
+detection** as a workaround.
+
+## What happens at watermark crossing
+
+When the watermark passes `W = T`:
+
+1. Any window with `end <= T` is **closed**.
+2. The window's final aggregate is emitted (possibly with
+   "early/on-time/late" labels).
+3. Late events (event-time before T arriving after the watermark)
+   are either:
+   - Dropped (default for many configurations).
+   - Routed to a side output.
+   - Used to **refine** an already-emitted window (within the
+     **allowed lateness** beyond grace).
+4. After window-end + grace, the window state is **garbage
+   collected**.
+
+```
+window: [10:00, 10:05)
+allowed lateness: 5 min
+
+10:05:00 - watermark hits 10:05
+           window emits result
+10:05:00 to 10:10:00 - late events accepted, refinements emitted
+10:10:00 - watermark hits 10:10, window state freed
+10:10:00+ - late events for this window are dropped
+```
+
+## Late data: drop, side-output, or refine
+
+What to do with events arriving after their window's watermark
+is a critical decision.
+
+<Cheatsheet>
+| Strategy | When to use | Trade-off |
+|---|---|---|
+| Drop | Best-effort dashboards | Silent data loss |
+| Side output | Need to know how much you missed | Extra path to reconcile |
+| Refine (re-emit) | Dashboards that update on correction | Sink must support upsert |
+| Both refine and side-output | Highest correctness | Most complex |
+</Cheatsheet>
+
+The Beam model frames every emission as a **pane** of the window:
+**early panes** (before watermark, speculative), **on-time**
+(at watermark, the "official" answer), **late panes**
+(refinements). The terminology is helpful.
+
+## Idle source watermarks
+
+A common failure: stream B receives no events for 10 minutes.
+Its watermark stays at 10:14. The pipeline waits. The downstream
+join blocks. The dashboard freezes.
+
+Fix: **idle timeout** on the source. After K seconds of no
+events, advance the watermark to "current processing time minus
+grace" so downstream can proceed without that input.
+
+```js
+WatermarkStrategy
+  .forBoundedOutOfOrderness(Duration.ofSeconds(30))
+  .withIdleness(Duration.ofMinutes(1));
+```
+
+Trade-off: if events do arrive after idleness was declared,
+they're late. Acceptable for most pipelines; not for ones where
+silence has meaning.
+
+## Heuristic vs perfect watermarks
+
+The Beam paper distinguishes:
+
+- **Perfect watermark**: when emitted at T, **guaranteed** no
+  more events with event-time < T will arrive. Only possible
+  with closed-input sources (e.g., a file batch reader).
+- **Heuristic watermark**: a best guess. Late events might still
+  arrive. Required for live sources.
+
+In production, almost every watermark is heuristic. Allowed
+lateness + side outputs handle the unavoidable mistakes.
+
+## Concrete example: a tumbling event-time count
+
+```js
+// Beam-flavored pseudocode
+pipeline
+  .from(kafkaSource())
+  .assignTimestamps(e => e.eventTimeMillis)
+  .withWatermark(forBoundedOutOfOrderness(30s))
+  .windowInto(fixedWindows(60s))
+  .triggering(
+    AfterWatermark
+      .pastEndOfWindow()
+      .withEarlyFirings(AfterProcessingTime(10s))
+      .withLateFirings(AfterEvent.elementCount(1)),
+  )
+  .accumulatingFiredPanes()
+  .allowedLateness(5min)
+  .to(sink);
+```
+
+Behavior:
+
+- Every 10 seconds of processing time → early pane (interim
+  count, marked early).
+- At watermark crossing window-end → on-time pane (the canonical
+  count).
+- For each late event up to 5 minutes after watermark → late
+  pane (refined count).
+- After 5 minutes past watermark → window GC; later events
+  dropped.
+
+The sink sees the same window multiple times. It must upsert
+(replace previous value for this window key).
+
+## Watermarks and exactly-once
+
+Watermarks are about **correctness** (closing windows). Exactly-
+once is about **delivery semantics** (no duplicates, no loss).
+They're orthogonal but coupled in mature systems.
+
+A pipeline with watermarks + exactly-once needs:
+
+- Source watermarks committed alongside source offsets so
+  restarts pick up the right watermark.
+- Window state and watermark progress checkpointed atomically
+  with output offsets (Flink's two-phase checkpoint, Kafka
+  Streams' EOS).
+
+See **Exactly-once stream processing** for the full picture.
+
+## Pitfalls
+
+<Callout variant="warning">
+**No watermark configured.** Window operators implicitly use
+processing-time watermarks, which silently switches semantics.
+Configure explicitly.
+</Callout>
+
+<Callout variant="warning">
+**Allowed lateness = 0.** Every late event dropped. Common in
+naïve setups. Always set lateness > 0 unless drop-late is the
+deliberate choice.
+</Callout>
+
+<Callout variant="warning">
+**Slow watermark from one input stalls everything.** Use
+idleness detection on per-partition / per-input watermarks.
+</Callout>
+
+<Callout variant="warning">
+**Heuristic watermark assumed perfect.** "We never get late
+data" is wrong. Mobile and IoT routinely deliver hours late.
+</Callout>
+
+<Callout variant="warning">
+**Watermark resets on restart.** State recovery must include
+the watermark; otherwise the restarted job re-emits already-
+emitted windows.
+</Callout>
+
+## In summary
+
+- **Watermark = "no events with event-time < W will arrive."**
+  Lets unbounded streams close windows.
+- **Sources emit watermarks**; operators propagate the minimum
+  of their inputs.
+- **Heuristic watermarks** are the norm; combine with allowed
+  lateness + side outputs.
+- **Idle sources** stall the pipeline; configure idleness
+  detection.
+- **Triggers + accumulation modes** decide early/on-time/late
+  emissions for each window.
+- **Watermarks + exactly-once** must be checkpointed together
+  for restart correctness.

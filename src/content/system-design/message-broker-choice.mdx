@@ -1,0 +1,299 @@
+export const level = 'senior';
+
+# Choosing a message broker
+
+Five mainstream brokers, each optimized for a different shape.
+The mistake is picking by familiarity ("we know Rabbit") or
+fashion ("everyone uses Kafka") instead of by **the shape of the
+problem**.
+
+This page is a comparison, not a tutorial. For mechanics see the
+individual broker entries and **Messaging patterns**.
+
+## The brokers
+
+<Cheatsheet>
+| Broker | Shape | Strong at | Weak at |
+|---|---|---|---|
+| **Kafka** | Log | High-throughput streams, replay, multi-consumer | Operational complexity, latency, message-level features |
+| **RabbitMQ** | Queue + routing | Per-message routing, priorities, RPC patterns | Streaming-scale throughput, replay |
+| **AWS SQS / SNS** | Managed queue + topic | Simplicity, AWS integration, zero ops | Ordering, throughput limits, advanced features |
+| **Apache Pulsar** | Log + queue hybrid | Multi-tenancy, geo-replication, both pub/sub and queue | Smaller ecosystem, newer ops experience |
+| **NATS / JetStream** | Subject pub/sub | Latency, simplicity, edge use cases | Mature ecosystem of integrations |
+</Cheatsheet>
+
+## Kafka
+
+The dominant choice for **event streaming, log-based
+architectures, and high-throughput pipelines**. Records are
+appended to partitioned logs and retained for a configurable
+window (days to forever).
+
+**Strengths**:
+
+- Throughput: a single broker handles ~100 MB/s sustained;
+  clusters scale to TBs/sec.
+- Replay: any consumer can rewind to any offset within retention.
+- Strict per-partition ordering.
+- Mature ecosystem: Connect, Streams, Schema Registry, MirrorMaker.
+- Used as the system of record in log-centric architectures.
+
+**Weaknesses**:
+
+- Operationally heavy. KRaft (Kafka 4.0, March 2025) removed
+  ZooKeeper but cluster management is still non-trivial.
+- Higher per-message latency than queue brokers (~10ms in
+  default config, lower with tuning).
+- Per-message features (priorities, TTL, delayed delivery) are
+  not first-class.
+- No native dead-letter queue (build with extra topics).
+
+**Use when**:
+
+- Multiple independent consumers of the same stream.
+- You need replay or CDC integration (Debezium).
+- Volume > 10K msg/s sustained.
+- Building event sourcing, stream processing, or audit pipelines.
+
+**Skip when**:
+
+- One producer, one consumer, no replay need.
+- You need rich per-message routing.
+- Throughput is < 1K msg/s and you'd rather not run a cluster.
+
+## RabbitMQ
+
+The mature queue + routing broker. Exchanges (direct, topic,
+fanout, headers) and queues give you fine-grained routing
+control. Classic mirrored queues plus modern **quorum queues**
+(Raft-based, since 3.8) provide HA.
+
+**Strengths**:
+
+- Rich routing: per-message headers, priorities, TTL, delayed
+  exchanges, RPC reply-to.
+- Native dead-letter exchanges.
+- Per-message ack semantics with manual control.
+- Lower per-message latency than Kafka (~1ms in steady state).
+- Streams (added in 3.9) bring Kafka-shaped logs alongside
+  queues.
+
+**Weaknesses**:
+
+- Throughput per node is lower than Kafka (~50K msg/s sustained).
+- Classic mirrored queues had operational surprises;
+  **quorum queues are the recommended default in 2026**.
+- Ecosystem for stream processing is thin.
+
+**Use when**:
+
+- You need rich routing (priorities, headers, RPC patterns).
+- Per-message ack/nack with retries and delays.
+- Mid-volume (1K - 50K msg/s).
+- Background jobs at scale.
+
+**Skip when**:
+
+- You need replay and multi-consumer-group semantics.
+- Throughput exceeds what RabbitMQ handles per node.
+- You want Kafka-style log semantics (use Streams or Kafka).
+
+## AWS SQS / SNS
+
+Managed, AWS-native, zero ops. SQS = queue, SNS = topic. Combine
+SNS → SQS for fanout-to-queues.
+
+**Strengths**:
+
+- **Truly zero ops.** No clusters, no upgrades, no monitoring
+  pagers.
+- Integrates with everything in AWS.
+- Per-message visibility timeout = built-in retry semantics.
+- SQS FIFO supports per-message-group ordering (capped
+  throughput).
+
+**Weaknesses**:
+
+- Per-message latency: SQS standard ~10-100ms, FIFO higher.
+- Throughput: SQS standard is virtually unlimited; **FIFO is
+  capped** (3000 msg/s per FIFO queue with high-throughput
+  mode, 300 without).
+- No retention beyond 14 days max.
+- No streaming/log semantics.
+- Limited cross-region.
+- Costs add up at scale: per-request pricing surprises bills.
+
+**Use when**:
+
+- On AWS, you don't want to operate infrastructure.
+- Background job queues, simple fanout via SNS → SQS.
+- Volume is moderate (< few thousand msg/s sustained).
+
+**Skip when**:
+
+- You need replay or long retention.
+- Throughput exceeds FIFO limits and you need ordering.
+- You're going multi-cloud.
+
+## Apache Pulsar
+
+The "logs + queues, multi-tenant" broker. Originally Yahoo,
+incubated to Apache. Topics support both queue (Shared
+subscription) and pub/sub (Exclusive/Failover) and log
+(Key_Shared) semantics on the same data.
+
+**Strengths**:
+
+- **Separation of compute (brokers) and storage (BookKeeper)**:
+  brokers are stateless, storage scales independently. Easier
+  rebalancing than Kafka.
+- Multi-tenancy is first-class (namespaces, ACLs, quotas).
+- Native geo-replication.
+- Functions and SQL on top.
+- Tiered storage (hot/cold) is mature.
+
+**Weaknesses**:
+
+- Smaller community than Kafka. Fewer third-party integrations.
+- More components (BookKeeper + brokers + ZooKeeper, or with
+  newer setups, Oxia).
+- Less stack-overflow help when something goes wrong.
+
+**Use when**:
+
+- Multi-tenant SaaS where you serve many small streams.
+- Geo-replication is a hard requirement.
+- You're picking from scratch and don't have Kafka muscle memory.
+
+**Skip when**:
+
+- Team has Kafka expertise and the workload fits Kafka.
+- You need the largest ecosystem of connectors.
+
+## NATS / JetStream
+
+Lightweight subject-based pub/sub. NATS Core is ephemeral and
+fire-and-forget. JetStream adds durable, queue-shaped subjects
+with consumer groups and replay.
+
+**Strengths**:
+
+- **Very low latency** (sub-ms). Smallest broker on the chart.
+- Subject hierarchies (`orders.us.created`) with wildcards.
+- Embeddable, edge-friendly.
+- JetStream gives Kafka-like persistent streams in a single
+  binary.
+- Cluster operation is dramatically simpler than Kafka.
+
+**Weaknesses**:
+
+- Smaller ecosystem.
+- Less mature stream-processing story.
+- Tooling thinner (UIs, connectors, monitoring).
+
+**Use when**:
+
+- You want pub/sub at the edge or in-cluster with minimal ops.
+- Latency matters more than max throughput.
+- You're already running NATS for service discovery / RPC.
+
+**Skip when**:
+
+- You need the rich Kafka ecosystem.
+- The team needs deep operator experience already in the
+  market.
+
+## A decision tree
+
+<Steps>
+<Step n={1} title="Are you on AWS and OK with managed only?">
+SQS for queues, SNS+SQS for fanout, EventBridge for routing.
+Don't run your own broker if you don't have to.
+</Step>
+<Step n={2} title="Do you need replay / multiple independent consumer groups?">
+Yes → Kafka or Pulsar.
+No → continue.
+</Step>
+<Step n={3} title="Do you need rich per-message features (priorities, TTL, RPC, complex routing)?">
+Yes → RabbitMQ.
+No → continue.
+</Step>
+<Step n={4} title="Is latency or simplicity the dominant constraint?">
+Yes → NATS / JetStream.
+No → continue.
+</Step>
+<Step n={5} title="Is multi-tenancy or geo-replication a primary requirement?">
+Yes → Pulsar.
+Otherwise → Kafka by default.
+</Step>
+</Steps>
+
+## Volume reference points
+
+A rough sizing chart (single broker / cluster of 3 modest
+nodes, mixed workload, well-tuned):
+
+<Cheatsheet>
+| Broker | Throughput (msg/s) | Sustained MB/s | Notes |
+|---|---|---|---|
+| RabbitMQ classic | ~20-50K | ~100 | Quorum queues similar |
+| RabbitMQ Streams | ~1M+ | ~500 | Closer to Kafka |
+| Kafka 3-broker cluster | ~1M | ~300 | Easily scales horizontally |
+| SQS standard | "Unlimited" | N/A | Per-message pricing |
+| SQS FIFO | 3K (HT mode) | N/A | Capped on purpose |
+| NATS Core | ~10M+ | ~700 | In-memory, no persist |
+| NATS JetStream | ~1M | ~200 | With persistence |
+| Pulsar 3-broker | ~1M | ~300 | BookKeeper layer separate |
+</Cheatsheet>
+
+Numbers are rough; vendor benchmarks vary widely. Use these for
+"can I use X" sanity, not capacity planning.
+
+## A non-broker option: outbox without a broker
+
+For small services with a few async consumers, you don't always
+need a broker. The **outbox pattern + a worker** reads from a
+table and calls downstream APIs directly. Crude but works for
+< 100 msg/s and one or two consumers.
+
+```js
+// Worker reads outbox, calls API directly, marks sent
+const row = await db.outbox.next();
+await downstream.notify(row.payload);
+await db.outbox.markSent(row.id);
+```
+
+Add a broker the day you need fanout or replay. Until then, the
+DB is the message bus.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Picking by familiarity.** "We know Rabbit, so we'll put a
+stream of 10M msg/s through it." It won't scale; you'll spend a
+year migrating to Kafka. Pick from the shape, not the resume.
+</Callout>
+
+<Callout variant="warning">
+**Picking Kafka for a queue workload.** Kafka shines at logs.
+For a simple work queue with 1K msg/s, it's enormous overhead.
+SQS, RabbitMQ, or BullMQ are kinder.
+</Callout>
+
+<Callout variant="warning">
+**Trusting "managed makes everything fine."** Managed Kafka
+(MSK, Confluent Cloud) removes one set of operational pains,
+adds another (vendor pricing, lock-in, debugging at the
+boundary). Read the price sheet.
+</Callout>
+
+## In summary
+
+- **Kafka**: high-volume streams, replay, multi-consumer logs.
+- **RabbitMQ**: rich per-message routing, RPC, queue semantics.
+- **SQS/SNS**: managed simplicity on AWS.
+- **Pulsar**: multi-tenant + geo, separation of compute/storage.
+- **NATS/JetStream**: low latency, edge, minimal ops.
+- **Pick from the shape**: command vs fact, single vs many
+  consumers, volume, replay, ops appetite. Not from
+  familiarity.

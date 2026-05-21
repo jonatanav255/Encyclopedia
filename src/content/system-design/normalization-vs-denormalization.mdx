@@ -1,0 +1,250 @@
+export const level = 'mid';
+
+# Normalization vs denormalization
+
+Normalization is the process of decomposing tables until each
+fact lives in exactly one place. Denormalization is the
+deliberate inverse — duplicate or pre-join data so reads are
+cheaper. Both are tools; neither is a virtue.
+
+The choice shapes write paths, read paths, service boundaries,
+and where bugs come from.
+
+## The point of normalization
+
+The classical rules (1NF through BCNF) collapse to a single
+discipline: **every non-key fact appears in exactly one row of
+exactly one table**. That gives you:
+
+- **No update anomalies.** Change a user's email in one place
+  and every order, comment, and notification reflects it.
+- **Tighter storage.** A row exists once; foreign keys are
+  4–8 bytes vs duplicating a denormalized blob.
+- **Clean constraints.** Foreign keys, unique indexes, and check
+  constraints can encode invariants the DB enforces.
+- **Honest queries.** A query that joins six tables is doing
+  six tables' worth of work; nothing is hidden.
+
+For OLTP workloads where writes and reads are balanced and
+correctness matters, normalized is the default.
+
+## The point of denormalization
+
+Reads are amplified. The same row can be read thousands of
+times for each write. If every read pays the join cost, you've
+bought correctness with latency you can't afford.
+
+Denormalization moves the cost from read time to write time:
+
+- **Duplicate fields** the join would have fetched.
+- **Pre-aggregate** counts the query would have computed.
+- **Pre-join** rows into wide read-model tables.
+- **Materialize views** for hot queries.
+
+In return:
+
+- **One read, no joins.** Latency drops by 1–2 orders of
+  magnitude.
+- **Predictable plans.** No planner surprises on edge cases.
+- **Shardable.** A denormalized read model partitions cleanly
+  by the access key.
+
+## The trade-off, made explicit
+
+<Compare a="Normalized" b="Denormalized">
+<>
+Writes are cheap and consistent. Reads pay join cost. Schema
+changes propagate via FK relationships. Storage is minimal.
+Best when reads and writes are balanced or correctness
+dominates.
+</>
+<>
+Reads are cheap and predictable. Writes touch many places and
+must keep them consistent. Storage grows with duplication.
+Best when reads dwarf writes and the read pattern is stable.
+</>
+</Compare>
+
+The hidden tax on denormalization is **fan-out at write time**.
+A user-name change in a denormalized comments table touches
+every comment that user ever made. That's not free — and it's
+not transactional once it spans tables, shards, or services.
+
+## Where denormalization belongs
+
+Some shapes are well-suited:
+
+<Steps>
+<Step n={1} title="Read-mostly aggregates.">
+Display name on a comment row. Pre-computed counts (likes,
+followers). Cached "snapshot" of a related object at the time
+of the write (order line items keep product name + price,
+because they shouldn't change retroactively).
+</Step>
+<Step n={2} title="Time-series and event logs.">
+Each row is immutable once written; there's nothing to update
+later. Duplicating context costs nothing operationally.
+</Step>
+<Step n={3} title="Wide-column data models.">
+Cassandra and DynamoDB force denormalization — you write the
+same data into multiple tables, one per query pattern. This is
+intentional, not a workaround.
+</Step>
+<Step n={4} title="Read models in CQRS.">
+Commands update the normalized write model; events project
+into denormalized read models tuned for each query. Stale
+between writes; trivially fast to query.
+</Step>
+</Steps>
+
+## Where it does not
+
+Equally clear anti-patterns:
+
+- **Mutable shared facts.** A user's email duplicated across
+  ten tables guarantees they will drift.
+- **Strong consistency required.** If "all copies must match
+  immediately or money breaks," do not denormalize.
+- **Unbounded fan-out.** Denormalizing a celebrity's name into
+  10M posts means every name change is a 10M-row update.
+- **Exploratory analytics.** Denormalized rows pre-shape the
+  data for one access pattern and box you out of others.
+
+The rule of thumb: denormalize when the duplicated data is
+**immutable**, **append-only**, or **infrequently changed
+relative to reads**.
+
+## How denormalization shapes services
+
+This is the part most teams miss. Once you commit to a
+denormalized read model, you've committed to a **write
+pipeline that maintains it**. That pipeline is a service
+boundary.
+
+```
+[order-service]   writes normalized orders
+       ↓ (event)
+[orders-events topic]
+       ↓
+[orders-readmodel-service] maintains wide rows
+       ↓
+[reads]
+```
+
+The split between write and read sides is the architectural
+consequence of denormalization. Sub-points:
+
+- The read-model service **owns its data**; nobody writes to
+  it except the projector.
+- The write service publishes events; consumers project them.
+- "Joining across services at request time" becomes "join
+  ahead of time during projection."
+
+Microservice decomposition implicitly demands denormalization
+because cross-service joins are slow and brittle. Each service
+keeps the denormalized slice it needs.
+
+## Maintaining denormalized data
+
+Three mechanisms in increasing order of complexity:
+
+### 1. App-level dual writes
+
+```js
+await db.transaction(async (tx) => {
+  await tx.users.update({ id, name });
+  await tx.comments.update({ user_id: id }, { author_name: name });
+});
+```
+
+Simple. Works only when both tables live in the same DB and
+the table being updated isn't massive. Outside one DB, see
+the dual-write problem.
+
+### 2. Event-driven projection
+
+```
+write → outbox → broker → projector → denormalized table
+```
+
+The write service emits an event; a projector consumer
+updates the denormalized table. Eventually consistent;
+decoupled; survives the read side being offline.
+
+Failure modes: projector lag, message loss, projector bugs
+producing skew. Mitigate with idempotent updates keyed by
+event id and periodic reconciliation jobs.
+
+### 3. Change data capture
+
+CDC tails the WAL of the write store. Same shape as
+event-driven, but the source of truth is the database, not
+the application. Best when you want denormalization without
+changing application code.
+
+## Reconciliation
+
+Denormalized data **drifts**. Plan for it.
+
+- **Idempotent projection** so replays are safe.
+- **Periodic reconcile jobs**: scan the normalized source,
+  recompute the denormalized rows, write only the diffs.
+- **Snapshot + replay**: occasionally rebuild the read model
+  from a clean snapshot to bound drift.
+
+Treat the denormalized store as a **cache that happens to be
+durable**. Caches go stale; you accept it and design recovery.
+
+## A practical heuristic
+
+For each piece of denormalized data, write a one-line answer:
+
+```
+Field: comments.author_name
+Source: users.name
+Update path: outbox + projector on user.updated event
+Stale tolerance: 60s
+Drift recovery: nightly reconcile job
+```
+
+If you can't fill this in, you don't have a denormalization
+plan — you have a duplication bug.
+
+## Common pitfalls
+
+### Premature denormalization
+
+The team denormalizes "for performance" before measuring,
+then discovers the read was already fast and they've taken on
+a write pipeline for nothing. Always profile first.
+
+### Treating it as a schema decision
+
+Denormalization is not a one-time schema choice — it's an
+ongoing maintenance contract. Owning the projector, monitoring
+lag, and reconciling drift are part of the cost.
+
+### Forgetting historical accuracy
+
+Some "denormalization" is actually **snapshotting** — order
+line items intentionally freeze product name + price at order
+time. Do not "fix" this by joining live to the product table.
+Snapshots are correct; they're not stale.
+
+### Storing the wrong derivation
+
+A count column denormalized from a related table is fine until
+someone deletes rows directly. The derivation must be the only
+write path, or it must be re-computable.
+
+## In summary
+
+- Normalize for correctness and write simplicity; denormalize
+  for read latency and shardability.
+- Denormalize **immutable** or **rarely-changed** facts; never
+  mutable shared facts under strong consistency.
+- Every denormalized field implies a maintenance pipeline —
+  app-level, event-driven, or CDC.
+- The split between write and read models is the architectural
+  consequence: it shapes services, ownership, and ops.
+- Expect drift; build reconciliation in from day one.

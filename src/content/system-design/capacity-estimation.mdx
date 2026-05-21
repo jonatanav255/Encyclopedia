@@ -1,0 +1,271 @@
+export const level = 'mid';
+
+# Capacity estimation
+
+Capacity estimation is the arithmetic that turns product
+assumptions into infrastructure decisions. "10M DAU" by itself
+sizes nothing. "10M DAU × 20 actions/day × 500-byte payload" is
+an architecture.
+
+The back-of-envelope page covers the constants and one-off
+examples. This page is the procedure — what to estimate, in
+what order, and what each number forces.
+
+## The four numbers to compute, every time
+
+For any system, in this order:
+
+<Steps>
+<Step n={1} title="QPS — read and write, separately.">
+Read QPS and write QPS have different sizing consequences. Reads
+go to caches, replicas, CDNs. Writes go to leaders, queues,
+durable storage. Conflating them produces wrong infrastructure.
+</Step>
+<Step n={2} title="Storage — daily growth and total retention.">
+Daily growth answers "how big are the WAL/ingest pipes?" Total
+retention answers "how big is the database?" Different answers.
+</Step>
+<Step n={3} title="Bandwidth — ingress and egress.">
+Egress is usually 5-100x ingress for content-heavy systems.
+Egress is the CDN/edge bill. Ingress is the API tier's load.
+</Step>
+<Step n={4} title="Connections — if long-lived.">
+For chat/streaming/SSE/WebSockets, concurrent sockets dominates
+QPS as a sizing constraint. For request-response APIs, skip this.
+</Step>
+</Steps>
+
+Each number is order-of-magnitude. Aim for "right within 3x";
+trying to be more precise is wasted effort.
+
+## The base formulas
+
+```
+Daily actions     = DAU × actions/user/day
+Average QPS       = daily actions / 10^5      // 10^5 ≈ seconds/day
+Peak QPS          = average × 3              // typical
+Daily storage     = daily actions × bytes/action
+Yearly storage    = daily storage × 365
+Egress bandwidth  = QPS × bytes/response
+Concurrent sockets = concurrent users × sockets/user
+```
+
+Memorize these five. They cover ~80% of system-design estimation.
+
+## A worked end-to-end: photo-sharing app
+
+Walking the full pipeline. The product gives you:
+
+- 50M DAU.
+- 2 photo uploads per active user per day.
+- 50 photo views per active user per day.
+- Average photo size after compression: 200 KB.
+- Metadata per upload: 1 KB (user, EXIF, captions, hashtags).
+- 1 year of retention; cold storage tolerated after 30 days.
+
+### Write QPS
+
+```
+Uploads/day = 50M × 2 = 100M
+Avg write QPS = 100M / 10^5 = 1 000 QPS
+Peak write QPS = 1 000 × 3 = ~3 000 QPS
+```
+
+3K write QPS is comfortable for a sharded relational store; no
+need for exotic write paths.
+
+### Read QPS
+
+```
+Views/day = 50M × 50 = 2.5B
+Avg read QPS = 2.5B / 10^5 = 25 000 QPS
+Peak read QPS = 25 000 × 3 = ~75 000 QPS
+```
+
+75K read QPS won't be served directly by Postgres replicas. CDN
++ object store handles photo bytes; a metadata cache (Redis)
+fronts the relational store for view counts and feed lookups.
+
+### Storage growth
+
+```
+Photo bytes/day = 100M × 200 KB = 2 × 10^13 B = 20 TB/day
+Metadata/day    = 100M × 1 KB   = 100 GB/day
+Yearly photo    = 20 TB × 365 ≈ 7.3 PB
+Yearly metadata = 100 GB × 365 ≈ 36 TB
+```
+
+7 PB/year forces object storage (S3-class) plus tiering — hot 30
+days on standard, the rest on infrequent-access / glacier-class.
+The 36 TB of metadata fits in a sharded relational cluster.
+
+### Egress bandwidth
+
+```
+Read QPS (peak) = 75 000
+Bytes/response  = 200 KB photo + 1 KB metadata ≈ 200 KB
+Peak egress     = 75 000 × 200 KB = 15 GB/s = 120 Gbps
+```
+
+120 Gbps of egress is firmly a CDN problem — direct serving
+would dominate the bill in egress fees alone. Origin sees only
+cache-miss traffic, say 5% of that = 6 Gbps.
+
+### Sockets
+
+Request-response, mostly. Skip — unless you add chat or live
+photo-comment streams.
+
+Now the architecture is *forced*:
+
+- API tier behind LB → metadata in sharded Postgres.
+- Photo blobs in S3.
+- Photo URLs served via CDN; origin = S3 with signed URLs.
+- Redis cache for hot metadata and view counts.
+- Lifecycle policy: 30 days → IA → Glacier.
+- Region count: one or two; doesn't need globally active-active.
+
+## Read/write ratio matters more than absolute QPS
+
+A system with 1 000 QPS reads and 1 000 QPS writes is harder than
+a system with 100 000 QPS reads and 1 000 QPS writes. Reads
+scale horizontally cheaply; writes don't.
+
+<Compare a="Read-heavy (100:1 or higher)" b="Write-heavy (1:1 or worse)">
+<>
+Cache aggressively. Replicate to read replicas across regions.
+CDN where possible. Write path can stay simple (single-leader
+RDBMS). Cost is mostly cache memory and edge bandwidth.
+</>
+<>
+Single-leader RDBMS will choke. Need sharding by key, or a
+log-structured store (Cassandra-class), or write-through queues
+to flatten bursts. Read replicas help less because reads aren't
+the problem.
+</>
+</Compare>
+
+The first question you ask after DAU: **what's the read/write
+ratio?** It often matters more than DAU itself.
+
+## Peak vs steady-state
+
+Steady-state QPS is what you'd see at a random moment. Peak QPS
+is what you have to actually serve. The ratio depends on the
+product:
+
+<Cheatsheet>
+| Product type | Typical peak/avg ratio |
+|---|---|
+| B2B SaaS (workday-driven) | 2-3x |
+| Consumer social/news (evening peak) | 3-5x |
+| Retail / e-commerce | 5-10x (100x on Black Friday) |
+| Live streaming events | 10-100x (cliff at event start) |
+| Newsfeed with viral content | localized spikes 10-100x on hot keys |
+| Trading / financial | 2x during market hours, 100x during news |
+</Cheatsheet>
+
+Size for **peak**, not average. Then verify your design handles
+the next category up (10x growth) — see "what breaks first."
+
+## Capacity per component
+
+Once you have peak QPS, you divide by per-component capacity to
+get a count.
+
+<Cheatsheet>
+| Component | Order of magnitude |
+|---|---|
+| L7 load balancer | 100K-1M RPS |
+| App server (modern, I/O-bound) | 1K-5K RPS |
+| App server (CPU-bound) | 10K RPS |
+| Postgres / MySQL leader (writes) | 1K-10K QPS |
+| Postgres / MySQL replica (reads) | 10K-50K QPS |
+| Redis (single instance) | ~100K ops/sec |
+| Cassandra node | ~10K writes/sec, ~25K reads/sec |
+| Kafka broker | ~100 MB/s sustained ingest |
+| S3 (per prefix) | 3 500 PUT/s, 5 500 GET/s |
+| Standard SSD | 10K-100K IOPS |
+</Cheatsheet>
+
+These move with hardware and tuning. They're fine for sizing on
+a whiteboard.
+
+## Common amplifications to watch for
+
+Capacity estimates underestimate when **one action triggers many
+downstream actions**. Sources of amplification:
+
+- **Fanout** — one post writes to 1M follower inboxes.
+- **Replication** — each write goes to N replicas synchronously.
+- **Retries** — failed RPCs retry 3-5x by default, sometimes
+  multiplying with exponential backoff that aligns into thundering
+  herds.
+- **N+1 queries** — fetching a list and then fetching each
+  child individually inflates DB QPS Nx.
+- **Synchronous tracing / logging** — every request emits 3-10
+  log lines and a span; sized separately for log ingest.
+
+When the math says "1K writes/sec" but the system feels heavier
+than that, hunt for amplification.
+
+## What to do with the numbers
+
+<Steps>
+<Step n={1} title="Compare to component capacity.">
+Read QPS = 75K. Single Postgres replica = 25K. Need at least 3
+replicas (plus headroom = 5). Storage = 7 PB; obviously not on
+local SSDs; obviously object storage.
+</Step>
+<Step n={2} title="Check for the next 10x.">
+Will this design hold at 750K read QPS? If yes, you have
+headroom. If no, name the next bottleneck out loud — the
+interviewer will ask.
+</Step>
+<Step n={3} title="Cost the result, even approximately.">
+20 TB/day of photo storage at $0.023/GB/mo = ~$140K/mo for hot
+storage alone. That's a real number; it can change the design
+(force more aggressive tiering, lower resolution, etc).
+</Step>
+<Step n={4} title="Document the math.">
+Save the table in the design doc. Future-you will rerun it when
+DAU triples, and your conclusions won't drift if the inputs are
+written down.
+</Step>
+</Steps>
+
+## Common mistakes
+
+### 1. Forgetting metadata size
+
+A "200 KB photo" is also a 1 KB metadata row, a 200 B feed
+fanout entry, a search-index document, and a logs entry. Metadata
+fanout is often comparable to the blob size at scale.
+
+### 2. Treating CDN-served traffic as origin load
+
+If 95% of reads hit the CDN, origin sees 5% of the QPS. Sizing
+origin to peak read QPS over-provisions by 20x.
+
+### 3. Ignoring connection setup overhead
+
+For short requests, TLS handshake (~5 round trips on cold connect)
+can dwarf the request itself. Connection pooling and keep-alive
+change effective per-server capacity by 2-10x.
+
+### 4. Aggregating across regions
+
+10K QPS in one region is 10x harder than 1K QPS in each of 10
+regions. Regional capacity matters more than global.
+
+## In summary
+
+- Compute four numbers: QPS (read/write separately), storage
+  (daily + total), bandwidth (in/out), and connections (if
+  long-lived).
+- Read/write ratio shapes architecture more than absolute QPS.
+- Size for peak, not average; default peak/avg = 3x.
+- Compare to per-component capacity, then count components.
+- Sanity-check at 10x — name the next bottleneck before the
+  interviewer does.
+- Write the math down. Reruns are inevitable.

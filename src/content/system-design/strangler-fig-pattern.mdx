@@ -1,0 +1,270 @@
+export const level = 'senior';
+
+# Strangler fig pattern
+
+You don't rewrite a legacy system. You **strangle** it: route slices
+of traffic to a new system one at a time until the legacy is doing
+nothing and you can turn it off. Martin Fowler named the pattern;
+Newman's *Monolith to Microservices* is its operating manual.
+
+Big-bang rewrites fail. Stranglers usually work because they let you
+ship value continuously and rollback at every step.
+
+## Why rewrites fail
+
+A clean-slate rewrite assumes:
+
+- You can specify everything the legacy does today.
+- The team can build it faster than the legacy team is changing it.
+- Customers will wait.
+
+All three are usually false. The legacy system has years of edge
+cases nobody remembers. The rewrite team falls behind because legacy
+ships features in parallel. Customers can't wait — and worse, can't
+afford to be stuck running half-and-half for two years.
+
+The strangler avoids this by **never having two competing systems
+at once**. You move one slice at a time, and at every moment, every
+request is served by exactly one system.
+
+## The shape
+
+```
+                  [router / facade]
+                       │
+        ┌──────────────┴──────────────┐
+        ↓                             ↓
+   [new system]                  [legacy system]
+   handles slice A,              handles everything else
+   then A+B,
+   then A+B+C, ...
+```
+
+The router (a reverse proxy, gateway, or even DNS) decides which
+system handles a given request. Over time, the new system handles
+more; eventually it handles everything; legacy is decommissioned.
+
+## The discipline
+
+Newman's checklist for a strangler:
+
+<Steps>
+<Step n={1} title="Pick a single, small slice.">
+A feature or endpoint that's well-bounded and not deeply entangled.
+Auth, search, notifications, and reporting are common first slices
+because they're often peripherally coupled.
+</Step>
+<Step n={2} title="Build the new implementation alongside.">
+The new system implements that slice — fresh code, modern stack,
+correct boundaries. It runs in production from day one, but no
+traffic hits it yet.
+</Step>
+<Step n={3} title="Route some traffic.">
+Cut a small percentage of traffic to the new system. Compare results
+against legacy (mirror traffic if possible). Fix discrepancies until
+they're zero.
+</Step>
+<Step n={4} title="Ramp up.">
+1% → 10% → 50% → 100%. Each step is reversible. Each gives you data:
+errors, latency, business metrics. Don't move forward until the
+current step is stable.
+</Step>
+<Step n={5} title="Delete the legacy slice.">
+Once the new system serves 100%, remove the legacy implementation
+of that slice. Not "leave it disabled" — actually delete it, so it
+can't be accidentally re-enabled, and so nobody mistakes it for
+current code.
+</Step>
+<Step n={6} title="Repeat with the next slice.">
+Now pick the next feature. Continue until legacy is empty.
+</Step>
+</Steps>
+
+The hard part isn't building the new system. It's the discipline to
+do this many times, in sequence, without abandoning one slice
+half-done.
+
+## The router
+
+The router is the single most important component of a strangler:
+
+<Cheatsheet>
+| Routing layer | Granularity | Cost |
+|---|---|---|
+| DNS / load balancer | Whole hostname or path prefix | Cheap, coarse, slow to change. |
+| Reverse proxy (NGINX, Envoy) | Per path, per method, per header | Flexible; the common choice. |
+| API gateway | Per route, with policy and observability | Expensive but full-featured. |
+| Inside the legacy app | A new "facade" controller that delegates | Useful when you can't put infra in front. |
+| Feature flag | Per user/percentage at runtime | Finest-grained; pairs with any of the above. |
+</Cheatsheet>
+
+A common pattern: reverse proxy for path-based routing, feature flag
+for percentage-based ramp inside that path. The proxy decides "this
+endpoint goes to the new service"; the flag decides "but only for
+2% of users so far."
+
+## The hard cases
+
+Three slices that are hard to strangler:
+
+### Shared database
+
+Both legacy and new write to the same tables. As long as that's true,
+they're coupled and the strangler doesn't really separate them. See
+**The shared-database antipattern**. The migration path is usually:
+
+```
+1. Replicate the legacy schema to a new owned DB (CDC).
+2. Move reads to the new DB.
+3. Dual-write from new system to both DBs during transition.
+4. Cut writes over; legacy becomes read-only.
+5. Stop replicating; delete the legacy DB.
+```
+
+This is slow and risky. It's the work; there is no shortcut.
+
+### Cross-cutting state
+
+Sessions, caches, rate-limit counters used by both sides. Either
+share them (and treat them as a contract), or migrate them as part
+of the same slice. Don't strangle a feature without including its
+state.
+
+### Synchronous calls back into legacy
+
+The new system needs data still owned by legacy. You have two
+choices:
+
+- **Call legacy synchronously** as a service. Fine if legacy is
+  reliable; awful if it's a fragile monolith. Wrap with timeouts and
+  circuit breakers (see **Stability patterns**).
+- **Move the owning data** as part of the slice. Slower but the
+  honest answer when legacy is the bottleneck.
+
+## Patterns inside the strangler
+
+### Branch by abstraction
+
+When you can't put infra in front of legacy, refactor legacy to call
+an internal **abstraction**:
+
+```
+[legacy code] → [abstraction] → legacy implementation
+                              → new implementation (off by default)
+```
+
+Then flip the abstraction's pointer to the new implementation. This
+is the strangler done inside the codebase. Slower than infra-level
+routing, but works when you can't change the perimeter.
+
+### Event interception
+
+Instead of routing requests, route **events**. Legacy publishes
+domain events; the new system subscribes, builds its own view, and
+catches up to current state. Once caught up, switch reads to the new
+view, then writes.
+
+This is how many CDC-based migrations work: legacy keeps writing to
+its DB; CDC streams change events to the new system; the new system
+becomes the source of truth gradually.
+
+### Parallel run / shadow traffic
+
+For high-stakes slices (payments, pricing), mirror all live traffic
+to the new system but discard its responses. Compare offline. When
+mismatch rate is acceptably low, switch to serving from the new
+system.
+
+Don't compare in production by default — comparison loads both
+systems and amplifies failures. Sample.
+
+## Failure modes
+
+A few that bite real teams:
+
+### Permanent transition
+
+The slice never gets to 100% because "it's almost there." Eighteen
+months later, both systems are still running, both must be on-call,
+and the migration has paused indefinitely.
+
+The fix: set explicit deadlines per slice. If a slice isn't at 100%
+by the deadline, either commit to finishing or kill the new
+implementation. Never both, indefinitely.
+
+### Diverging behavior
+
+Legacy and new behave subtly differently. Customers find the
+differences and file support tickets. Each "fix" makes the systems
+more identical in the wrong way — by porting legacy quirks into the
+new code.
+
+The fix: discover differences with shadow traffic before you ramp;
+fix or deliberately accept each one with product sign-off.
+
+### Routing layer becomes the new monolith
+
+The router accrues per-slice rules until it's a thicket of
+conditional logic. Now the router is the bottleneck for both systems.
+
+The fix: keep routing declarative (path-based, header-based). If
+you're writing imperative code in the router, the strangler is
+turning into something else.
+
+### Legacy keeps changing
+
+The legacy team keeps shipping features faster than the new system
+catches up. The migration goal recedes.
+
+The fix: freeze new feature work in slices being migrated. New
+features land in the new system only. This is usually a political
+decision more than a technical one — the team needs leadership
+support.
+
+### Forgotten cleanup
+
+The new system hits 100%, but legacy code remains "just in case." A
+year later, nobody knows if the legacy code path is reachable, and
+nobody dares delete it.
+
+The fix: deletion is part of the slice's "done" definition. If it's
+not deleted, the slice is not done.
+
+## A reusable plan
+
+For any strangler migration, draft this before you start:
+
+```
+- What's the first slice? Why is it small?
+- What's the router, and what's its granularity?
+- How do we detect parity? (Shadow traffic, comparison, metrics.)
+- What's the rollback if a step goes wrong?
+- What's the timeline per slice? Per the whole migration?
+- What's the data plan? Shared DB → owned DB strategy?
+- When does the slice count as "done"? (Legacy code deleted.)
+```
+
+If you can't answer those, you're not ready. Don't start.
+
+<Callout variant="info">
+Strangler migrations succeed when the team can articulate, at any
+moment, exactly which percentage of which slices is served by which
+system. They fail when the answer becomes "it depends, we'd have to
+check."
+</Callout>
+
+## In summary
+
+- Strangler fig replaces a legacy system one slice at a time,
+  routing traffic through a facade or proxy.
+- Each slice is small, reversible, and complete (including data
+  ownership and deletion of legacy code).
+- The router is the critical component: prefer path-based reverse-
+  proxy routing plus per-user feature flags for ramp.
+- Hard cases (shared DB, cross-cutting state, sync calls back to
+  legacy) usually need CDC, branch-by-abstraction, or event
+  interception.
+- Failure modes are mostly organizational: permanent transition,
+  legacy still changing, forgotten cleanup. Set deadlines per slice.
+- Big-bang rewrites fail; stranglers work because they ship value
+  continuously and roll back per step.

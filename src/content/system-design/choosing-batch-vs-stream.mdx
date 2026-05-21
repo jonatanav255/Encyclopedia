@@ -1,0 +1,192 @@
+export const level = 'senior';
+
+# How to choose: batch vs stream
+
+Batch processes **bounded** data sets at intervals. Stream
+processes **unbounded** data continuously.
+
+The choice depends on freshness requirements, cost, operational
+complexity, and the correctness guarantees you need.
+
+## Batch wins when
+
+- **Freshness is hours or days.** Nightly reports, weekly
+  ETL, monthly billing rollups.
+- **Cost matters.** Batch jobs use ephemeral resources; no
+  always-on infrastructure.
+- **Reprocessing is common.** Bug in your aggregation logic →
+  re-run the batch. Stream replay is harder.
+- **Heavy aggregations.** Multi-billion-row joins are
+  cheaper in batch (Spark, Athena, BigQuery).
+- **Team familiar with SQL / Spark, less so with stream
+  processing.**
+
+## Stream wins when
+
+- **Freshness is seconds.** Fraud detection, monitoring,
+  trading signals, real-time dashboards.
+- **Data is continuously produced.** Reading from Kafka /
+  Pulsar; a batch job at the end of every hour is
+  artificially constrained.
+- **Stateful real-time computations.** Per-minute sliding
+  windows of metrics; ongoing user sessions.
+- **Reactivity.** "When X happens, trigger Y" in real time.
+
+## The hybrid: Lambda and Kappa architectures
+
+Few systems are purely batch or purely stream.
+
+### Lambda
+
+Both pipelines run in parallel:
+
+- Stream pipeline computes "best effort" real-time view
+  (dashboards, alerts).
+- Batch pipeline recomputes the "correct" view from raw
+  events overnight.
+- Reads merge both: real-time for recent, batch for historical.
+
+Used by Twitter, Netflix, many ad-tech systems.
+
+Cost: operate two pipelines; reconcile their outputs.
+
+### Kappa
+
+Just stream. Replay from the beginning of the stream when
+you need to recompute.
+
+- Single pipeline; lower operational burden.
+- Requires a strong stream-processing framework (Flink,
+  Kafka Streams with exactly-once).
+- Reprocessing means replaying from log position 0; doable
+  but takes time on petabyte-scale logs.
+
+Used by newer systems where the stream framework has matured
+enough to do this safely.
+
+See kappa-vs-lambda-architecture.
+
+## Cost model
+
+Batch:
+
+- **Compute**: ephemeral; only pay when running.
+- **Storage**: cheap (object storage, parquet/orc).
+- **Operational**: scheduled DAGs (Airflow, Dagster); fail/retry/alert.
+
+Stream:
+
+- **Compute**: always-on; pay for idle.
+- **Storage**: log (Kafka) retains everything for some
+  window.
+- **Operational**: 24/7 systems with checkpoints, state
+  backends, and tail-latency monitoring.
+
+For most use cases, batch is cheaper. Stream pays off when
+freshness drives revenue.
+
+## Correctness considerations
+
+### Batch is more forgiving
+
+A bug in batch code → re-run, fix the output. Source data is
+preserved.
+
+A bug in stream code → the bad output has already gone to
+downstream systems. Reprocessing requires replaying the stream
+through corrected code while keeping downstream consistent.
+
+### Stream exactly-once
+
+Stream processing's hardest property. Achievable today with:
+
+- **Kafka transactions** for atomic produce + consume.
+- **Flink/Beam checkpoints** for state snapshots.
+- **Idempotent sinks** for the final write.
+
+(See exactly-once-stream-processing.)
+
+### Event time vs processing time
+
+Stream forces you to confront: do you compute based on when
+the event happened, or when you saw it?
+
+- **Processing time**: what your clock says now. Fast,
+  wrong-but-immediately-available.
+- **Event time**: timestamp in the event. Correct, but
+  requires watermarks to know when "the window is done."
+
+(See event-time-vs-processing-time and watermarks.)
+
+Batch typically gets event-time correctness for free
+(everything's already in the past).
+
+## Use case fits
+
+<Cheatsheet>
+| Use case | Best fit |
+|---|---|
+| Nightly billing rollup | Batch |
+| Daily KPI dashboard | Batch |
+| Fraud detection | Stream |
+| Real-time alerting | Stream |
+| Recommendation model training | Batch |
+| Recommendation serving / live re-ranking | Stream |
+| Search index build | Batch + incremental stream |
+| Log analytics | Stream into a query engine (ClickHouse, etc.) |
+| Replication (CDC) | Stream |
+| Data warehouse hydration | Batch (or stream into the warehouse) |
+</Cheatsheet>
+
+## Common mistakes
+
+### "We need real-time" → stream → costs explode
+
+Real-time costs ~10× batch in compute and operations. Many
+"we need real-time" requirements are actually "we need it
+within 5 minutes." A 5-minute micro-batch (Spark Streaming,
+Delta Live Tables) is much cheaper than per-event stream.
+
+### "Batch is old" → all-stream → eventual consistency
+everywhere
+
+Stream is the cool kid, but if your dashboards need
+exactness for the CFO, batch reconciliation is mandatory.
+Don't replace batch with stream "because async is faster" if
+the use case needs strong correctness.
+
+### Treating Kafka topic as a database
+
+A bounded "stream" with infinite retention isn't a stream
+job; it's a batch job with weird tooling. Just use a data
+warehouse.
+
+## Decision questions
+
+<Steps>
+<Step n={1} title="What's your freshness SLA?">
+> hour → batch. < minute → stream. In between → micro-batch.
+</Step>
+<Step n={2} title="How does the data arrive?">
+File drops daily → batch. Continuous events → stream-ready.
+</Step>
+<Step n={3} title="Do you need exactness?">
+Stream if exactly-once is well-understood by your team.
+Otherwise batch reconciliation alongside stream "best effort."
+</Step>
+<Step n={4} title="What's the cost ceiling?">
+Stream costs more in steady state. Batch is cheaper if
+freshness allows.
+</Step>
+</Steps>
+
+## In summary
+
+- Batch for hourly/daily freshness, cost-sensitive, heavy
+  joins, easy reprocessing.
+- Stream for seconds-fresh, reactive, stateful computations.
+- Lambda runs both for "real-time best effort + batch
+  truth."
+- Kappa runs stream-only with replay for recomputation.
+- Stream needs careful event-time, watermarks, exactly-once
+  handling — most of the operational cost.

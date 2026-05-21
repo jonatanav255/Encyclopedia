@@ -1,0 +1,200 @@
+export const level = 'senior';
+
+# Request collapsing (single-flight)
+
+When N concurrent requests want the **same** data, run the
+underlying call **once** and share the result. The N-1 other
+callers wait on the in-flight call rather than starting their
+own.
+
+Also called *single-flight*, *request deduplication*, or
+*coalescing*. It's the standard fix for cache stampede on the
+request path.
+
+## The pattern
+
+```js
+const inflight = new Map();
+
+async function get(key) {
+  if (inflight.has(key)) {
+    return inflight.get(key);
+  }
+  const promise = doExpensiveCall(key)
+    .finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+  return promise;
+}
+```
+
+Now N concurrent `get('user:42')` calls trigger one downstream
+fetch. All N return the same value.
+
+## Why this matters
+
+Without collapsing:
+
+- 100 concurrent requests for the same cache-missed key.
+- 100 DB queries hit Postgres simultaneously.
+- Postgres melts.
+- Cache eventually populates; the next 100 see the cached
+  value.
+
+With collapsing:
+
+- 100 concurrent requests for the same key.
+- 1 DB query goes; 99 wait on it.
+- DB sees normal load.
+
+## In-process vs cluster-wide
+
+### In-process
+
+The `Map` above. Works **within a single process**. Two
+processes still both query the DB.
+
+For most apps, in-process is enough. Each process has its own
+view; the DB sees N · (cluster_size) requests in the worst
+case, not N · (total_requests).
+
+### Cluster-wide
+
+Coordinate via Redis or a shared lock. Only the lock holder
+queries; others wait on the cached result.
+
+```js
+async function get(key) {
+  // Try local cache first
+  const local = localCache.get(key);
+  if (local) return local;
+
+  // Try Redis cache
+  const cached = await redis.get(key);
+  if (cached) return cached;
+
+  // Take a short lock; only one process queries
+  const lockToken = await redis.set(`lock:${key}`, 'me', { NX: true, EX: 5 });
+  if (lockToken) {
+    try {
+      const value = await dbQuery(key);
+      await redis.set(key, value, { EX: 60 });
+      return value;
+    } finally {
+      await redis.del(`lock:${key}`);
+    }
+  } else {
+    // Someone else is querying; wait for the cache
+    await sleep(50);
+    return get(key);
+  }
+}
+```
+
+Cluster-wide is more complex. Use only when the DB can't
+handle "in-process count × cluster size" stampedes.
+
+## Distinguished from batching
+
+<Compare a="Batching" b="Coalescing">
+<>
+Combine many **different** items into one batch call. E.g.,
+100 `getUser(N)` calls become one `getUsers([ids])` call.
+</>
+<>
+Multiple requests for the **same** thing share one
+underlying call. 100 callers want `getUser(42)` → 1 call to
+backend.
+</>
+</Compare>
+
+DataLoader does both: batches by collecting concurrent
+`.load(id)` calls into one batch, and (with caching) coalesces
+when the same id is requested twice in the same batch.
+
+## When to coalesce
+
+- **Cache-miss path under high concurrency.** The canonical
+  case.
+- **Expensive computation reused.** Multiple consumers want
+  the result of one ML inference.
+- **Refresh of hot data.** Background refresh while serving
+  stale; only one refresh at a time.
+- **Expensive validation.** "Is this token still valid?" —
+  many callers, one auth-service call.
+
+## When not to
+
+- **Personalized requests.** If `get(user:42)` returns
+  different data per requester (with their permissions), you
+  can't share.
+- **Side-effect-bearing requests.** "POST /charge" with the
+  same idempotency key — coalescing this is correct, but
+  needs careful semantics.
+- **Already-fast paths.** Coalescing adds locking overhead.
+  If the operation is sub-ms, just do it.
+
+## Edge cases
+
+### The in-flight call fails
+
+99 callers waiting on a call that errors. Do they all error?
+Or do they retry?
+
+Pattern: 1 caller gets the error and retries (if appropriate);
+the other 98 also get the error. Don't auto-retry inside
+the coalescer — let callers decide.
+
+### TTL on the in-flight entry
+
+Without cleanup, a hung call leaves the in-flight entry
+forever. Use a short timeout:
+
+```js
+const promise = Promise.race([
+  doExpensiveCall(key),
+  new Promise((_, rj) => setTimeout(() => rj(new Error('timeout')), 30_000)),
+]).finally(() => inflight.delete(key));
+```
+
+### Stampede on the coalescer itself
+
+If 100K parallel requests all hit the in-process Map at the
+same instant, the Map operations themselves can briefly
+contend. For Go: use `sync/singleflight` (lock-free at scale).
+For Node: a regular Map is fine; JS is single-threaded.
+
+## Libraries
+
+- **Go**: `golang.org/x/sync/singleflight` — canonical.
+- **Java**: Caffeine cache with `loadingCache` does
+  coalescing per key.
+- **Node.js**: many libraries; or hand-roll in ~10 lines.
+- **DataLoader**: combines batching + coalescing.
+
+For most languages, the hand-rolled version above is fine.
+
+## Coalescing for writes
+
+For mutations, coalescing is subtle:
+
+- "Increment counter X by 1" — N concurrent calls SHOULD
+  each happen. Don't coalesce.
+- "Compute and cache result X" — N concurrent calls should
+  share. Coalesce.
+
+The rule: coalesce only **idempotent reads** or **idempotent
+computations**. Never side-effecting mutations.
+
+## In summary
+
+- Request collapsing: many concurrent identical requests share
+  one underlying call.
+- In-process Map covers most cases; Redis-based cluster-wide
+  for higher scale.
+- Standard fix for cache stampede on the request path.
+- Distinguished from batching: batching combines different
+  items; coalescing dedupes identical ones.
+- Don't coalesce mutating operations.
+- Watch for hung in-flight entries; always TTL them.
+- Libraries: Go singleflight, Caffeine loadingCache,
+  DataLoader.

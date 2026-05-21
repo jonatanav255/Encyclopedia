@@ -1,0 +1,299 @@
+export const level = 'senior';
+
+# B-Tree vs LSM storage engines
+
+Underneath every database is a storage engine — the layer that
+turns keys and values into disk pages. The two dominant designs
+are **B-Trees** (in-place updates) and **Log-Structured Merge
+trees** (append-and-compact). Picking one shapes the read,
+write, and space profile of the entire database.
+
+## What a B-tree does
+
+A B-tree (technically B+ tree in most implementations) is a
+sorted, balanced tree of fixed-size pages. Each internal page
+holds keys + child pointers; each leaf holds keys + values (or
+keys + row locations).
+
+```
+              [k=20 | k=60]
+             /     |     \
+       [k=5,10]  [k=30,50]  [k=70,90]
+```
+
+Operations:
+
+- **Lookup**: O(log_B N) page reads, each a random I/O.
+- **Insert**: locate the leaf, write into it; split if full.
+- **Update**: rewrite the page in place; log it via WAL.
+- **Delete**: mark the entry; periodically compact.
+
+The on-disk shape evolves slowly. Pages live at fixed
+locations; updates rewrite the same page; the tree height
+stays small (3-5 levels for billions of keys at 4 KB pages).
+
+## What an LSM tree does
+
+An LSM tree separates the write path from the on-disk
+representation.
+
+```
+[memtable] (in-memory, sorted) — every write goes here
+   ↓ flush when full
+[L0 SSTables] (sorted runs)
+   ↓ compact
+[L1 SSTables] (sorted, non-overlapping)
+   ↓ compact
+[L2 SSTables] ...
+```
+
+- **Memtable**: an in-memory sorted structure (skiplist or
+  red-black tree). Writes append to a WAL for durability.
+- **SSTable** (sorted string table): an immutable sorted file
+  on disk. Once written, never modified.
+- **Compaction**: a background process merges SSTables,
+  dropping superseded versions and tombstones.
+
+Operations:
+
+- **Write**: append to WAL + insert into memtable. O(1) on
+  average. Sequential disk I/O.
+- **Read**: check memtable, then each level. Bloom filters
+  short-circuit misses.
+- **Update**: write the new value; older versions sit until
+  compaction drops them.
+- **Delete**: write a tombstone; compaction removes it.
+
+The on-disk shape evolves constantly. Background compaction is
+mandatory, not optional.
+
+## The fundamental trade-off
+
+<Compare a="B-tree" b="LSM tree">
+<>
+**In-place updates.** Each row exists once on disk. Reads are
+predictable: log_B N page reads per lookup. Writes incur random
+I/O — the page being updated is wherever it happens to live.
+Sequential scans are fast because the tree is sorted on disk.
+Space overhead is low (~10–30%).
+</>
+<>
+**Append-only.** Writes are sequential, batched, and fast at
+any scale. Reads may have to consult multiple levels. Space
+amplification (live data + tombstones + duplicates) is higher.
+Background compaction continuously rewrites data, costing
+sustained I/O bandwidth.
+</>
+</Compare>
+
+This trade-off plays out across three metrics:
+
+- **Read amplification**: bytes read from disk per logical
+  read. B-trees ~1–4×; LSMs 2–10× depending on level count.
+- **Write amplification**: bytes written to disk per logical
+  write. B-trees ~2–10× (page rewrites + WAL); LSMs 5–30×
+  (compaction).
+- **Space amplification**: on-disk size / live data size.
+  B-trees ~1.3×; LSMs 1.5–3×.
+
+LSMs win at write throughput, B-trees win at read consistency,
+and both have rough edges at tail latency.
+
+## Read amplification, more precisely
+
+For an LSM read:
+
+1. Check the memtable (in memory, free).
+2. For each level, check the bloom filter; on hit, read the
+   SSTable's index, then the data block.
+3. Stop when the key is found or tombstoned.
+
+A well-tuned LSM with bloom filters does ~1 disk I/O for most
+hits. Cold reads on rare keys hit several levels. p99 latency
+is higher than a B-tree because the worst case touches more
+files.
+
+A B-tree read is always the same shape: traverse the tree.
+Latency variance is low, which is why OLTP engines on B-trees
+have very predictable response times.
+
+## Write amplification, more precisely
+
+For a B-tree write:
+
+1. WAL append (sequential).
+2. Page modify in cache.
+3. Eventually, page flush (random I/O to the page location).
+4. Replication writes a copy of the WAL.
+
+For an LSM write:
+
+1. WAL append (sequential).
+2. Memtable insert (in memory).
+3. Eventual flush to L0 SSTable (sequential).
+4. Compaction rewrites the data several times as it migrates
+   to deeper levels.
+
+If the database has 6 levels with size ratio 10×, each row is
+ultimately rewritten ~6 times during compaction. Write
+amplification of 10–30× is normal.
+
+Why is this acceptable? Because the writes are **sequential**.
+Sequential SSD or NVMe writes are dramatically faster than
+random ones (5–50× on consumer SSDs, less on enterprise NVMe).
+LSMs trade I/O count for I/O pattern.
+
+## Space amplification and compaction
+
+LSMs accumulate stale data:
+
+- Updated keys leave old versions in older levels.
+- Deleted keys leave tombstones that propagate down until they
+  meet every older copy.
+- Compaction lags during write spikes.
+
+A 1 TB logical dataset on RocksDB may occupy 1.5–2.5 TB on
+disk between compactions. This is the **space amplification
+cost** of the design.
+
+Compaction strategies trade off differently:
+
+- **Leveled compaction** (RocksDB default, Cassandra LCS):
+  small space amp (~1.1–1.3×), large write amp (10–30×).
+  Best for read-heavy.
+- **Size-tiered compaction** (Cassandra STCS default):
+  small write amp (3–10×), large space amp (~2×). Best for
+  write-heavy with infrequent reads.
+- **Time-window compaction** (Cassandra TWCS): for time-series
+  data where old data ages out and is dropped wholesale.
+
+The choice is a tuning knob a senior operator should
+understand.
+
+## Read patterns that suit each
+
+<Cheatsheet>
+| Workload | Better fit |
+|---|---|
+| OLTP, mixed read/write | B-tree |
+| Point reads, predictable p99 | B-tree |
+| Range scans | Either; B-tree slightly more predictable |
+| Write-heavy ingest (events, logs) | LSM |
+| Time-series append-only | LSM with TWCS |
+| Heavy update workload | B-tree (LSM hides the cost in compaction) |
+| Very large single-node datasets | LSM (better compression in SSTables) |
+| Read-mostly with cold tail | B-tree (no compaction overhead) |
+</Cheatsheet>
+
+## What each database uses
+
+<Cheatsheet>
+| Engine | Storage |
+|---|---|
+| Postgres (heap + B-tree indexes) | B-tree |
+| MySQL InnoDB | B-tree (clustered) |
+| SQLite | B-tree |
+| SQL Server | B-tree |
+| MongoDB WiredTiger (default) | B-tree |
+| MongoDB WiredTiger (LSM option) | LSM |
+| Cassandra | LSM |
+| ScyllaDB | LSM |
+| HBase / Bigtable | LSM |
+| RocksDB / LevelDB | LSM |
+| DynamoDB (internal) | LSM |
+| CockroachDB / TiDB | LSM (RocksDB / Pebble) |
+| ClickHouse (MergeTree) | LSM-like |
+| BadgerDB | LSM |
+</Cheatsheet>
+
+A useful split: **traditional OLTP databases tend to be
+B-tree; horizontally scalable newer engines tend to be LSM**.
+Not absolute — WiredTiger is in MongoDB and is B-tree by
+default — but the pattern holds.
+
+## Operational characteristics
+
+### Compaction storms
+
+LSMs have a sneaky failure mode: a sustained write spike
+outpaces compaction. Levels grow, read amplification climbs,
+disk fills with stale data. The recovery is more compaction —
+which competes with foreground reads and writes for I/O.
+
+Monitor: SSTables per level, pending compaction bytes, write
+stall events. Cassandra and RocksDB expose these directly.
+
+### Vacuum vs compaction
+
+Postgres MVCC accumulates dead row versions, which `VACUUM`
+reclaims. This is functionally a B-tree's version of
+compaction. The big difference: vacuum runs less continuously
+and can fall behind on write-heavy tables, causing **bloat**.
+
+Both kinds of engines have a "background process that must
+keep up" failure mode. Don't believe the marketing that says
+either is maintenance-free.
+
+### Bloom filters
+
+Standard equipment on LSMs. A bloom filter per SSTable
+indicates "key definitely not here" with no false negatives
+and a tunable false-positive rate (typically 1%). Without
+them, every level lookup is a disk hit.
+
+B-trees don't need bloom filters because the tree itself is
+the index. They sometimes add them for partition pruning in
+sharded engines.
+
+### Random vs sequential writes on modern SSDs
+
+The historical performance gap between random and sequential
+writes on NVMe is narrower than on rotational drives, but it's
+not zero. Sequential writes still align with SSD page erase
+units; random writes trigger garbage collection inside the SSD.
+LSM still wins under heavy write load, just by smaller
+multiples than 10 years ago.
+
+## Choosing for a workload
+
+Three questions:
+
+<Steps>
+<Step n={1} title="What's the write rate, sustained?">
+Below ~10K writes/sec/node, either engine handles it.
+Above ~50K/sec/node sustained, LSMs are the easier path.
+</Step>
+<Step n={2} title="What's the read latency SLO at p99?">
+Sub-millisecond p99 with low variance favors B-trees. LSM p99
+spikes during compaction unless heavily tuned.
+</Step>
+<Step n={3} title="What's the on-disk dataset size?">
+Multi-TB single-node datasets benefit from LSM's compression
+and append-only writes. Smaller datasets that fit in
+cache-friendly working sets favor B-trees.
+</Step>
+</Steps>
+
+For most application workloads, the database choice (Postgres
+vs Cassandra) is the real decision, and the storage engine is
+along for the ride. But knowing which engine sits underneath
+explains the operational behavior you'll see.
+
+<Callout variant="info">
+Modern engines blur the line. CockroachDB and TiDB run LSM
+(Pebble / RocksDB) under a SQL surface. WiredTiger offers
+both. Treat "B-tree vs LSM" as describing **the dominant cost
+shape**, not a strict binary.
+</Callout>
+
+## In summary
+
+- B-trees do in-place updates: predictable reads, modest write
+  cost, low space overhead. The default for OLTP.
+- LSMs append + compact: huge sustained write throughput,
+  higher read and space amplification, mandatory background
+  compaction.
+- Postgres / MySQL / SQL Server / WiredTiger default → B-tree.
+  Cassandra / RocksDB / HBase / Bigtable / Dynamo → LSM.
+- Pick the database for your access pattern; the storage
+  engine determines how it bends under load.

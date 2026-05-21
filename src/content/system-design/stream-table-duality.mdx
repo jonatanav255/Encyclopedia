@@ -1,0 +1,300 @@
+export const level = 'staff';
+
+# Stream-table duality
+
+The unifying insight of modern stream processing: **a table is a
+snapshot of a stream, and a stream is a changelog of a table**.
+Given one, you can derive the other. The two are duals.
+
+The framing comes from Confluent's Kafka Streams team
+(Sax, Wang, Noll) and from Akidau's *Streaming Systems*. It's
+the conceptual foundation underneath Kafka Streams' KTable,
+ksqlDB's STREAM/TABLE distinction, Flink SQL's dynamic tables,
+and Materialize.
+
+## The duality
+
+```
+stream (changelog)
+e1: {key: A, value: 1}
+e2: {key: B, value: 5}
+e3: {key: A, value: 7}
+e4: {key: A, value: 12}
+
+table (snapshot at time of e4)
+A → 12
+B → 5
+```
+
+The stream is an ordered sequence of changes. The table is the
+result of applying those changes — the **current value per key**.
+
+Going the other way:
+
+```
+table (point in time)
+A → 12
+B → 5
+C → 99
+
+stream (regenerated as changelog)
+{key: A, value: 12}
+{key: B, value: 5}
+{key: C, value: 99}
+```
+
+Producing a stream from a table is "scan the table, emit each
+row as an event." Producing a table from a stream is "fold the
+stream by key, keep latest."
+
+This is intuitive once you see it; it's profound because it lets
+the same engine treat both representations uniformly.
+
+## Where this shows up
+
+### Kafka Streams: KStream vs KTable
+
+Kafka Streams has two abstractions over a topic:
+
+- **KStream**: each record is an independent event. `e1, e2,
+  e3, ...` Aggregations sum across all events.
+- **KTable**: each record is an update to the value for that
+  key. Same topic, different interpretation.
+
+```js
+// Same topic, two interpretations
+const events = builder.stream('user-events');     // KStream
+const profiles = builder.table('user-profiles');  // KTable
+```
+
+The choice of `stream` vs `table` changes the semantics of every
+operation that follows. A `join` between two KStreams produces
+all matching event pairs; a `join` between a KStream and a
+KTable enriches each event with the current value from the
+table.
+
+### ksqlDB: STREAM vs TABLE
+
+The SQL surface for the same idea:
+
+```js
+const sql = `
+  CREATE STREAM user_events (id BIGINT, action VARCHAR)
+    WITH (KAFKA_TOPIC='events', VALUE_FORMAT='JSON');
+
+  CREATE TABLE user_profiles (id BIGINT PRIMARY KEY, email VARCHAR)
+    WITH (KAFKA_TOPIC='profiles', VALUE_FORMAT='JSON');
+
+  SELECT e.id, e.action, p.email
+  FROM user_events e
+  JOIN user_profiles p ON e.id = p.id
+  EMIT CHANGES;
+`;
+```
+
+The `EMIT CHANGES` clause makes the result a continuously-updated
+table whose changelog is itself a stream.
+
+### Flink SQL: dynamic tables
+
+Flink's "dynamic table" is a table that changes over time. Each
+INSERT/UPDATE/DELETE on the dynamic table produces a changelog
+event. Queries over dynamic tables return materialized views
+that also change over time.
+
+```js
+const sql = `
+  CREATE TABLE orders (
+    user_id BIGINT, amount DECIMAL, ts TIMESTAMP_LTZ(3),
+    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+  ) WITH ('connector' = 'kafka', ...);
+
+  SELECT user_id, SUM(amount)
+  FROM orders
+  GROUP BY user_id;
+`;
+```
+
+The result is a dynamic table; behind it, Flink maintains state
+that updates as orders arrive.
+
+## Three changelog encodings
+
+The stream-as-changelog representation has three common flavors:
+
+<Cheatsheet>
+| Encoding | Each record contains | Pros | Cons |
+|---|---|---|---|
+| **Upsert** | Latest value per key (`null` = delete) | Simple, compact | No history of intermediate values |
+| **Append** | Each event independent (no overwrite) | Full history preserved | Building table requires fold |
+| **Retract** | (-, old), (+, new) for updates | Exact-correctness for aggregates | Verbose, harder to reason about |
+</Cheatsheet>
+
+Kafka compacted topics are upsert. Regular Kafka topics are
+append. Flink's dynamic tables produce retract streams when
+queries can produce updates (e.g., aggregations).
+
+Retract streams are particularly important for **correct
+aggregates**: when a value changes from 5 to 7, the changelog
+emits `(-5)` then `(+7)`, so any downstream SUM updates
+correctly. Without retract, an aggregate would just add 7,
+counting both.
+
+## The join cases
+
+The duality unlocks three join kinds:
+
+### Stream-stream join
+
+Two streams; join on key + time window.
+
+```
+A: {id: 1, t: 10:00}
+B: {id: 1, t: 10:01}
+Join: emit ({id:1, A.value, B.value})
+```
+
+Bounded time window required (otherwise state grows forever).
+Each event waits for a matching event on the other side within
+the window.
+
+### Stream-table join
+
+A stream is enriched with the current value from a table.
+
+```
+event stream: {user_id: 42, action: 'click'}
+              ↓
+              join with user_profiles[42] = {email: ...}
+              ↓
+emit: {user_id: 42, email: ..., action: 'click'}
+```
+
+The table is materialized locally; the stream looks up
+synchronously. No time window needed — the join is always against
+"current state of the table." This is the most common join in
+practice; it replaces remote calls to a profile service with
+local lookups against a continuously-updated table.
+
+### Table-table join
+
+Two tables; produce a third table that's the join. Updates to
+either input update the output.
+
+```
+users: A → (Alice)
+orders_by_user: A → (count: 3)
+
+joined: A → (Alice, count: 3)
+```
+
+Used to denormalize for read-optimized views. See **Materialized
+views**.
+
+## State storage and the table
+
+The KTable is held in a **state store**:
+
+- **Local** (RocksDB, in the JVM heap for Flink).
+- **Replicated** to a changelog topic for fault tolerance.
+- **Compacted** so the changelog is bounded in size.
+
+If the processor crashes, the state is rebuilt by replaying the
+compacted changelog topic. That's the duality in action: the
+table is the state; the changelog is the stream representation
+of the state.
+
+```
+KTable state store (local RocksDB)
+   ↓ updates ↑ reads
+KTable changelog topic (compacted Kafka topic)
+```
+
+When you scale a Kafka Streams job from 1 to 4 instances, each
+instance owns its share of partitions and reads the changelog to
+rebuild its share of state. The duality makes this rebuild
+straightforward.
+
+## Why this matters for design
+
+The duality removes the dichotomy "we have streams **or** we have
+databases." Modern streaming systems treat both as views of the
+same underlying changelog:
+
+- **Want to query current state?** Read the table.
+- **Want to react to changes?** Subscribe to the stream.
+- **Want to rebuild state?** Replay the stream.
+- **Want to bootstrap a new view?** Start a new consumer from
+  offset 0.
+
+Materialize, RisingWave, and ksqlDB lean into this fully —
+their query model is "all queries are continuous materialized
+views over streaming tables." Postgres + Debezium + Flink lean
+toward "the OLTP DB is the table; CDC is the stream; everything
+else is downstream."
+
+## In practice
+
+A typical microservice using the duality:
+
+```
+[Kafka: user-events]     (append stream)
+                            ↓
+                    aggregate by user_id
+                            ↓
+[Kafka: user-state]      (compacted, upsert)  ← KTable
+                            ↓
+                join with new events
+                            ↓
+[Kafka: enriched-events]  (append stream)
+                            ↓
+                       sink to DB
+```
+
+Three topics; same engine; everything reactive. The compacted
+"user-state" topic is the durable form of the KTable; the engine
+holds it locally in RocksDB; CDC consumers can use it as the
+canonical "current state per user."
+
+## Pitfalls
+
+<Callout variant="warning">
+**Treating a stream as a table without compaction.** Without
+compaction, "the table" loses key-uniqueness invariants because
+old versions linger.
+</Callout>
+
+<Callout variant="warning">
+**Treating a table as a stream without retract semantics.**
+Aggregations over a table without retract double-count when
+inputs change.
+</Callout>
+
+<Callout variant="warning">
+**Cross-partition joins.** Two streams partitioned by different
+keys can't be joined directly; one must be re-partitioned.
+Co-partitioning is the prerequisite for stream-stream joins.
+</Callout>
+
+<Callout variant="warning">
+**Confusing KTable with a remote DB.** A KTable is a local
+materialized state store. Operations on it are local; you can
+reason about consistency. A remote DB lookup is an external
+call with its own latency and failure modes — different
+animal.
+</Callout>
+
+## In summary
+
+- **Table = snapshot of a stream**; **stream = changelog of a
+  table**. Mathematical duals.
+- **Kafka Streams' KStream/KTable**, **ksqlDB STREAM/TABLE**,
+  **Flink dynamic tables** all encode this idea.
+- **Upsert, append, retract** are the three changelog encodings.
+- **Stream-table joins** replace remote service calls with
+  local materialized lookups.
+- **State stores + compacted changelog topics** make tables
+  durable and rebuildable.
+- **Modern streaming systems are unified** by this duality —
+  queries over streaming tables, materialized views, continuous
+  aggregates all fall out of it.

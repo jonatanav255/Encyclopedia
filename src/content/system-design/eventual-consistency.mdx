@@ -1,0 +1,130 @@
+export const level = 'mid';
+
+# Eventual consistency
+
+The weakest practical model: if writes stop, replicas converge.
+No bound on how long.
+
+That sounds dismissive but it's the contract behind most
+caches, CDNs, search indexes, view counters, presence systems,
+analytics rollups, and Dynamo-class databases. When "minutes
+old is fine," eventual consistency is the cheapest, most
+available, most scalable choice.
+
+## What the application has to tolerate
+
+- **Stale reads.** A read can return a value that's older than
+  the latest write.
+- **Reads going backwards.** A client may see value V, then on
+  next read see an older value V-1 (no monotonic reads
+  guarantee).
+- **Concurrent writes that need merging.** Two writes happen at
+  the same time; the system needs a rule for which wins (LWW,
+  CRDT, custom merge).
+- **Read-your-writes failures.** A user updates their profile,
+  refreshes, sees the old version. Common enough that most
+  "eventually consistent" production systems bolt on
+  session-level read-your-writes.
+
+## When eventual is the right choice
+
+- **Caches.** Stale data for a few seconds is fine; cost is
+  much lower than a coordinated cache.
+- **CDNs.** Pushes are propagated asynchronously.
+- **View counts / like counts.** Off by 1% for 30 seconds is
+  invisible.
+- **Analytics rollups.** Yesterday's numbers can be
+  recalculated at midnight.
+- **Multi-region read replicas of mostly-read data.** Async
+  replication is much cheaper than sync.
+- **Cross-system event-driven updates.** Service A's database
+  is updated; service B catches up via CDC or messaging.
+
+## When it isn't
+
+- **Money.** A bank account balance can't be eventually
+  consistent at the request level.
+- **Unique constraints.** Two requests can't both succeed at
+  claiming the same username.
+- **Inventory.** Don't sell the same seat twice.
+- **Configuration / metadata.** The routing table must be the
+  same on every node.
+- **Anything where the user just acted.** They expect to see
+  their own write.
+
+## Implementation cheap-tricks
+
+How real systems make eventual feel less weird:
+
+<Steps>
+<Step n={1} title="Sticky routing for read-your-writes.">
+Route a user's reads to the same replica that took their
+write for some window. The user always sees their own work.
+</Step>
+<Step n={2} title="Causal tokens.">
+Client carries a "minimum log position" token; reads block
+until the replica has caught up.
+</Step>
+<Step n={3} title="Anti-entropy.">
+Background process compares replicas and reconciles
+divergence even without explicit writes. Cassandra's
+Merkle-tree repairs; Riak's read-repair.
+</Step>
+<Step n={4} title="Hinted handoff.">
+A node that can't reach a replica stores its writes
+locally and replays them when the replica recovers.
+</Step>
+</Steps>
+
+## Conflict resolution
+
+When two writes are concurrent, the system picks a winner.
+Three families:
+
+- **Last-write-wins (LWW).** Pick the one with the higher
+  timestamp. Simple, silently loses data. Used in Cassandra
+  by default.
+- **CRDTs.** Use a data type whose merge function is
+  commutative, associative, idempotent. G-counters, OR-sets,
+  LWW-registers (with vector clocks). Riak, Redis CRDT,
+  collaborative editors.
+- **Application merge.** Surface the conflict to the
+  application. Dynamo originally did this; most apps choose
+  not to deal with it.
+
+## The cost the books don't mention
+
+Eventual consistency makes **debugging painful**. A user
+reports "I changed my email, it didn't save," but on the
+backend the write succeeded; it just hadn't replicated to the
+read path yet. Reproducing requires a stopwatch.
+
+Building observability around replication lag (per-replica,
+per-key) is part of the cost of eventual consistency. Without
+it, you'll spend hours chasing ghosts.
+
+## Examples in the wild
+
+<Cheatsheet>
+| System | Eventual on... | Tunable to stronger? |
+|---|---|---|
+| DynamoDB | Default reads | Yes (`ConsistentRead`) |
+| Cassandra | Replicas | Yes (QUORUM, ALL, LWT) |
+| MongoDB | Secondary reads | Yes (read preference + concern) |
+| Redis Cluster | Replicas during failover | No, accept the window |
+| S3 | (Strong since 2020) | N/A |
+| CloudFront / CDN | All reads | No, purge to force |
+| Search indexes | Reflect DB writes | No, accept the lag |
+</Cheatsheet>
+
+## In summary
+
+- Eventual consistency: replicas converge if writes stop, no
+  time bound.
+- Application must tolerate stale reads, backwards reads,
+  concurrent-write conflicts.
+- Right for caches, CDNs, counts, analytics; wrong for money,
+  uniqueness, "user just clicked save."
+- Most production "eventual" systems bolt on session-level
+  read-your-writes — the UX otherwise is too rough.
+- Debugging-cost is real; instrument replication lag.

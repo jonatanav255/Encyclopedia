@@ -1,0 +1,222 @@
+export const level = 'staff';
+
+# Multi-region replication
+
+The mechanism that keeps copies of your data in sync across
+geographic regions. The choices: synchronous vs asynchronous;
+single-leader vs multi-leader vs leaderless; conflict
+resolution strategy.
+
+Each choice trades latency, consistency, and availability
+differently.
+
+## Synchronous vs asynchronous
+
+### Synchronous
+
+The write doesn't return until all regions have ack'd. Zero
+data loss on regional failure; high write latency (cross-region
+round-trip).
+
+For US-East to EU-West: ~70-100ms RTT. Every write pays this.
+Acceptable for low-frequency critical writes (config changes);
+not for transactional traffic.
+
+### Asynchronous
+
+The write returns from the local region; replication happens
+in background. Low write latency; recent writes lost if the
+local region dies before replicating.
+
+The standard. Almost all production systems use async
+cross-region replication.
+
+### Semi-sync
+
+Wait for one nearby region's ack, async to others. Compromise
+between durability and latency.
+
+## Topology
+
+### Single-leader (active-passive)
+
+One region is the **primary**. All writes go there;
+secondaries replicate.
+
+```
+primary (us-east) ──► replica (us-west) [async]
+                  ──► replica (eu-west) [async]
+                  ──► replica (ap-southeast) [async]
+```
+
+Pros: simple consistency model; no conflicts possible.
+Cons: writes from far-away regions are slow (must cross to
+primary); failover required on primary failure.
+
+### Multi-leader (active-active partitioned)
+
+Each region has its own primary, but writes are **partitioned**
+by key. A given user's data has one home region; all writes
+for that user go to the home.
+
+```
+us-east primary for user_id % 3 == 0
+us-west primary for user_id % 3 == 1
+eu-west primary for user_id % 3 == 2
+```
+
+Pros: writes are local to the home region; strong consistency
+per partition.
+Cons: cross-partition operations pay cross-region latency;
+re-partitioning is expensive.
+
+### Multi-leader (active-active unpartitioned)
+
+Every region accepts writes for every key. Conflicts resolve
+asynchronously.
+
+```
+us-east, us-west, eu-west all primary for everything
+async replication; conflicts resolved per strategy
+```
+
+Pros: low latency everywhere; survives any single-region
+failure.
+Cons: conflicts are real and must be handled.
+
+### Leaderless (Dynamo-style)
+
+No single primary anywhere. Quorum reads/writes across
+regions; replication is gossip-based.
+
+Pros: maximally available.
+Cons: cross-region quorums are slow; tunable consistency
+gives back some.
+
+## Conflict resolution
+
+For multi-leader patterns, two writes to the same key from
+different regions need to merge.
+
+### Last-write-wins (LWW)
+
+Pick the write with the higher timestamp. Silently drops
+the loser.
+
+Works for: small atomic updates ("update profile name").
+Bad for: cart-style "user added X" data where both adds
+should be preserved.
+
+Requires synchronized clocks. NTP skew of 50ms across regions
+can systematically lose recent writes.
+
+### Vector clocks + application merge
+
+Detect concurrent writes via vector clocks. Surface both
+versions to the application. App merges (union of cart
+items, max of counts).
+
+More work but correct. Riak, Voldemort, original Dynamo did
+this. Most apps choose LWW anyway because the merge code is
+painful.
+
+### CRDTs
+
+Use a data type whose merge is well-defined: counters
+(commutative), sets (union), maps (recursive). Concurrent
+operations always merge cleanly.
+
+Limits to data shapes that have good CRDTs. Yjs, Automerge,
+Riak Datatypes, Redis Active-Active CRDTs.
+
+## What you replicate
+
+Three approaches:
+
+### Statement-based
+
+Replicate SQL statements. Replicas re-execute. Simple but
+fragile — `NOW()` or random functions produce different
+results.
+
+Used by older MySQL replication.
+
+### Row-based / log-based
+
+Replicate the **rows changed**, not the statement that changed
+them. Deterministic on replicas.
+
+Used by modern Postgres, MySQL row-based binlog, MongoDB
+oplog.
+
+### Block-based
+
+Replicate disk blocks. Very low-level; works regardless of
+DB.
+
+Used by SAN replication, some cloud DB backups. Bad for
+cross-region (block-level diff is wasteful over WAN).
+
+## CDC for replication
+
+For cross-region replication of data **across different
+systems**: capture changes from one system's log (CDC) and
+stream to the other.
+
+Example: us-east Postgres → CDC → Kafka → eu-west DynamoDB.
+
+This is how multi-system, multi-region replication is built
+when the systems aren't built for replication natively.
+
+## Failure modes
+
+### Replication lag
+
+The cross-region link is slow or busy. Replication falls
+behind. If the primary fails, RPO (recovery point objective)
+is the lag.
+
+Monitor lag; alert when it exceeds budget.
+
+### Replication broken silently
+
+A schema change on the primary breaks the replica's apply
+loop. Lag grows. If not alerted, the replica is useless when
+needed.
+
+Test replication frequently (apply a synthetic write, verify
+it appears in replicas).
+
+### Conflict resolution loses data
+
+LWW silently picked the loser. Months later, a customer
+notices their data went away.
+
+Use CRDTs where possible; surface conflicts for app review
+where not.
+
+### Cross-region network partition
+
+Replication halts. If reads were happening locally, fine —
+serve stale. If reads were happening cross-region,
+unavailable.
+
+Design which reads are allowed cross-region; failover modes
+when the link is gone.
+
+## In summary
+
+- Multi-region replication: keep data in sync across
+  geographies.
+- Sync = no loss, high latency. Async = fast, recent writes
+  at risk.
+- Topologies: single-leader (simplest), multi-leader
+  partitioned (consistent), multi-leader unpartitioned
+  (available), leaderless (Dynamo).
+- Conflict resolution: LWW (lossy), vector clocks + app
+  merge (correct but painful), CRDTs (clean for fitting
+  data shapes).
+- Replicate at the right level: row-based for SQL, CDC for
+  cross-system.
+- Failure modes: lag, silent breakage, conflict-induced
+  data loss, partition. Monitor all of them.

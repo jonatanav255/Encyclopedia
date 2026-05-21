@@ -1,0 +1,228 @@
+export const level = 'senior';
+
+# Slowly changing dimensions
+
+What do you do when a dimension's attributes change over
+time? A customer moves cities. A product gets a new
+category. An employee's title changes.
+
+Kimball's catalog of SCD types describes how to handle each
+case in a warehouse.
+
+## The choices
+
+<Cheatsheet>
+| Type | What it does | History |
+|---|---|---|
+| 0 | Never change (frozen) | N/A |
+| 1 | Overwrite the column | None |
+| 2 | Add a new row with effective dates | Full |
+| 3 | Add a "previous value" column | Limited |
+| 4 | Move history to a separate table | Full, separate |
+| 6 | Hybrid 1+2+3 | Full + current snapshot |
+</Cheatsheet>
+
+The right choice depends on **whether you need historical
+analysis**, and **at what cost**.
+
+## Type 0: never change
+
+The attribute is set on creation and never updates. Example:
+`dim_date.calendar_year` for a date dimension.
+
+Trivial; doesn't require any handling.
+
+## Type 1: overwrite
+
+Just update the column. The old value is gone.
+
+```sql
+UPDATE dim_customer SET city = 'New York' WHERE id = 42;
+```
+
+Pros: simple, smallest storage.
+Cons: history lost. Queries asking "what was this customer's
+city when they bought X?" return the current value, not the
+historical one — which may be wrong analytically.
+
+Use for: attributes where history doesn't matter (e.g.,
+customer's preferred font size).
+
+## Type 2: new row per change
+
+Each change creates a new row. The old row stays, marked
+"expired."
+
+```
+customer_id, surrogate_key, city,       effective_from, effective_to, current
+42,          1001,         'Seattle',  2020-01-01,    2024-06-15,   false
+42,          1029,         'New York', 2024-06-15,    9999-12-31,   true
+```
+
+Facts reference the surrogate key, capturing what the
+attribute was *at the time of the event*.
+
+Pros: full history; correct historical analysis.
+Cons: dimension grows; queries by natural key need filter
+on `current = true`; queries by date need to find the right
+surrogate.
+
+Use for: customer / product / employee attributes — the
+typical case.
+
+## Type 3: previous value column
+
+Add a "previous" column. Now you have current + one
+historical step.
+
+```
+customer_id, city,       previous_city
+42,          'New York', 'Seattle'
+```
+
+Pros: minimal change to schema; useful when you only care
+about one historical step.
+Cons: limited history.
+
+Use for: rare — type 2 is usually a better answer.
+
+## Type 4: history in a separate table
+
+Current state in the main dimension; full history in a
+sidecar.
+
+```
+dim_customer (current state)
+dim_customer_history (every change)
+```
+
+Pros: main dim stays small; queries against current state
+are fast.
+Cons: history queries are explicit; two-table dance.
+
+Use for: large dimensions where most queries are about the
+current state.
+
+## Type 6: hybrid
+
+Type 2 (new rows) + Type 3 (previous column) + Type 1 (an
+"updated_current" column that overwrites).
+
+Each row has the historical value AND the current value of
+the dimension AT THAT TIME. So you can pick:
+
+- Current view: `SELECT current_city FROM ...`
+- As-of-row view: `SELECT city FROM ...`
+
+Used in mature warehouses where queries want both views.
+
+## How fact tables interact
+
+The fact table references the dimension's **surrogate key**.
+A purchase made when customer 42 lived in Seattle references
+the Seattle-row surrogate key. Even if customer 42 later
+moves to New York, that fact still shows Seattle.
+
+```sql
+SELECT
+  dim_customer.city,
+  SUM(fact_sales.revenue)
+FROM fact_sales
+JOIN dim_customer ON fact_sales.customer_key = dim_customer.surrogate_key
+GROUP BY 1
+```
+
+City reflects when the sale happened, not "now."
+
+## Choosing the type
+
+Per dimension column:
+
+<Steps>
+<Step n={1} title="Do historical analyses care?">
+"What was the customer's status when they bought" — yes →
+type 2. "What's the customer's preferred language now" — no
+→ type 1.
+</Step>
+<Step n={2} title="How often does it change?">
+Rare changes → type 2 is cheap. Constant churn → type 4
+(keep main small).
+</Step>
+<Step n={3} title="Is there a strong as-of use case?">
+If yes, type 2 is essential. Otherwise, type 1 might
+suffice.
+</Step>
+<Step n={4} title="Storage tolerance?">
+Type 2 multiplies row count. For 100M customer rows with 5
+changes each, that's 500M rows. Cheap in modern warehouses;
+still worth considering.
+</Step>
+</Steps>
+
+## Implementation in dbt
+
+dbt's `snapshot` feature implements Type 2 automatically:
+
+```yaml
+snapshots:
+  - name: dim_customer
+    config:
+      target_schema: snapshots
+      unique_key: id
+      strategy: check
+      check_cols: ['city', 'tier', 'status']
+```
+
+dbt scans source rows, detects changes, inserts new rows
+with effective_from / effective_to. Updates happen on each
+dbt run.
+
+## Common mistakes
+
+### Type 1 by default
+
+Many ETL pipelines just `UPDATE` dimensions in place because
+it's easy. Historical analyses then give wrong answers — and
+nobody notices until a compliance audit.
+
+Fix: be explicit about which columns are SCD2 from the start.
+
+### Forgetting to update fact references
+
+After a Type 2 change, new fact rows must reference the
+**current** surrogate key. If the ETL doesn't know the rule,
+facts may all reference the same (old) surrogate key.
+
+Fix: ETL looks up the surrogate via `WHERE current = true`.
+
+### Mixing types within a dimension
+
+Some columns are Type 2, others Type 1, on the same
+dimension. Now when a Type 1 column updates, all the Type 2
+rows update too. Confusion.
+
+Fix: split dimensions if some columns are Type 2 and others
+are Type 1. Or accept that Type 1 changes propagate to all
+Type 2 rows.
+
+### Treating it as ancient history
+
+Modern lakehouse tables (Iceberg, Delta) support **time
+travel** — query the table as it was at any past time. This
+sometimes obviates explicit SCD modeling, but explicit SCD
+gives queryable historical attributes, not just "yesterday's
+table."
+
+## In summary
+
+- Slowly changing dimensions: how warehouses handle changing
+  attributes.
+- Types: 1 (overwrite, no history), 2 (new row, full history),
+  3 (previous column), 4 (history table), 6 (hybrid).
+- Type 2 is the default for analytical attributes; Type 1 for
+  cosmetic.
+- Fact tables reference the surrogate key at the time of the
+  event.
+- dbt's snapshot feature implements Type 2 declaratively.
+- Watch for: lazy Type 1 defaults, broken surrogate
+  lookups, mixed types within a dim.

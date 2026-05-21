@@ -1,0 +1,259 @@
+export const level = 'senior';
+
+# Defense in depth (architecture view)
+
+Defense in depth is the principle that **no single control
+should be load-bearing**. Layer multiple, independent
+mechanisms — perimeter, identity, network, application,
+data — so that breaking one doesn't compromise the system. The
+attacker has to defeat **all** of them.
+
+The phrase is military, but the engineering case is from
+*Building Secure and Reliable Systems* (Google) and the
+*OWASP* community: security failures are routine, so the
+question is "what is the next layer when the previous one
+fails?"
+
+## Why layers, not stronger walls
+
+A common reflex: "the WAF blocks SQL injection — we're safe."
+That's exactly what defense in depth rejects. WAFs have false
+negatives. Filters have bypasses. Patches have lag. The single
+biggest predictor of survivable security incidents is whether
+the **next** layer caught what the **first** layer missed.
+
+Three failure modes a single control can't handle:
+
+<Steps>
+<Step n={1} title="The control has a bug.">
+Every security product has CVEs. The WAF you trust has been
+bypassed in the past and will be again.
+</Step>
+<Step n={2} title="The control is misconfigured.">
+"Allow all" rules creep in. Default-deny gets overridden. A
+human types `0.0.0.0/0` and forgets.
+</Step>
+<Step n={3} title="The threat moves up a layer.">
+Filtering inbound requests doesn't stop a compromised insider.
+Network segmentation doesn't stop application-layer attacks
+**within** an allowed connection.
+</Step>
+</Steps>
+
+Each layer covers a class of failures the previous one can't.
+
+## The layer stack
+
+A practical model for a typical web system:
+
+<Cheatsheet>
+| Layer | Examples | What it catches |
+|---|---|---|
+| DDoS / edge | CDN, anycast, rate-limited gateway | Volumetric attacks, basic bot traffic |
+| WAF | Cloud-native WAF, ModSecurity rules | Known injection patterns, OWASP top 10 surface |
+| API gateway | Auth, schema validation, quotas | Auth-stripped requests, unknown endpoints |
+| Network | VPC, subnets, security groups | Lateral movement, unauthorized east-west traffic |
+| Service identity | mTLS, signed workload tokens | Service spoofing inside the cluster |
+| Application authorization | Policy engine, role checks | Authorized callers doing unauthorized things |
+| Input validation | Schema, encoding, parameterized queries | SQL injection, XSS, deserialization |
+| Data layer | Row-level security, field-level encryption, audit | Authorized app, unauthorized rows / fields |
+| Backups + immutability | Off-account snapshots, WORM | Ransomware, deletion attacks |
+
+</Cheatsheet>
+
+A determined attacker needs to defeat each layer **in
+sequence**. The total probability of bypass is the product of
+each layer's probability — not the minimum.
+
+## The classic worked example
+
+An attacker tries to exfiltrate customer SSNs. Defense in depth
+in action:
+
+```
+attacker → edge: DDoS/WAF blocks scans, rate-limited brute force
+attacker → gateway: token required, schema enforced
+attacker → service: AuthZ denies — they're a low-privilege user
+        (compromise a service account → next layer)
+attacker → service identity: mTLS rejects unmesh peer
+        (steal a cert → next layer)
+attacker → network: SG denies cross-zone reach to PII DB
+        (run on an app pod → next layer)
+attacker → app: ORM uses parameterized queries — no SQLi
+        (find an actual SQLi → next layer)
+attacker → DB: row-level security limits the query to "their" tenant
+        (compromise a tenant → next layer)
+attacker → data: SSNs are field-level encrypted; KMS denies decrypt
+        for this role
+        (decrypt fails or audit-logs every attempt)
+```
+
+Each layer is a tripwire. No single one is invincible; together
+they produce **either** rejection or **at minimum** strong
+detection signals before the damage completes.
+
+## Independence is the key property
+
+The layers must fail independently. Two anti-patterns:
+
+<Compare a="Genuine defense in depth" b="Theatrical defense in depth">
+<>
+- WAF blocks injection patterns.
+- App layer uses parameterized queries.
+- DB user has read-only on the relevant tables.
+- Sensitive fields are encrypted with a separate key.
+
+Each control has a **different** root cause if it fails.
+Bypassing one doesn't help bypass the others.
+</>
+<>
+- WAF blocks injection patterns.
+- App layer trusts WAF and skips parameterization.
+- DB user has full DB access because "the app validates."
+- Encryption keys are stored in the app's environment.
+
+All four "layers" depend on the WAF. One bypass cracks them
+all. The diagram has four boxes but only one real control.
+</>
+</Compare>
+
+A useful test: ask of each layer, "if I assume the layer above
+was completely bypassed, does this layer still help?" If no,
+it's not a separate layer.
+
+## What's at each layer
+
+A more concrete tour, with concrete tactics:
+
+### Edge
+
+- CDN with anycast and DDoS scrubbing.
+- Geographic restrictions where applicable.
+- Bot mitigation (challenge unknown user agents, prove-of-work).
+- Per-IP rate limits at the edge, before backend cost.
+
+### WAF
+
+- OWASP CRS rule set, tuned.
+- Custom rules for product-specific attack patterns.
+- Logging and alert on anomaly score, not just block.
+
+### Gateway
+
+- Token validation before the request hits service code.
+- Schema validation — reject unknown fields, oversized payloads.
+- Per-customer / per-token quotas.
+- Strip sensitive headers in either direction.
+
+### Network
+
+- Segmented VPC with default-deny security groups.
+- Identity-based east-west rules — see network segmentation.
+- No direct internet for data tier.
+
+### Service identity
+
+- mTLS between services with short-lived certs — see mTLS
+  between services.
+- Workload identity (SPIFFE) verified at each hop.
+- Mesh authorization policies for L7 calls.
+
+### Application authorization
+
+- Single policy engine (Open Policy Agent, custom) for all
+  AuthZ decisions.
+- Decision logs to a hot store for forensics.
+- Coarse roles + fine attribute-based rules.
+
+### Input validation
+
+- Parameterized queries everywhere. No string concatenation
+  into SQL.
+- Output encoding for user-controlled content.
+- Schema validation on every inbound payload.
+
+### Data layer
+
+- Row-level security or tenant prefixing.
+- Field-level encryption for PII (envelope encryption with KMS).
+- Read-only DB users for analytics and exports.
+- Audit logging at the DB level, not just app level.
+
+### Backups and immutability
+
+- Off-account, off-region backups.
+- WORM (write-once-read-many) snapshots.
+- Cross-account replication where the prod credentials can't
+  delete the backup.
+- Tested restore — backups you've never restored aren't
+  backups.
+
+## Costs
+
+Defense in depth is not free. Real costs:
+
+- **Latency**: every layer adds milliseconds. Acceptable in most
+  systems, problematic in latency-critical paths.
+- **Operational complexity**: more systems to maintain, more
+  rotations to manage, more knobs to misconfigure.
+- **False positives**: each layer can deny legitimate traffic.
+  Tuning takes time.
+- **Engineering effort**: a real defense-in-depth posture is a
+  team's quarterly roadmap, not a Friday's work.
+
+The case is the cost of **not** doing it: a single layer's
+failure being catastrophic. The trade-off is usually obvious
+for systems handling sensitive data; less obvious for low-stakes
+internal tools — which is why those are often where breaches
+start.
+
+## Anti-patterns
+
+- **"Castle and moat"** — heavy perimeter, soft interior. Common
+  for legacy on-prem environments; the lesson of every major
+  breach for 20 years.
+- **"Security through obscurity"** as the only layer. "Nobody
+  knows about this endpoint" is not a control.
+- **One control per concern.** Authentication only at the gateway;
+  trust the rest. Authorization only at the app; trust the
+  network.
+- **Reliance on a single vendor.** A single vendor's outage or
+  bug cracks all your defenses simultaneously.
+
+<Callout variant="info">
+Defense in depth has a sibling: **defense in breadth** — the
+controls cover all attack surfaces, not just the popular ones.
+Coverage matters; depth matters more. Both are required.
+</Callout>
+
+## When you can afford less
+
+Smaller systems with low-stakes data can run with fewer layers.
+But the framing is "which layers can we omit and accept that
+risk?" — not "we don't need any of this." A common pragmatic
+minimum:
+
+- TLS everywhere (already free).
+- Auth at the gateway with short-lived tokens.
+- App-layer authorization.
+- Parameterized queries.
+- Backups.
+
+Even that has five independent layers. Add the rest as scale,
+stakes, and threats grow.
+
+## In summary
+
+- No single control is load-bearing. Every important resource
+  has multiple independent defenses.
+- Each layer covers a class of failures the previous one
+  cannot.
+- Independence is the property — if every layer depends on the
+  same root, you have one layer.
+- The visible cost is operational complexity; the invisible
+  cost is the breach you'd otherwise have.
+- Test each layer with the assumption that the previous one
+  failed.
+- Backups and immutability are the layer past
+  "we lost the app" — and the layer most teams skip until they
+  need it.

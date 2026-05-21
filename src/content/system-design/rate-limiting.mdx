@@ -1,0 +1,314 @@
+export const level = 'mid';
+
+# Rate limiting
+
+Rate limiting protects a service from being **overwhelmed** — by a
+buggy client, an abusive one, or success itself. Without it, one bad
+actor can saturate the system; with it, you fail one client and
+keep the others healthy.
+
+The mechanics are simple in theory and surprisingly subtle in
+practice — especially when state has to be shared across servers.
+
+## Four algorithms
+
+<Cheatsheet>
+| Algorithm | Idea | Pros | Cons |
+|---|---|---|---|
+| Fixed window | Count per minute, reset on the minute. | Simple, cheap. | Burst at boundary: 100/min allows 200 in 1 second. |
+| Sliding window log | Log timestamps; count those in the last N seconds. | Accurate. | Memory grows with rate. |
+| Sliding window counter | Two adjacent fixed windows, blend by overlap. | Cheap, smoother. | Approximate. |
+| Token bucket | Bucket fills at rate R; each request takes a token. | Allows controlled bursts; standard for APIs. | Tuning bucket size matters. |
+| Leaky bucket | Requests join a queue draining at rate R. | Smooths bursts to a constant rate. | Adds latency; queue can overflow. |
+</Cheatsheet>
+
+The dominant choices in production: **token bucket** for public
+APIs (allows bursts), **sliding window counter** for global rate
+limiting at the edge.
+
+## Token bucket
+
+The most common pattern. A bucket holds at most `capacity` tokens;
+tokens refill at `rate` per second; each request takes one token.
+Out of tokens → reject (or queue).
+
+```js
+class TokenBucket {
+  constructor({ capacity, refillRate }) {
+    this.capacity = capacity;
+    this.refillRate = refillRate;  // tokens per second
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+  tryConsume(n = 1) {
+    this.refill();
+    if (this.tokens < n) return false;
+    this.tokens -= n;
+    return true;
+  }
+  refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    this.tokens = Math.min(
+      this.capacity,
+      this.tokens + elapsed * this.refillRate
+    );
+    this.lastRefill = now;
+  }
+}
+```
+
+Tunables:
+
+- **Capacity**: max burst. 100 = "can briefly send 100 in a heartbeat."
+- **Refill rate**: steady-state QPS. 10/sec = "sustained 10/sec."
+
+A client that's silent for a while can burst up to `capacity`; a
+chatty one is throttled to `refillRate`. This matches most API usage.
+
+## Sliding window counter
+
+Better than fixed window, cheaper than full log. Track counts in
+two adjacent windows and weight them:
+
+```js
+function slidingWindow(now, windowMs) {
+  const curWindow = Math.floor(now / windowMs);
+  const prevWindow = curWindow - 1;
+  const positionInCurrent = (now % windowMs) / windowMs;
+
+  const count =
+    countInWindow(prevWindow) * (1 - positionInCurrent) +
+    countInWindow(curWindow);
+  return count;
+}
+```
+
+Cloudflare and many CDNs use this — it's accurate to within ~1%
+and very cheap to compute (two counters per key).
+
+## Where to enforce
+
+The position in the stack matters:
+
+```
+[client] → [CDN edge] → [API gateway] → [service]
+              ↑              ↑              ↑
+        rate limit #1   rate limit #2   rate limit #3
+        (DDoS protect)  (per-key quota) (downstream protect)
+```
+
+<Cheatsheet>
+| Position | What it does | What it can't do |
+|---|---|---|
+| CDN / edge | Block bad IPs, raw flood. | Per-API-key business limits. |
+| API gateway | Per-key, per-user, per-route limits. | Per-service downstream protection. |
+| Service | Protect downstream resources (DB, cache, external API). | Stop traffic before it consumes capacity. |
+</Cheatsheet>
+
+You usually want **multiple layers**:
+
+- CDN: rough per-IP cap (10 000 req/sec/IP = obvious abuse).
+- Gateway: fine per-key quota (1 000 req/min/key = product tier).
+- Service: per-DB-key limit (1 query/sec per user against the
+  reports endpoint) to protect the downstream.
+
+Each layer protects a different resource. A single layer can't.
+
+## The hard problem: shared state across nodes
+
+A single server can enforce a limit with in-memory state. A fleet
+of N servers needs **shared state** — otherwise each server has its
+own count and the effective limit is N× higher than configured.
+
+Three patterns:
+
+### Centralized counter (Redis)
+
+The standard answer for moderate scale (10K – 100K QPS):
+
+```js
+// Sliding-window counter in Redis (atomic via Lua / pipeline).
+async function check(key, limit, windowSec) {
+  const now = Math.floor(Date.now() / 1000);
+  const windowKey = `rl:${key}:${Math.floor(now / windowSec)}`;
+  const count = await redis.incr(windowKey);
+  if (count === 1) {
+    await redis.expire(windowKey, windowSec * 2);
+  }
+  return count <= limit;
+}
+```
+
+Pros: simple, accurate, easy to operate.
+Cons: every request hits Redis (~0.5–2 ms p99). Redis itself
+becomes a hot path; shard or replicate.
+
+### Local counter + periodic sync
+
+For very high QPS, each server keeps a local count and **syncs to
+Redis periodically** (every second or N requests). The aggregate
+is approximate but cheap.
+
+```js
+let localCount = 0;
+function check(limit) {
+  localCount++;
+  if (localCount > limit / N_SERVERS * SAFETY) return false;
+  return true;
+}
+setInterval(syncToRedis, 1000);
+```
+
+Pros: ~0 latency added. Cons: imprecise; works only when an
+approximate limit is acceptable.
+
+### Distributed token bucket
+
+Each server holds a slice of the total bucket. Servers can "request
+more tokens" from a central authority when low. Used at scale by
+Amazon, Cloudflare. Complex; only do this if simpler patterns can't
+keep up.
+
+For most teams: Redis-based shared counter is the right answer.
+Don't reach for sophisticated systems prematurely.
+
+## Identifying the client
+
+The rate-limit key matters as much as the algorithm. Common choices:
+
+```
+- API key       → tier-based (free: 1 req/sec; paid: 100 req/sec)
+- User ID       → per-user quota; signed-in users
+- IP address    → anonymous traffic; the only thing for pre-auth
+- IP + endpoint → finer per-endpoint protection
+- (user, endpoint) → "this user, on this expensive endpoint"
+```
+
+Bad choices:
+
+```
+- Single global counter → useless; one user exhausts the limit
+- Cookie session ID    → attacker rotates cookies for free
+- Just User-Agent      → spoofed instantly
+```
+
+Real production systems use **layered keys**: a global per-IP DDoS
+limit + a per-key quota + a per-(user, endpoint) limit on hot
+endpoints.
+
+## What to return when limited
+
+When a request is rate-limited:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1745678900
+{ "error": "rate_limited", "retry_after": 30 }
+```
+
+- **429** is the standard status. Use it.
+- **`Retry-After`** in seconds (or RFC 1123 date). Clients with
+  retry logic respect it.
+- **`X-RateLimit-*`** headers let clients self-throttle.
+
+The `Retry-After` value should be the **actual reset time**, not a
+fixed value. Lying causes clients to retry too soon and amplify
+load.
+
+## Throttle vs reject
+
+Two responses to over-limit traffic:
+
+- **Reject** (return 429 immediately). Lightweight; pushes work to
+  client retries. Standard.
+- **Throttle / queue** (delay the response). Smoother but consumes
+  server capacity holding requests; can run out of connections.
+
+Reject is the right default. Queueing is for internal traffic with
+known senders that respect deadlines.
+
+## Common pitfalls
+
+### Per-server in-memory counters
+
+The classic mistake. With 10 servers, each enforcing 100 req/sec
+locally, the actual limit is ~1 000 req/sec. Spreads load unevenly.
+Use shared state.
+
+### Counting after work happens
+
+The handler does the work, then checks if the rate is exceeded.
+Checking too late provides no protection. Check before doing
+anything expensive.
+
+### No grace for clock skew
+
+The "minute boundary" depends on every server's clock. NTP drift of
+0.5 sec is enough to misalign windows. Either use server-side time
+consistently (Redis time), or accept that fixed-window boundaries
+will skew.
+
+### Burst at boundary (fixed window)
+
+Fixed window resets at the minute. A client can send 100 at 11:59:59
+and another 100 at 12:00:00 — 200 in one second. Use sliding window
+or token bucket where bursts are constrained.
+
+### Rate-limiting the wrong axis
+
+Rate-limiting at the IP level when your users are all behind a
+corporate proxy: all users share one IP, the proxy gets limited,
+the customer is angry. Limit by API key, not IP, when you can
+identify the caller.
+
+### Forgetting health checks
+
+Health checks from load balancers and monitoring are requests too.
+If they're rate-limited, the LB pulls the host. Whitelist health-
+check sources.
+
+### No back-pressure to clients
+
+A well-designed API uses `X-RateLimit-Remaining` to let clients
+self-throttle. Without these headers, clients only learn limits
+when they hit 429.
+
+## Rate limit vs quota vs concurrency
+
+Three related but distinct mechanisms:
+
+```
+- Rate limit: "<= X requests per N seconds"
+- Quota:      "<= Y requests per month/billing period"
+- Concurrency: "<= Z in flight at once"
+```
+
+You may need all three. Rate limit prevents bursts. Quota enforces
+billing tiers. Concurrency protects expensive operations (large
+exports, ML inference). See **Throttling and quotas** and
+**Bulkhead pattern**.
+
+<Callout variant="info">
+Every public API needs rate limiting on day 1. Adding it after the
+first abuse incident is expensive and the abuse has already happened.
+Start with sensible defaults; tune from data.
+</Callout>
+
+## In summary
+
+- Use **token bucket** for APIs (controlled bursts) or **sliding
+  window counter** for global protection.
+- Enforce at multiple layers: CDN/edge for DDoS, gateway for
+  per-key quota, service for downstream protection.
+- A single fleet needs **shared state**: Redis counters for moderate
+  scale; local + sync for very high QPS.
+- Identify the client by API key or user ID; IP is a fallback, not
+  a foundation.
+- Return **429 with `Retry-After`** and `X-RateLimit-*` headers so
+  clients can self-throttle.
+- Distinguish rate limit, quota, and concurrency — each protects a
+  different resource and you may need all three.

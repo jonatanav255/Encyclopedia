@@ -1,0 +1,215 @@
+export const level = 'junior';
+
+# Vertical vs horizontal scaling
+
+Two ways to handle more load: make one machine bigger, or add
+more machines. They sound similar; they live in different
+universes.
+
+**Vertical (scale up)**: bigger CPU, more RAM, faster disk on
+the same box. One instance, more horsepower.
+
+**Horizontal (scale out)**: more instances behind a load
+balancer. Same per-box specs, more boxes.
+
+Most systems do both. The interesting question is *which one
+first*, and *when do you stop*.
+
+## What each one buys you
+
+<Compare a="Vertical scaling" b="Horizontal scaling">
+<>
+- **No code changes**. Same app, bigger machine.
+- **Simpler ops**. One box, one log stream, one process.
+- **Lower latency** for in-process work (no network hops
+  between replicas, no cross-node locks).
+- **Strict ceiling**. AWS x2iezn maxes around 4 TB RAM, 448
+  vCPU. Beyond that you're out of luck.
+- **Single point of failure**. If the box dies, the service
+  dies.
+- **Non-linear cost**. The biggest instance is ~5–10× the price
+  per core of a small one.
+</>
+<>
+- **Effectively unlimited ceiling**. Add a thousandth box if
+  you have to.
+- **HA by default**. Lose one of N nodes, still up.
+- **Linear-ish cost**. N small boxes ≈ N × small price.
+- **Forces stateless design** (see stateless-services). Any
+  request must work on any replica.
+- **More moving parts**: load balancer, service discovery,
+  shared session store, distributed tracing.
+- **Coordination cost**. Caches, locks, and consistency get
+  harder once data is sharded across nodes.
+</>
+</Compare>
+
+## When vertical is the right call
+
+Engineers underrate vertical scaling. A modern bare-metal box
+with 96 cores and 768 GB RAM running Postgres + your monolith
+on the same machine can carry **enormous** load — tens of
+thousands of QPS — with operational complexity close to zero.
+
+Reach for vertical first when:
+
+- The workload fits in RAM.
+- You're below ~10K QPS sustained.
+- The team is small. Distributed systems have an ops tax that a
+  3-person team can't pay.
+- The state is hard to shard (graph data, transactional
+  consistency requirements, complex joins).
+- You're early-stage and need to ship, not architect.
+
+The canonical example: StackOverflow famously runs on a handful
+of beefy boxes serving hundreds of millions of pageviews. Not
+because they can't afford more — because they don't need them.
+
+## When you must go horizontal
+
+- **Beyond the biggest box.** Whatever the biggest instance is,
+  you've outgrown it (or you would in 12 months).
+- **Availability target > one-box reliability.** Even the best
+  hardware has a ~99.9% annual uptime ceiling without HA.
+  Three nines is one box; four+ requires replicas.
+- **Geographic distribution.** Users in Asia, Europe, US — one
+  box can't be close to everyone.
+- **Bursty load.** Autoscaling is cheap horizontally and
+  impossible vertically.
+- **Independent scaling of components.** Reads grow 10×; writes
+  grow 1.5×. One box scales everything together; horizontal
+  lets you scale the read path independently.
+
+## The cost curve
+
+```
+ cost per QPS
+   │
+   │       vertical (steep — premium for largest SKUs)
+   │      /
+   │     /
+   │    /
+   │   ────────  horizontal (flat, with constant LB/ops tax)
+   │   ___/
+   │  /
+   └──────────────── QPS
+          ^
+          crossover: where horizontal becomes cheaper
+```
+
+The crossover point isn't a constant. It depends on your
+workload, your cloud's SKU pricing, and your engineering cost.
+For typical web stacks it lands somewhere between 1K and 10K
+QPS — past that, horizontal usually wins on cost too.
+
+## The hidden cost of going horizontal too early
+
+The dangerous failure mode is **premature distribution**. A
+2-person team builds five microservices, three databases, a
+message broker, and a Kubernetes cluster — to serve 50 QPS.
+They spend 80% of their engineering time on infrastructure and
+0% on product. Six months in, the product is dead and the
+infrastructure is beautiful.
+
+<Callout variant="warning">
+The single biggest predictor of a startup that ships nothing is
+"adopted microservices before product-market fit." Vertical
+scaling on a single monolith with a managed database will carry
+you further than your gut says.
+</Callout>
+
+DDIA, the SRE book, and Building Microservices all repeat this
+warning. Distribute when you have to. Not before.
+
+## The other axis: state
+
+The reason horizontal scaling is *hard* isn't compute — it's
+**state**. CPU and RAM are easy to add. The session, the cache,
+the database, the file uploads — those have to live somewhere
+that all N instances can reach.
+
+- **Stateless app servers** → trivially horizontal. Spin up
+  more, register with the LB, done.
+- **Stateful app servers** (in-memory session, local disk
+  cache) → hard. You either pin users to a server (sticky
+  sessions) or move state out.
+
+The whole rest of this section — stateless services, sticky
+sessions, session stores, sharded databases — exists to deal
+with this. The first step in going horizontal is **getting
+state out of the app**.
+
+## Diagonal scaling
+
+A common real-world pattern: scale a service vertically
+*within a horizontal cluster*. Bigger boxes per replica, fewer
+replicas, less coordination overhead.
+
+A 4-node cluster of 32-core boxes is often cheaper to operate
+than a 32-node cluster of 4-core boxes:
+
+- Less LB state.
+- Fewer cross-replica RPCs.
+- Less observability noise.
+- Better cache hit rates (more memory per box).
+
+This is sometimes called "diagonal scaling." Use it.
+
+## Decision rules
+
+<Cheatsheet>
+| Situation | Default move |
+|---|---|
+| < 1K QPS, single region, small team | Vertical. Monolith + big DB box. |
+| 1K–10K QPS, single region | Vertical, plus 1 read replica for HA. |
+| 10K+ QPS or HA SLO > 99.9% | Horizontal app tier, vertical DB. |
+| Multi-region | Horizontal everywhere; replicate DB across regions. |
+| Bursty load (10×+ spikes) | Horizontal with autoscaling. |
+| Compute-bound, hard to parallelize | Vertical first; bigger CPUs. |
+| Memory-bound, fits in 768 GB | Vertical. Avoid distributed cache complexity. |
+| Write-throughput-bound past one box | Horizontal — but it's sharding, see scaling-reads-vs-writes. |
+</Cheatsheet>
+
+## Common mistakes
+
+### "We need microservices to scale"
+
+No, you need horizontal scaling to scale. Microservices is one
+way to do it — and a way with enormous coordination cost.
+Horizontal scaling of a monolith (N copies of the same binary
+behind a load balancer) is strictly simpler and usually
+sufficient.
+
+### Scaling the app tier but not the database
+
+You add 10 app servers. The database remains one box. Now you
+have 10× the connection count and 10× the contention on the
+same DB. The bottleneck moved; it didn't go away. Always check
+where the actual constraint is.
+
+### Equating "horizontal" with "stateless"
+
+Stateful services *can* scale horizontally (sharded databases,
+partitioned message queues). But the patterns are very
+different from stateless app servers. Don't draw the same
+diagram for both.
+
+### Ignoring the ops tax
+
+Each new node is a thing to deploy, monitor, patch, and debug.
+A 100-node cluster doesn't cost 100× a 1-node setup — it costs
+more, because at 100 nodes you need on-call rotation, runbooks,
+chaos testing, distributed tracing, and a lot more.
+
+## In summary
+
+- Vertical = bigger box. Simple, fast, capped, fragile.
+- Horizontal = more boxes. Scalable, available, complex, taxes
+  every other system around it.
+- Default vertical until the constraint forces horizontal.
+- The constraint is usually availability or a single-box
+  ceiling, not raw QPS.
+- Going horizontal mostly means **getting state out of the
+  app** — the rest is comparatively easy.
+- Diagonal (fewer-but-bigger replicas) beats both pure modes
+  for many workloads.

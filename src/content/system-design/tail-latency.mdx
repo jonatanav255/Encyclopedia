@@ -1,0 +1,184 @@
+export const level = 'senior';
+
+# Tail latency
+
+The latency at the **slow end of the distribution** — the
+95th, 99th, 99.9th percentile. Averages lie; tails dominate
+user experience.
+
+Jeff Dean's "Tail at Scale" paper made this famous: in
+systems with fan-out, the slowest of N calls determines the
+user-visible latency. As N grows, the tail grows worse than
+linearly.
+
+## The math
+
+A single backend with p99 latency of 100ms:
+
+```
+P(this one call takes > 100ms) = 0.01
+```
+
+Now your page makes 10 backend calls:
+
+```
+P(all 10 calls finish under 100ms) = 0.99^10 ≈ 0.904
+P(user sees >100ms) = 1 - 0.904 ≈ 0.096
+```
+
+10% of users see worse than 100ms — even though each backend
+hits 99% of the time.
+
+For 100 calls: 0.99^100 ≈ 0.366. Two thirds of users see a
+slow page.
+
+The user-facing p99 is much worse than per-call p99. This is
+"tail amplification under fan-out."
+
+## What causes tails
+
+Real systems have many sources of occasional slowness:
+
+- **Stop-the-world GC.** A JVM might pause 100–500ms once per
+  minute.
+- **Bursty traffic.** Queue depths spike under bursts.
+- **Resource contention.** CPU, lock, cache thrash.
+- **Hot keys.** One key gets 10× the load, slowing its
+  shard.
+- **Network blips.** TCP retransmits, switch buffer overflow.
+- **Slow disks.** SSDs occasionally garbage-collect.
+- **Noisy neighbors.** Other tenants on the same hardware.
+- **Tail-of-tails in dependencies.** Downstream's tail
+  amplifies up to you.
+
+Each of these is rare per-call, but with millions of calls,
+some always hit it.
+
+## Mitigations
+
+### Hedged requests
+
+Send to two replicas, take the first reply. (See
+hedged-requests.) Cuts tail at the cost of small extra load.
+
+### Request collapsing
+
+Multiple concurrent identical requests share one downstream
+call. The first response satisfies all callers. Tail of any
+one drives many users instead of single users.
+
+### Tighter timeouts and circuit breakers
+
+Don't wait for the absurd. If a call exceeds 5× normal p99,
+fail. The user gets a fast error or fallback, not a slow
+response.
+
+### Smarter load balancing
+
+Random or round-robin LB sends some requests to currently-slow
+backends. Latency-aware LB (least-loaded, EWMA latency) avoids
+them.
+
+### Reduce fan-out
+
+Restructure pages to need fewer parallel calls. Aggregating
+endpoints (GraphQL, BFF) can reduce N from 50 to 5.
+
+### Parallelize independent dependencies
+
+If a page needs 10 things and they're independent, fetch in
+parallel. The user-facing latency is the max of the 10, not
+the sum.
+
+### Speculative execution
+
+For long-running work, kick off a backup execution on a
+different machine. Whichever finishes first wins. MapReduce,
+Spark, Hadoop all do this.
+
+### Reduce per-call variance
+
+GC tuning. Larger caches. Avoid hot keys. Preload data.
+Less variance → smaller tail.
+
+## Measuring tails
+
+p99 is the standard target; for large fan-out, p999 matters
+even more. Track:
+
+- p50 — typical latency.
+- p95 — most users.
+- p99 — slow case.
+- p999 — pathological case (matters at scale).
+- max — what's the worst we've seen?
+
+**Never report only the mean.** A mean of 50ms hides a p99 of
+2 seconds. The mean is the least informative number you can
+publish.
+
+### Histograms, not just summaries
+
+Pre-aggregated percentiles (Datadog summary metric, Prometheus
+quantile sketch) can't be added across instances. A histogram
+(buckets of counts) can. Use histograms.
+
+```
+# good: histogram metric
+http_request_duration_seconds_bucket{le="0.1"} 100
+http_request_duration_seconds_bucket{le="0.5"} 150
+http_request_duration_seconds_bucket{le="1.0"} 160
+http_request_duration_seconds_bucket{le="+Inf"} 165
+```
+
+Reaggregate per request type, per backend, per region —
+recompute percentiles correctly.
+
+## Latency budget breakdown
+
+For an N-ms latency SLO, work out where each ms goes:
+
+```
+SLO: 500ms p99 for page load.
+
+Network (client to LB):    50ms
+LB to service:             5ms
+Service routing/auth:      10ms
+DB query (cached):         5ms
+External call:             100ms
+Render:                    20ms
+Network (response):        50ms
+                          ----
+Total budget:              240ms
+Slack:                     260ms
+```
+
+Each segment has a sub-SLO. When the page misses, you know
+which segment overshot.
+
+## Tails in distributed systems
+
+The famous Tail at Scale paper:
+
+- Latency tails are amplified by fan-out.
+- They're caused by inherent variability in hardware,
+  software, and shared resources.
+- The right strategy is **hedged requests, tied requests, and
+  speculative execution** — not "make every call faster."
+
+Trying to eliminate the tail at the source is whack-a-mole.
+Designing for tail tolerance is the strategy that scales.
+
+## In summary
+
+- Tail latency: p95, p99, p999 — the slow end matters more
+  than the mean.
+- Fan-out amplifies tails: a page with 10 calls sees worse
+  tails than any single call.
+- Causes: GC, contention, hot keys, network blips, noisy
+  neighbors, downstream tails.
+- Mitigations: hedged requests, request collapsing, tight
+  timeouts, latency-aware LB, reduce fan-out, reduce variance.
+- Track p99 / p999 with histograms (re-aggregatable across
+  instances), never just the mean.
+- The strategy at scale: design for tolerance, not
+  elimination.

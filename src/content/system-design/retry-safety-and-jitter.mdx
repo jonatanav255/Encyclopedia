@@ -1,0 +1,348 @@
+export const level = 'mid';
+
+# Safe retries and jitter
+
+Retrying is the most common reliability technique and the most
+common cause of self-inflicted outages. The difference between
+"safe retries" and "retry storm" is **exponential backoff with full
+jitter** plus a **retry budget**.
+
+This is the AWS Architecture blog's "Exponential Backoff and Jitter"
+made operational, with corrections from the SRE book.
+
+## The four components
+
+A complete retry policy has four moving parts:
+
+<Cheatsheet>
+| Component | Purpose | If missing |
+|---|---|---|
+| Exponential backoff | Wait longer between retries | All retries fire at the same cadence; retry storm. |
+| Jitter | Randomize the wait | Retries from many clients synchronize into thundering herds. |
+| Retry budget | Cap retries as a % of normal traffic | Retries dominate load during a partial outage. |
+| Retryable-only filter | Don't retry 4xx | Wasted load on never-going-to-succeed requests. |
+</Cheatsheet>
+
+Skip any one and you have a system that's worse than no retries.
+
+## Exponential backoff
+
+Each retry waits longer than the last:
+
+```js
+function backoff(attempt, base = 100, max = 30_000) {
+  const delay = Math.min(base * 2 ** attempt, max);
+  return delay;
+}
+```
+
+Sequence (base 100ms): 100, 200, 400, 800, 1600, 3200, ...
+
+Why exponential, not linear? Linear retries (every 1 second) keep
+the failed downstream under constant pressure. Exponential gives the
+downstream room to recover before the next attempt — and the system
+naturally spreads retries across time.
+
+Cap the maximum delay (`max`). Without a cap, an attempt at 1024
+seconds is useless — the user has already given up.
+
+## Why jitter
+
+Without jitter, every retrying client uses the same delays: 100,
+200, 400, 800. A blip at time T causes thousands of clients to
+retry at T+100, T+300, T+700 — **synchronized waves** that hit the
+recovering downstream simultaneously.
+
+```
+Without jitter:
+T:    [outage]   thousands fail
+T+100ms:              wave of retries (all clients)
+T+300ms:              wave again
+T+700ms:              wave again
+```
+
+Jitter randomizes the delay so retries spread:
+
+```js
+// "Full jitter" — AWS recommendation
+function fullJitter(attempt, base = 100, max = 30_000) {
+  const exp = Math.min(base * 2 ** attempt, max);
+  return Math.random() * exp;
+}
+```
+
+With full jitter, retries are uniformly distributed in `[0, exp]`.
+The downstream sees a smoothed retry curve instead of waves.
+
+### Jitter flavors
+
+<Cheatsheet>
+| Flavor | Formula | Notes |
+|---|---|---|
+| No jitter | `base * 2^n` | Synchronized; bad. |
+| Equal jitter | `base * 2^(n-1) + random(0, base * 2^(n-1))` | Half deterministic, half random. |
+| Full jitter | `random(0, base * 2^n)` | All random; AWS's measured choice. |
+| Decorrelated | `random(base, prev_delay * 3)` cap | Spreads retries even better at high contention. |
+</Cheatsheet>
+
+For most use cases: **full jitter**. AWS's blog post showed it gives
+better recovery characteristics under load than the others. Use
+decorrelated jitter when you're already at scale and full jitter
+isn't smooth enough.
+
+## Retry budget
+
+Even with backoff and jitter, retries amplify load. A simple example
+from the SRE book:
+
+```
+Normal traffic:    1 000 req/sec.
+Downstream blips.  Half the calls fail.
+Each failed call retries 3 times.
+
+Effective load: 1 000 * (0.5 + 0.5 * 3) = 1 500 req/sec.
+```
+
+A 50% failure rate produces 150% of normal load. Under sustained
+failure, retries make the downstream less likely to recover.
+
+A **retry budget** caps total retries as a fraction of normal
+traffic:
+
+```
+- Successful requests in the last minute: 50 000.
+- Retry budget: 10% → 5 000 retries allowed in the next minute.
+- Beyond the budget: don't retry; fail immediately.
+```
+
+Implementation sketch:
+
+```js
+class RetryBudget {
+  constructor({ ratio = 0.1, windowMs = 60_000 }) {
+    this.ratio = ratio;
+    this.window = windowMs;
+    this.successes = [];
+    this.retries = [];
+  }
+  noteSuccess() { this.successes.push(Date.now()); this.trim(); }
+  canRetry() {
+    this.trim();
+    return this.retries.length < this.successes.length * this.ratio;
+  }
+  noteRetry() { this.retries.push(Date.now()); this.trim(); }
+  trim() {
+    const cutoff = Date.now() - this.window;
+    while (this.successes[0] < cutoff) this.successes.shift();
+    while (this.retries[0] < cutoff) this.retries.shift();
+  }
+}
+```
+
+Envoy, Finagle, and most modern RPC libraries have this built in.
+If you're rolling your own retry layer, build the budget too.
+
+## What's retryable
+
+Only retry errors that **might succeed on retry**:
+
+```
+- Network errors (ECONNRESET, ETIMEDOUT)
+- 5xx server errors (except 501 Not Implemented)
+- 429 Too Many Requests (honor Retry-After)
+- 408 Request Timeout
+```
+
+Do NOT retry:
+
+```
+- 4xx client errors (400, 401, 403, 404, 422)
+- Non-idempotent operations without an idempotency key
+- Errors marked non-retryable by the API
+```
+
+A 400 means the request is wrong; retrying makes it wrong again.
+Retrying a 4xx is wasted load.
+
+```js
+function isRetryable(err) {
+  if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') return true;
+  if (err.status === 429 || err.status === 408) return true;
+  if (err.status >= 500 && err.status < 600 && err.status !== 501) return true;
+  return false;
+}
+```
+
+## A complete policy
+
+Putting it all together:
+
+```js
+async function retry(fn, {
+  maxAttempts = 5,
+  base = 100,
+  max = 30_000,
+  budget,
+  isRetryable: isRetryableFn = isRetryable,
+  signal,
+} = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) throw new Error('aborted');
+    try {
+      const result = await fn();
+      budget?.noteSuccess();
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableFn(err)) throw err;
+      if (attempt === maxAttempts - 1) break;
+      if (budget && !budget.canRetry()) throw err;
+      budget?.noteRetry();
+      const delay = Math.random() * Math.min(base * 2 ** attempt, max);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+```
+
+That's the full picture: attempts, retryability, budget, jitter,
+abortability.
+
+## Don't multiply retries
+
+Library A retries 3 times. Library B (calling A) retries 3 times.
+Library C retries 3 times. Total: **27 requests per logical
+operation**. Each amplifies the downstream during a failure.
+
+```
+Client → A retries (3) → B retries (3) → C retries (3)
+       1 logical call  → 27 actual requests on bad day
+```
+
+Rules:
+
+- Retry at **one layer** only. Usually the outermost (closest to
+  the user).
+- Disable retries in inner layers or set their attempts to 1.
+- Audit every HTTP/gRPC client for hidden retry defaults.
+
+This bug is the #1 cause of "retry storm" outages.
+
+## Deadlines beat attempts
+
+Counting attempts is the wrong unit. Time is the right unit.
+
+A user request has a deadline ("respond within 15 seconds"). All
+retries must fit inside it:
+
+```js
+async function retryWithDeadline(fn, { deadlineMs }) {
+  const deadline = Date.now() + deadlineMs;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    try { return await fn(); } catch (err) {
+      if (!isRetryable(err)) throw err;
+      const remaining = deadline - Date.now();
+      if (remaining < 100) throw err;  // not worth retrying
+      const delay = Math.min(
+        Math.random() * 100 * 2 ** attempt,
+        remaining / 2
+      );
+      await sleep(delay);
+      attempt++;
+    }
+  }
+  throw new Error('deadline exceeded');
+}
+```
+
+A deadline-aware retry never retries past the moment the answer
+would be useless. If the user has been waiting 14 seconds, a retry
+that takes 5 more seconds is not a fix.
+
+gRPC, Finagle, and Envoy propagate deadlines through the call
+graph. HTTP usually doesn't; use an explicit timeout per attempt
+and shrink your retry budget as the deadline approaches.
+
+## Don't retry without idempotency
+
+Retrying a POST without idempotency keys can cause **duplicate
+state**: two payments, two orders, two emails. The retry library
+doesn't know what the call does.
+
+Rules:
+
+- Retry GETs freely (idempotent by definition).
+- Retry PUTs freely (state-replacing; idempotent).
+- Retry DELETEs (idempotent in HTTP, although 404 on second call).
+- Retry POSTs **only with an idempotency key** (see "Idempotency
+  keys").
+
+Some libraries (`got`) retry only known-idempotent methods by
+default. Lean on this.
+
+## Failure modes
+
+### Retry storm
+
+A blip causes mass retries; downstream is now under double load;
+fails more; more retries. The system can't recover until the storm
+dissipates.
+
+Fixes: full jitter, retry budget, circuit breaker (see **Circuit
+breaker**).
+
+### Hidden retries piling up
+
+Multiple layers each retry independently. The downstream sees N^L
+requests where L is the layer count.
+
+Fix: retry at one layer. Audit defaults.
+
+### Retries hiding bugs
+
+A flaky operation that "passes if you retry" hides the real bug. The
+metric is **retry rate** — high retry rate is a symptom, not a
+success.
+
+Fix: track retries per operation; alert on rate growth. A doubling
+retry rate is an early warning of downstream trouble.
+
+### Infinite retries
+
+`while (true) { try { ... } catch { sleep(); } }`. The job never
+fails, just keeps slowly hammering. The on-call alarm never fires.
+
+Fix: every retry loop has a max attempts AND a max duration.
+
+### Retrying after partial side effects
+
+The first call succeeded for items 1–5, failed for item 6. The
+retry now sends all items, redoing 1–5. Without per-item idempotency,
+items 1–5 are duplicated.
+
+Fix: idempotency keys per item; design partial-failure responses
+(see "Bulk and batch APIs").
+
+<Callout variant="warning">
+The retry rate of your dependencies is the most under-watched
+reliability metric. If you don't graph it, you don't know when
+your system started to fail — you only know when retries stopped
+being enough to hide it.
+</Callout>
+
+## In summary
+
+- A safe retry policy has: exponential backoff, full jitter, retry
+  budget, retryable-only filter.
+- Use **full jitter** unless measurement shows otherwise.
+- Cap retries by both **attempts** and **deadline**. Deadlines beat
+  attempts.
+- Retry at **one layer only** — nested retries multiply.
+- Never retry non-idempotent operations without idempotency keys.
+- Track retry rate as a first-class metric; rising retries are an
+  early warning, not a success.
+- Pair retries with circuit breakers and bulkheads — retries handle
+  transient failure; the others handle sustained failure.

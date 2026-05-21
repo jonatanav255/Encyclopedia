@@ -1,0 +1,325 @@
+export const level = 'junior';
+
+# System design interview framework
+
+A 45-minute system design interview is a structured conversation,
+not a free-form discussion. The candidates who fail it usually
+fail by skipping the structure — they dive into databases at
+minute 3 and never come up for air.
+
+The framework below is what almost every interviewer (and the
+two canonical books — Xu's *System Design Interview* Vol 1+2
+and Tan's *Acing the System Design Interview*) wants you to do,
+in roughly the same order, in roughly the same time budget.
+
+## The eight-phase frame
+
+```
+1. Clarify scope           (5-7 min)
+2. Estimate scale          (3-5 min)
+3. API design              (3-5 min)
+4. Data model              (3-5 min)
+5. High-level architecture (5-7 min)
+6. Deep dives              (10-15 min)
+7. Bottlenecks & scale-ups (3-5 min)
+8. Tradeoffs called out    (2-3 min)
+```
+
+Total: ~40-45 minutes. The first 5 phases are "the answer."
+Phase 6 is where seniority shows. Phases 7-8 are how you close.
+
+## 1. Clarify scope
+
+Restate the prompt in your own words. Then ask a small number of
+focused questions:
+
+- Who are the users?
+- What are the core actions? (3-7 verbs.)
+- Scale? (DAU, read/write ratio, geography.)
+- Latency target? Availability target?
+- What's **out of scope**?
+
+You're aiming for a contract you and the interviewer agree on
+**before** you draw anything. State your defaults out loud so
+they can be corrected in seconds. See
+"Requirements gathering for system design" for the full question
+bank.
+
+End of phase 1: a short FR list, a short NFR list, and an
+explicit out-of-scope list.
+
+## 2. Estimate scale
+
+Numbers, not adjectives. Compute:
+
+- Read QPS and write QPS, separately.
+- Storage growth per day and per year.
+- Bandwidth in and out.
+- Concurrent connections, if long-lived.
+
+Use peak = 3x average as default. Use 10⁵ seconds/day. Don't be
+precise; be order-of-magnitude. See "Capacity estimation" for
+the procedure.
+
+This is the phase that **forces** the architecture in phase 5.
+"3K write QPS" allows a sharded RDBMS; "500K write QPS" forces a
+log-structured store. State the consequence as you compute the
+number.
+
+## 3. API design
+
+Lay out the 2-6 endpoints that the core actions need. For each:
+
+- Method + path.
+- Request payload (key fields, not every field).
+- Response shape.
+- Auth/identity assumption.
+
+```bash
+POST /tweets
+  { text: string, mediaIds?: string[] }
+  → { id: string, createdAt: timestamp }
+
+GET /feed?cursor=<opaque>&limit=<int>
+  → { items: Tweet[], nextCursor: string|null }
+```
+
+Prefer REST-ish JSON for clarity unless the prompt specifically
+asks about gRPC or GraphQL. Cursor pagination, not offset.
+
+You'll come back and add internal APIs in phase 5; the goal here
+is to anchor what the **client** sees.
+
+## 4. Data model
+
+Three questions:
+
+- What entities exist?
+- What's the **access pattern** (key by what, sort by what,
+  filtered by what)?
+- What lives in SQL, what in NoSQL, what in cache, what in
+  object storage?
+
+Show the primary keys and the obvious indexes. Mention sharding
+key if scale demands it. Don't enumerate every column.
+
+```
+users(id PK, handle UNIQUE, email, createdAt)
+tweets(id PK, authorId, text, mediaIds, createdAt)
+  index: (authorId, createdAt DESC)  -- for "user's tweets"
+follows(followerId, followeeId, PK(followerId, followeeId))
+```
+
+Naming the access pattern in plain English ("we read user
+timelines, sorted newest first, paginated by cursor") is more
+useful than 12 columns.
+
+## 5. High-level architecture
+
+Draw the box-and-arrow diagram. The minimal shape for most
+backend systems:
+
+```
+[ client ]
+    ↓
+[ CDN / edge ]
+    ↓
+[ load balancer ]
+    ↓
+[ stateless API tier ]   ←→  [ cache ]
+        │
+        ├─ writes ─→  [ async queue / fanout ]
+        ↓
+[ primary data store ]   [ object storage for blobs ]
+        │
+        └─ async ─→  [ read replicas ]   [ search index ]   [ analytics ]
+```
+
+Walk the path of **one read** and **one write** through the
+diagram. That's the heart of phase 5. Avoid drawing things you
+don't intend to talk about.
+
+## 6. Deep dives
+
+This is where the senior signal is. Pick 2-4 genuinely hard
+parts of **this specific system** and go deep:
+
+- For Twitter: fanout-on-write vs fanout-on-read, celebrity
+  handling.
+- For Uber: matching algorithm, geo-sharding, surge pricing.
+- For URL shortener: short-code generation, hot-key caching.
+
+For each:
+
+- Name the **specific problem** ("celebrity user has 100M
+  followers; per-tweet fanout writes 100M rows").
+- State the **constraint** that forces a choice.
+- Give the **mechanism** you'd use.
+- Acknowledge the **tradeoff**.
+
+The interviewer will steer you toward what they care about; let
+them. If they ask, "what about consistency?", drop into that
+deep dive even if it wasn't on your list.
+
+<Callout variant="info">
+Most candidates fail phase 6 by **not having opinions**. The
+interviewer doesn't want a survey of options. They want "I'd
+choose A because constraint B, and I accept cost C." Pick a
+direction; be ready to defend it.
+</Callout>
+
+## 7. Bottlenecks & scale-ups
+
+The closing senior signal. Two questions:
+
+- What breaks first if traffic 10x's?
+- How do we fix it?
+
+Answers usually involve: read replicas → sharding → hot-key
+mitigation → cache tiering → regional sharding → cell isolation.
+Don't enumerate every possible bottleneck — pick the 2-3 most
+likely, name them, and sketch the next step.
+
+```
+"At 10x, the inbox write QPS becomes 30K/s, which exceeds a
+single Postgres leader. We'd shard by userId across N leaders.
+The next bottleneck would be celebrity fanout — we'd switch
+celebrities to fanout-on-read at that point."
+```
+
+## 8. Tradeoffs called out
+
+A short pass over the choices you made. Goal: show you knew
+they *were* choices.
+
+- "I chose eventual consistency on feeds because read QPS is
+  100x writes; the cost is sometimes-stale timelines, which is
+  fine for this product."
+- "I chose Postgres over Cassandra because we're at 3K write QPS
+  and the team is small; Cassandra's ops cost isn't justified."
+- "I chose to denormalize the timeline because the alternative
+  is a 100-table join on every read."
+
+This phase is short (2-3 min) but high-leverage — it converts
+"I made these decisions" into "I made these decisions
+*deliberately*."
+
+## Time-box the phases
+
+Watching the clock matters. If you've spent 15 minutes on
+clarification, you'll run out of time before the deep dives —
+which is the part the interviewer is grading hardest.
+
+<Cheatsheet>
+| Phase | Budget | If running over... |
+|---|---|---|
+| Clarify | 5-7 min | State defaults, ask interviewer to interrupt if wrong |
+| Estimate | 3-5 min | Skip precision, get to orders-of-magnitude |
+| API | 3-5 min | Sketch 3 endpoints, defer the rest |
+| Data model | 3-5 min | Skip non-key fields; just keys + indexes |
+| High-level | 5-7 min | Draw fast, walk read/write paths |
+| Deep dives | 10-15 min | Cut to 2 instead of 4; go deeper on each |
+| Bottlenecks | 3-5 min | Name 2; sketch fixes |
+| Tradeoffs | 2-3 min | One-liner per choice |
+</Cheatsheet>
+
+Practice with a real timer. Drift in early phases is the most
+common failure mode.
+
+## What interviewers actually grade
+
+Most rubrics roughly map to:
+
+<Steps>
+<Step n={1} title="Problem framing">
+Did you scope the problem? Did you ask the right clarifying
+questions? Did you state assumptions explicitly?
+</Step>
+<Step n={2} title="Estimation literacy">
+Can you do back-of-envelope math? Do your component choices
+match your scale numbers?
+</Step>
+<Step n={3} title="Component design">
+Do you know what each box does and why it's there? Can you
+name a credible alternative for each?
+</Step>
+<Step n={4} title="Depth in the right places">
+On the genuinely hard parts of this problem, do you have
+substantive depth? (Vs. having only surface knowledge of
+everything.)
+</Step>
+<Step n={5} title="Trade-off awareness">
+For every choice, can you articulate the alternative and why
+you didn't take it? This is the senior bar.
+</Step>
+<Step n={6} title="Communication">
+Are you driving the conversation? Are you listening when the
+interviewer hints at a topic? Are you reasoning out loud
+clearly?
+</Step>
+</Steps>
+
+You don't have to be perfect on all six. You do have to be
+**solid** on framing, estimation, and trade-off awareness.
+Without those, no amount of depth will close.
+
+## Common failure modes
+
+- **Drawing first.** No requirements, no estimation, just boxes
+  on the board. Recoverable if you stop and clarify within
+  10 minutes.
+- **Pattern-matching to a famous system.** "Twitter does X" is
+  not a justification — you have to argue why X fits **this**
+  system.
+- **No opinions.** Surveying options without picking one is a
+  fail. Pick a direction, be ready to defend, change your mind
+  when challenged with a good reason.
+- **Ignoring the interviewer.** When they ask "what about
+  failures?", they're telling you that's the next topic. Drop
+  everything and go there.
+- **Running out of time before deep dives.** The senior signal
+  lives there. Budget early phases tightly so you have time.
+- **Refusing to acknowledge weaknesses.** "And this is
+  perfect." No — every design has costs. Name them. The
+  interviewer will trust you more.
+
+## A reusable opening
+
+Memorize this skeleton so it's automatic:
+
+```
+"Sure — so we're designing X. Let me make sure I understand the
+core actions: users can [A], [B], [C]. The most important
+NFRs are [latency / availability / scale]. Out of scope I'll
+assume [auth / payment / etc]. Sound right?
+
+[wait for yes/correction]
+
+Let me size this. With [DAU], [actions/day], [bytes/record], we
+get [read QPS], [write QPS], [storage/year]. The bandwidth
+implies [CDN required / not].
+
+For the API, the four endpoints I'd start with are: [...].
+
+For the data model, the entities are [...]; the primary access
+pattern is [...].
+
+Now the high-level diagram..."
+```
+
+That's the first 12 minutes, mostly script. The rest is where
+you have to actually think.
+
+## In summary
+
+- Eight phases, ~45 minutes, in order: clarify → estimate →
+  API → data model → architecture → deep dives → bottlenecks →
+  tradeoffs.
+- Keep the early phases tight; the senior signal is in the deep
+  dives.
+- State your defaults out loud so the interviewer can correct
+  them in seconds.
+- Pick directions and defend them; surveys without opinions
+  don't pass.
+- The framework is just the structure. The content is the
+  trade-off chain you build inside it.

@@ -1,0 +1,355 @@
+export const level = 'senior';
+
+# Schema evolution
+
+Schema evolution is the discipline of changing message formats over
+time **without breaking existing clients or servers**. In a polyglot
+distributed system, schemas are forever — the data lives in caches,
+in databases, in events sitting in Kafka topics, in clients running
+old code in the field. Every change to a schema is a decade-long
+commitment.
+
+Kreps's writings on Kafka, Hewitt's *Cassandra: The Definitive
+Guide*, and Designing Data-Intensive Applications (Kleppmann) all
+treat this as central. The vocabulary:
+
+<Cheatsheet>
+| Property | Definition |
+|---|---|
+| **Backward compatibility** | New schema can read old data (new code reads old messages). |
+| **Forward compatibility** | Old schema can read new data (old code reads new messages, ignoring unknown fields). |
+| **Full compatibility** | Both backward and forward. The strict goal. |
+| **Breaking change** | A change that neither old nor new can read across the boundary. |
+</Cheatsheet>
+
+The goal: full compatibility everywhere. The reality: it requires
+discipline most teams underestimate.
+
+## Why both directions matter
+
+In a distributed system, you can't synchronize deploys. At any
+moment:
+
+```
+- Producer v2 writes messages.
+- Consumer v1 (still running) reads them. ← needs forward compat
+- Producer v1 (still running) writes messages.
+- Consumer v2 reads them. ← needs backward compat
+- Old data sits in storage; new code reads it. ← needs backward compat
+- New data sits in storage; old code might still read it. ← forward compat
+```
+
+A change is **safe to deploy** only if all four directions work.
+Otherwise you need a coordinated rollout (rare, error-prone) or
+you'll silently corrupt or lose data.
+
+## Per-format rules
+
+The three dominant formats — Protobuf, Avro, JSON — have different
+mechanics.
+
+### Protobuf
+
+Rules from Google's docs and Geewax:
+
+```
+Backward + forward compatible:
+- Add a new optional field with a new field number.
+- Remove an optional field (better: mark `reserved`).
+- Rename a field (the wire is the field number, not the name).
+- Change int32 ↔ int64 (within the int family; widening).
+
+Breaking:
+- Change field number (it IS the identity).
+- Change field type across families (string ↔ int).
+- Reuse a field number for a different field.
+- Add or remove a `required` field. (Proto2 had `required`; proto3
+  removed it for this reason.)
+- Change a singular field to repeated (or vice versa).
+```
+
+**Field numbers are forever.** Once you've assigned 7 to `email`,
+that's `email` for the life of the schema. If you remove `email`,
+mark 7 as `reserved`:
+
+```js
+// .proto
+// message User {
+//   string name = 1;
+//   reserved 7;            // was email; do not reuse
+//   reserved "email";       // also reserve the name
+// }
+```
+
+Tools (Buf, protolock) enforce this in CI. Without enforcement,
+someone will reuse a number and silently corrupt old data.
+
+### Avro
+
+Avro is the Kafka-ecosystem default and has the strongest schema-
+evolution story. Rules:
+
+```
+Backward compatible:
+- Add a field with a default value.
+- Remove a field that had a default value.
+
+Forward compatible:
+- Add a field with a default.
+- Remove a field that had a default.
+
+Breaking:
+- Add a field WITHOUT a default (consumers can't read old data).
+- Rename a field without an alias.
+- Change a field's type to an incompatible one.
+```
+
+Avro's schema registry (Confluent's is the canonical one) enforces
+compatibility levels at registration time. You **can't accidentally**
+push a breaking change in a well-configured cluster — the registry
+rejects the new schema.
+
+### JSON
+
+JSON has no native schema; you bring discipline. Common rules:
+
+```
+Backward + forward compatible by default IF:
+- Adding fields: existing readers ignore unknown fields.
+- Optional fields are accepted as missing.
+- No required fields are added.
+
+Breaking:
+- Removing a field that readers depend on.
+- Renaming a field.
+- Changing a field's type (string → number).
+- Changing semantics (units, encoding) silently.
+```
+
+The "by default" is doing a lot of work — it depends on every client
+ignoring unknown fields. Some don't (strict deserializers, ORMs that
+fail on unknown columns). Either:
+
+- Use JSON Schema with `additionalProperties: true` to encode the
+  policy.
+- Generate client SDKs from OpenAPI/JSON Schema with tolerant
+  defaults.
+- Test compatibility explicitly.
+
+## Defaults are the secret weapon
+
+The single most useful rule across all three formats: **new fields
+need defaults**.
+
+A new field with a default means:
+
+- Old code reading new data: ignores the field. OK.
+- New code reading old data: the field is missing, default applies. OK.
+
+A new field **without** a default means:
+
+- New code reading old data: the field is missing, deserialization
+  may fail or produce undefined behavior. NOT OK.
+
+Always add fields with defaults. Always.
+
+## What never gets renamed
+
+Names are part of the contract. They live in:
+
+- Application code that references the field.
+- Documentation.
+- Database column names (if mirrored).
+- Log queries grepping for field values.
+- Customer integrations.
+
+Renaming a field is **always a breaking change** to a meaningful
+chunk of the world. Avoid it. If you must:
+
+```
+1. Add the new field (with default) alongside the old.
+2. Write to both. Read from new with fallback to old.
+3. Migrate readers, one at a time.
+4. Stop writing the old field.
+5. Delete the old field after the data ages out.
+```
+
+This is months of work. The "rename" was an illusion of simplicity.
+
+## Reserved fields
+
+When you remove a field, **don't reuse the field number/name**:
+
+```
+// .proto
+// reserved 5, 7, 12;
+// reserved "old_status", "legacy_id";
+```
+
+Why: old messages in storage still have data at those positions. If
+you reuse the slot for a different field, deserialization
+interprets bytes as the wrong type and silently corrupts.
+
+Reservations are forever. Schema files grow over time; that's fine.
+
+## Compatibility levels in registries
+
+Schema registries (Confluent, AWS Glue) offer compatibility levels:
+
+<Cheatsheet>
+| Level | Means | Use case |
+|---|---|---|
+| NONE | Anything goes. | Don't. |
+| BACKWARD | New schema can read old data. | Consumers upgrade first. |
+| FORWARD | Old schema can read new data. | Producers upgrade first. |
+| FULL | Both. | Independent upgrades; default for production. |
+| BACKWARD_TRANSITIVE | New reads all prior. | Long retention; replay support. |
+| FORWARD_TRANSITIVE | All prior read new. | Same; against all history. |
+| FULL_TRANSITIVE | Strict; everyone reads everything. | Highest discipline. |
+</Cheatsheet>
+
+For Kafka topics with long retention (event sourcing, audit logs),
+**FULL_TRANSITIVE** is the right default. It enforces that any
+historical message is readable by any future consumer. Worth the
+discipline.
+
+## A worked example
+
+You have a `User` event with `{ id, name, email }`. You want to add
+`signup_country`. Possibilities:
+
+### Safe: add optional with default
+
+Protobuf:
+
+```js
+// // proto3
+// message User {
+//   string id = 1;
+//   string name = 2;
+//   string email = 3;
+//   string signup_country = 4;  // empty string when missing
+// }
+```
+
+All four directions work. Ship it whenever.
+
+### Safe: deprecate, don't delete
+
+You want to retire `email`. Mark deprecated, don't remove:
+
+```js
+// // proto3
+// message User {
+//   string id = 1;
+//   string name = 2;
+//   string email = 3 [deprecated = true];
+//   string contact_email = 5;
+// }
+```
+
+Migrate consumers to `contact_email`. Keep `email` set for now.
+After a year of low usage, mark `reserved 3` and stop writing it.
+
+### Breaking: type change
+
+You want `signup_country` to be an enum, not a string. **Breaking**.
+Strategy:
+
+```
+1. Add `signup_country_enum` field (field number 5).
+2. Producers write both `signup_country` (string) and
+   `signup_country_enum` (enum).
+3. Consumers prefer the enum, fall back to the string.
+4. After full migration, deprecate `signup_country`.
+```
+
+Two fields for the same data, for a year. That's the cost of a
+schema change. Plan accordingly.
+
+## Schemas in databases
+
+The same rules apply to database migrations (see "Database
+migrations"):
+
+- Adding nullable columns: safe.
+- Renaming columns: breaking.
+- Type changes: usually breaking.
+- Removing columns: breaking if any code reads them.
+
+The "expand-and-contract" pattern is schema evolution applied to
+databases:
+
+```
+1. Expand: add the new column alongside the old; write both.
+2. Migrate: backfill the new column; switch readers; verify.
+3. Contract: stop writing the old column; remove the old column.
+```
+
+Each step is independently deployable. The whole migration is many
+deploys. There is no skipping.
+
+## Failure modes
+
+### "We only have one version in the field"
+
+You may today. Tomorrow you'll have two: the canary, the rolling
+deploy, the old job that's still running. Schema discipline applies
+on day 1 because by day 30 you'll have multi-version coexistence
+whether you planned for it or not.
+
+### "Just bump the major version"
+
+In an event log with retention, the historical data was written by
+v1. Consumers reading the log must handle v1 forever. "Bumping the
+version" doesn't make old data go away.
+
+### Strict deserializers
+
+Some clients (Java with Jackson, Go with strict JSON, TypeScript
+with strict types) **fail on unknown fields by default**. Adding a
+new field is then a breaking change for them.
+
+Configure tolerant deserialization in client SDKs and document it
+as a requirement.
+
+### Renames feeling free
+
+In a database with one consumer (a single service), a rename feels
+free. Then a downstream service starts reading via CDC, an analyst
+queries the warehouse, a backup tool exports — and now the rename
+broke things you didn't know existed.
+
+Don't rename unless you can prove no consumer depends on the name.
+You usually can't.
+
+### Compatibility without testing
+
+A registry says "this is compatible." Real consumers fail anyway —
+because the registry checked the wire format but not the **semantics**.
+Adding a `status_enum` value that older clients don't recognize is
+wire-compatible but semantically broken.
+
+Test compatibility at the consumer level, not just the registry
+level.
+
+<Callout variant="info">
+A useful rule: **never make a breaking schema change in one deploy.**
+Always split into expand → migrate → contract. The total time is
+longer; the risk is far lower; reverts are cheap at each step.
+</Callout>
+
+## In summary
+
+- Schema evolution is the discipline of never breaking existing
+  producers or consumers across a deploy.
+- Aim for **full compatibility**: backward + forward.
+- Per format: Protobuf — field numbers are forever, reserve when
+  removing. Avro — defaults are mandatory; the registry enforces.
+  JSON — disciplined by convention; default to additive changes.
+- Always add fields with defaults. Never rename. Reserve, don't
+  reuse.
+- For databases, apply expand-and-contract; multi-step migrations
+  are the only safe path.
+- Schema registries enforce wire compatibility; consumer testing
+  enforces semantic compatibility. You need both.

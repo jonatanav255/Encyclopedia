@@ -1,0 +1,149 @@
+export const level = 'senior';
+
+# Failure detectors
+
+How do you know a node is dead? You don't — you can only know
+it hasn't responded recently. A **failure detector** turns
+"silence" into a probabilistic verdict, with a controllable
+tradeoff between **detection latency** and **false positives**.
+
+## The two axes
+
+- **Completeness**: every dead node is eventually flagged dead.
+- **Accuracy**: live nodes are not flagged dead.
+
+In an asynchronous network with no upper bound on message
+delay, you can't have both perfectly (FLP impossibility). All
+real failure detectors are heuristic.
+
+## Heartbeat-based detection
+
+The simplest scheme: every T seconds, expect a heartbeat. If
+none in 3T (or 2.5T, or some multiple), flag dead.
+
+Problems:
+
+- **Fixed timeout is wrong everywhere.** Local network 100ms,
+  cross-region 500ms; one timeout can't fit both.
+- **Bursty delays** (GC pause, network congestion) cause false
+  positives.
+- **Heartbeats don't catch every failure** — a node can be
+  alive but serving requests slowly.
+
+## Phi-accrual failure detector
+
+Hayashibara et al's contribution: instead of binary
+"alive/dead," output a continuous **suspicion value** ϕ.
+
+Each node tracks the mean and variance of inter-heartbeat
+intervals from each peer. ϕ measures how many standard
+deviations the current gap is from the expected gap. A higher
+ϕ means more suspicious.
+
+```js
+// Pseudocode for phi computation
+const samples = recentHeartbeatIntervals(peer);
+const mean = avg(samples);
+const sd = stddev(samples);
+const elapsed = Date.now() - lastHeartbeat(peer);
+const phi = -log10(1 - normalCDF((elapsed - mean) / sd));
+```
+
+The application sets a threshold (typically ϕ = 8, meaning
+roughly 10^-8 probability that the peer is alive). Increasing
+the threshold reduces false positives at the cost of slower
+detection.
+
+Used by Cassandra, Akka, ScyllaDB. Adapts to network conditions
+automatically — a flaky cross-region link doesn't generate
+constant false positives.
+
+## SWIM-style detection
+
+(See gossip-protocols for the full SWIM protocol.) Briefly:
+
+1. Each round, ping one random peer.
+2. If no ack within timeout, ask K other peers to indirectly
+   ping it.
+3. If none of the indirect pings ack, mark "suspect."
+4. After another timeout, mark "dead" and gossip the verdict.
+
+Used by HashiCorp memberlist, Uber Ringpop. The indirect probe
+filters out network-path failures (peer is alive but
+unreachable from me specifically).
+
+## Failure detection ≠ failure handling
+
+Detection answers "is the node dead?" Handling answers "what
+do we do about it?" The two are separate decisions:
+
+- **Detection too fast → false positives → unnecessary
+  failover.** Failover under load on a healthy cluster causes
+  more outages than node failures.
+- **Detection too slow → real failures take time to recover.**
+  Users see errors during the gap.
+
+Production systems usually have **multiple thresholds**:
+
+- Soft (10–30 s): stop sending new traffic to the node.
+- Hard (60–120 s): trigger failover.
+- Very hard (5+ min): mark dead in the registry permanently.
+
+## Common pitfalls
+
+### GC pauses look like death
+
+A JVM doing a 30-second STW GC stops responding. Heartbeat
+times out. Cluster marks it dead. GC finishes, node "comes
+back from the dead" — but now its slots have been reassigned
+and writes have been duplicated.
+
+Fixes: GC-aware heartbeat (longer timeouts), fencing tokens on
+takeover, idempotent operations.
+
+### Asymmetric partitions
+
+A can ping B, B can't ping A. Each thinks the other is dead.
+SWIM's indirect probes mitigate this; binary heartbeats do not.
+
+### Cascading failures from over-aggressive detection
+
+Node A is slow (high load). Failure detector marks it dead.
+Its traffic shifts to B, C, D. Now they're overloaded. Their
+heartbeats slow. They get marked dead too. Etc.
+
+Fix: **rate-limit failover decisions.** Never failover more
+than X% of the cluster in any window.
+
+### Network partition declaring half the cluster dead
+
+A network partition splits a 6-node cluster 3:3. Each half
+marks the other dead. Without quorum-based decisions, both
+halves keep accepting writes — split-brain.
+
+Fix: require quorum (4 of 6) before any state change. The
+3-node minority refuses writes.
+
+## Designing a heartbeat
+
+For a new system, the defaults that work:
+
+- **Heartbeat interval: 1 s.** Frequent enough for fast
+  detection, infrequent enough for low bandwidth.
+- **Soft timeout: 5–10 s** (stop new traffic).
+- **Hard timeout: 30–60 s** (declare dead, trigger failover).
+- **Use phi-accrual or SWIM** rather than fixed-timeout
+  heartbeat for any cluster larger than ~10 nodes.
+
+## In summary
+
+- Failure detection turns "no recent message" into a verdict
+  with a controllable false-positive rate.
+- Fixed-timeout heartbeats are simple but brittle; phi-accrual
+  adapts to network conditions.
+- SWIM combines random probing + indirect probes for scalable
+  detection.
+- Detection ≠ handling — use multiple thresholds, rate-limit
+  failover.
+- Watch for GC pauses, asymmetric partitions, and cascading
+  failover from over-aggressive detection.

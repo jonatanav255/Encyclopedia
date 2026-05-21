@@ -1,0 +1,181 @@
+export const level = 'senior';
+
+# Hot keys
+
+A single key (cache entry, DB row, Kafka partition) gets a
+disproportionate share of traffic. The shard or node that
+owns it overloads while the rest of the cluster sits idle.
+
+This is one of the hardest problems in distributed systems —
+because the system was designed assuming traffic spreads
+evenly, and a single key violates that assumption hard.
+
+## How hot keys happen
+
+- **Celebrity follower count.** Someone with 100M followers
+  posts; reads of their profile spike on one shard.
+- **Sale event SKU.** "Limited drop on item X at noon" — every
+  request hits the same key.
+- **Singleton counter / global ID.** All increments serialize
+  on one shard.
+- **Trending topic.** Search/feed query routes to one
+  partition.
+- **Hot cache key after invalidation.** Combined with cache
+  stampede.
+- **Skewed user IDs.** A poorly chosen partition key (e.g.,
+  email address, where free email providers like gmail
+  dominate) can produce 80/20 hot spots.
+
+## Detection
+
+If you don't measure it, you won't see it until it's already
+hurting:
+
+- **Per-shard QPS** in your monitoring. A single shard with
+  10× the load of others is hot-key suspect.
+- **Slowlog / top-keys analytics.** Redis MONITOR (in dev),
+  Kafka per-partition lag, RDS Performance Insights.
+- **Tracing for slow queries** — if one key consistently
+  appears in p99 tails, it's hot.
+
+Distributed databases like Cassandra and DynamoDB expose
+metrics for "partition hot spot" — set alerts on them.
+
+## Mitigation 1: replicate the hot key
+
+For read-heavy hot keys, replicate the key to N nodes.
+Requests hash to one of the N copies (random or round-robin),
+distributing load.
+
+```js
+// Instead of cache key "post:viral_id"
+// Use cache key "post:viral_id:replica_0..N"
+const replica = Math.floor(Math.random() * N);
+const key = `post:viral_id:${replica}`;
+```
+
+Writes go to all N copies. Reads pick one. N = 10–100
+depending on traffic.
+
+Trade-off: writes are N× more expensive. Only worth it for
+extreme read/write ratios.
+
+Used in Twitter for celebrity timelines.
+
+## Mitigation 2: split the hot key
+
+For write-heavy hot keys (a global counter, a leaderboard):
+split into N sub-keys, each receiving 1/N of the writes.
+Aggregate on read.
+
+```js
+// Write: pick a random sub-counter
+const i = Math.floor(Math.random() * 64);
+await db.increment(`counter:posts:${i}`);
+
+// Read: sum across all sub-counters
+const counts = await db.mget(Array.from({length: 64}, (_, i) => `counter:posts:${i}`));
+const total = counts.reduce((a, b) => a + b, 0);
+```
+
+Reads are now 64 queries instead of 1, but each shard handles
+1/64 of the write load. Standard pattern for high-frequency
+counters. See design-distributed-counter.
+
+## Mitigation 3: route hot keys to dedicated nodes
+
+Identify hot keys at the routing layer; send them to
+specialized nodes (more CPU, more RAM) while the long tail
+spreads normally.
+
+Twitter's "celebrity tier" did this — popular accounts'
+timelines lived in a higher-resource backend.
+
+Operationally tricky: detect "hot" online, route accordingly,
+fail back when the key cools.
+
+## Mitigation 4: per-key request collapsing
+
+If multiple requests want the same key at the same time, only
+one goes to origin; others wait on the result. See request-collapsing.
+
+Doesn't help with truly hot read-only patterns, but flattens
+spikes from in-progress refreshes.
+
+## Mitigation 5: caching layer in front
+
+A read-through cache absorbs most of the load. The shard
+behind it sees a tiny fraction. This is the simplest fix for
+**read-hot** keys; it doesn't help **write-hot** keys.
+
+CDN, app-level cache, or even a per-process LRU on each
+service node — any of them help if the data is read-mostly.
+
+## Hot keys in Kafka
+
+Partitions are the unit of parallelism. A single hot partition
+can throttle the whole topic:
+
+- **Partition key concentration.** If 90% of messages use the
+  same key, they all land on one partition.
+- **Mitigation**: use a higher-cardinality partition key (user
+  ID + day, not just user ID); or accept some ordering loss
+  and round-robin the writes.
+
+Kafka 2.4+ added **sticky partitioner** which balances better
+when keys are null, and 3.x has tools for measuring per-key
+volume.
+
+## Hot keys in Redis Cluster
+
+Each key lives in one slot, one node. Hot keys hot one
+node. Patterns:
+
+- **Replicate the hot key** to N additional cache keys, route
+  reads round-robin (`get:popular:0..9`).
+- **Use a local in-process LRU in front of Redis** for the top
+  100 keys; refresh from Redis with TTL.
+- **Move the workload off Redis** for that key — embed in a
+  CDN-cached endpoint instead.
+
+## Hot keys in DynamoDB
+
+DynamoDB documents this explicitly. Symptoms: throttling on
+specific partitions despite total table headroom.
+
+Fixes:
+
+- **Adaptive capacity** — DynamoDB tries to give hot partitions
+  more throughput; works for short bursts.
+- **Write sharding** — append a random suffix to the partition
+  key, scatter writes, sum/scan on read.
+- **Caching layer (DAX)** — absorbs read spikes.
+
+## Design-time prevention
+
+The cheapest fix is to never have a hot key. Two practices:
+
+<Steps>
+<Step n={1} title="Use high-cardinality partition keys.">
+Email > company; user-id > country; (user-id, hour-bucket) >
+user-id alone for time-bound writes.
+</Step>
+<Step n={2} title="Avoid singleton-shaped keys.">
+"Global counter," "next ID," "current leader" — these
+serialize traffic. Use sharded counters, UUIDs, or leases
+with renewable tokens instead.
+</Step>
+</Steps>
+
+## In summary
+
+- Hot keys: one key gets disproportionate traffic; the
+  partition that owns it overloads while others idle.
+- Detect via per-shard QPS, slowlog, per-partition metrics.
+- Mitigate: replicate (read-heavy), split (write-heavy),
+  dedicated tier (operationally heavy), caching layer
+  (read-only), request collapsing.
+- Choose partition keys with high cardinality at design time
+  to avoid the problem altogether.
+- Kafka, Redis Cluster, DynamoDB all have specific tools for
+  this; use them.

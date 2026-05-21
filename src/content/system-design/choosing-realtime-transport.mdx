@@ -1,0 +1,192 @@
+export const level = 'mid';
+
+# How to choose: polling vs long-polling vs SSE vs WebSocket
+
+Four ways to push data from server to browser (or any client).
+The right pick depends on direction, frequency, infrastructure
+constraints, and reconnection behavior.
+
+## The four options
+
+<Cheatsheet>
+| Transport | Direction | Frequency fit | Infra friendliness |
+|---|---|---|---|
+| Polling | Client → server | Slow (10s+) | Maximum (just HTTP) |
+| Long polling | Client → server (held open) | Medium (1s–10s) | Very high |
+| Server-sent events (SSE) | Server → client (one-way) | High (sub-second) | High (HTTP) |
+| WebSocket | Bidirectional | High (sub-second) | Lower (proxy support varies) |
+</Cheatsheet>
+
+## Polling
+
+Client makes periodic HTTP requests asking "anything new?"
+
+```js
+setInterval(async () => {
+  const r = await fetch('/api/events?since=' + lastSeen);
+  // ...
+}, 5000);
+```
+
+Pros: every HTTP cache, proxy, LB, CDN works. No connection
+state. Trivial to debug.
+
+Cons: latency = polling interval. Bandwidth waste. If 100K
+clients poll every second, that's 100K QPS at your server for
+mostly-nothing responses.
+
+When to use: slow-changing data (notification badge counter,
+infrequent status checks). Default for "I don't have real-time
+infrastructure."
+
+## Long polling
+
+Client sends a request; server holds it open until it has
+something to send (or a timeout). Client immediately reissues.
+
+```js
+async function loop() {
+  while (true) {
+    const r = await fetch('/api/events?since=' + lastSeen + '&wait=30');
+    process(r);
+  }
+}
+```
+
+Pros: near-realtime latency (server returns immediately on
+new data). Same HTTP infrastructure as polling. Survives
+load balancers and proxies.
+
+Cons: each event = a new HTTP request. Connection setup
+overhead. Servers must support holding many open connections.
+
+When to use: pre-WebSocket era classic; still useful when you
+need fresh data but can't use WebSocket (corporate proxies
+blocking, etc.).
+
+## Server-sent events (SSE)
+
+One-way HTTP streaming from server to client. The connection
+stays open; the server writes `data: ...\n\n` chunks as
+events occur.
+
+```js
+const es = new EventSource('/api/stream');
+es.onmessage = (e) => process(JSON.parse(e.data));
+```
+
+Server side:
+
+```js
+res.writeHead(200, {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  'Connection': 'keep-alive',
+});
+res.write(`data: ${JSON.stringify(event)}\n\n`);
+```
+
+Pros: it's just HTTP — proxies, LBs, auth, mTLS all work.
+Built-in browser support (`EventSource`) with auto-reconnect
+and `Last-Event-ID` header for resuming.
+
+Cons: one-way (server → client only). Browsers limit ~6
+concurrent SSE connections per origin.
+
+When to use: dashboards, notifications, progress streaming,
+LLM token streaming — anywhere the server pushes and the
+client doesn't push back over the same connection.
+
+## WebSocket
+
+Full-duplex, persistent connection over a single TCP
+connection (after an HTTP Upgrade handshake). Both sides can
+send anytime.
+
+```js
+const ws = new WebSocket('wss://api.example.com/ws');
+ws.onmessage = (e) => process(JSON.parse(e.data));
+ws.send(JSON.stringify({ type: 'subscribe', topic: 'orders' }));
+```
+
+Pros: bidirectional, low overhead per message (no HTTP
+headers after handshake), low latency.
+
+Cons: it's not HTTP after the handshake. Caches, CDNs,
+some corporate proxies don't proxy it cleanly. Need to handle
+reconnection, heartbeats, message framing manually. Server
+must hold connection state.
+
+When to use: real-time chat, collaborative editing, live
+gaming, anything where the client sends frequently. The
+default for "I need bidirectional realtime."
+
+## Reconnection and resume
+
+All four need to handle disconnects:
+
+<Steps>
+<Step n={1} title="Polling: trivially resumes next interval.">
+Just pass `since` cursor.
+</Step>
+<Step n={2} title="Long polling: same.">
+Each request is independent.
+</Step>
+<Step n={3} title="SSE: built-in.">
+Browser auto-reconnects; sends `Last-Event-ID` header so
+server can resume from the last seen event.
+</Step>
+<Step n={4} title="WebSocket: DIY.">
+You implement reconnect logic, heartbeat, and resume-from-cursor
+manually.
+</Step>
+</Steps>
+
+For WebSocket, libraries like `socket.io`, `phoenix-channels`,
+or `reconnecting-websocket` save the trouble.
+
+## Scaling
+
+A single server holding 10K WebSocket / SSE connections is
+normal; 100K is achievable with care (libuv, Erlang VM, Go);
+1M needs specialized infra.
+
+Behind a load balancer, **sticky sessions** are typical so a
+reconnect lands on the same backend. Alternative: a session
+store in front (Redis-backed) so any backend can resume.
+
+For SSE specifically, watch the **browser's 6-connection
+limit** per origin — sites with many SSE streams need
+domain sharding or use a single multiplexed stream.
+
+## Mobile and battery
+
+Mobile clients should avoid holding open connections when
+backgrounded. Foreground = WebSocket or SSE; background =
+fall back to OS-level push (APNs, FCM).
+
+## Decision in practice
+
+- "I just need a notification badge to update": **polling**
+  every 30s.
+- "Status of a long job": **long polling** or **SSE**.
+- "Streaming LLM responses": **SSE**.
+- "Chat / collab editor / game": **WebSocket**.
+
+When unsure, start with SSE — it's HTTP-friendly and
+auto-reconnects. Upgrade to WebSocket if you need
+client-to-server in the same channel.
+
+## In summary
+
+- Polling: simple, slow, easy to scale. For low-frequency
+  updates only.
+- Long polling: low latency over HTTP; legacy approach,
+  still useful for hostile proxy environments.
+- SSE: one-way server → client streaming over HTTP;
+  reconnects for free; ideal for dashboards, notifications,
+  LLM streaming.
+- WebSocket: bidirectional, low overhead per message; the
+  default for chat / collab / games; more work to operate.
+- Default start: SSE. Upgrade to WebSocket only when you
+  need client-initiated frames over the same channel.

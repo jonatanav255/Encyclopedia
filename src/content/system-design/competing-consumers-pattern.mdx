@@ -1,0 +1,288 @@
+export const level = 'mid';
+
+# Competing consumers
+
+The simplest scale-out pattern in messaging: **multiple workers
+pull from one queue; each message goes to whichever worker is
+free next**. The queue distributes work across the worker pool.
+
+Hohpe and Woolf's *Enterprise Integration Patterns* introduced
+the name in 2003. The shape predates that by decades — it's how
+classic job queues, print spoolers, and batch processing systems
+worked.
+
+## The shape
+
+```
+       producer ──→ [queue] ──→ worker A
+                            ──→ worker B
+                            ──→ worker C
+```
+
+Each message has **one consumer**. Workers compete for messages;
+the queue serves them out one-at-a-time-per-message. Add a
+worker, drain faster. Remove a worker, drain slower.
+
+This is the **queue model**, not pub/sub (see Pub/sub vs queue).
+A second consumer doesn't get its own copy of the message — it
+gets the *next* message.
+
+## What you get
+
+- **Horizontal scalability**: throughput scales linearly with
+  worker count, up to the queue's serve capacity.
+- **Failure tolerance**: a worker crashing means at most one
+  in-flight message is delayed; others continue.
+- **Load leveling**: producers can burst; workers drain at
+  their sustainable rate.
+- **At-least-once delivery** when implemented correctly:
+  uncommitted messages are redelivered after a timeout.
+
+The pattern is the bread-and-butter of background-job systems
+(BullMQ, Sidekiq, Celery), SQS queues, RabbitMQ work queues,
+and per-partition Kafka consumer groups.
+
+## The ack/visibility model
+
+Competing consumers requires **explicit acknowledgement** to be
+safe.
+
+```
+worker.receive()           # broker checks message out
+worker.process()           # do the work
+worker.ack()               # broker deletes
+```
+
+If the worker crashes between `receive` and `ack`, the broker
+must redeliver. Mechanisms:
+
+- **Visibility timeout** (SQS, RabbitMQ): the message is hidden
+  from other consumers for N seconds after delivery. If not
+  acked in that window, it becomes visible again.
+- **Heartbeats** (BullMQ): the worker periodically signals "still
+  alive." If heartbeats stop, the broker reclaims.
+- **Session-based consumer leases** (Kafka via offset commit):
+  partition assignments are released on session timeout.
+
+The visibility timeout is the central tuning knob:
+
+- Too short → in-progress work gets duplicated because the broker
+  reclaims before the worker finishes.
+- Too long → if the worker really crashed, the message waits
+  unnecessarily.
+
+A typical target: 2-3x the p99 processing time. If processing is
+usually 5s but occasionally 30s, set visibility to 60-90s.
+
+## At-least-once + idempotency
+
+Competing consumers naturally give **at-least-once**. A worker
+might fail after the side effect but before the ack; on
+re-delivery, the side effect repeats.
+
+You need idempotent handlers. See **Idempotent consumer / inbox
+pattern**.
+
+```js
+async function handle(job) {
+  const claimed = await markProcessed(job.id);
+  if (!claimed) return;       // duplicate
+  await doWork(job.payload);
+}
+```
+
+Skip this and "we charged the card twice" becomes a routine
+incident.
+
+## How many workers?
+
+The scaling law:
+
+```
+target QPS  =  workers × messages-per-worker-per-second
+workers     =  target QPS / per-worker throughput
+```
+
+The bottleneck is whichever resource the handler maxes out first.
+For CPU-bound work, scale to roughly `cores per worker × N
+workers ≈ peak QPS`. For I/O-bound (waiting on DB or API), you
+can over-subscribe — 10 workers per CPU core or more.
+
+Practical knobs:
+
+- **Concurrency per worker**: how many messages a single worker
+  processes in parallel.
+  - BullMQ: `new Worker(name, handler, { concurrency: 10 })`
+  - KafkaJS: one partition per consumer in group; `partitionsConsumedConcurrently`
+  - RabbitMQ: `prefetch` count + parallel handlers
+- **Worker count**: number of processes/containers.
+- **Prefetch count**: how many in-flight messages per consumer
+  before requiring an ack.
+
+Prefetch matters: a too-large prefetch lets one worker hoard
+messages while others sit idle. RabbitMQ defaults are low
+(prefetch 250) for a reason — small prefetch ensures load
+balancing.
+
+## When competing consumers don't work
+
+The pattern assumes messages are **independent** — any worker can
+handle any message. Two cases break this:
+
+### Per-entity ordering
+
+"Process user 42's events in order." Multiple workers pulling
+from one queue process them concurrently → out of order.
+
+Solutions:
+
+- **Per-key sharding** (Kafka with partition key, SQS FIFO with
+  message group). One consumer per shard preserves order.
+- **Single consumer** for the ordered work. No competition.
+- **Synchronize at the application layer**: take a per-user lock
+  during processing. Slower but works on any broker.
+
+See **Message ordering**.
+
+### Sticky session / stateful work
+
+"All of user 42's events should be handled by the same worker
+because that worker holds expensive in-memory state."
+
+Competing consumers gives you random assignment. Sticky
+processing requires:
+
+- **Consistent-hashing routing** at the producer side, or
+- **Per-key partitions** (Kafka-style), or
+- **Pulling work by key** rather than from a flat queue.
+
+## Operational concerns
+
+### Queue depth as the SLI
+
+The single most useful metric for a competing-consumers system
+is **queue depth**. Two health signals:
+
+- Steady state: depth oscillates around a low number. Healthy.
+- Growing: producers outpace consumers. Add workers or shed
+  load.
+
+A common alert: "queue depth > N for > 5 minutes." N is set so
+that even with continued growth, downstream impact doesn't
+exceed acceptable lag.
+
+### Worker auto-scaling
+
+The natural fit:
+
+```
+queue depth > threshold → add workers
+queue depth < low threshold for X minutes → remove workers
+```
+
+Cloud queues integrate with auto-scaling out of the box. SQS
++ ECS or Kubernetes HPA with custom metrics is a 20-line setup.
+
+Beware the **bursty short queue**: depth spikes for 30s and
+your autoscaler adds workers that take 5 minutes to start.
+You've paid for capacity that arrives after the burst. Tune
+scale-up thresholds to be sensitive (small bursts trigger) and
+scale-down to be lazy (don't remove until depth is low for a
+sustained window).
+
+### Poison messages
+
+A single message that always fails will keep coming back. Without
+a retry cap and a dead-letter queue, workers loop on the same
+message forever. See **Dead-letter queues**.
+
+```js
+new Worker('jobs', handler, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+});
+```
+
+### Long-tailed messages
+
+99% of messages take 100ms; 1% take 60 seconds. With a fixed
+visibility timeout of 30s, the slow tail keeps reappearing on
+other workers, who also time out, ad infinitum.
+
+Three ways out:
+
+1. **Per-message extension**: workers heartbeat to extend the
+   visibility timeout while processing.
+2. **Route slow messages to their own queue** based on payload
+   inspection.
+3. **Time-out aggressively**: kill the worker if processing
+   exceeds X. Convert to a permanent failure (DLQ) above a
+   threshold.
+
+## Versus Kafka consumer groups
+
+Kafka's consumer groups (see **Partitions and consumer groups**)
+are the **partitioned** form of competing consumers. Workers
+compete, but each partition is owned by exactly one worker at a
+time. This gives per-partition ordering for free, at the cost of
+needing a partition key.
+
+A "single partition Kafka topic with N consumers" devolves to
+"one active consumer, N-1 idle" — Kafka enforces 1 consumer per
+partition within a group. For pure competing-consumer semantics
+without ordering, increase the partition count.
+
+## Combining with pub/sub
+
+A common topology: **pub/sub broadcast, then per-subscription
+competing consumers**.
+
+```
+[topic / SNS] ──→ [subscription A / queue A] ──→ workers A
+              ──→ [subscription B / queue B] ──→ workers B
+              ──→ [subscription C / queue C] ──→ workers C
+```
+
+Each consuming service gets its own queue and its own pool of
+workers competing on it. This is the standard shape for
+event-driven microservices: SNS → SQS → workers, or Kafka
+broadcast topics → consumer groups, where each group is a pool
+of competing consumers within itself.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Auto-ack with crash-prone work.** Auto-acking on receive
+silently downgrades to at-most-once. Always ack after the
+handler completes successfully.
+</Callout>
+
+<Callout variant="warning">
+**Visibility timeout too short.** Workers retry messages that
+are still processing. Duplicates and wasted work. Watch for
+"this message was processed 3 times" in logs.
+</Callout>
+
+<Callout variant="warning">
+**Prefetch too large.** One worker hoards 1000 messages, others
+sit idle. Set prefetch to a small multiple of concurrency.
+</Callout>
+
+<Callout variant="warning">
+**Competing consumers + ordering requirement.** Doesn't work.
+Either drop ordering or partition.
+</Callout>
+
+## In summary
+
+- **Competing consumers = one queue, many workers, one message
+  per worker.** The default scale-out pattern.
+- **At-least-once** by ack-after-process. Handlers must be
+  idempotent.
+- **Tune visibility timeout** to ~2-3x p99 processing time;
+  monitor for redeliveries.
+- **Queue depth is the SLI.** Auto-scale workers on it.
+- **Doesn't preserve order across messages.** Partition if you
+  need it.
+- **Pair with pub/sub** for "broadcast + parallel processing per
+  consumer" architectures.

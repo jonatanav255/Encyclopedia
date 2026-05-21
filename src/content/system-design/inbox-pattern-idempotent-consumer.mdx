@@ -1,0 +1,294 @@
+export const level = 'senior';
+
+# Idempotent consumer / inbox pattern
+
+If your broker is at-least-once (it is, regardless of marketing),
+your consumers will see duplicates. The **inbox pattern** turns
+that fact into a non-problem: each consumer remembers what it has
+already processed, atomically, and skips repeats.
+
+The result is **effectively-once** processing — at-least-once on
+the wire, exactly-once in business state.
+
+## The problem
+
+```js
+// Bug: this handler is not idempotent
+async function onOrderCreated(event) {
+  await db.orders.insert({ id: event.id, ...event });
+  await mailer.send(event.userEmail, 'Order confirmed');
+  await ledger.debit(event.userId, event.amount);
+}
+```
+
+The broker retries. The consumer crashes mid-handler. The
+producer's retry produces the same event ID with a new
+broker-side offset. Any of these duplicates the message — and the
+handler runs again.
+
+Consequences: duplicate orders, duplicate emails, double
+debits. The classic "we charged the customer twice" incident.
+
+## The inbox table
+
+The simplest idempotency primitive: a table whose primary key is
+the **event ID**. Insert before processing; if the insert fails
+(unique-key conflict), you've already processed it.
+
+```js
+const create = `
+  CREATE TABLE inbox (
+    event_id   UUID PRIMARY KEY,
+    consumer   TEXT NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`;
+```
+
+The handler becomes:
+
+```js
+async function onOrderCreated(event) {
+  await db.transaction(async (tx) => {
+    try {
+      await tx.inbox.insert({
+        event_id: event.id,
+        consumer: 'order-svc',
+      });
+    } catch (err) {
+      if (isUniqueViolation(err)) return; // already processed
+      throw err;
+    }
+
+    await tx.orders.insert({ id: event.id, ...event });
+    await tx.ledger.insert({ userId: event.userId, amount: event.amount });
+    // mailer.send is queued via outbox; see below
+  });
+}
+```
+
+Two critical properties:
+
+1. **The dedup insert and the side effect are in one
+   transaction.** Either both commit or both roll back. There is
+   no "marked processed but didn't do the work" state.
+2. **The event ID is provided by the producer**, not generated
+   on receipt. The producer's outbox row UUID, or a domain ID
+   that's unique per logical event.
+
+This is the **inbox** — a sibling of the **outbox**. The producer
+writes to its outbox; the broker delivers; the consumer commits
+to its inbox + state in one transaction. Together they bracket
+the broker with idempotency.
+
+## What counts as "the event ID"?
+
+Three sources, in decreasing preference:
+
+1. **Producer-assigned UUID** in the event envelope. Carried
+   through the broker. Surfaces as `event.id`.
+2. **Broker offset/sequence number**. Stable within a partition,
+   useful as a fallback. Doesn't help across producer retries
+   if the producer isn't idempotent.
+3. **Hash of payload**. Last resort. Same event with different
+   timestamps will hash differently; replays of the same event
+   that should be deduped will hash the same as their
+   predecessors only if the payload is bit-identical.
+
+```js
+// Best: UUIDv7 assigned by the producer
+const event = { id: uuidv7(), type: 'order.created', ... };
+```
+
+UUIDv7 is sortable, indexed efficiently in B-trees, and unique.
+This is the 2026 default.
+
+## Non-database side effects
+
+The clean version above assumed all side effects are DB writes.
+That's not realistic. Real consumers send emails, call third-party
+APIs, write to S3.
+
+The shape that works: **wrap non-DB effects in the outbox of
+that side**. The consumer's transaction commits "I've processed
+this event AND queued the email." A separate worker drains the
+queued effects, idempotently.
+
+```js
+await db.transaction(async (tx) => {
+  await tx.inbox.insert({ event_id: event.id });
+  await tx.orders.insert({ ...event });
+  await tx.outbox.insert({
+    type: 'send_email',
+    payload: { userId: event.userId, template: 'order_confirmed' },
+  });
+});
+// separate worker reads outbox, calls mailer with idempotency key = event.id
+```
+
+Now the consumer commit makes "process + send email" atomic in
+its local state. The email send is still at-least-once, but the
+mailer accepts an idempotency key (most do), so duplicates are
+collapsed at the external boundary.
+
+External APIs without idempotency support: you'll get duplicate
+calls. Best you can do is log them and reconcile.
+
+## Storage and pruning
+
+The inbox grows. With 1k events/sec, that's 86M rows/day, ~2.6B/month.
+You can't keep them forever.
+
+Three strategies:
+
+### Time-based pruning
+
+Keep N days; delete older.
+
+```js
+// Daily cron
+await db.inbox
+  .where('received_at < NOW() - INTERVAL "30 days"')
+  .delete();
+```
+
+Works because the broker's retention is shorter than N days.
+After 30 days, a duplicate of an event that old won't reappear
+anyway.
+
+### Watermark-based pruning
+
+Track the lowest offset/timestamp the broker can deliver. Delete
+inbox rows older than that watermark — they cannot be replayed.
+
+```
+broker retention horizon: 7 days
+inbox keeps: 14 days
+guaranteed safe.
+```
+
+This is the most accurate but requires understanding the broker's
+retention.
+
+### Bloom filter as L1
+
+For very high volume, the inbox table is the L2; an in-memory
+bloom filter is the L1.
+
+```js
+if (bloom.has(event.id) && await db.inbox.exists(event.id)) {
+  return; // duplicate
+}
+await db.transaction(async (tx) => {
+  await tx.inbox.insert(...);
+  bloom.add(event.id);
+  ...
+});
+```
+
+False positives on the bloom (~1%) cost an extra DB read; false
+negatives are impossible. Memory-bounded.
+
+## Window-based dedup
+
+For domains where duplicates only happen within a short window
+(seconds, minutes), you don't need a permanent inbox. A
+TTL'd cache works.
+
+```js
+// Redis dedup with 1-hour window
+const fresh = await redis.set(
+  `inbox:${event.id}`, '1', 'NX', 'EX', 3600,
+);
+if (!fresh) return;
+await process(event);
+```
+
+Pros: bounded memory, no DB pressure.
+Cons: not transactional with the side effect — a crash between
+`set` and `process` skips the message permanently. Only safe when
+the broker's redelivery window is shorter than the TTL **and**
+you accept the rare loss.
+
+For correctness-critical domains (financial, audit), stick with
+the transactional DB inbox.
+
+## Per-consumer vs shared inbox
+
+Each consumer has its own inbox. A single event consumed by three
+services produces three independent inbox rows (one per
+consumer), three independent decisions.
+
+```
+event.id = "abc-123"
+  → order-svc.inbox    (processes, side-effect = create order)
+  → mailer-svc.inbox   (processes, side-effect = send email)
+  → analytics-svc.inbox (processes, side-effect = increment counter)
+```
+
+Don't try to share an inbox table across services. Each service
+has independent deployment, independent retries, independent
+state. Sharing creates coupling and contention.
+
+## Combined with outbox: end-to-end effectively-once
+
+```
+[producer DB tx]  ────→ [outbox]
+       │
+       ↓
+   [publisher worker] (at-least-once to broker)
+       │
+       ↓
+   [broker] (durable, at-least-once delivery)
+       │
+       ↓
+   [consumer]
+       ↓
+[consumer DB tx]  ────→ [inbox + side effects]
+```
+
+At every hop, the work is idempotent. The producer's outbox
+publisher can retry forever; the broker can redeliver; the
+consumer can be re-invoked. The end-to-end effect is identical
+to "every event processed exactly once."
+
+This pattern is the foundation of every robust event-driven
+service. Stopford and Bellemare both treat it as the baseline
+shape for "events that matter."
+
+## Pitfalls
+
+<Callout variant="warning">
+**Dedup table outside the transaction.** "Insert into inbox,
+then in a separate DB call do the work" lets the second call
+fail without rolling back the first — and now the event is
+"processed" but the side effect didn't happen. Always one
+transaction.
+</Callout>
+
+<Callout variant="warning">
+**Event ID assigned on the consumer side.** A new ID per delivery
+means duplicates have different IDs. Useless. Producer assigns.
+</Callout>
+
+<Callout variant="warning">
+**Pruning before the broker's retention horizon.** A replayable
+broker can deliver a 30-day-old event. If you prune at 7 days,
+you'll process it again.
+</Callout>
+
+<Callout variant="warning">
+**No index on event_id.** It is the primary key, but check —
+seen in the wild where someone added a surrogate ID and made
+event_id a non-unique column. Lookups become full table scans.
+</Callout>
+
+## In summary
+
+- **Brokers are at-least-once.** Consumers need to be idempotent.
+- **Inbox table keyed on event_id**, inserted in the same
+  transaction as the side effect → effectively-once.
+- **Producer-assigned UUIDs** are the right event ID.
+- **Combine with outbox** for end-to-end effectively-once.
+- **Prune** older than the broker's retention horizon.
+- **Per-consumer inbox**, never shared.

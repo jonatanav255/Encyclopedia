@@ -1,0 +1,262 @@
+export const level = 'staff';
+
+# Multi-tenancy isolation
+
+A multi-tenant system serves many independent **tenants**
+(customers, organizations, accounts) from shared infrastructure.
+The architectural choice — how strongly each tenant is isolated
+from the others — drives nearly everything else: cost per
+tenant, blast radius of a bug, performance characteristics, the
+compliance story, and the migration path as the business grows.
+
+The canonical taxonomy is **pool**, **silo**, and **bridge**.
+Pick one per resource (compute, storage, network, identity);
+mix per layer; revisit per customer tier.
+
+## The three models
+
+<Cheatsheet>
+| Model | What | Cost per tenant | Isolation | Blast radius |
+|---|---|---|---|---|
+| Pool | All tenants share one set of resources | Lowest | Logical (tenant ID in every query) | High — a bug or noisy neighbor affects everyone |
+| Silo | Each tenant gets its own resources | Highest | Physical (separate DB, separate cluster) | Lowest — issues contained to one tenant |
+| Bridge | Mixed: some resources pooled, some siloed | Middle | Depends on which is which | Tunable |
+
+</Cheatsheet>
+
+Real systems are almost always bridges. The interesting choice
+is **which** resources to pool and which to silo.
+
+## Pool model
+
+A single application instance, a single database, a single
+cache. Every record has a `tenant_id`. Every query filters by
+it. Every cache key includes it.
+
+```ts
+async function getOrders(req) {
+  return db.query(
+    'SELECT * FROM orders WHERE tenant_id = $1 AND user_id = $2',
+    [req.tenant.id, req.user.id]
+  );
+}
+```
+
+Wins:
+
+- **Cheapest** at scale. One DB, one cluster, one rotation. The
+  per-tenant marginal cost approaches zero.
+- **Easiest to operate.** One thing to monitor, patch, back up.
+- **Best for small tenants** that don't justify their own
+  infrastructure.
+
+Costs:
+
+- **Noisy neighbor.** One tenant's heavy query slows everyone.
+  See latency tails and resource quotas.
+- **Single point of compromise.** A SQL injection or missing
+  `tenant_id` filter is catastrophic — leaks across all
+  tenants.
+- **Hard to give per-tenant compliance.** "Our data lives in
+  region X" or "we have a separate backup" needs a fundamentally
+  different architecture.
+- **Database scale limits.** One Postgres can't grow forever.
+
+The pool model **requires discipline** at every query site. A
+single missing `WHERE tenant_id = ?` is a cross-tenant data
+leak. Defenses:
+
+<Steps>
+<Step n={1} title="A query layer that injects tenant_id automatically.">
+Wrap the DB access so every query takes a `TenantContext` and
+the SQL is built with it. Bare queries are forbidden.
+</Step>
+<Step n={2} title="Row-level security at the database.">
+PostgreSQL's RLS feature enforces `tenant_id = current_setting('app.tenant')`
+in the DB itself. The app sets the session variable; the DB
+enforces. Even a SQLi gets caught.
+</Step>
+<Step n={3} title="Per-tenant audit trails.">
+Every cross-tenant query is logged and alerted on.
+</Step>
+<Step n={4} title="Test cross-tenant access in CI.">
+Property tests that try to access another tenant's data and
+assert it fails. Run on every PR.
+</Step>
+</Steps>
+
+## Silo model
+
+Each tenant gets its own instance: separate database, possibly
+separate application servers, sometimes a separate cluster.
+
+```
+tenant A → DB_A, Redis_A, app pods labeled tenant=A
+tenant B → DB_B, Redis_B, app pods labeled tenant=B
+tenant C → DB_C, Redis_C, app pods labeled tenant=C
+```
+
+Wins:
+
+- **Strong isolation.** A bug in one tenant's instance doesn't
+  reach another's data.
+- **Per-tenant compliance.** "Customer-managed encryption keys,"
+  "data resident in Frankfurt," "DBA-level audit" — easy when
+  it's a dedicated stack.
+- **Performance isolation.** No noisy neighbor; each tenant has
+  guaranteed resources.
+- **Cleaner blast radius for incidents.** A bad deploy can be
+  rolled out per-tenant.
+
+Costs:
+
+- **Operational overhead grows linearly.** 1000 tenants = 1000
+  databases to monitor, back up, upgrade. Automation is
+  mandatory.
+- **Cost per tenant is high.** Idle resources for low-usage
+  tenants are a real expense.
+- **Cross-tenant aggregations are hard.** Analytics "across all
+  tenants" requires federation.
+- **Schema migrations are 1000 migrations.** Orchestrated, slow,
+  and you'll have stragglers.
+
+The silo model fits **regulated industries** and **enterprise
+tiers** where customers contractually require it.
+
+## Bridge model
+
+Mix. Per resource:
+
+<Cheatsheet>
+| Resource | Pool or silo? | Why |
+|---|---|---|
+| App servers | Pool (stateless) | Cheap to scale; no data to isolate |
+| Identity / auth | Pool (single tenant directory) | Simpler operations |
+| Database | Per-tier — pool small, silo enterprise | Cost vs isolation |
+| File storage | Per-tenant prefix in shared bucket | IAM-enforced isolation, cheap |
+| Background jobs | Pool with per-tenant queues | Fairness + cost |
+| Analytics warehouse | Pool with tenant_id partitioning | Cross-tenant rollups easy |
+
+</Cheatsheet>
+
+The shape: most things are pooled (cheap), the few things that
+**must** be isolated for compliance or noisy-neighbor reasons
+are siloed. The hard part is keeping the bridge intentional —
+"silo if you must, pool if you can" is the working principle.
+
+## Pool with hard partitioning
+
+A middle pattern that's often underused: pool, but partition the
+shared resources so each tenant has carved-out capacity.
+
+Examples:
+
+- **Postgres with declarative partitioning** by `tenant_id`.
+  Each partition is independently maintainable, vacuumable,
+  index-tunable.
+- **Cassandra / DynamoDB** with `tenant_id` as the partition
+  key — work is bounded to a single partition per tenant.
+- **Kafka with per-tenant topics** or per-tenant partitions.
+  Consumer lag, throughput, and rate-limiting are per-tenant.
+- **Kubernetes namespaces** per tenant with resource quotas.
+  Noisy neighbor bounded by quota.
+
+It looks like a pool from a cost perspective and a silo from a
+fairness perspective.
+
+## Compute isolation: pods, VMs, accounts
+
+The shared-infrastructure spectrum, in order of strength:
+
+- **Process isolation** (multiple tenants in one process) —
+  weakest. Bugs in one tenant's code can read another's
+  memory.
+- **Container isolation** (separate pods per tenant) —
+  reasonable. The kernel is still shared; container escapes
+  exist but are rare.
+- **VM isolation** (separate VMs) — strong. Hypervisor escapes
+  are rarer still.
+- **Account isolation** (separate AWS/GCP accounts per tenant)
+  — strongest in the cloud. The IAM boundary is the trust
+  boundary.
+
+For per-customer compliance ("they get their own AWS account"),
+account-level isolation is increasingly the answer. AWS Control
+Tower and similar tooling make this tractable.
+
+## Noisy neighbor mitigation
+
+Even in a pool model, you can prevent one tenant from ruining
+others' day:
+
+- **Per-tenant rate limits** at the API gateway.
+- **Per-tenant DB connection budgets** — no tenant can take more
+  than N pool slots.
+- **Per-tenant query timeouts** — kill long-running queries
+  bounded to the tenant.
+- **Per-tenant CPU shares** in batch / async work — fair-queue
+  the worker pool.
+- **Tail-latency-aware load shedding** — when p99 climbs, shed
+  load from the worst tenant before degrading everyone.
+
+Without these, the pool model is fragile against a single
+heavy user.
+
+## Identity and auth
+
+Multi-tenant auth has its own architectural choices:
+
+- **Shared user directory with `tenant_id` scoping.** One user
+  belongs to one tenant. Cheap.
+- **Federated** — each tenant brings its own identity provider
+  (SAML, OIDC). Critical for enterprise.
+- **Per-tenant OAuth client / signing key** — useful when
+  tenants integrate with you and you want their integrations
+  scoped.
+
+The architectural rule: **never** assume a user from tenant A
+can be authorized to do anything in tenant B without explicit
+elevation. Tenant scoping at the token level, then validated at
+every layer.
+
+## Migrating tiers: pool → silo
+
+A common scaling story: free tier is pooled; paid tier is pooled
+with partitions; enterprise tier is siloed. The migration paths
+to support:
+
+- **Pool → silo for one tenant**: copy that tenant's data to a
+  dedicated DB, switch the routing layer to point them to it,
+  delete from the pool. Doable; downtime depends on data
+  volume.
+- **Silo → silo across regions**: replicate, cut over, retire.
+- **Pool → pool with hard partitioning**: usually a schema
+  change; can be done with table partitioning and minimal
+  downtime.
+
+Building the routing layer that knows "tenant X lives on shard
+Y or in dedicated instance Z" early pays for itself the first
+time you need to migrate.
+
+<Callout variant="warning">
+The most expensive multi-tenant migration is from **pool with
+no `tenant_id` discipline** to anything else. A codebase where
+queries assume "one DB, all users" is a multi-quarter rewrite to
+introduce tenant scoping. Bake `tenant_id` into the model and
+the query layer from day one even if you stay pooled forever.
+</Callout>
+
+## In summary
+
+- Three models: pool, silo, bridge. Real systems are bridges.
+- Pool is cheapest, riskiest; silo is safest, most expensive.
+- Pool requires discipline — automated `tenant_id` injection,
+  row-level security, cross-tenant tests.
+- Silo requires automation — 1000 tenants is 1000 databases to
+  manage.
+- The interesting question is per-resource: which resources to
+  pool, which to silo.
+- Per-tenant rate limits and quotas prevent the pool from
+  being noisy-neighbored.
+- Build the tenant-routing layer early; it underpins every
+  future migration.

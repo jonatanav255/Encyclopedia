@@ -1,0 +1,189 @@
+export const level = 'senior';
+
+# Pipes and filters
+
+A pattern where data flows through a series of **filters**
+(processing stages), connected by **pipes** (queues or
+streams). Each filter transforms its input and emits to the
+next pipe. Each filter is independently scalable and testable.
+
+It's Unix's design (`grep ... | sort | uniq`). It's behind
+Kafka Streams topologies, Apache Beam, MapReduce, ETL
+pipelines, modern stream-processing frameworks.
+
+## The shape
+
+```
+input → [filter A] → pipe → [filter B] → pipe → [filter C] → output
+```
+
+Each filter:
+
+- Reads from its input pipe.
+- Processes one record at a time (or in micro-batches).
+- Emits to its output pipe.
+- Is stateless or holds small, well-defined state.
+
+Pipes can be in-process channels (Go channels, RxJS streams)
+or external (Kafka topics, SQS queues).
+
+## Why it works
+
+- **Composability.** Add or reorder filters without rewriting
+  the others.
+- **Independent scaling.** A slow filter gets more replicas;
+  others don't.
+- **Backpressure.** A slow downstream filter signals upstream
+  to slow down via the pipe's bounded buffer.
+- **Testability.** Each filter is a function `(input) =>
+  output` — easy to test in isolation.
+- **Resilience.** A filter crash doesn't kill the others; on
+  restart, it picks up from where it left off.
+
+## Example: log processing
+
+```
+raw_logs → [parse] → parsed → [enrich w/ geo] → enriched → [aggregate] → metrics_db
+                                                                              ↓
+                                                                       [index search] → search_db
+```
+
+- `parse`: structured-log conversion.
+- `enrich`: lookup geo from IP.
+- `aggregate`: per-minute counters.
+- `index`: feed search index.
+
+Adding a new sink (e.g., archive to S3) = a new filter
+reading from `enriched`. No change to upstream.
+
+## Per-filter design
+
+A good filter is:
+
+- **Pure**: same input → same output, no hidden state.
+- **Idempotent**: safe to re-run on the same input. The
+  next stream replay shouldn't double-count.
+- **Bounded latency**: a stuck filter blocks the whole
+  pipeline.
+- **Observable**: emits metrics for throughput, errors,
+  lag.
+
+Pipeline:
+
+```ts
+async function enrichGeo(record: ParsedLog): Promise<EnrichedLog> {
+  const geo = await geoLookup(record.ip);
+  return { ...record, geo };
+}
+```
+
+Stateless. Idempotent. Easy to test.
+
+## State in a filter
+
+Some filters need state (e.g., windowed aggregation):
+
+```ts
+class MinutelyCounter {
+  private buckets = new Map<string, number>();
+  
+  process(record: EnrichedLog) {
+    const bucket = floorMinute(record.ts);
+    const key = `${record.service}:${bucket}`;
+    this.buckets.set(key, (this.buckets.get(key) ?? 0) + 1);
+  }
+  
+  flush(now: number) {
+    // emit closed buckets, evict from memory
+  }
+}
+```
+
+Stateful filters are harder: failover means losing the buffer.
+Stream frameworks (Flink, Kafka Streams) checkpoint state to
+allow recovery.
+
+## In-process vs out-of-process pipes
+
+<Compare a="In-process" b="Out-of-process">
+<>
+Cheap (function calls or channels). No serialization
+overhead. No persistence — crash loses in-flight data.
+Within one service.
+</>
+<>
+Durable (Kafka, SQS). Survives crashes. Filters scale
+independently. Pay serialization, network, and ops cost.
+Cross-service.
+</>
+</Compare>
+
+The two coexist: a Kafka topic between major stages, with
+in-process pipelines inside each stage's process.
+
+## When pipes-and-filters wins
+
+- **Streaming ETL** — data flowing from source to warehouse
+  with transformations.
+- **Event processing** — react to events, fan out to multiple
+  sinks.
+- **Log/metrics pipelines** — Vector, Fluent Bit, OpenTelemetry
+  Collector all use this pattern.
+- **Command-line tools** — Unix pipes; orchestration of small
+  programs.
+- **Image / video processing** — decode → resize → encode →
+  upload, each as a filter.
+
+## When it doesn't
+
+- **Tight latency** — every pipe adds queueing and
+  serialization. For sub-ms paths, monolithic code wins.
+- **Strong consistency** across the whole pipeline — pipes
+  introduce eventual consistency by design.
+- **Random access** — pipes are forward-only. If you need to
+  query past data, you need a separate store.
+
+## Backpressure
+
+A pipe with infinite buffer = memory exhaustion when consumers
+are slow. Always bound buffer sizes:
+
+- In-process: bounded channel; sender blocks when full.
+- Out-of-process: Kafka has configurable retention; consumers
+  must keep up or get truncated; alerts on consumer lag.
+
+(See backpressure.)
+
+## Failure handling
+
+- **Retry within filter** for transient failures.
+- **Dead-letter pipe** for poison records; manual review.
+- **Idempotent sinks** so replay is safe.
+- **Checkpoint state periodically** so a crashed filter can
+  resume.
+
+## Modern stream-processing frameworks
+
+Apache Beam, Flink, Kafka Streams, Spark Streaming, ksqlDB —
+all are domain-specific pipes-and-filters implementations
+with:
+
+- A DSL for defining pipelines.
+- Stateful operators (windowing, joins, aggregations).
+- Exactly-once semantics via checkpoints.
+- Auto-scaling of operator parallelism.
+
+If you're building anything beyond simple per-record
+transformation, use one of these instead of hand-rolling.
+
+## In summary
+
+- Pipes and filters: stages connected by queues; data flows
+  one direction.
+- Composable, independently scalable, testable, naturally
+  backpressured.
+- In-process pipes for low-latency; out-of-process for
+  durability and cross-service.
+- Stateful filters need checkpointing for recovery.
+- Modern stream-processing frameworks productize the pattern;
+  use them for non-trivial pipelines.

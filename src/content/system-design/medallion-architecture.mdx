@@ -1,0 +1,192 @@
+export const level = 'senior';
+
+# Medallion architecture (bronze/silver/gold)
+
+A naming convention from Databricks for **layered data
+curation** in a lakehouse:
+
+- **Bronze**: raw ingested data, mostly untransformed.
+- **Silver**: cleaned, standardized, joined data.
+- **Gold**: business-level aggregates, ready for consumption.
+
+Data flows bronze → silver → gold. Each layer has higher
+quality, more transformation, smaller volume, and broader
+consumer audience.
+
+## What each layer holds
+
+### Bronze (raw)
+
+- Direct copy of source systems' data.
+- Minimal transformation: format conversion, basic
+  partitioning by date.
+- Schema may evolve to match source changes.
+- Often append-only.
+
+Examples: raw Kafka topics dumped as parquet, daily Salesforce
+extracts, application database CDC streams.
+
+### Silver (cleaned)
+
+- Deduplicated, validated, joined to dimension tables.
+- Schema enforced; quality tested.
+- One or more "natural-key + history" tables.
+- The canonical source for analytic workloads.
+
+Examples: cleaned customer table, fact_orders with foreign
+keys resolved, deduplicated event stream.
+
+### Gold (business-ready)
+
+- Pre-aggregated to the grain consumers need.
+- Optimized for specific dashboards or APIs.
+- Multiple gold tables per silver source — different
+  consumers, different shapes.
+
+Examples: daily KPI dashboard, ML feature tables, BI cube.
+
+## Why the layering
+
+Bronze is **immutable** and **complete**. If silver / gold
+ever has a bug, you can rebuild them by re-running transforms
+on bronze.
+
+Silver is **curated** and **stable**. Changing source schemas
+in bronze shouldn't break gold consumers; the silver layer
+absorbs the change.
+
+Gold is **disposable**. Build many gold tables for many use
+cases; rebuild any of them from silver.
+
+## Concrete shape in dbt
+
+```
+models/
+  staging/         # bronze: copies of source tables
+    stg_orders.sql
+    stg_users.sql
+  intermediate/    # silver: cleaned, joined
+    int_orders_enriched.sql
+  marts/           # gold: consumer-facing
+    finance/
+      daily_revenue.sql
+    product/
+      user_engagement.sql
+```
+
+dbt's recommended project structure mirrors medallion exactly.
+
+## Why bronze matters
+
+Without preserving raw data:
+
+- You can't fix a transformation bug without re-extracting
+  from sources (expensive, sometimes impossible).
+- New use cases must wait for new pipelines.
+- Audit / compliance can't go back to "what did the source
+  actually send?"
+
+Bronze keeps the option open. Storage is cheap; lost data
+isn't replaceable.
+
+## Schema in each layer
+
+<Cheatsheet>
+| Layer | Schema |
+|---|---|
+| Bronze | Loose (matches source); evolves with source |
+| Silver | Strict (validated, typed); evolves carefully |
+| Gold | Strict (denormalized for consumers); evolves rarely |
+</Cheatsheet>
+
+Schema changes propagate from bronze upward. A new column in
+the source appears in bronze immediately; it must be
+explicitly added to silver, then to gold if relevant.
+
+## Quality checks per layer
+
+- **Bronze**: minimal — file exists, row count > 0.
+- **Silver**: extensive — uniqueness, referential integrity,
+  null rates, business rules.
+- **Gold**: metric-level — total revenue matches expected,
+  aggregates sum correctly.
+
+dbt + Great Expectations + Soda are the standard testing
+stack.
+
+## When to use it
+
+- Lakehouse with multiple consumers of the same data.
+- Data evolves; pipelines need to be rebuildable.
+- Audit / compliance requires raw retention.
+- Multiple gold use cases per silver dataset.
+
+When you don't need it:
+
+- Tiny project with one consumer.
+- Pure operational system (no analytics).
+- Data is ephemeral (no need to keep raw history).
+
+## Common antipatterns
+
+### Skipping silver
+
+"Bronze → gold directly" looks faster but creates problems:
+
+- Many gold tables each re-implement the same cleaning logic.
+- A bug in cleaning needs N gold tables fixed.
+
+Silver is the de-duplication of cleaning logic.
+
+### Gold as the only consumer interface
+
+A consumer needs a slightly different grain or filter, but
+the gold table doesn't match. So they build their own from
+silver. Now there are multiple "gold" sources of the same
+data.
+
+Fix: govern gold tables; encourage consumer requests through
+the data team rather than ad-hoc builds.
+
+### Bronze grows forever
+
+Without retention, bronze accumulates terabytes. Storage cost
+grows.
+
+Fix: bronze retention policies (e.g., 2 years of raw data,
+older to archive tier).
+
+### Silver tables that are gold in disguise
+
+Silver should be the cleaned-and-typed version of bronze, not
+the consumer-shape. A "daily revenue" silver table is doing
+gold's job; rename.
+
+## Variants
+
+### Bronze / silver / gold / platinum
+
+Some teams add a "platinum" layer for ML features or
+machine-readable APIs.
+
+### Just bronze and gold
+
+Skip silver if there's only one consumer and cleaning logic
+is small.
+
+### Per-domain mesh
+
+In data mesh, each domain has its own medallion stack. The
+platform's job: enforce the medallion convention across
+domains.
+
+## In summary
+
+- Medallion architecture: bronze (raw) → silver (cleaned) →
+  gold (business-ready).
+- Bronze preserves raw history for rebuildability.
+- Silver is the canonical clean source; gold is consumer-shaped.
+- Quality checks heaviest in silver; metric-level in gold.
+- dbt's recommended structure mirrors medallion.
+- Skip silver only for trivial projects; otherwise it's the
+  de-duplication of cleaning logic.

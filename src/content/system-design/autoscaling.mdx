@@ -1,0 +1,282 @@
+export const level = 'mid';
+
+# Autoscaling
+
+Autoscaling means "add capacity automatically when load goes
+up, and remove it when load goes down." It is one of the most
+attractive ideas in cloud computing and one of the easiest to
+get badly wrong. Most autoscaling outages aren't from too
+little capacity — they're from autoscaling reacting to the wrong
+signal, too slowly, or too fast.
+
+## What autoscaling actually solves
+
+Three real problems:
+
+1. **Variable load.** Daily peaks 3× troughs. Black Friday is
+   100× normal. Without autoscaling, you size for peak and pay
+   for idle servers 23 hours a day.
+2. **Failed nodes.** A replica dies; autoscaling brings up a
+   replacement.
+3. **Bursty traffic.** Marketing email goes out, traffic
+   spikes for 10 minutes, autoscaling expands and contracts.
+
+It does not solve:
+
+- A bottleneck downstream (DB, cache, broker). Adding app
+  servers when the database is the bottleneck makes things
+  worse — more connections, more contention.
+- Slow code. If a request takes 5 seconds, autoscaling will
+  scale you to a thousand replicas and the user still waits
+  5 seconds.
+- Cost. Autoscaling can lower your bill, but only if your code
+  releases resources properly during scale-in.
+
+## The two flavors
+
+### Reactive autoscaling
+
+Watch a metric. When it crosses a threshold, scale. When it
+falls, scale back. Most cloud autoscalers (AWS ASG, GCP MIG,
+K8s HPA) are reactive.
+
+```
+if avg_cpu > 70% for 2 minutes → add 1 instance
+if avg_cpu < 30% for 5 minutes → remove 1 instance
+```
+
+Pros: simple, no prediction needed. Cons: always lags real
+load. By the time CPU hits 70%, the queue is already growing.
+
+### Predictive autoscaling
+
+Forecast load from historical patterns (time of day, day of
+week, marketing schedule) and provision ahead of the spike.
+
+Pros: capacity is ready before the spike hits. No warm-up lag.
+Cons: forecasts are wrong. Unanticipated spikes still fall
+through. Costs more (you're paying for capacity you might not
+need).
+
+Production reality: most teams use **reactive** with
+**scheduled minimums** — predefined floor capacity at known
+busy times (Monday morning, retail Friday evening, etc.), with
+reactive scaling above that. Pure prediction is rare.
+
+## What signal to scale on
+
+This is the single biggest cause of autoscaling failure: scaling
+on a signal that doesn't represent saturation.
+
+<Cheatsheet>
+| Signal | Good for | Bad for |
+|---|---|---|
+| CPU utilization | CPU-bound services (image processing, ML, JSON parsing). | I/O-bound services where 100% CPU isn't your bottleneck. |
+| Request rate (RPS) | Predictable per-request cost services. | When request cost varies a lot (cheap GET vs expensive search). |
+| Latency (p95/p99) | Detecting saturation regardless of cause. | Reactive only — by the time latency is bad, you're already in trouble. |
+| Queue depth (workers) | Async workers. The most accurate signal for queue-driven systems. | Synchronous services with no explicit queue. |
+| Connection count | Long-lived connection servers (WebSocket). | HTTP services where connections are short. |
+| Custom (business metric) | "Active games" for game servers, "active streams" for video. | Complexity — you have to define and emit the metric. |
+| Memory utilization | Memory-bound services (caches, in-memory DBs). | Most app servers (memory usually isn't the bottleneck). |
+</Cheatsheet>
+
+The mistake new teams make: **CPU on a Node.js or Python app
+server**. These services are I/O-bound — they spend most of
+their time waiting on the DB or downstream APIs, with low CPU.
+By the time CPU hits 70%, the service is wildly overloaded on
+its actual bottleneck (event loop lag, connection saturation).
+
+For Node.js, scale on **event loop lag** or **p95 latency**.
+For background workers, scale on **queue depth**. For
+classic synchronous services, scale on **request rate
+per replica**.
+
+## Warm-up and cold-start
+
+Autoscaling can only add capacity as fast as a new instance
+becomes useful. That gap is **warm-up time**:
+
+- VM boot + OS + container pull: 30–120 s.
+- App startup, JIT warm-up, cache warm: 30 s – several minutes.
+- Health-check passes, LB registers: 10–30 s.
+
+In the worst case, you've signaled "add a server" 5 minutes
+before that server actually carries traffic. If your spike is
+30 seconds long, autoscaling missed it entirely.
+
+Mitigations:
+
+- **Keep a warm baseline** of N replicas — never scale below it
+  during known-busy hours.
+- **Pre-pull container images** on standby nodes.
+- **Optimize startup**. AOT-compile, prefetch dependencies,
+  warm caches from a shared source.
+- **Use serverless** for truly unpredictable bursts. Functions
+  cold-start fast (low hundreds of ms for modern platforms),
+  scale to thousands of concurrent invocations in seconds.
+
+<Callout variant="warning">
+The most common autoscaling outage: load spike arrives, the
+existing replicas saturate, latency goes through the roof,
+autoscaler kicks in. New replicas take 90 s to start. During
+those 90 s, queues fill, retries amplify load, and the system
+melts. By the time new capacity is up, the spike is over and
+you're paying for replicas you don't need.
+</Callout>
+
+## Scale-in is the dangerous direction
+
+Scale-out adds capacity. The worst case is "you spent some
+money on idle servers." Scale-in removes capacity — and that
+can fail much harder:
+
+- **Active connections get killed**. Long-running uploads,
+  WebSockets, large queries cut mid-flight.
+- **In-flight work is lost** if the service doesn't drain
+  gracefully.
+- **Caches go cold** when a replica is destroyed; the remaining
+  replicas absorb the load of cold-start traffic.
+
+Patterns that mitigate scale-in damage:
+
+- **Graceful shutdown**: on `SIGTERM`, stop accepting new
+  requests, drain in-flight ones, then exit. Health-check
+  fails before the LB sends a SIGKILL.
+- **Connection draining**: LBs (ALB, NLB, K8s) support draining
+  — new connections go elsewhere; existing connections finish.
+- **Termination delays**: don't scale in faster than the
+  longest acceptable request duration.
+- **Slower scale-in than scale-out**. Scale out aggressively
+  (it's safe); scale in conservatively (it's destructive).
+
+Most autoscaler configs ship with `scale_out_cooldown = 60s`
+and `scale_in_cooldown = 300s` for exactly this reason.
+
+## Autoscaling and downstream dependencies
+
+When the app tier scales out, every downstream system feels it:
+
+- **Database connections**: 10 → 50 replicas at 100 connections
+  each = 5000 connections to Postgres, which maxes at ~500
+  without PgBouncer. Add a connection pooler before
+  autoscaling the app tier.
+- **Cache hit rate**: more replicas = each has a smaller share
+  of traffic = local caches are colder = more hits to Redis or
+  DB.
+- **Rate limits on third-party APIs**: doubling your app tier
+  doubles outbound traffic. Make sure the provider can handle
+  it.
+
+The app tier's autoscaling group must be sized to a database
+that can support the maximum scale-out. Otherwise you've moved
+the bottleneck downstream.
+
+## Kubernetes HPA, VPA, CA
+
+The three Kubernetes autoscalers, in case the term comes up:
+
+- **HPA (Horizontal Pod Autoscaler)**: scales pod replicas.
+  The closest analog to traditional ASGs.
+- **VPA (Vertical Pod Autoscaler)**: changes pod resource
+  requests (more CPU/RAM per pod). Often used for batch jobs
+  where horizontal doesn't fit.
+- **CA (Cluster Autoscaler)**: adds nodes to the cluster when
+  pods can't be scheduled. Sits below HPA.
+
+HPA + CA is the typical pair: HPA decides "we need 20 pods,"
+CA notices "we need another VM to fit 20 pods," cloud provider
+provides it.
+
+## Serverless autoscaling
+
+Functions-as-a-service (AWS Lambda, Google Cloud Functions,
+Cloudflare Workers) autoscale to thousands of concurrent
+executions per second with no config. You write a function;
+the platform handles capacity entirely.
+
+Tradeoffs:
+
+- **Pros**: zero capacity planning. Pay per invocation. Truly
+  bursty workloads (sporadic) cost almost nothing.
+- **Cons**: cold starts (especially on JVM/CLR). Limited
+  execution time. Vendor lock-in. Hard to use for stateful or
+  long-running work.
+
+For unpredictable, spiky, mostly-async work, serverless beats
+traditional autoscaling. For steady-state services with
+predictable load, containers/VMs are cheaper and faster.
+
+## Cost vs capacity
+
+Autoscaling promises elasticity. The dishonest sell: "you'll
+pay only for what you use." The honest version:
+
+- You'll pay for **your peaks plus your warm baseline plus
+  buffer**.
+- Provisioning is **lossy** — instances are usually billed in
+  whole hours or whole instances, not seconds.
+- **Reserved capacity** (1–3 year commits) is 30–60% cheaper
+  than on-demand. Past a stable baseline, reserved beats
+  autoscaled.
+
+The right config is usually: **reserved instances for the
+baseline + autoscaled on-demand for the peaks + spot/preemptible
+for non-critical work**.
+
+## Common pitfalls
+
+### Scaling on CPU for I/O-bound services
+
+Already covered, but worth repeating: a Node.js app at 30% CPU
+might be hitting event loop lag of 200 ms. CPU never gets
+high. Latency-based scaling catches this; CPU-based scaling
+doesn't.
+
+### Aggressive scale-in on health blips
+
+A transient health check failure triggers scale-in. The
+replicas that "failed" come back, but autoscaler already
+replaced them — net effect is a cold-cache event for no reason.
+Use cooldowns and require sustained signal before acting.
+
+### Retry storms during scale-out lag
+
+Existing replicas saturate; clients retry; retries amplify
+load; replicas degrade further. By the time new capacity
+arrives, the system is in a feedback loop. Mitigate with
+exponential backoff + jitter on clients, load shedding on
+servers, and circuit breakers between tiers.
+
+### Missing minimum replicas
+
+Setting `min_size = 1` means autoscaler can take you to one
+replica. Lose that replica and you're out. Always
+`min_size >= 2` for any non-trivial service, in different AZs.
+
+### Per-instance state breaking scale-in
+
+Replica holds cached data, an in-progress upload, an active
+WebSocket. Scale-in destroys it. See stateless-services. If
+your service has state, it can't be autoscaled freely.
+
+### Autoscaling everything
+
+Some services should be fixed-size: caches (autoscaling
+invalidates the cache), stateful coordinators (you don't add a
+second leader), single-purpose orchestrators. Autoscaling is
+for stateless tiers.
+
+## In summary
+
+- Reactive autoscaling on the right signal is the default.
+  Predictive is rare and oversold.
+- For I/O-bound services, scale on latency, queue depth, or
+  event-loop lag — not CPU.
+- Warm-up gap means autoscaling is bad at very short spikes.
+  Keep a warm baseline and consider serverless for spikes.
+- Scale-in is the dangerous direction. Drain gracefully, slow
+  down the in-cooldown, plan for connection cleanup.
+- Verify downstream can absorb your max scale-out. Pool DB
+  connections.
+- Reserved baseline + autoscaled peaks beats pure autoscaling
+  on cost.

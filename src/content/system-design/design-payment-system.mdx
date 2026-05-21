@@ -1,0 +1,362 @@
+export const level = 'staff';
+
+# Design a payment system
+
+A payment system moves money between parties: a customer pays
+a merchant, a merchant gets paid out, refunds happen, disputes
+get resolved. The interesting parts: **exactly-once semantics**,
+idempotency, double-entry bookkeeping, integration with external
+networks (card schemes, bank rails), reconciliation, and
+regulatory constraints.
+
+Mistakes in this system cost money in dollars, not in pages
+loaded. Many of the design choices look paranoid until you've
+seen what happens without them.
+
+## 1. Clarify the scope
+
+- Accept card payments at checkout (online).
+- Process refunds, chargebacks.
+- Merchant payouts.
+- Multi-currency, multi-country.
+- Reporting/reconciliation for accounting + audit.
+- PCI scope minimization (don't store raw card numbers).
+- Fraud: out of scope (separate system; we feed it signals).
+- Subscription billing: out of scope here.
+
+## 2. Estimate scale
+
+```
+Daily transactions   = 50M
+Avg TXN value        = $50
+Peak TPS             = 50M / 10^5 × 3 = ~1 500 TPS sustained, 10K TPS spike
+
+Storage:
+  transactions       = 50M × 5 KB = 250 GB/day (with audit log)
+  yearly             = 90 TB (kept indefinitely for regulatory)
+  ledger entries     = ~3-4 per txn (double-entry) → 200M/day
+
+Latency target:
+  authorization      = < 1 s p99 (user waits)
+  capture/settle     = within minutes; not user-facing
+  payout             = T+1 or T+2 to merchant bank
+
+Availability:
+  payments money path = 99.99%+; downtime is direct revenue loss
+```
+
+The system isn't huge by Twitter/YouTube standards; what matters
+is **correctness, durability, and auditability** at moderate
+volume.
+
+## 3. API
+
+```bash
+# Customer-facing
+POST /v1/payment_intents
+  Idempotency-Key: <client-uuid>
+  Body: { amount, currency, merchantId, paymentMethodToken }
+  Resp: { id, status: "requires_action"|"succeeded"|"failed", clientSecret }
+
+POST /v1/payment_intents/:id/confirm
+
+POST /v1/refunds
+  Idempotency-Key: <key>
+  Body: { paymentIntentId, amount? }
+
+# Merchant
+GET  /v1/balance
+GET  /v1/transactions
+POST /v1/payouts
+  Body: { amount, destination }
+
+# Internal events
+Webhook: payment.succeeded, payment.failed, charge.refunded, chargeback.created
+```
+
+**Every state-changing API takes an `Idempotency-Key`.** Without
+this, the system is broken — a retried POST after a timeout
+would charge the customer twice.
+
+## 4. High-level design
+
+```
+[ checkout client ]  → [ Edge / gateway (TLS, WAF, PCI-scope iframe) ]
+       │                          │
+       │                          ↓
+       │                 [ Tokenization service ]   ──→  [ Vault ]
+       │                                                 (PCI-scoped)
+       ↓
+[ Payment intent service ]
+       │
+       ├──→ [ Payments DB (intents, transactions) ]
+       ├──→ [ Idempotency store (Redis + DB) ]
+       ↓
+[ Authorization service ]   ──→  [ Card networks / acquirers / banks ]
+       │                                  ↓
+       ↓                                  response
+[ Capture / settlement worker ]
+       │
+       ↓
+[ Ledger service ]   --→  [ Double-entry ledger DB ]
+       │
+       ↓
+[ Reconciliation jobs ]   ←── [ Bank statements ]   [ Network reports ]
+       │
+       ↓
+[ Payout service ]   ──→  [ Bank rails (ACH/SEPA/wires) ]
+
+Webhooks/events ↓
+[ Event service ] → [ Kafka ] → merchants + internal consumers (fraud, analytics)
+```
+
+Two strict design rules:
+
+- **All money state lives in the ledger.** Other services hold
+  cached views; the ledger is the source of truth.
+- **All external calls are idempotent and reconciled.** Never
+  trust a single response; always reconcile against the
+  authoritative report from the network/bank.
+
+## 5. Data model
+
+```
+payment_intents {
+  id              string PK (e.g. pi_<uuid>)
+  amount          bigint                   -- in minor units (cents)
+  currency        char(3)
+  merchant_id     string
+  status          enum(requires_action, processing, succeeded, failed, canceled)
+  idempotency_key string UNIQUE
+  client_secret   string
+  metadata        json
+  created_at, updated_at
+}
+
+transactions {
+  id              string PK
+  payment_intent_id string
+  type            enum(authorization, capture, refund, chargeback, fee, payout)
+  amount_cents    bigint
+  currency        char(3)
+  external_id     string         -- network or bank reference
+  status          enum(pending, succeeded, failed)
+  occurred_at     timestamp
+}
+
+ledger_entries {                  -- double-entry
+  id              string PK
+  txn_id          string
+  account_id      string        -- account ids: customer, merchant_pending, merchant_available, fees, etc
+  amount_cents    bigint        -- positive = credit, negative = debit
+  currency        char(3)
+  posted_at       timestamp
+}
+
+idempotency_records {
+  key             string PK
+  request_hash    bytes
+  response        json
+  created_at      timestamp
+}
+```
+
+Idempotency table is critical: store the **first response** and
+return it verbatim on every retry. Different request body with
+the same key → reject as a misuse.
+
+## 6. Deep dives
+
+### 6.1 Idempotency, exactly-once-ish
+
+Network exists; retries exist. Without idempotency, a 500
+followed by a retry charges twice.
+
+Pattern:
+
+```
+on POST /payment_intents with Idempotency-Key K:
+  begin tx
+  if exists (idempotency_records where key=K and request_hash=H):
+      return stored response
+  reserve key K with request_hash=H
+  do the work (DB writes, external call)
+  store response in idempotency_records
+  commit
+  return response
+
+if request_hash differs from stored:
+  return 400 "idempotency key reused with different body"
+```
+
+Reserve **before** doing the work so concurrent retries with the
+same key serialize. Keep idempotency records for at least
+24 hours (clients retry that long).
+
+### 6.2 Double-entry ledger
+
+Every monetary movement is a **balanced pair of entries**.
+
+```
+customer pays $100:
+  - debit customer_funding_account     -100
+  - credit merchant_pending_account    +100
+  (sum = 0)
+
+merchant captures (auth → capture):
+  - debit merchant_pending  -100
+  - credit merchant_available  +100
+
+refund of $30:
+  - debit merchant_available  -30
+  - credit customer_refunds    +30
+
+processor fee $2.50:
+  - debit merchant_available  -2.50
+  - credit fees_revenue        +2.50
+```
+
+Sum of all entries by currency must equal zero — every period,
+forever. The ledger lets you audit, reconstruct any account
+balance by replay, and reconcile against bank statements without
+ambiguity. Fowler's *PoEAA* and the ledger-design chapter in
+*Designing Data-Intensive Applications* are canonical.
+
+The ledger is **append-only**. You don't mutate entries; you
+write reversing entries. This is what makes audit possible.
+
+### 6.3 Authorization, capture, settlement
+
+Card payments have a multi-step state machine:
+
+<Steps>
+<Step n={1} title="Authorize">
+Call the card network: "may I take $100?" Bank responds yes/no
+within seconds. Holds the amount on the card.
+</Step>
+<Step n={2} title="Capture">
+"OK, finalize the auth." Triggers the actual movement of funds
+in the next batch. Can happen seconds or days later.
+</Step>
+<Step n={3} title="Settle">
+The acquirer aggregates captures and settles with the merchant's
+account, usually T+1 or T+2.
+</Step>
+</Steps>
+
+We persist state at every step. If the network responds "auth
+approved" but our process crashes before recording it, the next
+retry might re-auth a fresh $100. Avoid this with:
+
+- **Pre-write intent** before calling the network ("about to
+  authorize K, idempotency-key X").
+- **Write the response after** with the same key.
+- **Reconciliation job** that pulls daily network reports and
+  flags any auth we initiated that we never recorded (and vice
+  versa).
+
+### 6.4 Reconciliation
+
+Trust nothing. Every day:
+
+```
+- pull authoritative report from card network / bank / acquirer
+- match against our `transactions` rows by external_id
+- flag mismatches:
+    - in their report, not ours      → "we missed something"
+    - in ours, not theirs            → "stuck transaction; investigate"
+    - amounts differ                 → "must resolve manually"
+```
+
+Reconciliation issues are the most common source of money loss.
+A robust system **always reconciles** and a queue of unmatched
+items is part of the operational workflow.
+
+### 6.5 Refunds and chargebacks
+
+- **Refund**: merchant-initiated; we initiate refund call to
+  network; eventually money returns to customer; ledger entries
+  recorded.
+- **Chargeback**: customer-initiated dispute via their bank;
+  we receive notification; funds are withdrawn from merchant's
+  account preemptively; merchant has window to dispute.
+
+Both are state machines with multiple async steps. Ledger
+captures each step as journal entries; no destructive updates.
+
+### 6.6 PCI scope minimization
+
+Storing raw card numbers (PAN) triggers PCI-DSS scope. The
+modern practice: **never let raw PAN touch your servers**.
+
+```
+checkout client  → [ Stripe/Adyen-style iframe / tokenization SDK ]
+                         │
+                         ↓
+                  raw PAN goes directly to PCI vault
+                         │
+                         ↓
+                  client receives a *token*
+                         │
+                         ↓
+  client → your API: { paymentMethodToken: tok_... }
+```
+
+Your application sees only the token. The vault is the PCI-scope
+component; your fleet stays out of scope. Compliance burden
+drops by orders of magnitude.
+
+### 6.7 Multi-currency
+
+Storing amounts in minor units (cents, paise, ¥1) avoids float
+errors. Per-currency ledgers must each balance independently —
+never mix EUR and USD into one accumulator.
+
+FX conversion is an **explicit transaction** with its own ledger
+entries: debit USD pending, credit EUR pending, with an FX-spread
+entry to the FX-revenue account.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 15K TPS auth path | Single payments DB leader | Shard by merchant_id; per-shard leader |
+| Ledger write hot key | One merchant's account | Sharded sub-accounts; periodic rollup |
+| Network call latency | Synchronous external call adds to user wait | Reuse connections; pre-stage auth |
+| Reconciliation lag | Daily batch can't keep up | Stream reconciliation; near-real-time match |
+| Webhook fanout | Per-merchant delivery queues | Per-merchant outbox; backoff retry; DLQ |
+| Audit query | Ledger scan slow | Per-account snapshot tables; replay from snapshots |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Idempotency-by-key everywhere** over best-effort: small
+  storage cost; the only way to be safe with retries.
+- **Append-only double-entry ledger** over balance-mutation:
+  audit + replay capability worth the storage.
+- **Strong consistency** on the money path: no eventual; reads
+  go to the leader; we trade some throughput for correctness.
+- **Tokenization** over storing PAN: PCI scope minimized;
+  small integration cost.
+- **Reconciliation as a first-class subsystem**: not optional;
+  every external integration must have one.
+- **Sync auth + async capture/settle**: user-perceived latency
+  bounded; the rest happens in seconds-to-days timelines.
+
+## In summary
+
+- Payment systems live or die by idempotency, ledgers, and
+  reconciliation. None are optional.
+- Every state-changing endpoint takes an `Idempotency-Key`;
+  store the response, return it verbatim on retry.
+- Double-entry append-only ledger is the source of truth;
+  every balance is derived.
+- Tokenize early to keep your fleet out of PCI scope.
+- Reconcile daily against external reports; investigate
+  every mismatch.
+- Strong consistency on the money path. Sharding by merchant or
+  account, not by transaction id, because money moves between
+  accounts.
+- Correctness > latency > throughput. Most other systems flip
+  this.

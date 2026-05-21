@@ -1,0 +1,352 @@
+export const level = 'senior';
+
+# Refresh-ahead cache
+
+Refresh-ahead is a caching pattern that proactively refreshes
+entries **before they expire**, so users never wait for a
+cache miss. While other patterns expire entries and let the
+next reader pay the refresh cost, refresh-ahead does the work
+in the background. The user always gets a cache hit.
+
+The pattern is used at every CDN, every JIT-style content
+system, and in any service where the cost of a cache miss is
+catastrophic — a recommendation system serving 100 ms p99
+that takes 5 seconds to compute, a homepage that takes 30
+seconds to render.
+
+## The flat-tail-latency property
+
+In other caching patterns, latency has a bimodal shape:
+
+```
+   most requests: cache hit, 1 ms
+   miss requests: full recompute, 500 ms
+
+   p50: 1 ms
+   p99: 500 ms  (whoever happened to hit at expiry)
+```
+
+In refresh-ahead, the recompute happens in the background. The
+user always sees a hit:
+
+```
+   all requests: cache hit, 1 ms
+   background:   refresh of stale entries
+
+   p50: 1 ms
+   p99: 1 ms (the user never sees the refresh)
+```
+
+The user-visible latency distribution is flat. The cost is
+moved to the background — and to engineering effort to
+implement it well.
+
+## How it works
+
+A refresh-ahead cache has three knobs:
+
+1. **Hard TTL**: when the entry expires for real. After this,
+   it's gone.
+2. **Soft TTL** (refresh threshold): when refresh kicks in.
+   Typically 50–90% of the hard TTL.
+3. **Refresh strategy**: synchronous-on-near-expiry,
+   periodic, or trigger-on-access.
+
+```
+   key written at T0, hard TTL = 300s, refresh threshold = 240s
+
+   T0    ............ entry fresh ...........  T240
+                                                ↑
+                                                refresh starts here
+                                                (background)
+   T240 ......... refresh completes ........  T300
+                                                ↑
+                                                hard expiry
+                                                (rarely reached)
+```
+
+The most common implementation: on read, if the entry's age
+exceeds the soft TTL, return the stale entry **and** kick off
+a background refresh.
+
+```ts
+async function getWithRefreshAhead(key: string) {
+  const entry = await cache.get(key);
+  if (!entry) {
+    // hard miss — synchronous refresh
+    const fresh = await compute(key);
+    await cache.set(key, fresh, HARD_TTL);
+    return fresh;
+  }
+
+  if (entry.age > SOFT_TTL) {
+    // stale — return current, refresh in background
+    triggerBackgroundRefresh(key);
+  }
+  return entry.value;
+}
+
+function triggerBackgroundRefresh(key: string) {
+  // dedupe so multiple readers don't all trigger refreshes
+  if (refreshing.has(key)) return;
+  refreshing.add(key);
+  setImmediate(async () => {
+    try {
+      const fresh = await compute(key);
+      await cache.set(key, fresh, HARD_TTL);
+    } finally {
+      refreshing.delete(key);
+    }
+  });
+}
+```
+
+The deduplication is critical. Without it, every reader during
+the refresh window triggers their own refresh, and you've
+recreated a stampede.
+
+## stale-while-revalidate
+
+The same pattern formalized in HTTP via the
+`stale-while-revalidate` cache-control directive (RFC 5861).
+Browsers and CDNs that honor it serve the stale response
+immediately and revalidate in the background.
+
+```
+Cache-Control: public, max-age=60, stale-while-revalidate=30
+```
+
+- For 60 s: serve from cache; entry is fresh.
+- For the next 30 s: serve stale + revalidate in background.
+- After 90 s: stale unusable; synchronous fetch.
+
+This is how CDNs flatten tail latency for dynamic-ish content.
+Cloudflare, Fastly, and Vercel all support it. Used in
+combination with conditional requests (`If-None-Match`) so
+revalidation is cheap if the underlying content hasn't
+changed.
+
+## When refresh-ahead is the right pattern
+
+Three conditions, all needed:
+
+1. **Cache miss is expensive** (heavy computation, slow query,
+   external API call with rate limits).
+2. **You know in advance what's hot** — only a manageable
+   number of keys benefit from refresh. Refreshing all keys
+   is wasteful and infeasible.
+3. **Some staleness is acceptable** — the soft TTL window
+   serves slightly-old data.
+
+Best fits:
+
+- **CDN edge caches** for popular URLs.
+- **Top-N lists / leaderboards** that take seconds to compute.
+- **Recommendation systems** with expensive ML inference.
+- **Aggregated dashboards** with multi-second queries.
+- **Configuration / feature-flag caches** where the source is
+  slow and a brief lag is fine.
+
+Bad fits:
+
+- **Long-tail data**: most keys are rarely read. Refreshing
+  them all wastes compute. Use cache-aside for the long tail
+  + refresh-ahead for the head.
+- **Per-user unique data**: each user's data is read by them
+  once. Refreshing it before they read it again is
+  speculation that usually loses.
+- **Strict consistency requirements**: the user might still
+  see stale data during the refresh window. Use write-through
+  instead.
+
+## Identifying hot keys
+
+Refresh-ahead is most effective when applied selectively to
+hot keys. Three strategies for identifying them:
+
+### Top-K monitoring
+
+Track access frequency per key. The top K (say 1000) get the
+refresh-ahead treatment; everything else falls through to
+cache-aside.
+
+```ts
+// rough sketch
+const accessCounts = new LRU({ max: 100_000 });
+function recordAccess(key) { accessCounts.set(key, (accessCounts.get(key) ?? 0) + 1); }
+
+// periodically: pick top 1000, mark as refresh-ahead-eligible
+const hot = [...accessCounts.entries()]
+  .sort(([, a], [, b]) => b - a)
+  .slice(0, 1000)
+  .map(([k]) => k);
+```
+
+### Decay-based
+
+Track access with exponential decay. Recently-popular keys
+score high; previously-popular-but-cold keys decay out.
+
+### Explicit hot list
+
+For known-hot keys (homepage, top categories, popular
+products), maintain an allowlist in config. Refresh those
+explicitly.
+
+For most systems, a hybrid works: explicit list for known
+hot keys + automatic top-K tracking for dynamically hot ones.
+
+## Periodic refresh vs trigger-on-access
+
+Two implementations of refresh-ahead:
+
+### Trigger on access (lazy refresh-ahead)
+
+Refresh fires only when someone reads the key near expiry.
+If no one reads it, no refresh.
+
+Pros:
+
+- Doesn't waste compute on cold keys.
+- Naturally scales with read load.
+
+Cons:
+
+- A key that's read every 30 minutes (just past soft TTL each
+  time) gets refreshed on every read, but the refresh might
+  not finish before the read returns. First reader still
+  sees stale.
+
+The common pattern.
+
+### Periodic refresh (eager refresh-ahead)
+
+A background job refreshes each registered hot key on a
+schedule, regardless of reads.
+
+Pros:
+
+- Cache is always warm.
+- No first-reader-sees-stale window.
+
+Cons:
+
+- Refreshes happen even with zero traffic.
+- Requires a hot-key list (you have to know which keys to
+  refresh).
+
+Used in CDN configurations for known-hot URLs ("warmer" tools)
+and in systems with explicit list of "always warm" keys.
+
+## Probabilistic early refresh
+
+A clever middle ground: refresh probabilistically as the entry
+nears expiry.
+
+```ts
+function shouldRefresh(entry) {
+  const remaining = (entry.expiresAt - Date.now()) / 1000;
+  const beta = 1.0; // tunable
+  // negative if we're "overdue" — refresh
+  // close to zero means likely refresh
+  // strongly positive means don't refresh
+  const r = -Math.log(Math.random()) * beta * entry.refreshLatencyEst;
+  return remaining - r <= 0;
+}
+```
+
+Earlier readers refresh more rarely; readers closer to expiry
+refresh more often. Spread the refresh work across the entry's
+lifetime and avoid the "every reader at T240 fires a refresh"
+problem.
+
+This is the technique behind Vimeo's "XFetch" paper (2014)
+on solving cache stampedes. See cache-stampede for the
+related discussion.
+
+## Cost analysis
+
+Refresh-ahead trades user-visible latency for background
+compute:
+
+- **Synchronous miss**: 0 background compute, but one user
+  sees latency = compute cost.
+- **Refresh-ahead**: compute cost incurred for every hot key
+  every TTL period, regardless of read traffic.
+
+For low-traffic keys: refresh-ahead is wasteful.
+For high-traffic keys (100s of reads per TTL): refresh-ahead
+is essentially free per user; just spread.
+
+The crossover: refresh-ahead pays for itself once a key gets
+more than ~1 read per TTL — beyond that, you're recomputing
+once instead of N times (since multiple readers would
+otherwise all wait for or trigger refresh).
+
+## Common pitfalls
+
+### No deduplication of refresh
+
+100 concurrent reads near expiry. Each one fires a refresh
+because no one ever marked "refresh in progress." 100
+duplicate refreshes hammer the source. Always dedupe.
+
+### Refresh slower than soft TTL
+
+Soft TTL is 30 s; refresh takes 60 s to complete. By the
+time refresh finishes, the hard TTL has passed and the
+entry is gone. Now readers see a real miss. Either shorten
+refresh or lengthen TTLs.
+
+### Refreshing too aggressively
+
+Soft TTL set to 50% of hard TTL means refreshes happen twice
+as often as necessary. Make sure the soft/hard ratio reflects
+real tolerance for staleness, not paranoia.
+
+### Hot list not maintained
+
+The "always warm" list of keys gets stale — what was hot 6
+months ago isn't hot anymore. Periodic reviews are needed,
+or move to automatic top-K detection.
+
+### Refresh failure cascades
+
+Refresh of key X fails. The cache still has the stale value
+and returns it for ~30 more seconds. But the refresh worker
+keeps trying and failing — the load on the source doesn't go
+down. Implement exponential backoff on refresh failures.
+
+### Refresh-ahead on user-unique keys
+
+Every user has their own version. Refreshing each user's
+view in advance is N× more expensive than letting them
+fetch on demand. Refresh-ahead is for **shared** hot keys.
+
+## Combining patterns
+
+In practice, refresh-ahead is layered on top of cache-aside:
+
+- Most keys: cache-aside (lazy fill, simple invalidate).
+- Top-K hot keys: refresh-ahead (background refresh near
+  expiry).
+- Critical write-heavy keys: write-through (always fresh,
+  cost on writes).
+
+The system uses each pattern where it pays.
+
+## In summary
+
+- Refresh-ahead refreshes cache entries before they expire,
+  in the background.
+- The user always gets a cache hit → flat tail latency.
+- Soft TTL (refresh starts) vs hard TTL (entry expires) is
+  the key knob.
+- HTTP's `stale-while-revalidate` is the same idea in
+  protocol form.
+- Best for hot keys with expensive misses. Wasteful for
+  long-tail keys.
+- Probabilistic early refresh spreads the work across the
+  TTL window and avoids "every reader at T240" stampede.
+- Always dedupe refreshes — without it, you've recreated the
+  stampede problem you set out to avoid.

@@ -1,0 +1,248 @@
+export const level = 'senior';
+
+# Distributed tracing
+
+A trace is the timeline of a **single request** as it propagates
+through every service that touched it. Each service emits one or
+more **spans** — start time, duration, parent ID, attributes —
+and all spans of one request share a **trace ID**. Reassembled,
+the spans form a tree showing exactly where time went.
+
+It's the answer to "the request was slow, where?" in any
+non-trivial distributed system. Without it, you have logs from N
+services and a wall clock; with it, you have the request's
+actual story.
+
+Google's *Dapper* paper (2010) defined the model; Jaeger,
+Zipkin, AWS X-Ray, Google Cloud Trace, and now OpenTelemetry all
+implement variations of it.
+
+## The data model
+
+```
+trace_id: 7c3b...
+  span: api-gateway          [============================]  56 ms
+    span: auth-service          [=====]                       8 ms
+    span: order-service             [============]          22 ms
+      span: inventory-rpc              [==]                  4 ms
+      span: payment-rpc                   [========]        14 ms
+        span: db.charge                     [=====]          7 ms
+```
+
+Each span has:
+
+<Cheatsheet>
+| Field | What |
+|---|---|
+| `trace_id` | Same for every span in the request |
+| `span_id` | Unique per span |
+| `parent_id` | The span that caused this one (null for root) |
+| `name` | Human-readable operation (`GET /orders/:id`, `db.query`) |
+| `start_time` / `duration` | When and how long |
+| `status` | OK / error |
+| `attributes` | Key-value context (`http.status_code=200`) |
+| `events` | Timestamped point-in-time annotations within the span |
+| `links` | References to *other* traces (batch jobs, fanouts) |
+
+</Cheatsheet>
+
+This shape is the OpenTelemetry trace data model — and is
+broadly compatible with everything since Dapper.
+
+## Context propagation
+
+The single hard problem in distributed tracing. Every service
+must extract the trace context from the inbound request,
+**continue** it (create a child span with the same trace ID and
+the inbound span as parent), and **inject** the updated context
+into every outbound call.
+
+The W3C **Trace Context** header is the standard:
+
+```
+traceparent: 00-7c3bb1e0...-4f8a2d...-01
+tracestate: vendor1=...,vendor2=...
+```
+
+`traceparent` carries `<version>-<trace_id>-<parent_span_id>-<flags>`.
+`tracestate` is for vendor-specific data.
+
+<Steps>
+<Step n={1} title="Inbound: extract.">
+On request arrival, read `traceparent`. If present, you're a
+child of an existing trace. If absent, start a new trace with a
+new trace ID.
+</Step>
+<Step n={2} title="Continue: create a span.">
+Open a span for the work you're about to do, with the inbound
+span as parent. All work inside this request is a descendant.
+</Step>
+<Step n={3} title="Outbound: inject.">
+On every outbound HTTP/gRPC/queue call, set `traceparent` on
+the request. The downstream service will continue under you.
+</Step>
+<Step n={4} title="Close: end the span.">
+On response/error, record duration and status. Emit to the
+collector.
+</Step>
+</Steps>
+
+Skipping injection on **any** outbound call breaks the trace at
+that hop. The downstream service starts its own trace, looking
+unconnected. This is the single most common cause of "my traces
+show up as orphans."
+
+## Across non-HTTP transports
+
+The context must travel anywhere a request boundary does:
+
+- **HTTP/gRPC** — set headers.
+- **Message queues** (Kafka, RabbitMQ, SQS) — embed
+  `traceparent` in message headers/attributes. Consumer extracts
+  and continues as a `CONSUMER` span linked to the producer.
+- **Background jobs** — propagate context through the job
+  payload. Pre-context-propagation systems hand off via
+  correlation ID only and miss the parent/child relationship.
+- **Database calls** — typically not propagated *to* the DB, but
+  the client library should still create a span around the
+  query.
+
+## Sampling: you can't keep 100%
+
+A high-traffic system can produce billions of spans per day.
+Storing all of them is wasteful: 99% are routine successes whose
+detail you'd never look at. **Sampling** chooses which traces to
+keep.
+
+See trace sampling strategies for the full menu. The short
+version:
+
+- **Head sampling**: decide at trace start. Cheap; biased
+  toward fast/successful traces.
+- **Tail sampling**: decide after the trace completes, based on
+  what happened. Catches errors and slow traces; requires
+  buffering.
+- **Dynamic / adaptive**: bias sampling toward interesting
+  shapes (errors, slow, rare endpoints).
+
+The decision is encoded in the sampled flag on `traceparent` —
+when 0, downstream services know not to record.
+
+## What to instrument
+
+Auto-instrumentation gets you most of the way. OpenTelemetry has
+agents that wrap HTTP clients/servers, common DB drivers, and
+common message brokers without code changes. Take that as free.
+
+The remaining manual instrumentation is for **business
+operations** that auto-instrumentation can't name:
+
+```ts
+import { trace } from '@opentelemetry/api';
+
+async function captureOrder(orderId: string) {
+  const tracer = trace.getTracer('orders');
+  return tracer.startActiveSpan('order.capture', async (span) => {
+    span.setAttribute('order.id', orderId);
+    try {
+      await chargeCustomer();
+      await updateInventory();
+      span.setStatus({ code: 1 });
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: 2, message: String(err) });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+Wrap units of work that map to **product verbs**, not internal
+helpers. A 50-span trace where every span is `helperFunctionFoo`
+is noise; a 5-span trace where the spans are `auth`, `validate`,
+`charge`, `notify`, `respond` is signal.
+
+## Trace storage and querying
+
+A trace backend stores spans and indexes them by trace ID,
+service, operation, and attributes. Common queries:
+
+- "Find slow traces for service X" → `service = "orders" AND
+  duration > 1s`.
+- "Find traces that errored" → `status = ERROR`.
+- "Find traces for user X" → custom attribute filter.
+- "Reconstruct trace `7c3b...`" → fetch all spans by trace ID.
+
+The hot path is the trace ID lookup; everything else is
+secondary indexes. Storage cost is the main constraint and the
+reason sampling exists.
+
+## What traces are bad at
+
+- **Per-service aggregate metrics**. RED-style p99 over all
+  requests is computable from traces only if sampling rates are
+  known and corrected — and even then, the aggregate from
+  metrics is more accurate and cheaper.
+- **Pinning down which user is affected at scale**. A trace per
+  user is high cardinality; logs or wide events handle this
+  better.
+- **Forensic reconstruction long after the fact**. Traces are
+  usually sampled; the trace you want may not have been kept.
+
+This is why you don't pick traces alone — you use them
+alongside metrics and logs.
+
+## Operational warts
+
+A short list of things that bite in production:
+
+- **Clock skew between services** distorts the timeline. Hosts
+  drift by 10s of ms even with NTP; spans can appear to start
+  before their parent. Treat absolute timestamps on child spans
+  as approximate; use durations.
+- **Long-running spans** (a 5-minute batch job) defeat
+  buffering tail samplers. Use `links` and child spans
+  generously.
+- **Async fanout** with one parent and 100 children inflates the
+  trace; consider sampling within the fanout.
+- **PII in attributes**. Don't put emails, raw inputs, or
+  payloads on spans without a redaction strategy. Traces are
+  often retained in less-protected stores than the application
+  database.
+
+<Callout variant="warning">
+Distributed tracing is **diagnostic**, not contractual. Don't
+build alerts on trace counts — sampling means the counts lie.
+Build alerts on metrics; use traces to investigate.
+</Callout>
+
+## When traces pay for themselves
+
+The payoff curve:
+
+- **Monolith**: traces are nice but a profiler is more useful.
+- **3–5 services**: clear benefit; you stop guessing which
+  hop is slow.
+- **20+ services**: indispensable. The graph is too complex to
+  reason about without one.
+
+If you're starting a system and expect to grow into the latter,
+adopt OpenTelemetry from day one. Retrofitting tracing across N
+services later is significantly more work than instrumenting one
+service at a time.
+
+## In summary
+
+- A trace = one request, decomposed into a parent/child tree of
+  spans across services.
+- Context propagation (W3C traceparent) is the discipline; every
+  outbound call must inject.
+- OpenTelemetry is the de-facto standard for instrumentation,
+  context, and wire format.
+- Auto-instrument the framework boundaries; manually wrap
+  product verbs.
+- Sample aggressively; you can't keep 100% at scale.
+- Traces find the where; metrics find the what; logs find the
+  why.

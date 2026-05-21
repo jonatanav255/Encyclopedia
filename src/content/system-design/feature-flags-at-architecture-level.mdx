@@ -1,0 +1,272 @@
+export const level = 'mid';
+
+# Feature flags (architecture view)
+
+A feature flag is a runtime switch — usually a boolean, sometimes
+a percentage or a structured value — that gates whether a piece
+of code path runs. The architectural insight: **flags decouple
+deploy from release**. You can ship the code to production with
+the feature off, then enable it later, for some users, for some
+duration, without redeploying.
+
+That single move changes how teams plan, deploy, A/B test,
+incident-respond, and roll back. There's a separate devops page
+on the engineering practice; this page is the architecture
+view.
+
+## The four kinds of flags
+
+Pete Hodgson's classification (Martin Fowler bliki) is the
+standard vocabulary:
+
+<Cheatsheet>
+| Kind | Lifetime | Purpose | Owners |
+|---|---|---|---|
+| Release | Days to weeks | Hide unfinished features in main branch | Engineering |
+| Experiment | Days to weeks | A/B test variants | Product / data |
+| Ops | Months to forever | Kill switches, circuit breakers | Operations |
+| Permission | Forever | Premium / beta features, customer-specific | Product / sales |
+
+</Cheatsheet>
+
+The flags have different lifecycles and owners. Lumping them
+all into "feature flags" is the most common operational
+mistake — release flags should be deleted; permission flags
+must not be.
+
+## Why decouple deploy from release
+
+Three architectural wins:
+
+<Steps>
+<Step n={1} title="Trunk-based development becomes possible.">
+Engineers merge work-in-progress to main, behind an off flag.
+Continuous integration stays green; no long-lived feature
+branches.
+</Step>
+<Step n={2} title="Deploys become smaller and more frequent.">
+A deploy is "ship the code." A release is "turn it on for some
+users." Each is independently smaller; each is independently
+safer.
+</Step>
+<Step n={3} title="Rollback is configuration, not code.">
+A regressed feature is a flag turn-off, not a binary rollback.
+Sub-second; surgical.
+</Step>
+</Steps>
+
+The second-order effect: deploys lose their drama. When a deploy
+is just "ship dark code," you can deploy 50× a day. The releases
+happen at the org's pace, not the CI pipeline's.
+
+## Kill switches
+
+The most operationally valuable flag is the **kill switch**:
+"this feature can be turned off, instantly, without a code
+change." Every meaningful feature should have one.
+
+Examples:
+
+- A new recommendation service goes down — flip the flag,
+  recommendations fall back to a simple popular-items list.
+- A third-party API misbehaves — flip the flag, the dependency
+  goes dormant.
+- A bug in the new checkout flow — flip the flag, users get
+  the old flow.
+
+A kill switch turns "deploy a fix" into "click a button." The
+incident-response time drops from minutes to seconds.
+
+## Flag evaluation: where it happens
+
+```
+request
+  ↓
+flag service (or SDK with cached rules)
+  ↓
+boolean / value → code chooses path
+```
+
+Two architectures:
+
+<Compare a="Server-side evaluation" b="Client-side evaluation">
+<>
+The flag SDK runs in the backend. The backend chooses the
+behavior; the frontend just renders.
+
+- Flag rules + traffic data stay private.
+- Works for non-UI features (different DB queries, alternate
+  worker behavior).
+- Latency: SDK is cached; evaluation is microseconds.
+</>
+<>
+The flag SDK runs in the frontend. The frontend chooses
+behavior.
+
+- Easier for UI experiments.
+- Flag rules become public (any user can read them in
+  devtools).
+- Initial-load latency if the SDK fetches over the network.
+</>
+</Compare>
+
+Hybrid: rules evaluated server-side, the resulting variant
+**passed to** the client. Best of both — private rules,
+straightforward UI rendering.
+
+## Targeting rules
+
+A flag isn't just `on` / `off`. The rule engine can express:
+
+- 100% on for `env=staging`, 5% on for `env=prod`.
+- 100% on for users in beta program.
+- On for tenant ID in `[A, B, C]`, off for everyone else.
+- On for 10% of users sampled by user ID hash.
+- On for 1 hour starting at 14:00 UTC, then off again.
+
+The flag becomes a small **policy engine**. Rules are
+data, evaluated per request, with a deterministic hash so a
+given user gets a stable answer across requests.
+
+The flag system stores **the rule**, not the answer per user.
+This keeps state small and makes rule changes instant.
+
+## Architecture-level uses
+
+Beyond hiding UI features, flags drive several architectural
+patterns:
+
+<Cheatsheet>
+| Pattern | Flag use |
+|---|---|
+| Canary | Flag gates the new code path; canary rolls flag from 0% → 100% |
+| Dark launch | New service receives shadow traffic but its responses are flag-gated off |
+| Database migration | Flag chooses read-from-old vs read-from-new during dual-write |
+| Service rewrite | Flag routes between v1 and v2 of a downstream service |
+| Multi-region failover | Flag forces traffic to a healthy region |
+| Cost cutoff | Flag drops to a cheaper code path under high load |
+
+</Cheatsheet>
+
+A flag system is one of the highest-leverage pieces of
+infrastructure. It's also one of the easiest to underestimate
+until you have one.
+
+## The dark side: flag debt
+
+Every flag added accumulates **runtime branches**. After a year,
+a typical mature codebase has dozens of flags, half of them
+permanently on, half permanently off, none of them deleted.
+
+The pathologies:
+
+- **Combinatorial explosion**: with N flags, there are 2ⁿ
+  possible code paths. Most are untested in combination.
+- **Dead branches**: flags that have been "off" for two years
+  but haven't been deleted. The code rots.
+- **Ambiguous ownership**: a flag from a former teammate. No one
+  knows what happens if you flip it.
+
+Mitigation:
+
+<Steps>
+<Step n={1} title="Tag flags with an owner and an expected end date.">
+"Release" flags have a known end. "Ops" flags don't, but have
+an owner.
+</Step>
+<Step n={2} title="Automate the audit.">
+A weekly report of flags older than 90 days. Owners explain or
+delete.
+</Step>
+<Step n={3} title="Delete on rollout.">
+Once a feature is 100% rolled out and stable, **delete the
+flag** in a follow-up PR. The flag system should make this easy
+— hide flags that are 100% on; surface them for cleanup.
+</Step>
+</Steps>
+
+A team that ships flags but doesn't delete them ends up with a
+codebase nobody can refactor.
+
+## Operational properties to require
+
+A production-grade flag system needs:
+
+- **Hot reload** — changes propagate to running services within
+  seconds, no redeploy.
+- **Fail-open or fail-closed** — what does the service do if
+  the flag system is unreachable? Each flag declares the
+  default (`default=off` for kill switches; `default=on` for
+  permission flags).
+- **Local cache** — the SDK should serve cached rules during
+  flag-service outages.
+- **Audit log** — every flag change is logged with who, when,
+  why.
+- **Deterministic targeting** — same user gets the same answer
+  across services; usually by stable hash of `user_id + flag_id`.
+- **Multi-environment isolation** — staging flags can't leak to
+  prod.
+
+LaunchDarkly, Flagsmith, Split, Statsig, Unleash, and ConfigCat
+all provide these. Building your own is a multi-quarter
+project; off-the-shelf is usually the right answer past the
+toy stage.
+
+## Flags vs config
+
+A flag is a special-case config:
+
+- **Config**: settings that change per-environment, occasionally
+  per-deploy. Database hostnames, log levels, feature
+  parameters. Owned by ops; rarely changed.
+- **Flag**: a runtime switch on code paths. Often changed,
+  per-tenant or per-user.
+
+The two systems may share infrastructure. Conceptually they're
+different: config tunes a system, flags select between code
+paths.
+
+## A/B testing and experimentation
+
+Variant flags double as experiment infrastructure:
+
+```ts
+const variant = flags.getVariant('checkout-redesign', {
+  userId: user.id,
+});
+// variant is "control" or "treatment"
+```
+
+The flag system, combined with an event log, makes A/B testing
+a feature of the architecture rather than a separate platform.
+You log every variant assignment and every downstream behavior;
+the experiment analysis is a query.
+
+The architectural rule: **assignment is sticky per user**, even
+across multiple services and over weeks. Hash on `user_id`, not
+on request time.
+
+<Callout variant="info">
+Charity Majors and others argue that flags + canary + good
+observability **subsume** most traditional staging environments.
+The case: prod telemetry is the most realistic test. Ship dark,
+flag on for internal users, flag on for 1%, watch metrics, roll
+out.
+</Callout>
+
+## In summary
+
+- Flags decouple deploy from release; that's the architectural
+  point.
+- Four kinds — release, experiment, ops, permission — with
+  different lifecycles and owners.
+- Kill switches turn incident response from "deploy a fix"
+  into "click a button."
+- Flag rules live in a small policy engine; evaluation is
+  per-request with deterministic hashing.
+- Flag debt is real — delete release flags on rollout, audit
+  the rest.
+- Server-side evaluation keeps rules private; hybrid passes
+  variants to the client.
+- A robust flag system is one of the highest-leverage pieces
+  of infrastructure on a backend team.

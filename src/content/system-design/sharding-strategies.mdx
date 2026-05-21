@@ -1,0 +1,328 @@
+export const level = 'senior';
+
+# Sharding strategies
+
+Sharding splits a logical dataset across multiple physical
+nodes so writes (and storage) scale beyond a single machine.
+It is the highest-cost, highest-leverage scaling technique:
+done right, it unlocks indefinite write throughput; done wrong,
+it locks the system into permanent operational pain.
+
+The strategy choice is mostly about **how the shard function
+maps a key to a shard**, and how the system handles
+**resharding**, **hot partitions**, and **cross-shard
+queries**.
+
+## What sharding actually does
+
+Imagine one row table on one Postgres instance. You add a
+second instance and split the table by some key:
+
+```
+shard 0 (db-0):  users where user_id % 4 == 0
+shard 1 (db-1):  users where user_id % 4 == 1
+shard 2 (db-2):  users where user_id % 4 == 2
+shard 3 (db-3):  users where user_id % 4 == 3
+```
+
+Each instance is a normal database — same query model, same
+indexes, smaller. The application (or a middleware) knows which
+shard owns which key and routes accordingly.
+
+What you gain:
+
+- **Linear write throughput.** N shards → N× the writes.
+- **Linear storage.** N shards hold N× the dataset.
+- **Independent failure domains.** One shard down ≠ all down.
+
+What you lose:
+
+- **Cross-shard transactions.** ACID across shards is hard
+  (see distributed transactions).
+- **Cross-shard joins.** Each join either runs on every shard
+  and merges, or one side moves between shards.
+- **Operational simplicity.** Backups, migrations, schema
+  changes now happen N times.
+
+## The four strategies
+
+There are essentially four ways to map a key to a shard.
+
+### 1. Range sharding
+
+Keys fall into contiguous ranges; each shard owns a range.
+
+```
+shard 0: keys 'a'..'h'
+shard 1: keys 'i'..'p'
+shard 2: keys 'q'..'z'
+```
+
+**Pros**: range queries hit one (or a few adjacent) shards.
+Splitting and merging is straightforward — split a range in
+two when it grows. Natural fit for ordered keys (time,
+user_id).
+
+**Cons**: **hot shards** if keys cluster. New users in 2026
+mostly have `user_id` newer than 2024 — one shard takes the
+brunt. Timestamp keys are notoriously bad here.
+
+Used by: HBase, Bigtable, CockroachDB, MongoDB (when sharding
+by an ordered key), DynamoDB internally.
+
+### 2. Hash sharding
+
+Apply a hash to the key; modulo or consistent-hash the result.
+
+```
+shard = hash(key) % N
+```
+
+**Pros**: uniform distribution. Hot keys are still hot on one
+shard, but adjacent keys land on different shards — eliminates
+the timestamp-clustering problem.
+
+**Cons**: range queries hit every shard. "Get all orders
+between t1 and t2" becomes N parallel queries followed by a
+merge. Adding/removing a shard with naive modulo re-shards
+**everything**.
+
+Used by: Cassandra (consistent hashing), DynamoDB
+(hash partition key), most KV stores.
+
+#### Consistent hashing
+
+The fix for "modulo reshards everything." Map both keys and
+shard ids to a ring; each shard owns the arc from itself to
+the previous shard. Adding a shard moves only the keys in its
+arc — roughly 1/N of the data.
+
+```
+       0
+      / \
+   12     3   (shards on the ring)
+   |       |
+    9 --- 6
+```
+
+Add a 5th shard between 9 and 12: only the arc previously
+owned by shard at 12 moves to it. Other shards untouched.
+
+In practice, each shard owns many "virtual nodes" on the ring
+(100–256 per shard) for better balance.
+
+### 3. Directory / lookup sharding
+
+A separate **routing table** maps keys (or key ranges) to
+shards. The application consults the routing table on every
+read or write.
+
+```
+key range          | shard
+-------------------+------
+user_id 0..1M      | shard 0
+user_id 1M..2M     | shard 1
+user_id 2M..3M     | shard 2
+...
+```
+
+**Pros**: maximum flexibility. Split a hot range without
+rehashing. Move specific keys to dedicated shards. Move a
+"whale" tenant to its own database.
+
+**Cons**: the routing table is a system. It must be highly
+available, consistent enough that two clients agree on routing,
+and updated atomically with data movement. Often built on
+etcd, ZooKeeper, or a small relational DB.
+
+Used by: Vitess (the underpinning of YouTube and Slack DBs),
+Figma's sharding architecture, many internal systems that
+outgrew naive hash sharding.
+
+### 4. Geographic sharding
+
+Shard by location: the shard for a record is determined by the
+user's region.
+
+```
+us-east shard:   users where region = 'us-east'
+us-west shard:   users where region = 'us-west'
+eu-west shard:   users where region = 'eu-west'
+```
+
+**Pros**: data is local to its users — sub-50ms reads/writes
+within a region. Aligns with data-sovereignty laws (GDPR, data
+residency).
+
+**Cons**: cross-region queries hurt. Users who move regions
+require migration. Cross-region transactions (transfers,
+"global" features) are slow and require distributed protocols.
+
+Used by: most large user-facing services with regulatory or
+latency requirements. AWS DynamoDB Global Tables, Spanner
+geo-partitioning, Slack region-by-workspace.
+
+## Comparing the strategies
+
+<Cheatsheet>
+| Strategy | Range queries | Hot key tolerance | Resharding ease | Use when |
+|---|---|---|---|---|
+| Range | One shard | Poor | Easy | Range scans dominate; key naturally sortable |
+| Hash | All shards | Good | Painful (naïve) / OK (consistent) | Point lookups dominate; uniform load wanted |
+| Directory | Configurable | Best | Easy | Tenant skew; need explicit control |
+| Geographic | Within region | Per-region | Hard | Latency / data-sovereignty driven |
+</Cheatsheet>
+
+Many real systems combine: **hash within a region** (geographic
++ hash), **range within a tenant** (directory + range), etc.
+
+## Resharding
+
+The day you outgrow N shards is unpleasant. The mechanics:
+
+<Steps>
+<Step n={1} title="Add new shards.">
+Provision N more empty shards.
+</Step>
+<Step n={2} title="Run dual-write or change-stream replication.">
+Writes go to both old and new shards (dual-write), or the old
+shards replicate change events into the new ones (CDC).
+</Step>
+<Step n={3} title="Backfill.">
+Copy existing data from old shards to new shards, hashed
+according to the new function. Slow — read and replay
+everything.
+</Step>
+<Step n={4} title="Verify consistency.">
+Reconciliation jobs compare counts and checksums per range.
+Drift is normal; fix before cutover.
+</Step>
+<Step n={5} title="Cut over reads.">
+Atomically (per key or globally) switch reads to the new
+shards.
+</Step>
+<Step n={6} title="Stop dual-writing.">
+Decommission old shards.
+</Step>
+</Steps>
+
+This takes weeks to months on a serious system. The single
+strongest argument for **getting the partition key right
+upfront** is that resharding is so expensive.
+
+Consistent hashing and directory sharding both reduce
+resharding pain — only a fraction of data moves.
+
+## Hot partitions
+
+A hot partition is a shard receiving disproportionate traffic.
+Causes:
+
+- **Skewed keys**: one key (a celebrity, a viral product) is
+  ~1% of all reads.
+- **Sequential keys**: timestamps, monotonic IDs land on one
+  shard.
+- **Tenant skew**: 90% of writes come from your biggest
+  customer.
+
+Mitigations:
+
+- **Salting**: prefix the key with a random suffix to spread
+  it across shards. Adds complexity to reads (must query
+  every salt).
+- **Hot-key cache**: serve the hot key from a cache layer in
+  front of the database.
+- **Dedicated shard**: move the whale tenant to its own
+  database (directory sharding shines here).
+- **Reshape the access**: store time-bucketed counters per
+  shard rather than a global one.
+
+A useful diagnostic: distribution of QPS per shard. If max/min
+ratio is >2× sustained, you have a hot-shard problem.
+
+## Cross-shard queries
+
+The unavoidable downside. Three patterns for handling them:
+
+### Scatter-gather
+
+The router fans the query to every shard, collects results,
+merges in the router or coordinator.
+
+```
+client → router → [shard 0, shard 1, ..., shard N]
+                         ↓ partial results
+              merge → client
+```
+
+Works for non-correlated queries; latency is `max(shard
+latency)`. Inefficient for selective queries but unavoidable
+for "how many users total?" style.
+
+### Co-location
+
+Shard related data by the **same key**. Orders and order_items
+both sharded by `order_id` → joining them is per-shard, not
+cross-shard.
+
+Vitess and CockroachDB call this "interleaved" tables. It's
+the most powerful technique for keeping a sharded system
+queryable.
+
+### Secondary index / read model
+
+For queries by a non-shard-key field, maintain a separate
+denormalized table sharded by that field, populated by CDC
+from the primary. Example: primary sharded by `user_id`; a
+read model sharded by `email` for login.
+
+## Anti-patterns
+
+Recurring expensive mistakes:
+
+- **Sharding by timestamp**: every write lands on one shard
+  ("today"). Always.
+- **Sharding by tenant_id with massive tenant skew**: one
+  customer takes 50% of resources.
+- **Sharding too early**: 100 GB on one Postgres is much
+  easier than 10 GB on 10 Postgres. Shard when you can't
+  avoid it.
+- **Sharding the application without sharding the
+  application**: putting Vitess in front of one MySQL
+  instance "for future scaling" is overhead without benefit.
+- **Cross-shard transactions in the hot path**: every
+  high-throughput sharded system avoids them. If a feature
+  needs them, redesign the feature.
+
+## When not to shard
+
+- **Workload fits on one node** (after replicas for reads).
+  Most do, by far.
+- **No clear partition key.** Many fundamental algorithms
+  (most graph traversals, many analytical queries) don't
+  partition cleanly. Use a different architecture (column
+  store, graph DB) instead.
+- **Operational maturity below the line.** Sharded systems
+  require sophisticated backup/restore, schema migration, and
+  cross-shard tooling. Don't shard if you can't operate it.
+
+<Callout variant="info">
+Vertical scaling, read replicas, caching, and partitioning
+within a single database (Postgres declarative partitioning)
+get you remarkably far. Treat sharding as the last
+architectural step, not the first.
+</Callout>
+
+## In summary
+
+- Sharding splits data across nodes by a **shard function** of
+  the key. Four families: range, hash, directory, geographic.
+- Range supports scans, hash distributes uniformly, directory
+  is flexible, geographic is for latency / sovereignty.
+- Consistent hashing limits resharding to ~1/N of the data;
+  naive modulo doesn't.
+- Hot partitions kill scaled systems. Pick the key to spread
+  load; cache or dedicate-shard the offenders.
+- Cross-shard joins and transactions are expensive — co-locate
+  related data by the same key whenever possible.
+- Shard late, shard once, get the partition key right.

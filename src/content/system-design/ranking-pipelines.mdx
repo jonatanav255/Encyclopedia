@@ -1,0 +1,226 @@
+export const level = 'staff';
+
+# Ranking pipelines
+
+Search engines and recommendation systems don't compute one
+score; they run a **funnel of progressively more expensive
+ranking stages**, each working on a smaller set.
+
+```
+candidate generation (millions → thousands)
+        ▼
+light ranking (thousands → hundreds)
+        ▼
+heavy ranking (hundreds → tens)
+        ▼
+re-ranking (tens → top N)
+        ▼
+display
+```
+
+Total latency budget: under 200ms. Each stage gets a slice;
+the deeper stages get the smaller slice times the smaller
+candidate set.
+
+## Why a funnel
+
+A perfect ranker would score every document and pick the
+best. With billions of documents and a sub-200ms budget,
+that's impossible.
+
+So you cheap-score everything, expensive-score the top
+candidates. The funnel trades exhaustiveness for speed at
+each stage.
+
+## Stage 1: candidate generation (recall)
+
+Goal: from billions of items, get ~1000 candidates that
+plausibly match.
+
+Tools:
+
+- **Inverted index** (text matching).
+- **Vector similarity** (embedding-based recall).
+- **Filters** (category, geography, freshness).
+- **Collaborative filtering** lookups (users who liked X
+  also liked Y).
+
+Cheap operations on the full index. Recall (cover the
+relevant items) matters more than precision (don't return
+irrelevant). The next stages filter the noise.
+
+## Stage 2: light ranking
+
+Goal: from ~1000 candidates, pick top ~100.
+
+Signals: text-match score (BM25), simple features
+(item-level scores, freshness, popularity).
+
+Often a linear model or shallow gradient-boosted tree. ~1ms
+per candidate × 1000 candidates ≈ 1 second total — too slow
+if naive, fast with vectorization.
+
+## Stage 3: heavy ranking
+
+Goal: from ~100 candidates, score precisely. Returns top ~30.
+
+Signals: dozens to hundreds. User profile, item features,
+context, interaction history.
+
+Often a deep neural network (transformer-based for modern
+systems). ~10ms per candidate × 100 ≈ 1 second — but
+heavily vectorized on a GPU it's ~50ms total.
+
+## Stage 4: re-ranking
+
+Goal: apply business rules, diversity constraints, fairness
+adjustments. Final order.
+
+- **Diversity**: don't show 10 results from the same source.
+- **Freshness boost**: prefer newer items if relevance is
+  close.
+- **Personalization**: re-rank based on the specific user.
+- **Business rules**: promoted items, sponsored content,
+  legal compliance.
+
+Often a small re-rank step on top of the heavy ranker's
+output.
+
+## Budget allocation
+
+A 200ms latency budget might split:
+
+```
+recall:        10ms
+light:         30ms
+heavy:         50ms (often GPU-bound)
+re-rank:       20ms
+network/parse: 30ms
+buffer:        60ms
+```
+
+If any stage blows budget, the user sees a slow search.
+Tail-amplification is real; tight per-stage budgets needed.
+
+## Features
+
+Each stage has features fed into its model:
+
+- **Item features**: price, rating, recency, category.
+- **Query features**: length, language, head-vs-tail.
+- **User features**: location, tier, history.
+- **Interaction features**: previous clicks, dwell time, past
+  purchases on similar items.
+
+Modern systems have hundreds to thousands of features.
+**Feature store** infrastructure (Feast, Tecton, custom)
+serves them with low latency.
+
+## Online vs offline training
+
+Models are trained **offline** on logs:
+
+- Each query/result becomes a training example.
+- Label: did the user click? buy? engage?
+- Train periodically (daily, weekly) on accumulated data.
+
+Models are served **online** with low latency. Updated
+periodically (every few hours to weekly).
+
+## Logging for training
+
+Every served result needs to be logged for later training:
+
+- Query, user, candidates considered.
+- Scores from each stage.
+- Final order shown.
+- Outcomes (click? convert? dwell?).
+
+Without complete logs, the next model can't improve. Logging
+infrastructure is often as important as model code.
+
+## Common ranking architectures
+
+### Two-tower
+
+User and item each embedded into a vector. Score = dot
+product. Fast at scale.
+
+Used for candidate generation. Each tower trained against
+the other; embeddings cached.
+
+### Deep cross network (DCN)
+
+Cross features explicitly modeled. Used for heavy ranking
+where interaction terms matter.
+
+### Transformer-based
+
+Modern recommendation models are transformer architectures
+applied to user sequences. SASRec, BERT4Rec, etc.
+
+## Evaluation
+
+Offline metrics (NDCG, AUC, MAP) measure model quality
+against labels.
+
+Online metrics (A/B test results) measure real impact. A
+model that improves NDCG by 5% might lose 2% engagement —
+labels and behavior diverge.
+
+A/B tests are the truth. Offline metrics guide; online
+metrics decide.
+
+## Cost considerations
+
+Heavy ranking on GPU is expensive. A 100ms GPU call at 10K
+QPS = 1000 concurrent GPU calls. Plan for it:
+
+- Batch inference at the GPU level.
+- Cache popular query / context features.
+- Approximate models if cost is prohibitive.
+
+For some applications, "cheap-recall + simple ranking" beats
+sophisticated ranking financially. Always measure.
+
+## Watch-outs
+
+### Recall failures
+
+If recall misses the relevant items, no ranker downstream
+can recover. Recall is the foundation.
+
+### Position bias
+
+Users click higher-ranked items even when lower ones are
+better. Training data reflects this. Models can amplify the
+bias. Counterbalance with techniques like inverse-propensity
+weighting or randomization.
+
+### Cold start
+
+New users, new items have little signal. Default to
+popularity, exploration, or content-based methods until
+signal accrues.
+
+### Filter bubble
+
+Always serving "more of what they like" narrows the user's
+exposure. Add diversity / exploration constraints to break
+out.
+
+## In summary
+
+- Ranking pipeline = funnel of candidate generation → light
+  → heavy → re-rank.
+- Each stage cheaper or smarter than the last; total under
+  budget.
+- Candidate generation via inverted index + vector + filters
+  + collaborative.
+- Heavy ranking uses deep NNs (often transformer-based) on
+  GPU.
+- Re-rank handles business rules, diversity, fairness.
+- Logging is critical; A/B tests are the only honest
+  evaluation.
+- Watch for: recall misses, position bias, cold start, filter
+  bubbles.

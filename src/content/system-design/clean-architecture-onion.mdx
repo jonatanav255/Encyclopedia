@@ -1,0 +1,209 @@
+export const level = 'senior';
+
+# Clean / onion architecture
+
+Robert C. Martin's synthesis of hexagonal architecture, DDD,
+and earlier "onion" architecture (Jeffrey Palermo). Concentric
+circles of code, with a strict dependency rule:
+
+> Source code dependencies point only inward. Inner circles
+> know nothing about outer circles.
+
+```
+┌─────────────────────────────────────────┐
+│  Frameworks & Drivers (web, db, ui)     │
+│  ┌───────────────────────────────────┐  │
+│  │  Interface Adapters (controllers, │  │
+│  │  presenters, gateways)            │  │
+│  │  ┌─────────────────────────────┐  │  │
+│  │  │  Use Cases (app logic)      │  │  │
+│  │  │  ┌─────────────────────┐    │  │  │
+│  │  │  │ Entities (domain)   │    │  │  │
+│  │  │  └─────────────────────┘    │  │  │
+│  │  └─────────────────────────────┘  │  │
+│  └───────────────────────────────────┘  │
+└─────────────────────────────────────────┘
+```
+
+Same idea as hexagonal architecture, slightly different
+vocabulary, more rings.
+
+## The rings
+
+### Entities (innermost)
+
+Pure business objects with behavior. No framework. No I/O. No
+side effects. An `Order` entity knows about line items,
+shipping, statuses — but doesn't know how it's persisted.
+
+### Use cases
+
+Application-specific business rules. Orchestrate entities to
+implement features: "place an order," "cancel a subscription."
+Use cases call entities; never the reverse.
+
+### Interface adapters
+
+Translate between use cases and the outside world.
+Controllers parse HTTP and call use cases. Gateways implement
+interfaces the use cases need (repositories, mailers).
+Presenters format responses.
+
+### Frameworks and drivers (outermost)
+
+Express, Postgres, Stripe SDK, file system. Everything that's
+not your code. The ring where dependencies enter the system.
+
+## The dependency rule
+
+Code in an inner ring **does not** import from an outer ring.
+Use cases never `import express`. Entities never `import pg`.
+
+If a use case needs to "save an order," it depends on an
+abstract `OrderRepository` (defined in the use case ring).
+The Postgres adapter (interface adapter ring) implements that
+interface.
+
+```ts
+// Use case ring (inner)
+interface OrderRepository {
+  save(order: Order): Promise<void>;
+}
+
+class PlaceOrderUseCase {
+  constructor(private repo: OrderRepository, private prices: PriceCalculator) {}
+  
+  async execute(input: PlaceOrderInput) {
+    const order = new Order(input.userId, input.items);
+    const total = this.prices.compute(order);
+    order.setTotal(total);
+    await this.repo.save(order);
+    return { orderId: order.id };
+  }
+}
+
+// Interface adapter ring (outer)
+class PgOrderRepository implements OrderRepository {
+  async save(order: Order) { /* INSERT INTO orders ... */ }
+}
+```
+
+Compile dependencies all point inward; runtime composition
+(DI container, manual wiring) connects them.
+
+## Clean vs hexagonal vs onion
+
+<Compare a="Hexagonal" b="Clean Architecture">
+<>
+Two layers: core + adapters. Ports defined by core,
+implemented by adapters.
+</>
+<>
+Four (or more) layers: entities, use cases, interface
+adapters, frameworks. Explicit "use case" ring distinguishes
+app-level orchestration from pure domain.
+</>
+</Compare>
+
+They're functionally equivalent. Hexagonal is simpler;
+Clean is more explicit. Pick the vocabulary your team prefers.
+
+## What it actually achieves
+
+### Testability
+
+Use cases can be tested without any framework or DB. Mock
+the repository interface, run pure unit tests:
+
+```ts
+test('PlaceOrder', async () => {
+  const repo = new InMemoryOrderRepository();
+  const useCase = new PlaceOrderUseCase(repo, fakePrices);
+  const result = await useCase.execute({ userId: '1', items: [...] });
+  expect(result.orderId).toBeDefined();
+  expect(await repo.findById(result.orderId)).toMatchObject({ ... });
+});
+```
+
+### Replaceability
+
+Switch Postgres for DynamoDB: write a new gateway. The use
+cases and entities don't notice.
+
+### Explicit dependencies
+
+The wiring code (typically a `main.ts` or DI container) is
+the only place where infrastructure meets domain. You can
+see the whole system in one file.
+
+## What it costs
+
+### Indirection tax
+
+For every interface there's an implementation. Three files
+per CRUD endpoint. Small apps drown in abstraction.
+
+### Translation overhead
+
+DTOs at every boundary. The HTTP layer parses to a request
+DTO; the controller maps to a use case input; the use case
+returns a domain object; the presenter maps to a response
+DTO. Lots of copying.
+
+### Religious arguments
+
+Where does X belong — use case or entity? Should this
+validation live in the entity or the controller? Debates that
+don't pay back proportional to the time spent.
+
+## When to use it
+
+Same as hexagonal: complex domain, expectation of
+infrastructure change, multiple inbound channels, high test
+coverage of business logic. (See hexagonal-architecture for
+the same discussion.)
+
+Don't use it for:
+
+- CRUD apps where the "domain" is data + simple validations.
+- Small teams that won't enforce the dependency rule.
+- Projects where framework + ORM idioms work fine.
+
+The biggest mistake teams make: adopt Clean Architecture
+because a book said so, then write CRUD with 5 layers of
+indirection. The cost is the same as if you wrote the domain
+in `for (const item of items)` — just more files.
+
+## Common antipatterns
+
+### "Use case" that's just a delegate
+
+A use case that does `repo.findById(input.id)` and returns
+it. You've added a layer that does nothing. Either it should
+do work, or it shouldn't exist.
+
+### Entities that include persistence concerns
+
+`Order extends BaseModel` from your ORM. The entity is now
+tied to the DB. The dependency rule has been violated.
+
+Fix: entities are POJOs (plain objects). Repositories handle
+ORM concerns.
+
+### Framework-aware use cases
+
+Use case takes an Express `Request` as input. Tied to the
+framework. Should take a domain input type instead; the
+controller translates.
+
+## In summary
+
+- Clean / onion architecture: concentric rings, dependencies
+  point inward only.
+- Entities (pure domain) → use cases (app logic) → interface
+  adapters → frameworks.
+- Functionally equivalent to hexagonal; more rings.
+- Wins: testability without frameworks, replaceability of
+  infrastructure, explicit dependencies.
+- Costs: indirection, translation overhead, religious arguments.
+- Use for non-trivial domains; overkill for CRUD.

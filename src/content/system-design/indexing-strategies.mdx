@@ -1,0 +1,306 @@
+export const level = 'mid';
+
+# Indexing strategies
+
+An index is a separate data structure that maps a column (or
+expression) to row locations. It exists to make some queries
+fast and, in exchange, makes every write slower and the table
+larger. Every index is a bet that the read savings exceed the
+write cost.
+
+## What an index actually is
+
+For each row in the base table, the index stores `(key, rowid)`
+pairs sorted by key, plus a tree or hash on top of them.
+
+```
+table users:                index users(email):
+  rowid | email                key            | rowid
+  ------+--------               ---------------+------
+   1    | b@x                   a@x           | 5
+   2    | c@x                   b@x           | 1
+   3    | e@x                   c@x           | 2
+   ...                          ...
+```
+
+A query `WHERE email = 'b@x'` does a B-tree lookup on the
+index, finds the rowid, and fetches the row.
+
+The cost: every insert/update/delete to the base table is also
+an insert/update/delete to every index that covers the changed
+columns. With 8 indexes, one write becomes nine.
+
+## Primary vs secondary indexes
+
+- **Primary index** (sometimes called clustered): the rows are
+  physically ordered by the primary key. The "index" *is* the
+  table. InnoDB, SQL Server, and most LSM stores work this way.
+  Postgres heap tables don't — the primary key is just another
+  index pointing into a heap.
+- **Secondary index**: a separate structure that points at the
+  row. Lookups are two hops — index → rowid → row — unless the
+  query is covered (see below).
+
+The distinction matters because primary-key lookups can be
+strictly faster on clustered tables (one read) than on heap
+tables (two reads, often cached but still measurable).
+
+## Composite indexes
+
+An index on `(a, b, c)` is sorted by `a`, then `b` within each
+`a`, then `c` within each `b`. The prefix matters.
+
+<Cheatsheet>
+| Query | Uses index `(a, b, c)`? |
+|---|---|
+| `WHERE a = ?` | Yes |
+| `WHERE a = ? AND b = ?` | Yes |
+| `WHERE a = ? AND b = ? AND c = ?` | Yes |
+| `WHERE a = ? AND c = ?` | Partially (only a) |
+| `WHERE b = ?` | No |
+| `WHERE a = ? ORDER BY b` | Yes (index order) |
+| `WHERE a = ? ORDER BY c` | Partially |
+</Cheatsheet>
+
+**Rule**: list columns in the order of selectivity and equality
+usage. Equality predicates first, then a range or sort column
+last. A composite index is one index; you don't need separate
+indexes for `(a)` and `(a, b)`.
+
+## Covering indexes
+
+A query is **covered** when every column it needs (in the
+SELECT, WHERE, ORDER BY) is present in the index. The engine
+returns results without touching the base table.
+
+```js
+// Postgres
+`CREATE INDEX idx_orders_user_status
+   ON orders(user_id, status)
+   INCLUDE (created_at, total);`
+```
+
+A query `SELECT created_at, total FROM orders WHERE user_id =
+? AND status = 'paid'` reads only the index — typically a
+single page on hot data. This is the single biggest hidden
+optimization in OLTP systems.
+
+The cost: the index is wider, so it takes more memory and more
+work to maintain.
+
+## Partial indexes
+
+Index only rows matching a predicate.
+
+```js
+// Postgres
+`CREATE INDEX idx_orders_pending
+   ON orders(created_at)
+   WHERE status = 'pending';`
+```
+
+If only 0.5% of orders are pending, the index is 200× smaller
+and queries against pending orders are correspondingly faster.
+Index maintenance is also cheaper — non-pending rows never
+touch the index.
+
+Classic uses: soft-delete tables (`WHERE deleted_at IS NULL`),
+unprocessed queues, status-flagged rows.
+
+## Expression / functional indexes
+
+Index a computed value.
+
+```js
+// Postgres
+`CREATE INDEX idx_users_email_lower ON users(lower(email));`
+```
+
+A query `WHERE lower(email) = 'a@b.com'` now uses the index.
+Without the expression index, the planner can't use a normal
+`email` index because `lower(email)` is opaque.
+
+Common uses: case-insensitive search, JSONB field extraction,
+day truncation on timestamps.
+
+## Unique indexes
+
+A unique index enforces the constraint and also speeds up
+lookups by the unique column. They're not free — they require
+a synchronous check on insert. But for primary-key-like fields
+they're table stakes.
+
+Partial unique indexes are particularly useful:
+
+```js
+`CREATE UNIQUE INDEX one_active_subscription_per_user
+   ON subscriptions(user_id)
+   WHERE status = 'active';`
+```
+
+Enforces "at most one active subscription per user" without an
+application-level lock.
+
+## Inverted indexes
+
+For full-text and array containment. Each token (word) maps to
+the list of documents that contain it.
+
+```
+"the":   [doc1, doc2, doc5, ...]
+"quick": [doc1, doc3]
+"fox":   [doc1, doc7]
+```
+
+Postgres has GIN indexes for tsvector and JSONB; Elasticsearch
+and Lucene are built around inverted indexes; Cassandra has
+SASI. Useful for:
+
+- Full-text search.
+- JSONB `?` and `@>` operators.
+- Array contains queries.
+- Tags and labels.
+
+The cost is higher than a B-tree because each row can contribute
+many index entries (one per token). Builds are slower; writes
+amplify more.
+
+## Bitmap and hash indexes
+
+- **Hash index**: O(1) point lookups, no range support.
+  Postgres has them but they're rarely worth it over B-trees,
+  which are nearly as fast and support more.
+- **Bitmap index**: one bitmap per distinct value. Excellent for
+  low-cardinality columns in OLAP. Postgres builds bitmap
+  *scans* dynamically but doesn't store them as a permanent
+  index type. ClickHouse and similar OLAP engines do.
+
+For OLTP, you'll almost exclusively use B-tree, GIN/inverted,
+and occasionally GiST/BRIN.
+
+## BRIN (block-range) indexes
+
+For very large tables where the column is correlated with
+physical row order — typically a timestamp on an append-only
+table.
+
+```js
+`CREATE INDEX idx_events_ts BRIN ON events(ts);`
+```
+
+Stores min/max per block range, not per row. The index is
+tiny — a few KB for a TB table — but only useful when data is
+physically clustered by the indexed column. Ideal for
+time-series and append-only logs.
+
+## The write-amplification cost
+
+This is the single most underestimated cost in production
+systems.
+
+```
+INSERT INTO orders(...)  -- writes 1 row
+  -- + 1 row to PK index
+  -- + 1 row to each of 7 secondary indexes
+  -- + WAL entries for all of the above
+  -- + replication of WAL to N replicas
+= 8 index updates, ~16 disk writes, replicated N times
+```
+
+For a write-heavy table, every extra index costs roughly **10%
+write throughput**. Eight indexes can halve insert speed.
+
+Practical implications:
+
+- **Audit your indexes regularly.** Unused indexes are pure
+  cost. Query the system catalogs to find them
+  (`pg_stat_user_indexes`).
+- **Don't index every column "just in case."** Each one is paid
+  on every write forever.
+- **Consider partial indexes** to limit maintenance to the rows
+  that matter.
+- **Drop indexes during bulk load**, recreate after.
+
+## Index-only patterns
+
+A few configurations worth memorizing:
+
+<Cheatsheet>
+| Query shape | Index |
+|---|---|
+| Lookup by foreign key | Index the FK column |
+| Time-range on append-only table | BRIN on the time column |
+| Filter + sort by different columns | Composite `(filter, sort)` |
+| Soft-delete table | Partial index `WHERE deleted_at IS NULL` |
+| Case-insensitive search | Expression index on `lower(col)` |
+| JSONB field lookup | GIN on `jsonb_path_ops` |
+| Multi-tenant filter | Leading `tenant_id` in every composite |
+| Latest N rows per user | `(user_id, ts DESC)` |
+</Cheatsheet>
+
+## Maintenance and bloat
+
+B-trees in MVCC engines (Postgres, InnoDB) accumulate dead
+entries as rows are updated. Over time, indexes bloat — the
+on-disk size exceeds the live data by 2–10×.
+
+Symptoms: queries that used to be fast are slow; the index
+fits less in cache; the optimizer picks bad plans.
+
+Remediation:
+
+- `REINDEX CONCURRENTLY` on Postgres.
+- Adjust autovacuum to be more aggressive on write-heavy tables.
+- For unique indexes that grow, consider whether the unique
+  constraint is still needed.
+
+## Choosing indexes for a workload
+
+A repeatable process:
+
+<Steps>
+<Step n={1} title="Collect the slow queries.">
+`pg_stat_statements`, slow query log, APM traces. Sort by
+total time, not just per-query time.
+</Step>
+<Step n={2} title="Read each EXPLAIN.">
+Sequential scan on a large table is the obvious target.
+Filter conditions tell you the index column(s).
+</Step>
+<Step n={3} title="Design the smallest index that helps.">
+Often one composite index helps several queries. Prefer
+composites over single-column indexes when the prefix matches
+existing query shapes.
+</Step>
+<Step n={4} title="Consider covering.">
+If the query selects a few columns, INCLUDE them to make the
+index covering. Hugely effective for hot lookups.
+</Step>
+<Step n={5} title="Verify with EXPLAIN ANALYZE.">
+Plan should show "Index Only Scan" or "Index Scan" instead of
+"Seq Scan." Cost numbers should drop by orders of magnitude.
+</Step>
+<Step n={6} title="Audit periodically.">
+Drop indexes with zero scans over 30 days. They cost writes
+forever.
+</Step>
+</Steps>
+
+<Callout variant="warning">
+The optimizer can ignore an index even when it's a "perfect"
+match — usually because statistics are stale or selectivity is
+low. Run ANALYZE; check the planner's row estimates against
+reality.
+</Callout>
+
+## In summary
+
+- Indexes trade write cost and storage for read speed.
+- B-tree composites with the right column order solve most
+  problems; one composite often covers several queries.
+- Covering, partial, and expression indexes are the high-value
+  techniques most teams under-use.
+- Inverted (GIN) for text and JSONB; BRIN for time-series;
+  bitmap for OLAP.
+- Audit and drop unused indexes — they cost throughput
+  forever.

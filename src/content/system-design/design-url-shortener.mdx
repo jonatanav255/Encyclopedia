@@ -1,0 +1,232 @@
+export const level = 'mid';
+
+# Design a URL shortener
+
+A URL shortener (bit.ly, tinyurl) turns a long URL into a short
+unguessable code, and resolves clicks on the short code back to
+the original URL with sub-100ms latency, at hundreds of thousands
+of QPS, globally.
+
+This is the canonical "easy-looking, deceptively interesting"
+interview problem — most of the difficulty is in the read path,
+hot-key handling, and choosing the short-code scheme.
+
+## 1. Clarify the scope
+
+- Users can submit a long URL and get a short URL back.
+- Anyone can visit the short URL and be redirected (HTTP 301/302).
+- Short codes are unguessable; analytics are out of scope.
+- No edits/deletes for now; optional expiry per URL.
+- Custom aliases (vanity codes): in or out?
+- TTL: indefinite, or expire after N years?
+
+Out of scope I'd assume: user accounts beyond the API key, link
+preview, A/B testing per link, click analytics dashboards.
+
+## 2. Estimate scale
+
+```
+New URLs/day        = 100M
+Avg write QPS       = 100M / 10^5 = 1 000 QPS
+Peak write QPS      = ~3 000 QPS
+
+Read:write ratio    = 100:1 (industry typical)
+Reads/day           = 10B
+Avg read QPS        = 100 000 QPS
+Peak read QPS       = ~300 000 QPS
+
+Storage:
+  per record (long url ~200B + code ~10B + metadata) ≈ 500 B
+  daily growth = 100M × 500B = 50 GB/day
+  5-year storage = ~90 TB
+
+Bandwidth:
+  per redirect = ~500B (small header response)
+  peak egress  = 300K × 500B = 150 MB/s
+```
+
+300K read QPS forces a key-value store + CDN edge cache, not a
+single Postgres. 3K write QPS is comfortable for a sharded
+relational store or a managed KV.
+
+## 3. API
+
+```bash
+POST /api/v1/urls
+  Headers: Authorization: Bearer <token>
+  Body:    { longUrl: string, customAlias?: string, ttlDays?: int }
+  Resp:    { shortUrl: string, code: string, expiresAt?: timestamp }
+
+GET  /:code
+  Resp:    HTTP 302 Location: <longUrl>
+           Cache-Control: public, max-age=3600
+
+DELETE /api/v1/urls/:code
+  (owner only)
+
+GET  /api/v1/urls/:code/stats   (out of scope, mentioned for completeness)
+```
+
+## 4. High-level design
+
+```
+                          [ CDN / edge cache ]
+                                 ↓ (miss)
+[ client ] → [ DNS / Anycast ] → [ L7 LB ]
+                                    ↓
+                           [ Redirect service ]   ←──── [ Redis cache ]
+                                    │                        ↑
+                                    └──── [ KV store: code → longUrl ]
+                                                  │
+                                                  └── async ──→ [ analytics topic ]
+
+
+Write path:
+[ client ] → [ LB ] → [ Shorten service ] → [ ID gen / code generator ]
+                              ↓
+                       [ KV store ]  (idempotent insert)
+                              ↓
+                       [ CDN purge / pre-warm ]   (optional)
+```
+
+Reads are the money path. Writes are infrequent and tolerate a
+heavier path.
+
+## 5. Data model
+
+```
+url_mapping {
+  code            string  PRIMARY KEY    -- 7-char base62
+  long_url        string
+  owner_id        string
+  created_at      timestamp
+  expires_at      timestamp  NULL
+}
+```
+
+Sharding key: `code`. Range partitioning would create hot
+shards (all newly minted codes land on the latest shard); hash
+partitioning by `code` spreads writes evenly.
+
+Cache: `code → long_url` in Redis with TTL of ~1h; hot codes
+auto-promoted to longer TTL.
+
+Optional `users` and `analytics_events` tables; events go to a
+log/Kafka topic, not the synchronous path.
+
+## 6. Deep dives
+
+### 6.1 Short-code generation
+
+Three viable schemes, each with real trade-offs.
+
+<Cheatsheet>
+| Scheme | How | Pros | Cons |
+|---|---|---|---|
+| **Counter + base62** | Monotonic id → base62 encode | Short, dense, predictable | Guessable; needs a global counter (ZooKeeper / range allocator) |
+| **Hash of long URL** | MD5(longUrl)[:7] → base62 | Idempotent (same URL → same code) | Collisions; rehashing logic; no idempotency if URL differs by trailing slash |
+| **Random** | Random 7 base62 chars | Unguessable, simple | Collisions; must retry on insert; sparse keyspace |
+</Cheatsheet>
+
+The practical answer: **random base62** with a unique-key
+constraint, retry on collision. At 7 chars: 62⁷ ≈ 3.5 × 10¹²
+codes — ample headroom. Collision probability stays negligible
+until you've issued ~10⁹ codes.
+
+If the interviewer pushes on idempotency, layer it: hash the URL
+to detect repeats; store the mapping only if not already there;
+return the existing code. This collapses duplicate inserts of
+the same URL.
+
+### 6.2 Read path: cache, CDN, and hot keys
+
+The 300K QPS read load is dominated by hot codes (viral links).
+Cache strategy:
+
+<Steps>
+<Step n={1} title="CDN edge cache for the redirect itself.">
+The 302 response has a 1-hour `Cache-Control`. The CDN serves
+the redirect without touching origin for the second through
+N-th visit during that hour. This shaves ~95% of reads off
+origin.
+</Step>
+<Step n={2} title="Redis cluster as the second tier.">
+On CDN miss, the redirect service hits Redis. ~99% of CDN
+misses hit Redis. Origin DB sees under 1% of total reads.
+</Step>
+<Step n={3} title="DB as the floor.">
+On Redis miss, hit the KV store, populate Redis, return. Small
+fraction of total traffic.
+</Step>
+</Steps>
+
+**Hot key risk**: one viral link can saturate a single Redis
+shard. Mitigation: **replicate hot keys** across multiple shards
+(client adds a salt suffix `:0`-`:N`, random pick on read), or
+push very hot keys to per-process in-memory caches with a short
+TTL.
+
+### 6.3 Idempotency for the write path
+
+Without care, retried POSTs (from flaky networks) create
+duplicate codes for the same long URL. Two mechanisms:
+
+- **Idempotency key** in the request header — if the same key
+  arrives, return the original response.
+- **Deduplication index** on `(owner_id, hash(longUrl))` — the
+  shortener returns the existing code instead of creating a new
+  one when an owner re-shortens a URL they already shortened.
+
+For anonymous shortening, the second mechanism is a feature
+("two anonymous people shortening the same URL get the same
+code") or a privacy violation — pick a policy and document it.
+
+### 6.4 Abuse and safety
+
+Real-world URL shorteners are abuse targets: phishing, malware
+distribution. Production systems run incoming long URLs against
+threat-intel lists (Safe Browsing) on creation, and re-check
+periodically. A `status` column marks codes as `blocked` and
+serves a warning page instead of the redirect. This is product
+work, not interview-design depth, but worth naming.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 3M read QPS | Origin Redis (single shard) | Redis cluster; hot-key replication |
+| 30K write QPS | KV write throughput | Shard by code-prefix; pre-allocate ranges |
+| 1 PB storage | Single KV cluster | Multi-cluster; tier old codes to cold storage |
+| Cross-region p99 | Single-region origin | Replicate to 2-3 regions, anycast routing |
+| Hot viral link | CDN PoP cache eviction | Pin to CDN, increase TTL, pre-warm |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Random codes over counter**: unguessable + no central
+  counter dependency, at the cost of retry-on-collision and
+  occasionally non-idempotent inserts.
+- **302 over 301**: 302 lets us update the mapping and not have
+  stale browser caches; 301 is more cacheable. Pick 302 for
+  flexibility.
+- **Eventual consistency on creation**: a freshly created code
+  can take ~1s to propagate to all read replicas. Acceptable for
+  this product; a wallet wouldn't tolerate it.
+- **Storing the original URL forever**: small per-record cost,
+  big optionality. Pay it.
+
+## In summary
+
+- The hard part is the read path at 100-300K QPS, not the
+  shortening.
+- CDN > Redis > KV store, in that order. Each layer absorbs
+  ~95% of the traffic above it.
+- Random base62 codes are the practical default; counters need
+  global coordination and leak ordering.
+- Idempotency on writes via a request-level key or a
+  per-owner dedup index; pick a policy.
+- Hot keys (viral links) need explicit mitigation: replicate
+  across shards or pin in process-local caches.
+- At 10x scale, the next breaks are write throughput and
+  storage tier — both handled by sharding and tiering.

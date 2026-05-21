@@ -1,0 +1,348 @@
+export const level = 'senior';
+
+# Materialized views
+
+A **materialized view** is a continuously-updated copy of some
+derived data, kept in sync with its source by an incremental
+process. The query result is precomputed and stored; reads are
+cheap; the update is the work.
+
+Two contexts where the term shows up:
+
+- **Database materialized views** (Postgres, Oracle): a stored
+  query result, refreshed periodically.
+- **Stream-based materialized views** (Kafka Streams, Flink,
+  Materialize, ksqlDB): a continuously-updated table derived
+  from a stream.
+
+The latter is the modern interesting one. It's what powers CQRS
+read models, search indexes, dashboards, and feed timelines.
+
+## The shape
+
+```
+source-of-truth (OLTP DB, event stream, raw logs)
+          ↓
+   incremental update process
+          ↓
+  materialized view (denormalized, query-optimized)
+          ↑
+        reads
+```
+
+Reads are fast because the view is shaped for the query. Writes
+land in the source; the view catches up via the update process.
+
+This is the same idea as **derived data** in Kleppmann's *DDIA*
+— there's a system of record (the source) and every other
+representation is a derived projection.
+
+## Why bother
+
+The motivation in three words: **read amplification**.
+
+A naïve query joining 5 tables to produce a feed might take 800ms
+per request. Materialize the join into a single table; the read
+becomes a primary-key lookup, ~1ms. The update process pays the
+join cost once per change instead of per query.
+
+The trade is:
+
+- **More storage** (the materialized form is denormalized).
+- **Update latency** (the view lags the source).
+- **A new system to operate** (the maintenance process).
+
+For read-heavy data where the underlying query is expensive, it's
+usually worth it.
+
+## Database materialized views
+
+Postgres has `CREATE MATERIALIZED VIEW`:
+
+```js
+// SQL — fenced as js for fence rules
+const sql = `
+  CREATE MATERIALIZED VIEW user_stats AS
+  SELECT
+    user_id,
+    COUNT(*) AS posts,
+    MAX(created_at) AS last_post
+  FROM posts
+  GROUP BY user_id;
+`;
+```
+
+To refresh:
+
+```js
+const refresh = `REFRESH MATERIALIZED VIEW user_stats;`;
+const refreshConcurrently = `REFRESH MATERIALIZED VIEW CONCURRENTLY user_stats;`;
+```
+
+The basic `REFRESH` rebuilds the entire view. `CONCURRENTLY` does
+it incrementally while still allowing reads — but it requires a
+unique index and is still O(view size) work.
+
+Limitations:
+
+- **Not incremental**: each refresh recomputes everything.
+- **Refresh is manual**: cron or trigger required.
+- **Locks**: basic refresh blocks reads briefly; concurrent
+  refresh is heavy.
+
+Best for: data that's expensive to compute but updates
+infrequently (daily aggregates, reporting summaries).
+
+For real-time materialized views, look beyond the OLTP database.
+
+## Stream-based materialized views
+
+Modern stream processors continuously update views as events
+arrive.
+
+### Kafka Streams: KTable
+
+A KTable is a stream interpreted as a changelog of a table. Each
+record with key K updates the value for K.
+
+```js
+// Sketch
+const userStats = builder.stream('events')
+  .groupByKey()
+  .aggregate(
+    () => ({ count: 0, lastSeen: 0 }),
+    (key, event, agg) => ({
+      count: agg.count + 1,
+      lastSeen: event.timestamp,
+    }),
+    Materialized.as('user-stats-store'),
+  );
+
+// Query via interactive queries
+const value = streams
+  .store('user-stats-store', QueryableStoreTypes.keyValueStore())
+  .get('user-42');
+```
+
+The `Materialized.as(...)` creates a queryable state store backed
+by RocksDB. The KTable is a materialized view, updated per
+event, persisted locally, and replicated to a changelog topic
+for fault tolerance.
+
+### Flink / Materialize / ksqlDB
+
+The same shape, different surface. Materialize (the product) is
+explicitly a "streaming materialized view database" — write SQL,
+get a continuously-updated table. The query plan defines the
+update propagation; the engine handles incrementalization.
+
+```js
+// ksqlDB
+const sql = `
+  CREATE TABLE user_stats AS
+  SELECT user_id, COUNT(*) AS posts
+  FROM events
+  GROUP BY user_id
+  EMIT CHANGES;
+`;
+```
+
+`EMIT CHANGES` is the streaming part: the table is continuously
+updated as events arrive.
+
+## Materialized views as the read model
+
+The **CQRS** (Command Query Responsibility Segregation) pattern
+splits writes from reads. Writes update the source-of-truth (a
+relational DB, an event store). Reads happen against
+**materialized views** shaped for queries.
+
+```
+[Commands]
+    ↓
+[Write model: normalized OLTP DB or event log]
+    ↓ change stream / CDC / events
+[Materialized views: denormalized, per-query-shape]
+    ↑
+[Queries]
+```
+
+Pros:
+
+- Reads are fast and independent of write complexity.
+- Multiple views per source, each optimized for a different
+  query.
+- Write and read scale independently.
+
+Cons:
+
+- **Eventual consistency** between write and read views.
+- More moving parts.
+- Schema migrations span the view rebuilds.
+
+CQRS without materialized views is just "use a read replica."
+With materialized views, you get shaped read data — feeds,
+dashboards, full-text indexes — all derived from the same write
+model.
+
+## Common materialized views in the wild
+
+<Cheatsheet>
+| View | Source | Refresh model |
+|---|---|---|
+| Search index (Elasticsearch, OpenSearch) | OLTP DB | CDC → indexer |
+| Feed timeline | Posts + follows | Stream-based KTable |
+| Cache (Redis hashes for user profiles) | OLTP DB | CDC or write-through |
+| Analytics aggregates | Events | Stream window + sink |
+| Permissions cache | Auth tables | Periodic refresh |
+| Leaderboard | Events | Stream aggregation |
+</Cheatsheet>
+
+The pattern is identical in every row: a write to the source, a
+propagation process, a read-optimized representation.
+
+## Stream-table join
+
+A particularly powerful use of materialized views: joining a
+stream against a table.
+
+```
+events stream (order placed) ┐
+                              ├→ enriched stream
+products table (materialized) ┘
+```
+
+The "products" table is a materialized view of the product
+catalog. As events arrive, they're enriched with current product
+data without a round trip to the product service.
+
+Kafka Streams calls this **stream-table join**. It's how event
+pipelines avoid having to call out to other services for
+reference data — the reference data is **pulled in as a
+materialized view**.
+
+See **Stream-table duality** for the underlying theory.
+
+## How updates propagate
+
+Three propagation modes, with different correctness/latency
+trade-offs:
+
+### Full refresh
+
+Recompute the whole view periodically. Simple, slow. Used when
+the source isn't a stream and incremental updates are hard.
+Postgres `REFRESH MATERIALIZED VIEW`. Daily ELT.
+
+### Incremental update
+
+Update only the changed rows. Requires the engine to track what
+changed and apply incremental aggregation logic.
+
+For simple aggregations (count, sum, max), straightforward — add
+or subtract the delta. For complex ones (top-K, distinct count),
+hard — may require auxiliary state.
+
+Stream processors handle this natively. Materialize implements
+**incremental view maintenance** (IVM) over arbitrary SQL,
+including joins and subqueries, which is the cutting edge.
+
+### Refresh-on-read (lazy)
+
+A cache that's populated on miss. Not really a materialized view
+in the strict sense, but commonly conflated.
+
+```js
+async function getUserStats(userId) {
+  let stats = await cache.get(`stats:${userId}`);
+  if (!stats) {
+    stats = await db.computeStats(userId);
+    await cache.set(`stats:${userId}`, stats, { ex: 60 });
+  }
+  return stats;
+}
+```
+
+Simple but has a thundering-herd problem on miss. Real
+materialized views avoid this by being always-fresh.
+
+## Consistency
+
+Materialized views are **eventually consistent** with their
+source. The delay is:
+
+- Database materialized views: until next refresh.
+- Stream-based: typically sub-second under healthy operation.
+- Read-through cache: until TTL or next miss.
+
+Two consequences:
+
+1. **Read-your-writes** doesn't hold across views. User writes a
+   post; the feed view doesn't immediately reflect it. Either
+   accept this or route writer's reads to the write model
+   directly.
+2. **Cross-view consistency** is even weaker. Different views
+   may lag differently. "The feed says 5 posts, the profile
+   says 4" is normal during catch-up.
+
+CQRS designs typically embrace the eventual consistency
+explicitly — "if you want to see your own write immediately,
+read from the write model."
+
+## Operating materialized views
+
+The maintenance process is the hard part.
+
+- **Lag monitoring**: how far behind is the view? Alert when
+  lag exceeds N minutes.
+- **Rebuild capacity**: schema migrations or bug fixes require
+  rebuilding the view. How long does that take? Hours? Days?
+- **Backpressure**: if the source produces faster than the view
+  can apply, what happens? Buffer? Drop? Block?
+- **Initial load**: bootstrapping a new view from a non-empty
+  source. Bootstrapping from CDC + snapshot is a Debezium
+  pattern.
+
+The rule: **a materialized view is only as good as your ability
+to rebuild it**. Treat the source as durable; treat the view as
+derivable. If you can't rebuild, you can't migrate.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Treating materialized views as primary data.** They're
+derived. Lose them, rebuild from source. Designing as primary
+storage means painful migrations.
+</Callout>
+
+<Callout variant="warning">
+**Forgetting late events.** A stream-based materialized view
+that doesn't handle late updates (event time < watermark) will
+miss data. Set allowed lateness explicitly.
+</Callout>
+
+<Callout variant="warning">
+**Materialized view that depends on non-deterministic logic.**
+Rebuilds produce different results than the live state. Keep
+the view's logic deterministic (no external API calls during
+update).
+</Callout>
+
+<Callout variant="warning">
+**Refresh-on-read masquerading as materialized view.** A cache
+is not a materialized view. Different operational profile.
+</Callout>
+
+## In summary
+
+- **Materialized view = continuously-updated derived data.**
+  Reads are cheap; the update process pays the work.
+- **Database MVs** (Postgres) refresh periodically; **stream-
+  based MVs** (Kafka Streams, Flink, ksqlDB, Materialize) update
+  incrementally per event.
+- **Behind CQRS, search indexes, feed timelines, ML feature
+  stores.**
+- **Eventually consistent** with source; design read-your-writes
+  around this.
+- **Treat as derived**, not primary. Must be rebuildable.
+- **Lag is the SLI.**

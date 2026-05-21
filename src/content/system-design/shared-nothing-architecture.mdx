@@ -1,0 +1,309 @@
+export const level = 'senior';
+
+# Shared-nothing architecture
+
+In a shared-nothing system, each node has its own CPU, its own
+memory, and its own disk. Nodes coordinate only through the
+network. Nothing is centrally shared — no shared disk array,
+no shared filesystem, no shared lock manager, no shared cache.
+
+It is the architectural foundation underneath every
+modern internet-scale system: Cassandra, DynamoDB, BigTable,
+Spanner, Kafka, Elasticsearch, sharded Postgres, the
+hyperscaler clouds themselves. Once you understand
+shared-nothing, you understand why distributed systems are
+shaped the way they are.
+
+The phrase comes from Michael Stonebraker (1986). It was the
+deliberate departure from "shared-disk" and "shared-memory"
+designs that dominated the 1980s mainframe and clustered-server
+era.
+
+## The three families
+
+```
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ Shared memory    │  │ Shared disk      │  │ Shared nothing   │
+│                  │  │                  │  │                  │
+│ [cpu][cpu][cpu]  │  │ [node][node][node]│ │ [node]  [node]   │
+│      │           │  │      │           │  │  cpu     cpu     │
+│   [memory]       │  │      │           │  │  mem     mem     │
+│      │           │  │   [shared disk]  │  │  disk    disk    │
+│    [disk]        │  │                  │  │      ↔ network ↔ │
+└──────────────────┘  └──────────────────┘  └──────────────────┘
+```
+
+### Shared memory
+
+A single big machine. Multiple CPUs share RAM and disk. The
+OS handles concurrency. Used for in-memory databases on big
+boxes — fast within a node, doesn't scale past the box.
+
+### Shared disk
+
+Multiple compute nodes attached to a shared storage system
+(SAN, NAS, NVMe-over-fabric). Each node has its own CPU and
+RAM but reads/writes the same disks.
+
+Oracle RAC is the canonical example. Modern: AWS Aurora
+separates compute from storage in this style.
+
+Pros: any node can serve any query. Failover is fast (just
+hand off the disk).
+Cons: the shared disk is the bottleneck. Cache coherence across
+nodes requires complex distributed locking. Hard to scale
+past a few dozen nodes.
+
+### Shared nothing
+
+Each node owns its data. Queries are routed to the node that
+owns the relevant data. No shared resource, so no shared
+bottleneck — and no shared failure domain.
+
+Pros: scales effectively unbounded. Adding a node adds capacity
+proportionally. Failures are isolated to one node.
+Cons: every cross-node operation is a network call. Joins
+across nodes are expensive. Coordination (transactions, global
+indexes, top-N queries) is hard.
+
+## Why shared-nothing wins at scale
+
+Three reasons:
+
+1. **No coordination on the hot path.** Shared resources
+   require locks, leases, or cache coherence — and those don't
+   scale. A 1000-node shared-disk cluster spends most of its
+   time coordinating; a 1000-node shared-nothing cluster spends
+   most of its time computing.
+2. **Failure isolation.** If node 17's disk dies, only node 17's
+   data is affected. The other 999 nodes keep going. In a
+   shared-disk system, a corrupted disk affects everyone.
+3. **Commodity hardware.** A shared-nothing cluster doesn't need
+   exotic SAN gear. Cheap servers with local disks scale by
+   adding more of them.
+
+The cost is that **everything cross-node is a network call**.
+You design the data model and the access pattern so that the
+common operations are node-local; only occasional operations
+fan out.
+
+## What you give up
+
+The architecture's strength is its weakness:
+
+- **Cross-node joins are expensive.** "Show me all users with
+  orders this week" — if users are on shard A and orders on
+  shard B, you must fetch from both and join in the application
+  (or denormalize).
+- **Distributed transactions are slow and rare.** Atomically
+  updating two rows on different shards requires two-phase
+  commit or Saga patterns. Most shared-nothing databases
+  simply don't offer cross-shard transactions.
+- **Global indexes are hard.** A unique constraint across the
+  whole cluster requires coordination on every insert. Most
+  systems offer only per-shard unique constraints.
+- **Resharding is painful.** Splitting a hot shard or adding
+  capacity means physically moving data between nodes. With
+  consistent hashing (see consistent-hashing), the pain is
+  bounded but never zero.
+
+This is why systems like Cassandra and DynamoDB expose
+fundamentally different APIs from Postgres. They don't pretend
+to do cross-node joins — they make you design your access
+patterns so you never need one.
+
+## The partitioning question
+
+Shared-nothing only works if you can partition data so that
+most queries are answered by one node. Three common schemes
+(detailed in sharding-strategies):
+
+### Hash partitioning
+
+Hash the key, modulo number of nodes (or via consistent
+hashing). Cassandra, DynamoDB default. Good for uniform load
+distribution; bad for range queries.
+
+### Range partitioning
+
+Each node owns a contiguous range of keys. BigTable, HBase,
+DynamoDB's local secondary indexes use this. Good for range
+queries; risks hot spots.
+
+### Directory-based
+
+A lookup service maps each key to its shard. Most flexible —
+you can hand-place hot keys onto dedicated shards. Used by
+many ad hoc sharded Postgres deployments.
+
+Whichever scheme: the **partitioning key** is the single most
+consequential design decision. Pick the wrong key and you
+spend years fighting it.
+
+## Replication on top
+
+Shared-nothing nodes typically replicate their data to N other
+nodes for HA. So node 17's data lives on nodes 17, 18, and 19.
+If 17 dies, 18 or 19 takes over.
+
+```
+   [node 17]  primary owner of partition P
+       │
+       │ replicates to:
+       ▼
+   [node 18] [node 19]
+```
+
+Cassandra calls this "replication factor." DynamoDB hides it
+behind the managed service. Postgres + Citus does it via
+"distributed tables" with N replicas per shard.
+
+The replication can be **synchronous** (strong consistency at
+the cost of latency) or **asynchronous** (eventual consistency,
+faster writes). Most shared-nothing systems lean asynchronous
+because synchronous coordination across N nodes is exactly what
+shared-nothing was meant to avoid.
+
+## Coordination, when it's unavoidable
+
+Most operations are node-local. Some genuinely need cluster-wide
+coordination: leader election, schema changes, distributed
+transactions, cluster membership. The standard pattern is to
+isolate this coordination in a small, separate quorum-based
+service:
+
+- **Cassandra**: gossip + Paxos for lightweight transactions.
+- **HBase**: ZooKeeper for cluster metadata.
+- **Kafka**: Raft (KRaft) since 2025; ZooKeeper before.
+- **Kubernetes**: etcd (Raft) for cluster state.
+
+Quorum-based coordination is slow and not horizontally scalable
+the way the data plane is. The design pattern is "do everything
+possible on the fast data plane; touch the slow control plane
+only rarely."
+
+## Stateless services are shared-nothing too
+
+You don't have to be a database. A stateless service tier
+(see stateless-services) is a shared-nothing system: each
+replica has its own memory, no shared state, all coordination
+through the load balancer and the backing stores.
+
+When we say "horizontal scaling," we mean "build the system
+shared-nothing-style." The pattern applies all the way up the
+stack:
+
+- Stateless app servers behind a load balancer: shared-nothing.
+- Sharded database: shared-nothing.
+- Distributed cache (Redis Cluster, Memcached): shared-nothing.
+- Distributed message broker (Kafka): shared-nothing.
+- Distributed search (Elasticsearch): shared-nothing.
+
+Each owns its slice; coordination is the minimum required.
+
+## Aurora and the modern hybrids
+
+Modern cloud databases blur the boundary. AWS Aurora separates
+**compute** (shared-nothing) from **storage** (a multi-tenant
+distributed storage service shared across many Aurora
+instances). Snowflake similarly separates compute warehouses
+from a shared storage layer.
+
+This is sometimes called "disaggregated storage." It gets the
+best of both:
+
+- Compute scales horizontally and statelessly (shared-nothing).
+- Storage is a managed, replicated, durable service that any
+  compute node can access (effectively shared-disk but at
+  cloud scale, hidden behind an API).
+
+The distinction matters for design conversations: when someone
+says "Aurora is shared-disk," they're describing the storage
+layer. The query engine on top is shared-nothing.
+
+## When *not* to go shared-nothing
+
+Not every system needs to be distributed. The cost of going
+shared-nothing is real:
+
+- A single Postgres instance with 96 cores can handle 20K+
+  writes/sec on the right hardware. That's a billion writes
+  per year — enough for almost any mid-sized product.
+- A single Redis instance can do 100K+ ops/sec single-threaded.
+- A single Kafka broker can ingest 100 MB/s sustained.
+
+If you fit on one box, **fit on one box**. Shared-nothing pays
+off at scale. At small scale it just adds latency, partitioning
+pain, and operational complexity.
+
+The vertical-vs-horizontal page covers the tradeoff. Reach for
+shared-nothing when:
+
+- A single box can't hold your data.
+- A single primary can't take your write rate.
+- You need availability above what one box can provide.
+- You need geographic distribution.
+
+## Common pitfalls
+
+### Pretending shared-disk is shared-nothing
+
+"We're scaling horizontally" — but every node hits the same
+Postgres primary. That's not shared-nothing; it's shared-disk
+where the "disk" is your DB. The bottleneck is the same as
+ever.
+
+True horizontal scaling requires that the data layer is
+*also* shared-nothing — sharded, replicated, distributed. App-
+tier horizontal scaling is necessary but not sufficient.
+
+### Picking the wrong partition key
+
+The partition key dictates which queries are fast (node-local)
+and which are slow (scatter-gather). Pick a key that aligns
+with your hot queries.
+
+Classic mistakes: partitioning users by signup-date when most
+queries are per-user (forces cross-shard for every login),
+or partitioning by user-ID when most queries are by company
+(forces fanout across all employees of one company).
+
+### Designing around a global secondary index
+
+In a shared-nothing system, a global unique index requires
+coordination on every write. Designs that depend on global
+uniqueness usually fight the architecture. Common fixes:
+make the uniqueness local (per-tenant), use a centralized ID
+service, or accept eventual uniqueness with conflict
+resolution.
+
+### Forgetting that the control plane isn't shared-nothing
+
+Cluster metadata, schema, membership — these live in a small
+coordinator (etcd, ZooKeeper) that does NOT scale horizontally.
+Operations that hit the control plane have a much lower
+throughput ceiling than data-plane operations. Keep schema
+changes rare; don't put per-request state in the control plane.
+
+### Underestimating resharding
+
+You designed for 8 shards. Now you need 16. Moving half the
+data across nodes is a major operation that affects
+throughput, latency, and on-call burden. Plan resharding
+runbooks and use techniques like consistent hashing or virtual
+nodes that bound the impact.
+
+## In summary
+
+- Shared-nothing = each node owns its CPU, memory, and disk.
+  Coordination only over the network.
+- It's the foundation under every internet-scale system.
+- Wins by avoiding shared bottlenecks and isolating failures.
+- Trades: cross-node operations are expensive, joins are
+  hard, coordination is rare and slow.
+- Pick the partition key carefully — it shapes everything.
+- Replicate within shared-nothing for HA; isolate control-plane
+  coordination in a small quorum service.
+- Don't reach for it until you've exhausted vertical and
+  read-replica scaling. Past that point, it's the only thing
+  that works.

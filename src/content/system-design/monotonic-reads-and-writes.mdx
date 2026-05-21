@@ -1,0 +1,149 @@
+export const level = 'senior';
+
+# Monotonic reads and writes
+
+Two session guarantees that together prevent the "time goes
+backwards" class of bugs that plague eventually consistent
+systems.
+
+- **Monotonic reads:** a client's successive reads see
+  non-decreasing state. If you saw value V, your next read
+  sees V or newer — never V-1.
+- **Monotonic writes:** a client's writes apply in submission
+  order at every replica. Write 1 always lands before write 2.
+
+Easy to lose if you're not careful; expensive to recover.
+
+## Monotonic reads, illustrated
+
+Two replicas. Replica A has caught up to write #5; replica B
+is still on write #3.
+
+```
+client: read → load balancer → replica A → returns V5
+client: read again → load balancer → replica B → returns V3
+```
+
+Same client, same key, second read older than the first. A
+**non-monotonic** result. Real users notice and file bugs:
+
+- "I refreshed and my comment disappeared, then it came back."
+- "The counter went 100, 99, 100."
+- "My new like was there and then gone and then there again."
+
+Even when there's no data loss, the appearance of going
+backwards destroys user trust.
+
+## Implementation: pin or token
+
+Two approaches, same as read-your-writes:
+
+### Sticky routing
+
+Once a client reads from replica A, keep routing them to A.
+Until A fails, they'll never see a state older than what they
+already saw.
+
+Cheap. Doesn't survive replica failure cleanly. Fine for short
+sessions; degrades for long ones.
+
+### Read tokens
+
+Each response includes the log position of the data returned.
+The client sends it on the next read; the replica blocks until
+caught up.
+
+```js
+const { data, token } = await get('/feed');
+// ... later
+const next = await get('/feed', { headers: { 'X-Read-Min': token } });
+// next.token >= token guaranteed
+```
+
+Survives failover, works across replicas, works across devices
+if the token persists. The standard implementation in
+production systems.
+
+## Monotonic writes, illustrated
+
+Same client, two writes A and B issued in order. Without
+monotonic writes:
+
+```
+write A → replica 1 (slow path)
+write B → replica 2 (fast path) → propagates to others before A
+```
+
+Now some replicas have B but not A. Other clients reading
+might see B (which references A's effects) but not A. Bug.
+
+## Implementation: per-client write log position
+
+Each client tracks its own "max write position." Every write
+sent to a server includes that position; the server makes sure
+the previous write has been applied (or replicated) before
+applying the new one.
+
+In single-leader systems this is automatic — the leader sees
+writes in order. In multi-leader or leaderless systems, you
+need an explicit sequencing layer (usually a Lamport clock or
+HLC).
+
+## How they interact with the other session guarantees
+
+<Cheatsheet>
+| Combination | Gives you |
+|---|---|
+| Monotonic reads alone | "Time doesn't go backwards" — useful but incomplete |
+| Read-your-writes alone | "I see my writes" — incomplete, time can still go backwards on others' writes |
+| Both + monotonic writes + writes-follow-reads | Full **session consistency** — feels like a personal timeline even on eventually-consistent storage |
+</Cheatsheet>
+
+Pursuing all four is worth it; the implementation cost is one
+log-position token per session. The UX delta is enormous.
+
+## Failure modes
+
+### Replica recovery
+
+A replica that was offline returns. It's behind the cluster.
+A client whose token references a future log position will
+block — sometimes forever if the recovery never catches up.
+
+Fix: configurable max-wait timeout that falls back to leader
+read.
+
+### Token forgery
+
+Tokens carried in cookies/headers can be tampered with. A
+malicious client could request a way-future token to DOS the
+system. Sign or HMAC the token; never let clients construct
+their own.
+
+### Cross-key tokens
+
+A token from key A doesn't tell you anything about key B's
+replication state. A naive implementation gives monotonic
+reads per key, not globally. Real systems use a global log
+position (HLC, single Raft log) to give cross-key monotonicity.
+
+## When you don't need them
+
+For truly write-once, read-many data (an image upload, an
+immutable receipt), monotonic guarantees are free — there's no
+older version to regress to.
+
+For high-cardinality analytics rollups, exact monotonicity
+isn't worth the cost; let the dashboard refresh accept
+out-of-order updates.
+
+## In summary
+
+- Monotonic reads: per-client, time doesn't go backwards.
+- Monotonic writes: per-client, writes apply in order.
+- Lose them and users see "comment disappeared then came back"
+  bugs they remember forever.
+- Implementation: sticky replica or log-position token. Token
+  is the standard.
+- Combine with read-your-writes + writes-follow-reads to get
+  full session consistency cheaply.

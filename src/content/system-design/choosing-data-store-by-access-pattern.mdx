@@ -1,0 +1,174 @@
+export const level = 'senior';
+
+# Choosing a data store by access pattern
+
+The right database is determined by **how you read and write
+the data**, not by the data's shape. Two systems with
+identical schemas can need different stores if their query
+patterns differ.
+
+This page is a matrix from access pattern → recommended store
+family.
+
+## The five questions
+
+Before picking a store, answer:
+
+<Steps>
+<Step n={1} title="What's the read pattern?">
+Point-lookup by key? Range scan? Aggregation? Search?
+Traversal?
+</Step>
+<Step n={2} title="What's the write pattern?">
+Single-row CRUD? Append-only events? High-frequency updates
+to the same row?
+</Step>
+<Step n={3} title="What consistency do you need?">
+ACID multi-row? Per-key linearizable? Eventual?
+</Step>
+<Step n={4} title="What's the scale?">
+GB or TB? Millions or billions of rows? K or M QPS?
+</Step>
+<Step n={5} title="What's the latency budget?">
+Sub-ms? 10 ms? 100 ms?
+</Step>
+</Steps>
+
+The combination of answers points to a store family.
+
+## The matrix
+
+<Cheatsheet>
+| Access pattern | Store family | Example |
+|---|---|---|
+| Point lookup by primary key, low latency | KV store | Redis, DynamoDB, Aerospike |
+| Single-row CRUD with relationships | Relational | Postgres, MySQL |
+| Schema varies per document | Document DB | MongoDB, DynamoDB JSON |
+| Time-series writes + range scans + aggregations | TSDB | InfluxDB, TimescaleDB, ClickHouse |
+| Wide row + tunable consistency + high write throughput | Wide-column | Cassandra, ScyllaDB |
+| Graph traversals (friend-of-friend) | Graph DB | Neo4j, Neptune |
+| Full-text search + ranking | Search engine | Elasticsearch, OpenSearch, Vespa |
+| OLAP / analytical queries over billions of rows | Columnar warehouse | BigQuery, Snowflake, ClickHouse |
+| Object blobs (images, video) | Object storage | S3, GCS, Azure Blob |
+| Embedding similarity search | Vector DB | Pinecone, Weaviate, pgvector |
+| Append-only log + replay | Log store | Kafka, Pulsar, EventStoreDB |
+| Geospatial range queries | Geo-enabled relational or KV | PostGIS, Redis GEO |
+| Counter / aggregate increment-heavy | KV with atomic ops | Redis, DynamoDB |
+</Cheatsheet>
+
+## Concrete worked examples
+
+### "Show this user's order history, sorted by date, paginated"
+
+Pattern: point lookup by user_id + range scan + sort.
+
+Pick: **relational with index on (user_id, created_at DESC)**.
+Postgres handles this trivially.
+
+### "Track every user click; query last 30 days of conversions"
+
+Pattern: high-volume append + analytical aggregation.
+
+Pick: **append to Kafka** (durable log) → **stream to
+ClickHouse** (columnar for fast aggregation). Or pipe directly
+into BigQuery for batch analytics.
+
+### "Real-time leaderboard for a multiplayer game"
+
+Pattern: high-frequency increment + ranked range query.
+
+Pick: **Redis sorted set (ZSET)**. (See design-leaderboard.)
+
+### "Auto-suggest as the user types"
+
+Pattern: prefix lookup, latency under 100 ms.
+
+Pick: **trie / FST in memory** (see
+design-search-autocomplete) or **Elasticsearch completion
+suggester**.
+
+### "Find products similar to this one"
+
+Pattern: embedding similarity search.
+
+Pick: **vector DB** (Pinecone, Weaviate, or Postgres with
+pgvector for smaller scales).
+
+### "Multi-tenant SaaS with per-tenant data"
+
+Pattern: per-tenant CRUD with strong consistency, big tenants
+big, small tenants small.
+
+Pick: **relational with tenant_id partitioning**, or
+**Cassandra with tenant_id as partition key** if tenant count
+× data size is enormous.
+
+### "1M IoT devices reporting metrics every 10 seconds"
+
+Pattern: high write throughput, time-series, aggregations.
+
+Pick: **TSDB** (InfluxDB, Timescale, ClickHouse).
+
+## When you need multiple stores
+
+Most non-trivial products end up with 3–5 stores:
+
+- **Primary OLTP**: Postgres for transactional data.
+- **Cache**: Redis for hot data and rate limits.
+- **Search**: Elasticsearch for full-text and faceted search.
+- **Analytics**: ClickHouse / BigQuery for dashboards.
+- **Object storage**: S3 for blobs.
+
+They're populated via CDC, application writes, or async
+projections. The right approach is **specialize per access
+pattern**; don't force every query into one engine.
+
+## Antipatterns
+
+### "MongoDB for everything"
+
+Document stores are bad at joins, expensive at aggregation,
+and not natively transactional across documents. Forcing
+relational data into Mongo creates the worst of both worlds.
+
+### "Postgres for high-cardinality time-series"
+
+Postgres handles ~1M time-series rows/sec with care, ~10K
+trivially. Beyond that, a TSDB pays back the operational cost.
+
+### "Elasticsearch as primary store"
+
+Eventually consistent; doesn't have transactional guarantees;
+data loss possible on cluster issues. ES is a search index,
+not a source of truth. Always have a primary store (relational)
+that ES projects from.
+
+### "Cassandra for low-write loads"
+
+The operational cost of Cassandra only makes sense at scale.
+For a 1K-row table, Postgres is dramatically easier.
+
+## Decision checklist
+
+For any new feature:
+
+1. List the **read patterns** by frequency.
+2. List the **write patterns** by frequency.
+3. Pick the store family that matches the **dominant**
+   pattern.
+4. If multiple patterns are equally dominant, pick **multiple
+   stores** projected from a primary.
+5. Don't let "we already have Postgres" force a poor fit on
+   a fundamentally different access pattern.
+
+## In summary
+
+- Pick stores by access pattern, not data shape.
+- Matrix: KV (lookup), relational (CRUD), document (varied
+  schema), TSDB (time-series), wide-column (write-heavy),
+  graph (traversal), search (FTS), columnar (OLAP), object
+  (blobs), vector (similarity), log (append + replay).
+- Most real systems use 3–5 specialized stores.
+- Project secondary stores from a primary source of truth.
+- Antipatterns: one-store-fits-all, ES as primary, Postgres
+  at TSDB scale.

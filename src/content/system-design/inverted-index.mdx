@@ -1,0 +1,212 @@
+export const level = 'senior';
+
+# Inverted index
+
+The data structure at the heart of every search engine. A
+**forward index** maps document → terms; an **inverted index**
+maps term → documents.
+
+That inversion turns "find documents containing X" from a
+linear scan into a hashmap lookup.
+
+## What it looks like
+
+For documents:
+
+```
+doc 1: "the quick brown fox"
+doc 2: "the lazy brown dog"
+doc 3: "the quick fox jumps"
+```
+
+The forward index:
+
+```
+1 → [the, quick, brown, fox]
+2 → [the, lazy, brown, dog]
+3 → [the, quick, fox, jumps]
+```
+
+The inverted index:
+
+```
+the    → [1, 2, 3]
+quick  → [1, 3]
+brown  → [1, 2]
+fox    → [1, 3]
+lazy   → [2]
+dog    → [2]
+jumps  → [3]
+```
+
+A query for "quick fox" hits both terms; intersect the
+posting lists → [1, 3]. Done in microseconds even for
+billions of documents.
+
+## Building one
+
+<Steps>
+<Step n={1} title="Tokenize.">
+Break text into terms. "Hello, world!" → ["hello", "world"].
+</Step>
+<Step n={2} title="Normalize.">
+Lowercase, strip punctuation, stem ("running" → "run").
+Locale-specific normalization (Unicode NFC).
+</Step>
+<Step n={3} title="Remove stop words (optional).">
+Drop "the", "a", "and" if scoring doesn't need them.
+</Step>
+<Step n={4} title="Build the postings.">
+For each term, a posting list of (doc_id, frequency, positions).
+</Step>
+</Steps>
+
+## What's in a posting
+
+A naive posting is `[doc_id, doc_id, ...]`. Production
+postings are richer:
+
+- **doc_id**: which documents.
+- **term frequency**: how many times in the doc — used in
+  scoring.
+- **positions**: byte / token offsets — used for phrase
+  queries.
+- **field**: which field of the document (title vs body) —
+  used for boosting.
+- **norms**: normalized length for scoring.
+
+## Storage tricks
+
+Posting lists are huge. Two crucial compressions:
+
+### Delta encoding
+
+Doc IDs are stored sorted ascending. Store the differences:
+
+```
+ids:    [42, 47, 49, 100]
+deltas: [42, 5,  2,  51]
+```
+
+Smaller integers; better compression.
+
+### Variable-byte encoding
+
+Small integers use fewer bytes. A doc-id of 5 uses 1 byte;
+a doc-id of 1,000,000 uses 3 bytes.
+
+Combined with delta encoding, posting lists compress ~10×.
+
+## Querying
+
+A boolean query:
+
+```
+"quick AND fox" → intersect(postings["quick"], postings["fox"])
+"quick OR lazy" → union(postings["quick"], postings["lazy"])
+"NOT cat"       → subtract from all docs
+```
+
+Intersection and union of sorted lists is O(N + M) — linear
+in posting size.
+
+Phrase queries ("quick fox" as adjacent words) use position
+data: intersect, then verify positions are adjacent.
+
+## Scoring
+
+Beyond binary "matches / doesn't," **ranking** decides the
+order. The classic formula is TF-IDF + BM25.
+
+- **TF (term frequency)**: how often the term appears in this
+  document.
+- **IDF (inverse document frequency)**: rare terms score
+  higher.
+- **BM25**: refined TF-IDF with length normalization.
+
+```
+BM25(doc, term) = IDF(term) × (TF · (k+1)) / (TF + k · (1 - b + b · |doc| / avgdl))
+```
+
+Lucene, Elasticsearch, Solr, Postgres FTS all use BM25 by
+default.
+
+For modern systems: BM25 as a first-stage ranker,
+neural / learned-to-rank for re-ranking the top few hundred.
+
+## Building at scale
+
+### Segments
+
+A single growing inverted index is hard to update. Instead:
+
+- Write a new **segment** with each batch of docs.
+- Query merges results across all segments.
+- Background merge combines small segments into large.
+
+Lucene calls them segments; ClickHouse calls them parts;
+RocksDB calls them SSTables. Same idea.
+
+### Distributed shards
+
+The index doesn't fit on one node. Shard:
+
+- **By document hash**: each shard has random docs;
+  queries scatter to all shards.
+- **By document attribute**: e.g., by category;
+  queries that filter by category hit one shard.
+
+Most search engines (Elasticsearch, Solr) use document
+hashing.
+
+A query scatter-gathers across shards (see
+fanout-and-scatter-gather), then merges + re-ranks.
+
+## Updates
+
+Updates and deletes in an immutable inverted index:
+
+- **Update** = delete + reinsert.
+- **Delete** is marked (tombstone) in a "live docs" bitmap;
+  the doc is filtered out at query time.
+- Periodic merge physically removes deleted entries.
+
+This is why search indexes are eventually consistent: a
+deleted doc appears for a moment until its tombstone
+propagates.
+
+## Beyond text: structured fields
+
+Inverted indexes also work on structured fields:
+
+- **Numeric ranges**: index numbers as terms (e.g., "price
+  $10-20" is a term); use BKD trees for efficient range
+  queries.
+- **Keywords**: untokenized strings used as exact filters.
+- **Geo**: index lat/lon as geohash strings.
+- **Vectors**: HNSW for embedding similarity.
+
+Modern search engines mix all of these in one index.
+
+## Operating tips
+
+- **Index size = ~30-50% of source data size** typically; can
+  spike higher with positions + facets.
+- **Merge throttling** — don't let merges starve query
+  throughput.
+- **Refresh interval** trades index freshness for write
+  throughput. Default ~1s in Elasticsearch.
+- **Field-level configuration** — not every field needs
+  positions, norms, or fancy indexing.
+
+## In summary
+
+- Inverted index: term → posting list of documents.
+- Foundation of every search engine (Lucene, Elasticsearch,
+  Solr, Postgres FTS, modern vector + text hybrids).
+- Storage tricks: delta encoding + var-byte compress
+  postings ~10×.
+- Querying: intersect / union sorted posting lists.
+- Scoring: BM25 (default), with re-rank pipelines on top.
+- Segments + sharding scale beyond one machine.
+- Updates / deletes via tombstones + periodic merge.

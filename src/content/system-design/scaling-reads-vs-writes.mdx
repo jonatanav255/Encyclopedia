@@ -1,0 +1,289 @@
+export const level = 'mid';
+
+# Scaling reads vs writes
+
+Reads and writes scale differently. Reads scale almost for free
+with replication and caching. Writes hit a ceiling early —
+usually the disk or the WAL on a single primary — and breaking
+through that ceiling means sharding, async pipelines, or
+eventual consistency. Most real systems hit the write wall years
+before they ever struggle to read.
+
+If you can't answer "what's our read:write ratio?" you can't
+size the system.
+
+## Why reads scale easily
+
+Reads have three properties that make them trivial to scale:
+
+1. **Idempotent**. A read doesn't change state, so it's safe to
+   serve from any replica, retry on failure, or cache.
+2. **Stale-tolerant** for most use cases. Showing a 200 ms-old
+   value of a counter is usually fine. Showing a 2-minute-old
+   value usually still is.
+3. **Cacheable**. The output of a read can be saved and reused.
+   The output of a write can't.
+
+Practical implications:
+
+- **Read replicas** (see read-replicas-and-replication-lag)
+  multiply read capacity linearly. Add a follower, get another
+  ~10K QPS of read throughput.
+- **Caches** (see caching-overview) reduce read load on the
+  source. A 90% hit rate means 10× fewer reads to the DB.
+- **CDNs** push static and semi-static reads to the edge,
+  scaling effectively unbounded.
+
+For most web apps, reads are a solved problem at any scale you
+can imagine. The question is whether you're willing to pay the
+staleness tax of replication and caching.
+
+## Why writes are hard
+
+Writes have none of the read properties:
+
+1. **Not idempotent** (without effort). The same POST executed
+   twice creates two records. Retries are dangerous.
+2. **Order-sensitive**. Two updates to the same row aren't
+   commutative. Last-write-wins loses data; merge logic is
+   complex.
+3. **Not cacheable**. Every write must reach durable storage.
+
+In a single-leader database, **all writes funnel through one
+machine** — the primary. That primary's disk write speed,
+WAL flush rate, and lock contention bound your write
+throughput. A typical Postgres primary tops out somewhere
+between 1K and 10K writes per second, depending heavily on row
+size, indexes, and transaction shape.
+
+You can't just "add another primary." The whole architecture is
+designed around one. To scale writes past one primary, you
+change the architecture.
+
+## The read:write ratio
+
+The first number to compute in any design:
+
+```
+read:write = reads per second / writes per second
+```
+
+Typical bands:
+
+<Cheatsheet>
+| System | Approximate ratio |
+|---|---|
+| Social feed (Facebook, Twitter) | 100:1 to 1000:1 (read-heavy) |
+| E-commerce browsing | 50:1 to 200:1 (read-heavy) |
+| Search engine | 1000:1+ (extremely read-heavy) |
+| Banking transactions | 5:1 to 20:1 (mixed) |
+| Analytics ingestion | 1:100+ (write-heavy) |
+| IoT telemetry | 1:1000 (write-heavy) |
+| Logging pipeline | 1:1M (write only) |
+| Chat | 5:1 to 20:1 (mixed) |
+</Cheatsheet>
+
+The ratio dictates the architecture before any other choice.
+
+## Scaling read-heavy systems
+
+For a 100:1 read:write workload, the design follows a
+predictable path:
+
+<Steps>
+<Step n={1} title="One primary, several read replicas.">
+Writes hit primary. Reads spread across N followers. Linear
+read scaling. The primary remains a single point of write
+contention but that's fine — at 100:1 it has plenty of headroom.
+</Step>
+<Step n={2} title="Cache hot reads in Redis or Memcached.">
+Profile (user lookup, feature flag, top-N items) and cache them
+with a short TTL. Cache-aside is the default pattern
+(see cache-aside-pattern).
+</Step>
+<Step n={3} title="CDN for public, semi-static reads.">
+Product pages, images, blog posts. The CDN serves the bulk of
+requests without touching your origin (see cdn-architecture).
+</Step>
+<Step n={4} title="Materialize expensive read views.">
+Pre-compute aggregations (counts, leaderboards, dashboards) on
+write and serve them as point reads. Push the cost to the write
+path where you have time.
+</Step>
+<Step n={5} title="Edge compute and edge caching.">
+For globally-distributed read traffic, push computation and
+caching to the network edge (see edge-caching-and-compute).
+</Step>
+</Steps>
+
+At each step, the primary stays a single box and the system
+scales reads independently. The hardest part isn't capacity —
+it's reasoning about staleness across the layers.
+
+## Scaling write-heavy systems
+
+For a 1:100 read:write workload (write-heavy), the techniques
+are different — and harder:
+
+### Buffer with a queue
+
+Don't write straight to the database. Drop writes onto a
+broker (Kafka, Kinesis, Pulsar) and have workers batch them
+into the DB. Two benefits:
+
+- **Smoothing**: spikes don't blow up the DB; the queue absorbs
+  them.
+- **Batching**: 100 writes batched into one INSERT is 10–50×
+  cheaper than 100 individual writes.
+
+The cost is **latency** between write request and data being
+queryable. That gap is often acceptable for telemetry, events,
+metrics.
+
+### Partition / shard the write path
+
+Single primary maxes out at ~10K writes/sec. Sharding by user
+ID across 10 primaries gets you 100K writes/sec — at the cost
+of cross-shard transactions, fan-out queries, and resharding
+pain. Sharding is the nuclear option; defer it as long as
+possible.
+
+See horizontal-partitioning and consistent-hashing for the
+mechanics.
+
+### Write-optimized storage
+
+LSM-tree stores (Cassandra, ScyllaDB, RocksDB, BigTable) accept
+writes by appending to an in-memory buffer + WAL. They handle
+write rates 10–100× higher than B-tree stores (Postgres, MySQL)
+at the cost of read amplification and compaction overhead.
+
+For workloads that are 90%+ writes (time series, telemetry,
+logs), an LSM-tree store is usually the right tool. For mixed
+workloads, B-trees remain the default.
+
+### Append-only event log + projections
+
+Don't update rows in place. Append events; derive read views
+from the event stream. Writes are pure appends — fastest
+possible. Reads come from materialized projections that lag
+slightly.
+
+This is event sourcing. Useful when you need full history and
+can tolerate read-side delay.
+
+### Move work off the critical write path
+
+Many "writes" are really side effects of one user action:
+
+- User signs up → write to users, profiles, settings, analytics,
+  search index, audit log, notification preference, ...
+
+Doing all 8 writes synchronously in one request is slow and
+fragile. Write the core row (users) synchronously; emit an
+event and let consumers handle the rest asynchronously. Now
+the critical path has 1 write instead of 8.
+
+## Where systems actually fail
+
+In practice, the bottleneck isn't where you expect:
+
+- **Connections, not throughput.** A Postgres primary can handle
+  10K QPS but only ~500 connections without PgBouncer. Most
+  "DB can't keep up" outages are connection exhaustion, not
+  CPU/disk.
+- **Long transactions blocking short ones.** A single big UPDATE
+  holds locks that stall everything. Optimize for short
+  transactions.
+- **Index maintenance on writes.** Each index adds write cost.
+  10 indexes on a hot table can make writes 5× slower.
+- **WAL flush latency on synchronous commit.** Disk fsync is
+  the actual bottleneck. NVMe and group commit help.
+
+Profile before sharding. The cheap fix is usually somewhere
+unexpected.
+
+## Read-after-write consistency
+
+The hardest interaction between read and write scaling: a user
+writes, then immediately reads, and reads from a replica that
+hasn't caught up.
+
+Patterns:
+
+- **Route reads to primary for N seconds after a write** (per
+  user). Cheap, hides 99% of cases.
+- **Read-your-writes tokens**: write returns a position; read
+  passes the position; replica waits to catch up.
+- **Causal consistency**: track session-scoped causal tokens.
+
+See replication-and-cdc for the database-level mechanics.
+
+## A worked example
+
+A social product: 33M DAU, 50 reads/day/user, 2 writes/day/user.
+
+```
+Reads/day  = 33M × 50 = 1.65B → 16.5K QPS avg, ~50K peak
+Writes/day = 33M × 2  = 66M   → 660 QPS avg, ~2K peak
+Read:write ratio = 25:1
+```
+
+50K read QPS is trivially served by Postgres + 4 read replicas
++ Redis. 2K write QPS is well within a single primary's
+budget.
+
+Compare to a telemetry product: 1M devices, 1 event/second.
+
+```
+Writes/sec = 1M
+Reads/sec  = ~10 (dashboards)
+Read:write ratio = 1:100000
+```
+
+This is a different beast. No relational DB on earth handles 1M
+single-row INSERTs per second from one primary. The design is
+necessarily Kafka + a TSDB (ClickHouse, InfluxDB, TimescaleDB
+with hypertables) + batch writes.
+
+The math forces the architecture.
+
+## Common pitfalls
+
+### Solving the wrong axis
+
+"We can't keep up with our writes!" → adds Redis cache.
+Caches reduce reads. They do nothing for writes. Always confirm
+*which* axis is saturating.
+
+### Pretending writes are idempotent
+
+Adding retries to "make writes resilient" without idempotency
+keys duplicates data. Every write endpoint that can be retried
+needs an idempotency key or a dedupe strategy.
+
+### Sharding too early
+
+Sharding solves a write-throughput problem at enormous cost in
+complexity (cross-shard joins, resharding, hot shards, query
+routing). 99% of products never need it. Defer.
+
+### Treating eventual consistency as "free"
+
+Async write pipelines look cheap on the diagram. They cost you
+a whole new failure mode: "the user's write isn't visible
+yet." Every UI that depends on a freshly-written value is at
+risk. Plan for it.
+
+## In summary
+
+- Compute the read:write ratio first. Everything follows.
+- Reads scale with replicas, caches, and CDNs — usually
+  trivially.
+- Writes hit a single-primary ceiling early. Past that, it's
+  buffering, batching, sharding, or async pipelines.
+- Most "DB is slow" problems are connections, locks, or index
+  bloat — not raw throughput. Profile.
+- The architecture for a 100:1 read-heavy system and a 1:100
+  write-heavy system look almost nothing alike. Build the one
+  your ratio actually demands.

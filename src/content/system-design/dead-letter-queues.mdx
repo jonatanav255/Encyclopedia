@@ -1,0 +1,265 @@
+export const level = 'mid';
+
+# Dead-letter queues
+
+A **dead-letter queue** (DLQ) is the bucket you put messages in
+when they've failed too many times to keep retrying. The point
+isn't elegance — the point is to stop the retry loop from
+eating your broker, your workers, and your on-call sleep.
+
+Every production messaging system needs one. Most production
+DLQs are never drained, which is also a problem.
+
+## Why retries aren't enough
+
+Messages fail. The downstream API is flaky, the row is locked,
+the payload is malformed, the consumer has a bug. Brokers
+retry with exponential backoff: 1s, 2s, 4s, 8s, 16s. After N
+attempts (say, 5), what then?
+
+Two bad answers and one good one:
+
+1. **Retry forever.** The poison message blocks the partition (in
+   ordered systems) or burns worker cycles forever. Healthy
+   messages stack up behind it.
+2. **Drop on failure.** Silent data loss. You will not learn
+   about this until a customer complains.
+3. **Move to a DLQ.** Quarantine the message somewhere durable;
+   the main pipeline keeps flowing; humans can inspect and
+   replay.
+
+DLQ = isolation. The failing message stops blocking the rest.
+
+## The shape
+
+```
+   producer ──→ [main queue] ──→ worker ──┬→ success
+                                          │
+                                          └→ failure (× N retries)
+                                                      ↓
+                                              [dead-letter queue]
+                                                      ↓
+                                                 inspect / fix / replay
+```
+
+In RabbitMQ, the DLQ is another queue bound to a "dead-letter
+exchange." In SQS, every queue can have a redrive policy
+pointing at another SQS queue. In Kafka, there's no native DLQ —
+you implement it as a separate topic.
+
+## What goes into the DLQ envelope
+
+The DLQ message should carry **everything you need to triage**.
+Just the original payload is a footgun — you'll spend an hour
+hunting for context that should have been in the envelope.
+
+```js
+{
+  originalPayload: { ... },
+  topic: 'orders.created',
+  partition: 7,
+  offset: 91234,
+  failureReason: 'TypeError: cannot read property "id" of null',
+  stack: '...',
+  attempts: 5,
+  firstFailureAt: '2026-05-20T08:14:22Z',
+  lastFailureAt: '2026-05-20T08:15:31Z',
+  consumerId: 'order-svc-7d4b',
+  consumerVersion: 'v1.2.3',
+}
+```
+
+Without this, the DLQ is a pile of payloads you can't act on.
+With this, you can grep for "all v1.2.2 failures," "all
+NullPointerException," "all from 8 AM Tuesday."
+
+## Per-broker mechanics
+
+### SQS
+
+A queue has a redrive policy: after `maxReceiveCount` deliveries,
+SQS moves the message to a designated DLQ. Configured once, free.
+
+```js
+// terraform-ish
+resource "aws_sqs_queue" "main" {
+  name = "orders"
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+```
+
+The DLQ is itself an SQS queue. You poll it and act.
+
+### RabbitMQ
+
+A queue can specify `x-dead-letter-exchange` and optionally
+`x-dead-letter-routing-key`. Messages get dead-lettered when they
+are nack'd without requeue, expire, or exceed length limits.
+
+Combined with the **delayed-message plugin** or
+**rabbitmq_delayed_message_exchange**, you can build retry queues
+with exponential delay: failed → wait 10s → retry → failed → wait
+1 min → ... → DLQ.
+
+### Kafka
+
+No native DLQ. The pattern is **two extra topics**:
+
+```
+main topic ──→ consumer ──┬→ success
+                          ├→ transient failure → retry topic (delayed)
+                          └→ permanent failure → DLQ topic
+```
+
+The retry topic is processed by a consumer that waits before
+re-attempting (Spring Cloud Stream and similar libraries have
+this baked in). After N retries, the message lands in the DLQ
+topic. Kafka Connect's "DLQ" feature does the same shape for
+sink connectors.
+
+### BullMQ (Redis)
+
+Jobs have configurable `attempts` and `backoff`. Failed jobs
+with `removeOnFail: false` stay in the failed set.
+
+```js
+new Worker('orders', handler, {
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+  removeOnFail: false,
+});
+```
+
+Then you inspect the failed set via the BullMQ UI or
+programmatically.
+
+## Classification: when to retry vs send to DLQ
+
+Not every failure is equal. The right path depends on the cause.
+
+<Cheatsheet>
+| Failure cause | Retry? | DLQ? |
+|---|---|---|
+| Network timeout, downstream 5xx | Yes, with backoff | Only after N attempts |
+| Rate limit (429) | Yes, with delay matching `Retry-After` | Only if it persists |
+| Row locked, optimistic-concurrency conflict | Yes, immediate | No, it'll resolve |
+| Validation error / bad payload | No | Yes immediately |
+| Unknown event type / unsupported version | No | Yes immediately |
+| Authentication failure | No, this is a config issue | Yes, alert humans |
+| OOM in handler | No, retry won't help next time | Yes |
+| Business-logic rejection (e.g., "order already cancelled") | No | Maybe — consider a "completed" terminal state |
+</Cheatsheet>
+
+Smart consumers classify the error and choose. A `BadRequestError`
+goes straight to DLQ. A `TimeoutError` retries. The handler
+shouldn't blindly raise.
+
+```js
+async function handle(msg) {
+  try {
+    await process(msg);
+  } catch (err) {
+    if (err instanceof ValidationError) throw new PermanentError(err);
+    if (err instanceof TimeoutError) throw new RetryableError(err);
+    throw err; // unknown → retry, then DLQ
+  }
+}
+```
+
+## The operational discipline
+
+The single biggest DLQ failure mode: **the DLQ exists, nothing
+drains it**. Six months later there are 4 million messages, a
+support ticket about missing orders from January, and no one
+remembers what the codebase looked like when they failed.
+
+What "draining" actually means:
+
+<Steps>
+<Step n={1} title="Alert on growth.">
+Page when DLQ depth crosses a threshold. "DLQ > 100 messages"
+is a useful starting line. Tune to your volume.
+</Step>
+<Step n={2} title="Classify in the DLQ.">
+Bucket messages by failure type. "All ValidationErrors from
+endpoint X" tells you what to fix. "Random failures across
+endpoints" tells you the consumer is buggy.
+</Step>
+<Step n={3} title="Fix the root cause.">
+Code change, config change, schema migration. The DLQ is a
+backlog of "things the system thinks it shouldn't do." Make the
+system stop creating new DLQ entries.
+</Step>
+<Step n={4} title="Replay or discard.">
+For fixed bugs, replay the DLQ into the main queue. For payloads
+that can never succeed (corrupt, obsolete, out-of-policy),
+discard with a record. Don't leave them indefinitely.
+</Step>
+<Step n={5} title="Repeat weekly.">
+DLQ triage is a recurring chore, not a one-time cleanup. Put it
+on the on-call rotation.
+</Step>
+</Steps>
+
+## Replay carefully
+
+Replaying a DLQ into the main queue is not free:
+
+- **Ordering**: replayed messages now arrive after newer ones.
+  If your domain depends on order, this can produce wrong
+  outcomes (the cancellation now comes before the order).
+- **Idempotency**: a replayed message may be processed by a
+  consumer that already processed the original (if the consumer's
+  dedup state was wiped). Make sure inbox tables aren't pruned
+  before replay.
+- **Volume**: replaying 100k messages into a live queue can
+  saturate downstream APIs. Throttle.
+
+```js
+// Throttled replay
+for (const msg of failedMessages) {
+  await mainQueue.add('replay', msg.payload);
+  await sleep(100); // 10/sec ceiling
+}
+```
+
+## Anti-patterns
+
+<Callout variant="warning">
+**DLQ with no consumer or alarm.** A garbage dump nobody looks
+at. You're better off without it — at least logging on failure
+forces someone to find out.
+</Callout>
+
+<Callout variant="warning">
+**Same retry config for transient and permanent errors.** Five
+retries on a `ValidationError` wastes time. One retry on a
+network blip causes loss. Classify.
+</Callout>
+
+<Callout variant="warning">
+**Infinite retries with no DLQ.** The original poison message
+blocks the partition for hours. Healthy customers wait. Always
+cap attempts and quarantine.
+</Callout>
+
+<Callout variant="warning">
+**Replaying the DLQ without fixing the bug.** Same messages
+loop into the DLQ; queue depth oscillates; on-call burns out.
+Fix first, replay second.
+</Callout>
+
+## In summary
+
+- **DLQ isolates poison messages** so retries don't loop forever
+  and healthy traffic keeps flowing.
+- **Envelope every DLQ message** with original payload + reason +
+  context. Bare payloads are useless.
+- **Classify errors**: transient → retry with backoff; permanent →
+  DLQ immediately.
+- **Drain weekly**. A DLQ that's never inspected is a worse
+  outcome than no DLQ.
+- **Replay carefully** — order and idempotency are at risk.

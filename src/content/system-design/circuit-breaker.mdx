@@ -1,0 +1,198 @@
+export const level = 'senior';
+
+# Circuit breaker
+
+Borrowed from electrical engineering. When a downstream
+dependency starts failing repeatedly, **trip a circuit** that
+stops calling it for a while. Fail fast instead of piling up
+slow requests.
+
+The pattern saved thousands of outages from cascading. It's
+the most-important resilience pattern in distributed systems.
+
+## The three states
+
+```
+       ┌─────────────────┐
+       │                 │
+       ▼                 │
+   ┌────────┐        ┌────────┐
+   │ CLOSED │───────►│  OPEN  │
+   └────────┘        └────────┘
+       ▲                 │
+       │                 ▼
+       │            ┌──────────┐
+       └────────────│ HALF-OPEN│
+                   └──────────┘
+```
+
+- **Closed**: requests pass through normally. Failures
+  counted.
+- **Open**: requests fail fast (no downstream call); a timer
+  runs.
+- **Half-open**: after the timer, allow a few "probe"
+  requests. If they succeed, close; if they fail, re-open.
+
+## When to trip
+
+A simple rule: trip when error rate or latency over the
+recent window exceeds a threshold.
+
+```js
+const breaker = new CircuitBreaker(downstreamCall, {
+  errorThreshold: 0.5,          // trip if 50%+ of requests fail
+  volumeThreshold: 20,          // need at least 20 requests to measure
+  timeout: 1000,                // count slow requests (>1s) as failures
+  resetTimeout: 30_000,         // 30 sec before half-open probes
+});
+
+try {
+  const result = await breaker.fire(input);
+} catch (err) {
+  if (breaker.isOpen) {
+    return fallback();          // serve degraded
+  }
+  throw err;
+}
+```
+
+Tuning the thresholds is the hard part. Too sensitive →
+trips on transient blips. Too lenient → cascades before it
+trips.
+
+## Why fail fast helps
+
+Without a breaker:
+
+```
+service A → service B (timing out at 30s)
+                    ↑
+                   1000 requests pile up
+                    ↑
+                  service A threads exhausted
+                    ↑
+                  service A unavailable
+```
+
+With a breaker:
+
+```
+service A → breaker (open) → fail in 1ms
+                            → fallback response
+```
+
+The downstream gets a chance to recover; A stays alive.
+
+## Per-dependency, per-endpoint
+
+A circuit breaker isn't global. It's per **dependency** (the
+service you're calling) and often per **endpoint** (different
+endpoints fail independently).
+
+```
+breaker[paymentService.charge]   — independent state
+breaker[paymentService.refund]   — independent state
+breaker[searchService.query]     — independent state
+```
+
+A search service being slow shouldn't open the payment service
+breaker.
+
+## Fallbacks
+
+When the breaker is open, what do you serve?
+
+- **Cached response**: serve stale data with a "stale"
+  marker.
+- **Default value**: empty list, default config.
+- **Degraded experience**: "Recommendations unavailable" but
+  the page still loads.
+- **Skip the operation**: don't show recommendations at all.
+
+The fallback is just as important as the breaker. A breaker
+that always throws is just shifting the error from "slow" to
+"fast" without helping the user.
+
+## Half-open: probing recovery
+
+When the reset timer fires, try **one** request. If it
+succeeds, close the breaker. If it fails, re-open and start
+the timer again.
+
+Don't probe with many requests at once — you'd re-overload
+the downstream. One probe per timer.
+
+## Distributed circuit breakers
+
+A breaker in service A only tracks A's view of failures. Other
+instances of A see their own failures.
+
+For datacenter-wide consensus on "B is down," use a centralized
+health store (Redis, gossip-based). Instances vote on B's
+status; when enough agree, all open simultaneously.
+
+In practice, per-instance breakers are usually enough. They
+converge: if everyone sees failures, everyone opens.
+
+## When breakers fire incorrectly
+
+### Slow not failing
+
+The downstream is slow but not erroring. Without a latency
+threshold, the breaker doesn't trip. Slow requests pile up.
+
+Fix: count slow requests (> timeout) as failures. Trip on
+either error rate or latency.
+
+### Hammered downstream during half-open
+
+Two requests start at the same time; both pass the half-open
+check; both hit the downstream. If the downstream is still
+broken, you've doubled its pain.
+
+Fix: serialize probes — only one at a time.
+
+### Different failures look the same
+
+A 4xx (client error) shouldn't count toward the breaker.
+That's the client's fault, not the downstream's.
+
+Fix: only count 5xx and timeouts.
+
+### Cascading breakers
+
+A → B → C. C goes down. B's breaker opens. A's requests to B
+start failing because B can't get C's data. A's breaker
+opens.
+
+Now everything is open. When C recovers, half-open from A
+proves B is up… but B's half-open requires C to be up… the
+chain might not recover.
+
+Fix: timing diversity in resetTimeout (don't all use 30s).
+Or accept that the chain has to recover bottom-up.
+
+## Libraries
+
+- **resilience4j** (Java) — current standard.
+- **opossum** (Node.js) — Bulkhead and circuit breaker.
+- **istio / linkerd** — service mesh sidecars provide
+  application-transparent breakers.
+- **gobreaker** (Go) — small and focused.
+
+Use a library; don't hand-roll the state machine.
+
+## In summary
+
+- Circuit breaker: trip when downstream fails repeatedly;
+  fail fast instead of piling up.
+- Three states: closed (normal), open (skip), half-open
+  (probe).
+- Per-dependency, per-endpoint state.
+- Always pair with a fallback — degraded response > no
+  response.
+- Tune carefully: error rate, latency threshold, volume
+  threshold, reset timeout.
+- Watch for: slow-not-failing, half-open hammering,
+  cascading-breaker chains.
+- Use a library; service mesh sidecars do this for you.

@@ -1,0 +1,291 @@
+export const level = 'senior';
+
+# Choreography vs orchestration
+
+Multi-service workflows need coordination. Either each service
+listens for events and reacts on its own (**choreography**), or a
+central coordinator drives the sequence (**orchestration**). Both
+work; they fail differently.
+
+Richardson's *Microservices Patterns* devotes a chapter to this; the
+canonical pattern name for the workflow itself is **saga**.
+
+## The two shapes
+
+<Compare a="Choreography" b="Orchestration">
+<>
+**Decentralized**. Each service listens for events, does its work,
+emits new events. Nobody owns the flow.
+
+```
+OrderPlaced → Payment listens, charges,
+              emits PaymentCaptured.
+PaymentCaptured → Inventory listens, reserves,
+              emits InventoryReserved.
+InventoryReserved → Shipping listens, ships,
+              emits ShipmentDispatched.
+```
+
+The "flow" emerges from event subscriptions. No single place
+describes it.
+</>
+<>
+**Centralized**. A coordinator (workflow engine, saga handler)
+issues commands in sequence.
+
+```
+saga: OrderFulfillment
+  step 1: command Payment.charge
+  step 2: if ok, command Inventory.reserve
+  step 3: if ok, command Shipping.ship
+  on failure: compensate previous steps
+```
+
+The flow is explicit, in one place, readable as code.
+</>
+</Compare>
+
+Both patterns coordinate the same business workflow. The difference
+is **where the flow lives**.
+
+## What you trade
+
+<Cheatsheet>
+| Property | Choreography | Orchestration |
+|---|---|---|
+| Coupling | Loose. Services know only events. | Tighter. Coordinator knows all services. |
+| Flow visibility | Bad. Flow is implicit in subscriptions. | Good. Flow is one readable artifact. |
+| Single point of failure | None. | Coordinator (mitigated by replication). |
+| Add new step | Subscribe a new service to an event. | Edit the coordinator. |
+| Debug a failure | Trace events across services. | Inspect the saga state machine. |
+| Compensations | Each service decides; ad-hoc. | Coordinator decides; explicit. |
+| Domain ownership | Spread across teams. | Often a "workflow team" or shared. |
+| Best for | Open-ended event flows, fanout. | Defined transactional workflows. |
+</Cheatsheet>
+
+The fundamental tradeoff: **loose coupling vs. operational
+visibility**. Choreography decouples; orchestration explains.
+
+## When choreography fits
+
+A few situations where choreography is the right call:
+
+<Steps>
+<Step n={1} title="Event-driven domain with many independent consumers.">
+"User signed up" → analytics cares, marketing cares, billing cares,
+fraud cares. Each acts independently. Adding a new consumer doesn't
+touch existing ones.
+</Step>
+<Step n={2} title="Flow doesn't require strict ordering or rollback.">
+Notifications, audit logs, side effects. If one consumer fails, the
+others still work; the user is not blocked.
+</Step>
+<Step n={3} title="Each step's logic is owned by the team that owns the consuming service.">
+The "flow" is naturally distributed because the decisions are
+naturally distributed. Centralizing would be a forced abstraction.
+</Step>
+<Step n={4} title="You have strong observability already.">
+Distributed tracing, event log queryability, dashboards. You can
+reconstruct a flow from events when needed.
+</Step>
+</Steps>
+
+Newman's lean is "default to choreography." It scales organizationally
+better; coordinators tend to become bottlenecks.
+
+## When orchestration fits
+
+The cases where centralization actually helps:
+
+<Steps>
+<Step n={1} title="Strict multi-step transactions with compensations.">
+Order fulfillment with payment, inventory, shipping, refunds. If
+step 3 fails, you must undo steps 1 and 2. That logic lives somewhere;
+better it lives in one explicit place.
+</Step>
+<Step n={2} title="Cross-service flow is itself a domain concept.">
+"OrderFulfillment" is a real business process with its own state,
+SLAs, timeouts, and exception handling. It deserves a name and an
+owner. The orchestrator gives it both.
+</Step>
+<Step n={3} title="Operational visibility is critical.">
+Support needs to see "where is order 42 in the fulfillment process?"
+A saga state machine answers; an event trail doesn't.
+</Step>
+<Step n={4} title="Timeouts, retries, and human-in-the-loop steps.">
+"Wait up to 2 days for the warehouse to confirm." "If still no
+confirmation, page someone." Workflow engines (Temporal, Step
+Functions, Camunda) handle these natively; building them in
+choreography is bespoke and error-prone.
+</Step>
+</Steps>
+
+When in doubt: short-running pub/sub flow → choreography; long-
+running stateful business process → orchestration.
+
+## Sagas
+
+Both choreography and orchestration are implementations of the
+**saga pattern**: a sequence of local transactions across services
+with compensating actions on failure. The saga itself is the
+abstraction; choreography and orchestration are two ways to
+implement it.
+
+### Choreographed saga
+
+```
+Service A: write local TX → publish EventA1
+Service B: subscribe EventA1 → write local TX → publish EventB1
+Service C: subscribe EventB1 → write local TX → publish EventC1
+                                                ↘ on failure:
+                                                  publish EventC1Failed
+Service B: subscribe EventC1Failed → undo → publish EventB1Compensated
+Service A: subscribe EventB1Compensated → undo
+```
+
+Distributed undo logic. Each service knows how to react to its
+downstream's failure events.
+
+### Orchestrated saga
+
+```
+Saga.run() {
+  try {
+    await ServiceA.do();
+    await ServiceB.do();
+    await ServiceC.do();
+  } catch (e) {
+    if (didB) await ServiceB.undo();
+    if (didA) await ServiceA.undo();
+    throw;
+  }
+}
+```
+
+Single function (state machine in real frameworks) makes the rollback
+explicit. Operationally a workflow engine handles failures, retries,
+durability — see Temporal etc.
+
+Either way you need:
+
+- **Idempotency** on every step (saga may retry).
+- **Compensating actions** for every reversible step.
+- **Recovery** from partial failure (some steps done, some not).
+- **Audit/observability** to see where each saga instance is.
+
+## Compensation is not rollback
+
+Important: compensations are **business-level undos**, not database
+rollbacks. You can't `ROLLBACK` payment-captured. You can issue a
+refund. Compensations are:
+
+- **Semantically equivalent** to undoing the step, not bit-for-bit
+  reversal.
+- **Not always possible**. Sending an email cannot be unsent;
+  shipping a package cannot be unshipped. Compensations for these
+  steps are different (apology email, recall instructions).
+- **Themselves failable**. The refund might fail. Compensations need
+  retries and dead-letter paths too.
+
+Saga design starts with: for every step, what's the compensating
+action and can it fail? If you can't answer per step, you're not
+ready to ship the saga.
+
+## Workflow engines
+
+A few worth knowing:
+
+<Cheatsheet>
+| Engine | Style | Notes |
+|---|---|---|
+| Temporal | Code-first orchestration. Durable async/await. | The current modern default. Long-running, retries, timers built in. |
+| AWS Step Functions | JSON state machines. | Cheap, managed. Good for AWS-native flows. |
+| Camunda | BPMN-based; visual modeling. | Strong in enterprise; heavyweight. |
+| Cadence | Predecessor to Temporal. | Uber's. Mostly succeeded by Temporal. |
+| Netflix Conductor | JSON DSL, REST APIs. | Good for polyglot teams. |
+</Cheatsheet>
+
+Don't roll your own. Workflow durability (the engine survives
+crashes mid-flow) is the killer feature; rolling it yourself is
+months of work and you'll get the corner cases wrong.
+
+## Failure modes by style
+
+### Choreography failure modes
+
+- **Lost events**: a service was down when an event was published;
+  it never reacts. Solutions: persistent event log (Kafka, Streams),
+  consumer groups, replay.
+- **Cyclic dependencies**: service A publishes, B reacts and
+  publishes, A reacts and publishes... loop. Hard to spot in advance;
+  monitor event-graph metrics.
+- **Visibility black hole**: "where is order 42?" requires querying
+  event logs across services. Need correlation IDs and good tracing.
+- **Implicit coupling**: services depend on the event schema. A
+  payload change ripples silently. Treat event schemas as APIs.
+
+### Orchestration failure modes
+
+- **Coordinator bottleneck**: every saga goes through the
+  orchestrator. Capacity-plan it as a real service.
+- **Coordinator single point of failure**: orchestrator down →
+  workflows stall. Use a durable workflow engine; replicate it.
+- **Orchestrator-knows-too-much**: the coordinator becomes a god
+  service with knowledge of every other service's API. Keep
+  orchestrator logic *coordination-only*; domain logic stays in the
+  services.
+- **God-saga**: one mega-saga that handles everything. Split sagas
+  by business workflow, not by team.
+
+## Mixing: most real systems do
+
+In practice, large systems use both:
+
+- Choreography for open-ended event flows (signup → fanout to many
+  consumers, audit, analytics).
+- Orchestration for defined business processes (order fulfillment,
+  loan approval, refund flow).
+
+The boundary is per-workflow: each business process picks one style.
+Don't try to make all your workflows the same style for
+consistency's sake; pick the right tool per flow.
+
+## Decision frame
+
+Ask:
+
+```
+- Is this a defined business process with a name, owner, and SLA?
+  → Orchestration.
+- Is this an event fanout with N independent consumers?
+  → Choreography.
+- Does it have multi-step rollback?
+  → Orchestration (the rollback is the hard part; centralize it).
+- Do new consumers get added frequently without coordination?
+  → Choreography.
+- Do you need to answer "where is this instance right now?" in
+  real time? → Orchestration.
+```
+
+<Callout variant="info">
+Choreography defaults to lower coupling at the cost of visibility.
+Orchestration defaults to visibility at the cost of a coordinator
+to operate. Both are fine; the worst pattern is "we accidentally
+have both, and neither is well-implemented."
+</Callout>
+
+## In summary
+
+- Choreography: services react to each other's events; no central
+  coordinator. Loose coupling, poor flow visibility.
+- Orchestration: a coordinator drives the sequence. Tighter coupling,
+  explicit flow, easy to debug.
+- Both implement the **saga** pattern when multi-step workflows have
+  compensating actions on failure.
+- Default to choreography for event fanout; orchestration for
+  defined transactional business processes.
+- Workflow engines (Temporal, Step Functions) provide durable
+  orchestration; don't roll your own.
+- Compensations are business-level undos, not DB rollbacks. Plan
+  them per step.
+- Real systems mix both; pick per workflow, not for the whole system.

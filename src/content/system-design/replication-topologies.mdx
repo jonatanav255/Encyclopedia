@@ -1,0 +1,287 @@
+export const level = 'senior';
+
+# Replication topologies
+
+Replication copies data across nodes for **availability**,
+**read scaling**, and **geographic latency**. Three topologies
+account for nearly every production system: single-leader,
+multi-leader, and leaderless. Each enables a different
+combination of guarantees — and forbids others.
+
+## Single-leader (primary + replicas)
+
+One node accepts writes; replicas tail its change stream.
+
+```
+clients
+   ↓ writes + read-after-write
+[leader] → [replica 1]
+        → [replica 2]
+        → [replica 3]
+   ↑ reads (eventual)
+```
+
+Reads can go to any replica with the understanding that they
+may be slightly stale. Writes always go to the leader.
+
+**What this enables:**
+
+- **ACID transactions on the leader.** All writes serialize
+  through one node — single-source-of-truth invariants.
+- **Strong consistency** if reads also go to the leader.
+- **Predictable failover**: promote a replica when the leader
+  dies.
+- **Operational simplicity.** This is the default for
+  Postgres, MySQL, SQL Server, MongoDB replica sets, Redis
+  with replicas.
+
+**What this forbids / costs:**
+
+- **Write throughput** is bounded by one machine.
+- **Replication lag** means replica reads can be stale.
+- **Failover is a discrete event** — typically 5–60 seconds of
+  unavailable writes.
+- **Geographic writes are slow.** A user in Asia writing to a
+  US leader pays a cross-Pacific round trip.
+
+This is the right default. Most products run a single-leader
+topology forever and never need anything else.
+
+## Multi-leader (active-active)
+
+Multiple nodes accept writes; each replicates to the others.
+
+```
+[leader A]  ↔  [leader B]
+    ↑              ↑
+  clients        clients
+```
+
+A write goes to **any** leader and propagates to peers. Reads
+can hit any leader.
+
+Common shapes:
+
+- **Multi-region active-active**: a leader per region. Local
+  writes have local latency; cross-region replication is
+  background.
+- **Edge / collaborative apps**: every device is a leader for
+  its own local data; sync converges.
+
+**What this enables:**
+
+- **Write availability per region.** A user in Europe writes
+  to the EU leader at under 50ms.
+- **Survives whole-region failure.** Other leaders keep
+  accepting writes.
+- **Higher aggregate write throughput.**
+
+**What this forbids / costs:**
+
+- **Conflicts.** Two leaders update the same row "at the same
+  time" — neither sees the other's write. Now what?
+- **Causality and ordering** require careful design (vector
+  clocks, hybrid logical clocks).
+- **No global ACID** across leaders without consensus per
+  write.
+- **Operational complexity** dwarfs single-leader by an order
+  of magnitude.
+
+Conflict resolution strategies, none of which are free:
+
+- **Last-write-wins (LWW)**: tag each write with a timestamp;
+  the latest wins. Simple; silently loses data on clock skew.
+- **Application-defined merge**: app code reads both versions
+  and decides. Powerful; requires every write path to know
+  about merges.
+- **CRDTs**: data types designed so concurrent updates
+  commute. Bounded by the available CRDT types (counters,
+  sets, maps).
+- **Single-row leader pinning**: each row has a designated
+  "home" leader; conflicts are impossible. Loses some of the
+  benefits.
+
+Used by: Cassandra (technically leaderless but with multi-DC
+analog), CockroachDB (per-range Raft groups, multi-region
+deployments), Couchbase, Galera Cluster, BDR for Postgres,
+DynamoDB Global Tables.
+
+For most applications, the conflict-resolution complexity
+exceeds the latency benefit. Multi-leader pays off at genuine
+multi-region scale with conflict-tolerant data.
+
+## Leaderless (Dynamo-style)
+
+There is no leader. Clients write to **multiple nodes in
+parallel** and read from multiple nodes in parallel. Quorums
+bound consistency.
+
+```
+client → [node A] (write)
+       → [node B] (write)
+       → [node C] (write)
+client → [node A] (read)
+       → [node B] (read)
+       → [node C] (read) → merge
+```
+
+With **N replicas, W writes, R reads**, if `R + W > N` then
+every read overlaps every write — at least one node returns
+the latest version.
+
+**What this enables:**
+
+- **No discrete failover.** A node down? Continue with N-1.
+- **Tunable consistency**: pick `W` and `R` per query.
+- **Linear horizontal scaling.** Add nodes; data rebalances.
+- **Multi-DC active-active**: writes to any DC, replicated to
+  the rest.
+
+**What this forbids / costs:**
+
+- **No serializable ACID** without bolted-on consensus
+  (Cassandra LWT, DynamoDB transactions are quorum + Paxos
+  per write; slow).
+- **Concurrent writes produce conflicts.** Either
+  last-write-wins on timestamp, or surface conflicts as
+  sibling versions (Riak), or merge via CRDT.
+- **Read repair and anti-entropy** are continuous overhead.
+  Replicas drift; gossip + Merkle trees + repair processes
+  bring them back.
+- **Sloppy quorums and hinted handoff** add availability at
+  the cost of "stronger than R+W>N might suggest" anomalies.
+
+Used by: Cassandra, ScyllaDB, DynamoDB, Riak, Voldemort.
+
+Leaderless excels at **massive write throughput** with
+**multi-DC availability** and **eventual consistency** as the
+explicit deal. It's a specialized choice — most services don't
+need it.
+
+## Comparing the topologies
+
+<Cheatsheet>
+| Property | Single-leader | Multi-leader | Leaderless |
+|---|---|---|---|
+| Write throughput | One node's worth | N leaders worth | Cluster-wide |
+| Write availability | Leader-bound | Per-region | Always (with N-1) |
+| Strong consistency | On the leader | No, by default | Tunable (R+W>N) |
+| Conflict handling | Single writer, none | Mandatory | Mandatory |
+| Geographic writes | Slow to leader | Local | Local |
+| Failover | Discrete event | Continuous | Implicit |
+| ACID transactions | Yes | Very limited | Special-case (LWT) |
+| Operational complexity | Low | High | Medium-high |
+| Default for | OLTP, most apps | Multi-region active-active | Massive writes, telemetry |
+</Cheatsheet>
+
+## Read scaling vs failover
+
+Two distinct uses of replicas that beginners often conflate.
+
+- **Read scaling**: route reads to replicas. The replica's
+  staleness is acceptable. Lag matters.
+- **High availability**: replicas exist primarily for
+  failover. Reads still go to the leader for strong
+  consistency. Lag matters for RPO.
+
+A typical Postgres deployment uses replicas for both:
+
+- 1 leader + 2 sync replicas (one of which is the failover
+  target).
+- N async replicas behind the load balancer for reads.
+
+Don't conflate the two roles. A "read replica" that's the
+designated failover target must be sync; sync replicas are
+expensive to scale.
+
+## Failure modes by topology
+
+### Single-leader
+
+- **Leader dies**: failover. Window of unavailable writes.
+- **Network partition splits leader from replicas**: leader
+  alone; replicas hold last seen state.
+- **Split brain on failover**: old leader and new leader both
+  alive — both accept writes. Fence the old leader before
+  promoting (see split brain).
+
+### Multi-leader
+
+- **Cross-leader link fails**: each leader keeps accepting
+  writes locally. When the link comes back, conflicts must be
+  resolved.
+- **Clock skew**: LWW assigns wrong winner.
+- **Asymmetric partitions**: writes succeed locally, never
+  propagate, look fine until reconnection.
+
+### Leaderless
+
+- **Quorum lost**: reads/writes fail until enough replicas
+  return.
+- **Sloppy quorum**: writes succeed on temporary nodes during
+  a partition; hinted handoff propagates them after recovery.
+  Anomalies possible.
+- **Read repair backlog**: if drift exceeds repair throughput,
+  reads return stale data despite R+W>N.
+
+## Topology and the application
+
+The topology dictates application invariants you can rely on.
+
+- **Single-leader**: you can write `UPDATE balance = balance +
+  100` and trust it. The leader serializes.
+- **Multi-leader**: you cannot. Two leaders can both run this
+  statement; the merge depends on the conflict-resolution
+  strategy.
+- **Leaderless**: you cannot. Use a CRDT counter or
+  lightweight-transactions (and pay the cost).
+
+The number of features that "just work" in single-leader and
+require careful engineering in multi-leader / leaderless is
+larger than most teams expect. This is the strongest argument
+for staying single-leader as long as possible.
+
+## Migration paths
+
+The natural progression:
+
+```
+1 Postgres
+  → 1 Postgres + read replicas
+    → 1 Postgres + replicas + cache
+      → sharded Postgres (Citus, Vitess)
+        → sharded Postgres per region
+          → ...some teams stop here forever
+```
+
+vs
+
+```
+1 Cassandra cluster (leaderless from day 1)
+```
+
+Choose Cassandra when day-one workload is genuinely beyond
+what one Postgres can do. Otherwise, single-leader Postgres
+scales further than most engineers assume.
+
+<Callout variant="info">
+Spanner, CockroachDB, and TiDB combine **sharding** with
+**per-range single-leader** (Raft per range). From outside it
+looks like one ACID database; inside, each range elects a
+leader. This is the dominant 2026 pattern for "global ACID,"
+and it preserves single-leader simplicity at the protocol
+level while scaling horizontally.
+</Callout>
+
+## In summary
+
+- **Single-leader**: simple, ACID, write-throughput bound by
+  one node. The default; most products never outgrow it.
+- **Multi-leader**: writes anywhere, but conflicts are
+  unavoidable and complex to handle.
+- **Leaderless**: maximum availability + write throughput,
+  tunable consistency via R+W>N, no real ACID without
+  bolt-ons.
+- Topology decides what your application can take for granted.
+  Choose the simplest one that meets the requirements; pay the
+  complexity tax only when forced.

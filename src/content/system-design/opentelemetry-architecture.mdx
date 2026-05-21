@@ -1,0 +1,279 @@
+export const level = 'senior';
+
+# OpenTelemetry architecture
+
+OpenTelemetry (OTel) is the **vendor-neutral** standard for
+emitting and shipping telemetry — logs, metrics, traces — from
+applications to whatever backend you want. It's the CNCF
+project that resulted from the merger of OpenTracing and
+OpenCensus, and as of 2026 it's the default instrumentation
+layer for new systems.
+
+The promise: instrument your code once, switch backends without
+re-instrumenting. The reality is closer to that than anything
+that came before, with caveats.
+
+## The pieces
+
+<Cheatsheet>
+| Piece | What it does |
+|---|---|
+| API | What application code calls (`tracer.startSpan`, `meter.createCounter`) |
+| SDK | The reference implementation of the API — does the actual work |
+| Instrumentation libraries | Pre-built wrappers for HTTP, DB, queues, etc. |
+| Collector | Standalone service that receives, processes, and exports telemetry |
+| OTLP | The wire protocol between SDK, collector, and backend |
+| Semantic conventions | Standard names for common attributes (`http.method`, `db.system`) |
+
+</Cheatsheet>
+
+The split between **API** and **SDK** is the load-bearing
+design choice. A library author depends only on the API (a thin
+contract); the operator picks the SDK at runtime. A library that
+adds spans won't drag in a specific vendor.
+
+## The data plane
+
+A typical pipeline:
+
+```
++---------+    +-------+    +---------+    +-----------+
+| your    | -> | OTel  | -> |  OTel   | -> | backend   |
+| service |    | SDK   |    | Collector|    | (Jaeger,  |
+|         |    |       |    |          |    |  Tempo,   |
+|         |    |       |    |          |    |  vendor)  |
++---------+    +-------+    +----------+    +-----------+
+                  |              |
+                  +--------------+
+                     OTLP over gRPC or HTTP
+```
+
+- **In-process SDK** batches spans/metrics/logs.
+- **Exports via OTLP** to either a local collector (sidecar /
+  agent) or a centralized one.
+- **Collector** processes — sample, redact, enrich, fan out — and
+  exports to one or more backends.
+
+The collector is what makes this architecture composable. You
+can switch backends, add a second one, or change sampling
+without touching application code.
+
+## OTLP — the protocol
+
+OpenTelemetry Protocol. A protobuf-based wire format over gRPC
+(`:4317`) or HTTP/JSON (`:4318`). It's what every OTel SDK
+emits, what the collector receives, and what most backends
+accept.
+
+The point is **uniformity**. Before OTLP, every backend had its
+own format (Jaeger Thrift, Zipkin JSON, Prometheus text,
+proprietary blobs). OTLP standardizes the shape of a span, a
+metric data point, a log record across vendors.
+
+If your backend doesn't accept OTLP natively, the collector has
+exporters for almost every common format — Prometheus,
+Elasticsearch, vendor-specific. The application still speaks
+only OTLP.
+
+## The collector
+
+A go binary you run yourself. Configurable pipelines of:
+
+<Cheatsheet>
+| Stage | What | Examples |
+|---|---|---|
+| Receivers | Take data in | OTLP, Prometheus scrape, Kafka, Jaeger |
+| Processors | Mutate or filter | batch, attributes, tail_sampling, redact, memory_limiter |
+| Exporters | Send data out | OTLP to backend, Prometheus remote_write, S3, vendor APIs |
+
+</Cheatsheet>
+
+A minimal collector config:
+
+```js
+// otel-collector-config (yaml-ish, simplified)
+const config = {
+  receivers: { otlp: { protocols: { grpc: {}, http: {} } } },
+  processors: {
+    batch: {},
+    memory_limiter: { limit_mib: 512 },
+  },
+  exporters: {
+    otlphttp: { endpoint: 'https://backend.example.com' },
+  },
+  service: {
+    pipelines: {
+      traces: { receivers: ['otlp'], processors: ['memory_limiter', 'batch'], exporters: ['otlphttp'] },
+    },
+  },
+};
+```
+
+Deployment shapes:
+
+- **Sidecar / agent**: one collector per host or per pod.
+  Minimal latency to the SDK; many small collectors.
+- **Gateway**: a fleet of larger collectors behind a load
+  balancer. Centralized policy; sidecars optional.
+- **Both**: agent + gateway pipeline. Agent does cheap local
+  batching; gateway does tail sampling, fan-out, secret
+  redaction.
+
+The gateway tier is where tail sampling lives — it sees the
+whole trace at one place. See sampling strategies.
+
+## The three signal pipelines
+
+OTel handles all three pillars, with slightly different
+maturity:
+
+- **Traces** — most mature. The model and SDKs are stable. Most
+  backends accept OTLP traces directly.
+- **Metrics** — stable since 2022. Three instrument types
+  (counter, histogram, gauge) plus observers. Has a defined
+  bridge to Prometheus.
+- **Logs** — last to stabilize. Recommendation is to **bridge
+  existing loggers** (pino, slog, log4j, etc.) rather than write
+  log-emitting code in OTel API directly. The SDK then ships
+  them over OTLP and the collector can route them.
+
+The three share **resources** (host/process attributes), **trace
+context** (so logs carry trace_id, metrics carry exemplars), and
+**semantic conventions**.
+
+## Semantic conventions
+
+The boring half of OTel that does the heavy lifting. A registry
+of standard attribute names:
+
+```ts
+span.setAttribute('http.method', 'POST');
+span.setAttribute('http.route', '/orders/:id');
+span.setAttribute('http.status_code', 200);
+span.setAttribute('db.system', 'postgresql');
+span.setAttribute('db.statement', 'SELECT ...');
+span.setAttribute('messaging.system', 'kafka');
+span.setAttribute('messaging.destination', 'orders.events');
+```
+
+If every service uses `http.method` for HTTP method, then any
+backend can build dashboards that work across services without
+custom mapping. If every team invents `httpMethod`,
+`http_method`, `method`, dashboards become per-service.
+
+Following semantic conventions costs nothing per call site and
+pays off forever. Use them.
+
+## Instrumentation libraries
+
+For most frameworks, you don't write the instrumentation —
+OTel ships **auto-instrumentation** libraries that wrap common
+hooks:
+
+- HTTP client/server (express, fastify, fetch, http2)
+- DB drivers (pg, mysql2, mongodb, redis)
+- Message brokers (kafkajs, amqplib)
+- gRPC, AWS SDK, GCP SDK
+
+Enable them at startup:
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+
+const sdk = new NodeSDK({
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+```
+
+You get spans for every inbound HTTP request, outbound HTTP/DB
+call, and DB query — for free. Manual instrumentation is for the
+**business operations** auto-instrumentation can't name.
+
+## Resource attributes
+
+Every signal is tagged with the **resource** — the entity
+producing it. Standard fields:
+
+```
+service.name        = "orders-api"
+service.version     = "1.42.0"
+service.instance.id = pod uid
+deployment.environment = "prod"
+host.name           = host
+k8s.namespace.name  = "default"
+k8s.pod.name        = "orders-api-7d4..."
+```
+
+These tag every span/metric/log without per-call boilerplate. A
+backend query like "all spans from `orders-api` in `prod` since
+the last deploy" comes for free.
+
+## Configuration via environment
+
+OTel is configurable via env vars by design. This matters
+because operators can change behavior **without code changes**:
+
+```
+OTEL_SERVICE_NAME=orders-api
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.05
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod
+```
+
+A team can change sampling rate, switch backends, redirect to a
+local collector during debugging — all by changing env vars.
+The container image doesn't change.
+
+## Migration realities
+
+If you're coming from another instrumentation library:
+
+- **OpenTracing / OpenCensus** — both deprecated; OTel
+  supersedes them with documented migration paths.
+- **Jaeger / Zipkin SDKs** — replace with OTel SDK; the
+  collector can still export to Jaeger/Zipkin backends.
+- **prom-client (Node Prometheus)** — keep using it for now if
+  it works; bridge to OTel metrics when you want unified
+  pipelines.
+- **Vendor-specific agents** (Datadog, NewRelic) — most now
+  accept OTLP directly; the choice is whether to use the vendor
+  SDK or OTel SDK with their OTLP endpoint.
+
+<Callout variant="info">
+Adopting OTel is rarely a clean cutover. Most teams run
+old-and-new for months. The win is at the new-service boundary:
+greenfield services start in OTel, legacy gradually migrates.
+</Callout>
+
+## Costs and gotchas
+
+- **Auto-instrumentation overhead** is non-zero. Modern SDKs
+  add ~1–5% CPU; sometimes more on hot paths. Measure.
+- **The collector is a service you have to operate**. It can
+  fall over, leak memory, drop data. Memory limiter and batch
+  processors are not optional.
+- **PII** lives in spans without you noticing — request paths,
+  query strings, response bodies. Configure the collector
+  `attributes` and `redaction` processors to strip them before
+  export.
+- **Cardinality** still bites. OTel metric labels with high
+  cardinality blow up backends just like any other TSDB.
+
+## In summary
+
+- OTel is the standard for emitting telemetry; OTLP is the wire
+  format.
+- API/SDK separation lets libraries instrument without dragging
+  in a vendor.
+- The collector is the policy layer: sample, redact, enrich,
+  fan out.
+- Semantic conventions are what make cross-service dashboards
+  possible.
+- Auto-instrumentation gets you to "useful" fast; manual
+  instrumentation names your business verbs.
+- Vendor neutrality is real for traces and metrics; logs are
+  catching up.

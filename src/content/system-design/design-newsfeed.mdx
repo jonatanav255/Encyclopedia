@@ -1,0 +1,291 @@
+export const level = 'senior';
+
+# Design a newsfeed
+
+A generalized newsfeed — Facebook-style, LinkedIn-style, or
+Instagram-style. Users see a continuously updated stream of
+content from people, pages, and groups they follow. The
+difficulty is not the storage; it's the **ranking, freshness, and
+fanout at heavy-tail follower distributions**.
+
+Compare with `design-twitter`: a feed has the same fanout
+shape but adds ranking, richer content types, and "what should
+appear at the top right now" — a non-chronological problem.
+
+## 1. Clarify the scope
+
+- Personalized ranked feed, not strictly chronological.
+- Content types: posts, photos, video, shared links,
+  reactions/comments.
+- "Stories" or ephemeral content: out of scope here (separate
+  system).
+- Real-time? Near-real-time (~minutes) is acceptable.
+- Edit/delete propagation: needs to work, eventually.
+- Ranking signals: recency, affinity, engagement, type weight.
+
+## 2. Estimate scale
+
+```
+DAU                   = 1B (large social network)
+Posts/user/day        = 0.5  → 500M posts/day
+Avg write QPS         = 500M / 10^5 = 5 000 QPS
+Peak write QPS        = ~15 000 QPS
+
+Feed-views/user/day   = 30   → 30B feed reads/day
+Avg feed read QPS     = 300 000 QPS
+Peak feed read QPS    = ~1M QPS
+
+Followers/user        = ~300 avg; max 100M (public pages)
+Fanout writes         = 5K × 300 = 1.5M timeline entries/sec avg
+Storage:
+  per post (text+metadata)        = ~1 KB
+  per timeline ref                = ~30 B
+  daily post storage              = 500 GB
+  daily timeline storage (fanout) = ~50 TB (precomputed only)
+```
+
+The math forces three choices: hybrid fanout, materialization
+only for active users, and ranking computed at read time on a
+candidate set, not the full corpus.
+
+## 3. API
+
+```bash
+GET  /v1/feed?cursor=<opaque>&limit=20
+  Resp: { items: [Story], nextCursor, refreshToken }
+
+POST /v1/feed/refresh
+  -> triggers re-ranking on top of the user's candidate cache
+
+POST /v1/posts
+  Body: { type, text?, mediaIds?, audience }
+  Resp: { id, createdAt }
+
+POST /v1/posts/:id/react   { reaction }
+POST /v1/posts/:id/comments
+
+GET  /v1/posts/:id   -- direct deep link
+```
+
+Each `Story` carries: post payload, author summary, engagement
+counts, type, "why am I seeing this" reason code, ranking score.
+
+## 4. High-level design
+
+```
+[ client ] → [ edge / LB ] → [ API gateway ]
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        ↓                         ↓                         ↓
+ [ Feed-read service ]    [ Post service ]    [ Engagement service ]
+        │                         │                         │
+        ↓                         ↓                         ↓
+ [ Candidate store ]       [ Posts DB ]            [ Counts/cache ]
+ (per-user pre-ranked       (sharded)              (Redis: likes,comments)
+  inbox)
+        │                         │
+        │                         └── async ──→ [ Kafka: PostCreated ]
+        ↓                                              │
+ [ Ranker service ]                                    ↓
+ (ML model, request-time)                       [ Fanout workers ]
+        │                                              │
+        └── reads ──→ [ User-state cache ]             ↓
+                                                [ Candidate store updates ]
+
+
+Async pipelines:
+  PostCreated → fanout → inbox writes (active users only)
+  Engagement  → counters update + signals for ranker
+  Slow path: cold users assembled at read time from authors' recents
+```
+
+The split between **candidate generation** (cheap, async, lots
+of recall) and **ranking** (request-time, expensive, high
+precision) is the canonical architecture in modern feed systems.
+
+## 5. Data model
+
+```
+posts {
+  id              snowflake PK
+  author_id       bigint INDEX
+  type            enum(text, image, video, link, share)
+  text            string?
+  media_ids       string[]?
+  audience        enum(public, friends, group:<id>, ...)
+  created_at      timestamp
+}
+
+follows / friends {
+  user_id_a   bigint
+  user_id_b   bigint
+  PRIMARY KEY (a, b)
+}
+
+candidate_inbox  (Redis, per-user sorted set)
+  key: "fdin:<userId>"
+  value: sorted set of postId scored by (recency boost + author affinity)
+  capped at ~1 000 entries
+
+engagement_counts (per post)
+  key: "eng:<postId>" → { likes, comments, shares, reactions[type] }
+  Updated by stream processors batched per second.
+```
+
+`candidate_inbox` is the heart: pre-filtered, pre-scored
+candidates updated by fanout workers. Ranker reads it on each
+feed request and re-scores with fresh signals.
+
+## 6. Deep dives
+
+### 6.1 Hybrid fanout (push vs pull)
+
+Same as `design-twitter` deep dive:
+
+- **Push (fanout-on-write)** for ordinary users → write postId
+  into each active follower's candidate inbox.
+- **Pull (fanout-on-read)** for high-fanout authors (pages,
+  celebrities >50K followers) → query their recents at read
+  time and merge into candidates.
+
+Trade-off: push absorbs the cost on average users (good — there
+are billions of them), pull keeps celebrity posts from melting
+the fanout pipeline.
+
+### 6.2 Candidate generation
+
+For each feed read, the ranker needs ~1 000-2 000 candidates to
+pick the ~20 to show. Sources:
+
+```
+candidates = union(
+  candidate_inbox[userId][:500],           -- pushed normal posts
+  recent_posts(celebrity_followees, 5d),    -- pulled high-fanout
+  groups_recent(userId, 1d),                -- group memberships
+  pages_recent(userId, 3d),                 -- followed pages
+  recommended_from_friends_of_friends(userId, top 50)
+)
+deduplicate, filter (already-seen, blocked, NSFW), cap at 2K
+```
+
+Filters that **must** run server-side: already-shown
+deduplication (Bloom filter per user), audience rules (private
+posts not visible to non-followers), policy filters
+(blocked authors, content compliance).
+
+### 6.3 Ranking
+
+A lightweight ML model — typically a gradient-boosted or
+two-tower model — scores each candidate using features:
+
+- **User features**: affinity to each author, type preferences,
+  device, recent dwell time.
+- **Author features**: posting rate, recent engagement rate,
+  credibility flags.
+- **Post features**: age (recency decay), type, media presence,
+  early engagement.
+- **Context features**: time of day, hour-since-last-visit,
+  current session length.
+
+```
+score = model.predict([user_features, post_features, ...])
+top20 = top_k_by_score(candidates, k=20)
+```
+
+Latency budget: 30-50 ms for ranking ~2 000 candidates. Model
+must be cheap; expensive models live in candidate generation
+(async).
+
+### 6.4 Freshness vs cost
+
+Feed has competing requirements:
+
+- **Fresh**: a post 10 minutes old should be visible.
+- **Cheap**: re-ranking every candidate on every refresh is
+  expensive.
+
+Compromise: **two-tier cache**.
+
+<Steps>
+<Step n={1} title="Stable feed cache">
+Last-rendered feed (top 50 stories) cached for ~60s per user.
+Pull refreshes serve from this with minor freshness updates
+(new posts at the top, counter updates).
+</Step>
+<Step n={2} title="Candidate cache">
+The 2K-candidate set, refreshed by fanout + periodic pull. Used
+on pull-to-refresh or scroll past stable cache.
+</Step>
+<Step n={3} title="On-demand re-rank">
+On pull-to-refresh: re-run ranker on candidates with fresh
+features. Update stable cache.
+</Step>
+</Steps>
+
+### 6.5 Edit and delete propagation
+
+Posts are mutable (edits, privacy changes, deletes). The feed
+must respect them.
+
+- **Inbox stores IDs only**, not snapshots. Render fetches the
+  post content at read time. Edits visible on next render.
+- **Deletes**: on `PostDeleted`, mark the post; render filters
+  deleted posts. No need to scrub every inbox immediately;
+  filter at read time. Eventually compact inboxes asynchronously.
+- **Audience change** (post made friends-only): same — audience
+  check at read time, filter out post for non-friends.
+
+### 6.6 Already-seen suppression
+
+A user shouldn't see the same post twice. Track viewed `postIds`
+per user in a **Bloom filter** (low memory, false-positive
+filtering acceptable — we sometimes hide a fresh post the user
+hadn't actually seen).
+
+```
+seen = bloom("seen:<userId>")
+candidates = [c for c in candidates if c.id not in seen]
+on render: seen.add(rendered_ids)
+```
+
+TTL: ~7-14 days; older posts may reappear as the bloom empties.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 10M feed read QPS | Ranker fleet CPU | Quantize/distil model; cache ranks per (user, candidate-set hash) |
+| 15M fanout writes/s | Inbox write throughput | Tier inboxes: active users only; cold users 100% pull |
+| Inbox storage | Per-user capped lists explode | Trim aggressively (≤1K); cold users skipped entirely |
+| Engagement counts | Per-post hot counters | Sharded counters; HLL; per-post-shard increment |
+| Multi-region freshness | Cross-region replication lag | Per-region candidate store; cross-region async with explicit lag SLA |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Hybrid push/pull** over pure: avoids both write torch and
+  read torch.
+- **Candidate-then-rank** over rank-all: keeps request-time
+  latency bounded; full corpus ranking is impossible at scale.
+- **Bloom filter for seen** over exact set: huge memory savings
+  for tolerable false-hide rate.
+- **IDs in inbox, content at read**: simpler edit/delete; one
+  extra fetch per render, mitigated by content cache.
+- **Per-region candidate stores** over global: lower cross-region
+  RTT at the cost of cross-region freshness drift.
+
+## In summary
+
+- Feed is fanout + ranking + filters; each is its own pipeline.
+- Hybrid fanout is non-negotiable at the heavy-tail of
+  followers.
+- Candidate generation (async, recall-y) → ranking (sync,
+  precision) is the canonical split.
+- Store IDs in inboxes, not content snapshots; edits and
+  deletes become read-time filters.
+- Freshness vs cost: two-tier cache + on-demand re-rank on
+  refresh.
+- The architecture is shaped by ranking and filters, not raw
+  QPS — that's what distinguishes a feed from Twitter's
+  timeline.

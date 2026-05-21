@@ -1,0 +1,264 @@
+export const level = 'junior';
+
+# Back-of-envelope math
+
+The point isn't precision. The point is to rule out impossible
+designs in 30 seconds and find the right order of magnitude
+before you draw a single box.
+
+If you can't estimate **QPS, storage, and bandwidth** off the
+top of your head in any system-design interview or design
+review, you'll waste the next hour solving the wrong problem.
+
+## The numbers to memorize
+
+A small table that answers 80% of the math.
+
+<Cheatsheet>
+| Quantity | Value |
+|---|---|
+| Seconds in a day | ~86 400 ≈ **10⁵** |
+| Seconds in a month | ~2.6 × 10⁶ |
+| Seconds in a year | ~3.15 × 10⁷ |
+| Bytes in a KB / MB / GB / TB | 10³ / 10⁶ / 10⁹ / 10¹² |
+| Bits in a byte | 8 |
+| 2¹⁰ ≈ 10³ | (kilo) |
+| 2²⁰ ≈ 10⁶ | (mega) |
+| 2³⁰ ≈ 10⁹ | (giga) |
+| 2⁴⁰ ≈ 10¹² | (tera) |
+| Bytes in a UUID | 16 (raw) / 36 (hex string) |
+| Bytes in an int64 / float64 | 8 |
+| Typical small row in a DB | ~100–500 B |
+| Typical JSON event | ~500 B – 5 KB |
+</Cheatsheet>
+
+The single most useful number is **10⁵ seconds/day**. Anything
+"per day" → divide by 10⁵ to get "per second."
+
+## QPS estimation
+
+You want to know roughly how many requests per second the
+system handles. The product gives you DAU (daily active users)
+or MAU; you turn that into QPS.
+
+<Steps>
+<Step n={1} title="Start from DAU.">
+If given MAU, assume **DAU ≈ MAU / 3** as a default. Adjust if
+the product is more or less sticky than typical.
+</Step>
+<Step n={2} title="Pick an actions-per-user-per-day number.">
+For most products, **1–10 actions/day/user** is the right
+band. Heavy products (social feeds, chat) push 50–200.
+</Step>
+<Step n={3} title="Multiply, then divide by 10⁵.">
+Total daily requests = DAU × actions/day. QPS = that ÷ 10⁵.
+</Step>
+<Step n={4} title="Multiply for peak.">
+Average QPS isn't what you size for. Peak is typically
+**2–5× average**. Use 3× as a default.
+</Step>
+</Steps>
+
+### Worked example: 100M MAU social feed
+
+```
+DAU = 100M / 3 ≈ 33M
+Reads/user/day = 50 (heavy feed scrolling)
+Total reads/day = 33M × 50 = 1.65B
+Average read QPS = 1.65B / 10⁵ = 16 500 QPS
+Peak read QPS = 16 500 × 3 = ~50 000 QPS
+
+Writes/user/day = 2 (post, like, comment)
+Total writes/day = 33M × 2 = 66M
+Average write QPS = 66M / 10⁵ = 660 QPS
+Peak write QPS = 660 × 3 = ~2 000 QPS
+```
+
+Now you know: **~50K read QPS, ~2K write QPS**. That's enough
+to start picking architectures.
+
+## Storage estimation
+
+Same trick. Per-record size × records-per-day × retention.
+
+### Worked example: chat messages
+
+```
+DAU = 100M
+Messages/user/day = 20
+Message size (text + metadata) = 200 B
+Daily volume = 100M × 20 × 200 B
+            = 4 × 10¹¹ B
+            = 400 GB/day
+Yearly = 400 GB × 365 ≈ 150 TB/year
+```
+
+150 TB/year of cold messages is a fundamentally different
+problem from a 50 GB/year transactional database. The storage
+estimate forces the design choice: archive cold tiers, separate
+hot/cold paths, columnar storage for analytics, etc.
+
+## Bandwidth estimation
+
+QPS × payload size = bytes/sec.
+
+### Worked example: video streaming
+
+```
+Concurrent streams at peak = 1M
+Average bitrate = 5 Mbps
+Total = 1M × 5 Mbps = 5 Tbps egress
+```
+
+You can immediately see this isn't a "stick it behind nginx"
+problem — it's a CDN problem. Without that number, someone on
+your team will spend a week building the wrong thing.
+
+## Connections estimation
+
+For long-lived connections (WebSockets, gRPC streams, SSE):
+
+```
+Concurrent users × connections-per-user = total open sockets
+```
+
+A typical server can handle **10K–100K** concurrent connections
+(depends heavily on OS tuning, per-connection memory, and TLS).
+Divide total sockets by per-server capacity → number of servers.
+
+### Worked example: chat presence
+
+```
+1M DAU, all online during peak hour = 1M concurrent
+Sockets per user = 1 (one phone)
+Total sockets = 1M
+Per server = 50K
+Servers needed = 1M / 50K = 20 servers (just for sockets)
+```
+
+## Capacity by component
+
+Each component has rough capacity numbers worth knowing:
+
+<Cheatsheet>
+| Component | Order of magnitude |
+|---|---|
+| Single load balancer (L7) | ~100K – 1M RPS |
+| Single web server (modern) | ~10K RPS (CPU-bound), ~1K RPS (I/O-bound) |
+| Single Postgres instance (read) | ~10K – 50K QPS |
+| Single Postgres instance (write) | ~1K – 10K QPS |
+| Single Redis instance | ~100K ops/sec single-threaded |
+| Single Kafka broker | ~100 MB/s sustained ingest |
+| Single S3 prefix | ~3 500 PUT/s, 5 500 GET/s before sharding |
+| Datacenter network (10 GigE) | 1.25 GB/s per link |
+| SSD random read IOPS | ~10K – 100K |
+| Spinning disk random read IOPS | ~100 |
+</Cheatsheet>
+
+These are rough — vendor SKU and workload shape change them by
+2–3×. Good enough for a whiteboard.
+
+## Latency numbers
+
+Memorize the orders of magnitude. The actual values shift over
+time but the *ratios* are stable.
+
+<Cheatsheet>
+| Operation | Latency |
+|---|---|
+| L1 cache reference | ~1 ns |
+| L2 cache reference | ~4 ns |
+| Branch mispredict | ~3 ns |
+| Mutex lock/unlock | ~17 ns |
+| Main memory reference | ~100 ns |
+| Compress 1 KB with zstd | ~2 µs |
+| Send 1 KB over 1 Gbps | ~10 µs |
+| SSD random read | ~16 µs |
+| Read 1 MB sequentially from memory | ~3 µs |
+| Read 1 MB sequentially from SSD | ~50 µs |
+| Round trip within datacenter | ~500 µs |
+| Read 1 MB sequentially from disk | ~5 ms |
+| Disk seek | ~3 – 10 ms |
+| Round trip US east → US west | ~70 ms |
+| Round trip US → Europe | ~100 ms |
+| Round trip US → Asia | ~150 ms |
+</Cheatsheet>
+
+The "Jeff Dean numbers." A few patterns to internalize:
+
+- **Memory is ~100× faster than SSD** which is ~100× faster
+  than spinning disk. If your hot path hits disk, you're paying
+  10 000× the price of hitting RAM.
+- **Cross-region is ~150 000× a memory reference.** This is
+  why "just put a database in each region" sounds easy and is
+  actually very hard.
+- **A datacenter round-trip (~500 µs) is 5 000× a memory
+  reference.** Adding one network call inside the request path
+  is significant. Adding ten is catastrophic.
+
+## Common mistakes
+
+### 1. Using average without peak
+
+Sizing for average QPS guarantees you fall over at peak. The
+peak/average ratio for human-driven products is typically 3×;
+for retail it can be 100× (Black Friday); for newsfeed it can be
+spikes of 10× from one viral post.
+
+### 2. Forgetting amplification
+
+If a single user action triggers fanout to N followers, real
+QPS at the downstream is **user-QPS × N**. Twitter's
+write-side fanout to a celebrity's followers is the classic
+example.
+
+### 3. Sizing for steady state instead of growth
+
+A "1M users in year 1" product that grows 5×/year will be 5M in
+year 2 and 25M in year 3. Design for at least one growth
+horizon — otherwise the design is obsolete before it ships.
+
+### 4. Conflating storage and bandwidth
+
+"We store 1 TB" and "we serve 1 TB/day" are different by
+86 400 — one is a disk choice, the other is a CDN choice.
+Estimate them separately.
+
+## A reusable template
+
+For any "design X" question, fill in this table on the
+whiteboard before drawing components:
+
+```
+DAU                 = ____
+Read actions/day    = ____
+Write actions/day   = ____
+Read QPS (avg)      = DAU × reads/day / 10^5
+Write QPS (avg)     = DAU × writes/day / 10^5
+Peak read QPS       = avg × 3
+Peak write QPS      = avg × 3
+Storage / record    = ____
+Daily storage       = DAU × writes/day × bytes
+Yearly storage      = daily × 365
+Bandwidth (egress)  = QPS × response size
+```
+
+If you fill this in and *then* design, your design will be
+defensible. If you skip it, every choice will be guesswork.
+
+<Callout variant="warning">
+The numbers are wrong. That's fine — you only need them to be
+right to within ~3×. The point is to know whether you're
+solving a 100 QPS problem or a 1M QPS problem; those need
+fundamentally different architectures.
+</Callout>
+
+## In summary
+
+- Memorize 10⁵ seconds/day, the powers-of-two/ten table, and
+  the Jeff Dean latency numbers.
+- Always estimate QPS, storage, and bandwidth separately.
+- Multiply by 3 for peak.
+- Use the estimates to **eliminate** designs, not pick them —
+  if your math says 1M write QPS and Postgres maxes at 10K,
+  you don't argue with Postgres, you change the design.

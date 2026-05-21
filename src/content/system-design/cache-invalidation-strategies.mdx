@@ -1,0 +1,185 @@
+export const level = 'senior';
+
+# Cache invalidation
+
+"There are only two hard things in computer science: cache
+invalidation and naming things." — Phil Karlton.
+
+A cache holds a copy of data. The data changes. The cache
+either knows and updates, doesn't know and serves stale, or
+spends compute checking — these are the only three options.
+Every cache invalidation strategy is a position on this
+triangle.
+
+## TTL: the default
+
+Set a max age, evict when it expires.
+
+```js
+cache.set('user:42', user, 3600); // 1 hour
+```
+
+Pros: simple, no plumbing, self-healing. Cons: stale data
+for up to TTL after a write. Application has to tolerate it.
+
+When to use: read-mostly data where "minutes-old is fine"
+(profile cards, listing pages, dashboards). The default
+choice when you can't think of a reason to do something
+fancier.
+
+## Explicit purge / delete
+
+On write, invalidate the cache key.
+
+```js
+async function updateUser(id, data) {
+  await db.update(id, data);
+  await cache.del(`user:${id}`);
+}
+```
+
+Pros: next read sees fresh data immediately. Cons: every
+write path has to know every cache key it might invalidate.
+Forget one, stale forever.
+
+Variations:
+
+- **Purge-on-write**: synchronous; write blocks on cache
+  invalidation.
+- **Purge-async**: enqueue a purge after the write; faster
+  write path, brief stale window.
+
+## Write-through / write-around / cache-aside
+
+Three patterns for how writes interact with the cache. See
+cache-aside-pattern and write-through-cache. Each has its own
+invalidation semantics:
+
+- **Cache-aside**: app reads cache or DB; on write, app must
+  explicitly invalidate.
+- **Write-through**: app writes cache, cache writes DB; cache
+  is always fresh.
+- **Write-around**: app writes DB directly; cache is invalidated
+  on next read miss.
+
+## Versioned cache keys
+
+Instead of invalidating, change the key.
+
+```js
+// Old: cache.get('product:42')
+// New: cache.get(`product:42:v${productVersion}`)
+```
+
+When the product is updated, bump its version. Old cache
+entries are now unreachable; they expire naturally via TTL.
+
+Used by static-asset URLs (`/app.js?v=abc123`), CDN
+fingerprinted assets, GraphQL persisted queries.
+
+Pros: no explicit purge needed; cluster-wide consistency
+trivially. Cons: cache size grows as old versions linger
+until TTL; need a place to store/distribute the current
+version number.
+
+## CDC-driven invalidation
+
+A change in the source database emits an event; a subscriber
+purges the cache.
+
+```
+db → CDC stream → cache invalidator → cache
+```
+
+Decouples the application code from cache invalidation. The
+write path doesn't need to know which caches exist.
+
+Pros: handles multi-cache scenarios (CDN + Redis + browser
+each invalidated separately); no missed purges from
+forgotten code paths. Cons: more infra (CDC pipeline);
+brief lag between write and purge.
+
+Used by LinkedIn (Brooklin → Couchbase), Uber (Schemaless +
+CDC), most big systems.
+
+## Tag-based invalidation
+
+Tag each cache entry with one or more semantic tags. On
+write, purge by tag.
+
+```js
+cache.set(`product:42:summary`, value, { tags: ['product:42', 'category:5'] });
+cache.set(`category:5:listing`, value, { tags: ['category:5'] });
+
+// On product 42 update:
+cache.purgeByTag('product:42');
+
+// On category 5 reorganization:
+cache.purgeByTag('category:5');
+```
+
+Saves having to enumerate every key affected by a change.
+Used by Fastly, Cloudflare ("cache tags"), Varnish, modern
+CDNs.
+
+## The hardest case: dependent caches
+
+A product page caches the product's name and a list of its
+recent reviews. A review is updated. The review cache
+invalidates — but the product page's snapshot of "recent
+reviews" is now stale.
+
+Solutions:
+
+- **Layered TTLs**: page TTL = min(review TTL); both expire
+  together.
+- **Tag every aggregated cache** with all dependency tags;
+  purge across.
+- **Recompute on demand** with deeper stack visibility
+  (GraphQL fragment-level caching).
+
+Whatever you do, this is the case that bites. Document the
+invalidation dependencies explicitly.
+
+## Three rules
+
+<Steps>
+<Step n={1} title="Bound staleness with TTL even when you have purge.">
+Purges fail (network drops, code paths missed). TTL is the
+backstop. Belt and suspenders.
+</Step>
+<Step n={2} title="Don't share caches across consistency tiers.">
+Don't put "current price" and "user's preferred language" in
+the same Redis with the same default TTL. Different
+freshness requirements need different caches.
+</Step>
+<Step n={3} title="Make it observable.">
+Track cache hit rate, p99 staleness, purge failure rate.
+You won't notice gradual cache rot otherwise.
+</Step>
+</Steps>
+
+## Picking a strategy
+
+<Cheatsheet>
+| Data shape | Strategy |
+|---|---|
+| Read-mostly, low-stakes | TTL only |
+| Read-mostly, must-be-fresh | TTL + explicit purge on write |
+| Multi-cache (CDN + app cache + DB cache) | CDC-driven invalidation |
+| Static assets | Versioned URLs |
+| Aggregated views | Tag-based |
+| Per-user, short-lived | Short TTL only |
+</Cheatsheet>
+
+## In summary
+
+- Cache invalidation: pick one of TTL, explicit purge,
+  versioned keys, CDC, or tag-based — each has tradeoffs.
+- TTL is the default and the backstop; always set one even
+  when you have purge.
+- Explicit purge is the standard add-on; cover every write
+  path.
+- CDC + tag-based scale better as cache count grows.
+- Dependent caches (page caches that include other things)
+  are the hardest case — document dependencies explicitly.

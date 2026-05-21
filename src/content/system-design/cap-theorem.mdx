@@ -1,0 +1,272 @@
+export const level = 'mid';
+
+# CAP theorem
+
+The CAP theorem is the most quoted and least correctly cited
+result in distributed systems. "Pick two of three" is a
+slogan that fits on a slide and misleads in 90% of real
+arguments. The actual statement is narrower, more useful, and
+worth getting right.
+
+## What CAP actually says
+
+Eric Brewer's conjecture (2000), formalized by Gilbert and
+Lynch (2002):
+
+> In an asynchronous network model, a distributed data store
+> **cannot** simultaneously guarantee:
+>
+> - **Consistency** (linearizability: every read sees the
+>   most recent write),
+> - **Availability** (every request to a non-failing node
+>   eventually receives a non-error response), and
+> - **Partition tolerance** (the system continues to operate
+>   despite arbitrary message loss between nodes).
+
+The careful version of "pick two" is **during a network
+partition, you must choose between C and A** — because P is
+not a choice, it's a fact of life.
+
+You cannot build a distributed system that "doesn't tolerate
+partitions." Networks partition. The question is what your
+system does when they do.
+
+## The three properties, precisely
+
+### Consistency (C in CAP)
+
+Specifically **linearizability**: there exists a single
+total order of operations consistent with real time, such that
+every read returns the value of the most recent write in that
+order.
+
+This is **not** "eventual consistency," "ACID consistency"
+(the C in ACID is about invariants), or "transactional
+consistency." CAP-C is linearizability — the strongest
+single-object consistency guarantee.
+
+### Availability (A in CAP)
+
+Every request to a non-failing node receives a non-error
+response in finite time. Crucially: **every** non-failed node,
+not "the system as a whole."
+
+A system that returns errors from minority partitions during a
+split is **not available** by CAP's definition, even though
+the majority side is fine.
+
+### Partition tolerance (P in CAP)
+
+The system makes progress even when arbitrary subsets of
+messages between nodes are lost.
+
+In a single-node system, P is trivially "yes" — there are no
+inter-node messages to lose. CAP only matters for systems
+spanning multiple nodes that need to coordinate.
+
+## What CAP actually proves
+
+The proof is short and worth knowing.
+
+<Steps>
+<Step n={1} title="Suppose a distributed store guarantees C and A and P.">
+Consider two nodes N1 and N2, partitioned from each other.
+</Step>
+<Step n={2} title="A client writes value v to N1.">
+By A, N1 must accept and acknowledge the write.
+</Step>
+<Step n={3} title="Another client reads from N2.">
+By A, N2 must respond. By C, N2 must return v (the most recent
+write). But N1 and N2 can't communicate — N2 has no way to
+know about v.
+</Step>
+<Step n={4} title="Contradiction.">
+At least one of C or A must be sacrificed during the partition.
+</Step>
+</Steps>
+
+That's it. It's a result about **what happens during a
+partition**, not a statement about steady-state behavior.
+
+## Why "pick two" misleads
+
+Three reasons the slogan breaks down.
+
+### 1. P is not optional
+
+In any real distributed system, partitions happen. They are not
+something you can refuse to tolerate. "CA" — consistency +
+availability without partition tolerance — describes a
+single-node system or a synchronous, never-failing network.
+Neither exists at scale.
+
+The real choice is **CP** (during partitions, prefer
+consistency, sacrifice availability on minority sides) or **AP**
+(during partitions, prefer availability, accept temporary
+inconsistency).
+
+### 2. C and A are not binary
+
+Real systems offer a spectrum:
+
+- Linearizable per key with monotonic guarantees globally.
+- Per-shard linearizable; eventually consistent across shards.
+- Bounded staleness ("at most 5 seconds stale").
+- Read-your-writes within a session.
+- Eventually consistent (no guarantee).
+
+Similarly availability has shades — "majority partition stays
+up" vs "any single node stays up."
+
+### 3. CAP says nothing about latency
+
+In the absence of partitions, you can have both C and A. But
+even then, there's a latency cost to maintaining strong
+consistency (consensus round trips). Many real systems make a
+**latency vs consistency** trade with no partition involved.
+That's what PACELC extends.
+
+## Where systems actually sit
+
+<Cheatsheet>
+| System | Partition behavior |
+|---|---|
+| Single-leader Postgres / MySQL | CP — leader on the wrong side of a partition has no quorum; writes stop |
+| MongoDB replica set (majority readConcern) | CP — minority partitions can't accept writes |
+| ZooKeeper, etcd, Consul | CP — quorum required; minority unavailable |
+| Spanner, CockroachDB | CP — Paxos/Raft per range; quorum required |
+| Cassandra (default tunable) | AP — sloppy quorum, hinted handoff, eventual |
+| DynamoDB (default consistency) | AP — eventual reads; strong reads cost more |
+| Riak | AP — siblings on conflict; merge in app |
+| Redis (no Sentinel/Cluster) | CA-ish single node |
+| Redis Sentinel / Cluster | AP-leaning; split-brain risk if mistuned |
+| Kafka (with min.insync.replicas) | CP-leaning; minority partition can't write |
+</Cheatsheet>
+
+This classification is rough. Cassandra **can** be configured
+for strong consistency per write (R + W > N + LWT for
+serializable). Postgres **can** be deployed in ways that drop
+data on failover.
+
+The right framing: **what does the system do during a
+partition?** Drop writes on minority sides (CP) or accept
+writes and reconcile later (AP)?
+
+## CP systems
+
+Behavior under partition:
+
+- Minority partitions reject writes (and often reads).
+- Majority partition continues, possibly with reduced
+  redundancy.
+- After the partition heals, minority catches up from the
+  majority's log.
+
+Pros:
+
+- **Linearizable** reads and writes for majority clients.
+- **No conflict resolution** needed — only one history.
+- **Predictable failure semantics** for developers.
+
+Cons:
+
+- **Minority unavailability** is potentially significant —
+  if 2 of 5 nodes are partitioned off, 2 nodes are
+  unavailable to clients in that partition.
+- **Quorum requires odd cluster sizes** (3, 5, 7) to be
+  efficient.
+
+Use when correctness dominates: balance ledgers, inventory,
+booking systems, configuration stores.
+
+## AP systems
+
+Behavior under partition:
+
+- Every node continues to accept reads and writes.
+- After partition heals, divergent versions are reconciled
+  (last-write-wins, app merge, CRDTs, sibling resolution).
+
+Pros:
+
+- **Always available.** No matter which side of the partition
+  you're on, you get a response.
+- **Suitable for global / multi-region** with relaxed
+  consistency.
+
+Cons:
+
+- **Conflicts are unavoidable** and must be handled.
+- **Reads can return stale data** — sometimes very stale.
+- **Reasoning about correctness** is harder; bugs are subtle.
+
+Use when availability is paramount and stale data is
+tolerable: shopping cart, social feeds, presence indicators,
+metrics, IoT.
+
+## What CAP doesn't say
+
+A list of CAP misuses worth recognizing:
+
+- **"NoSQL is AP, SQL is CP."** Some NoSQL is CP (HBase,
+  MongoDB with majority); some SQL is AP-leaning (relaxed
+  Postgres failover). The label doesn't determine the
+  classification.
+- **"CAP forces you to give up one of {C, A, P}."** During
+  normal operation (no partition), you can have both. CAP
+  only constrains behavior during partitions.
+- **"Linearizability is the only consistency."** CAP-C is
+  linearizability, but useful systems offer many other
+  consistency models (causal, monotonic, bounded staleness).
+  Most apps need something weaker than linearizability.
+- **"CAP is a complete framework."** It says nothing about
+  partition frequency, latency in non-partitioned operation,
+  or operational cost. PACELC fills part of this gap; real
+  design considers far more.
+
+## Practical guidance
+
+<Steps>
+<Step n={1} title="Decide per data, not per database.">
+A single system may need CP for billing and AP for the
+activity feed. Some databases support both modes; many
+products mix multiple stores.
+</Step>
+<Step n={2} title="State the partition behavior explicitly.">
+"When a network partition happens, writes to the wallet table
+fail with 503; writes to the like-counter succeed and
+converge." That's an actionable design statement.
+</Step>
+<Step n={3} title="Plan for partition recovery.">
+After a CP partition, reads catch up via the log. After an AP
+partition, you need conflict resolution code. Both are work.
+</Step>
+<Step n={4} title="Test partitions.">
+Chaos engineering: introduce network drops, verify behavior
+matches the design. Most CAP violations are discovered in
+production.
+</Step>
+</Steps>
+
+<Callout variant="info">
+Brewer's 2012 retrospective (CAP Twelve Years Later) said the
+clearest thing: design systems that handle partitions
+**explicitly**. The "two of three" framing was a slogan from a
+keynote; the engineering reality is more nuanced and more
+useful. See PACELC for the natural follow-up.
+</Callout>
+
+## In summary
+
+- CAP says: during a network partition, a distributed store
+  must choose between linearizability (C) and full
+  availability (A). P is not optional.
+- "Pick two" is misleading. The real choice is **CP vs AP
+  under partition**.
+- Both C and A are spectrums; real systems make per-operation
+  or per-key trade-offs.
+- CAP is about partition behavior; PACELC extends it to
+  non-partition latency.
+- Decide CP vs AP per dataset, document the partition
+  semantics, and test the partition behavior in chaos
+  experiments.

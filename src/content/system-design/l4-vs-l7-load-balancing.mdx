@@ -1,0 +1,328 @@
+export const level = 'mid';
+
+# L4 vs L7 load balancing
+
+A load balancer is either Layer 4 (transport — TCP/UDP) or
+Layer 7 (application — HTTP). The distinction sounds academic;
+in practice it determines what features you can run, how fast
+the LB is, and how you debug it.
+
+## What each one sees
+
+```
+┌───────────────────────────────────────────────────┐
+│ L7 (HTTP)                                         │
+│  GET /api/users/42 HTTP/1.1                       │
+│  Host: api.example.com                            │
+│  Authorization: Bearer ...                        │
+│  Cookie: session=abc                              │
+├───────────────────────────────────────────────────┤
+│ L4 (TCP)                                          │
+│  src 192.0.2.10:54321 → dst 10.0.0.5:443          │
+│  flags: ACK, payload: <encrypted bytes>           │
+└───────────────────────────────────────────────────┘
+```
+
+An L4 LB sees IPs, ports, and flow state. The payload is
+opaque — to L4, an HTTP request and a gRPC stream are the
+same TCP packets.
+
+An L7 LB terminates the connection, parses the HTTP request,
+and can read every header, every cookie, the URL path, even
+the body. It then opens a new connection to the chosen
+backend.
+
+That parse-and-re-issue is the whole difference. Everything L7
+can do flows from "we understand the protocol." Everything L4
+can't do flows from "we don't."
+
+## What L4 can do
+
+L4 is fast and dumb. It can:
+
+- **Forward TCP/UDP packets** based on source/destination IP
+  and port.
+- **Pick a backend** by hash (5-tuple: src IP, src port, dst
+  IP, dst port, protocol) or by round-robin/least-conn at
+  connection establishment.
+- **Track connection state** (open, established, closed) so
+  packets in a flow land on the same backend.
+- **Health-check backends** at the TCP level (does port 80
+  accept connections?) or via a periodic L7 probe.
+- **Operate at extreme throughput**, often kernel-bypass
+  (DPDK, XDP) or in-kernel (IPVS, eBPF). AWS NLB does line-rate
+  on its hardware — millions of connections per second per
+  node.
+
+L4 LBs include: AWS NLB, GCP TCP/UDP Load Balancing, HAProxy
+in TCP mode, IPVS, kube-proxy, Envoy in TCP listener mode.
+
+## What L7 enables
+
+L7 has more work to do but every interesting LB feature lives
+here:
+
+### Path-based routing
+
+```
+/api/*      → users-service
+/payments/* → payments-service
+/static/*   → cdn-origin
+```
+
+This single feature is why you have an L7 LB in front of a
+microservice stack. Without it, each service needs its own
+hostname (and its own DNS, TLS cert, ingress).
+
+### Host-based routing
+
+```
+Host: api.example.com  → api-service
+Host: admin.example.com → admin-service
+```
+
+Multiple apps sharing one IP / one set of certs.
+
+### Header / cookie routing
+
+```
+Header X-Beta: true → new-version-backend
+Otherwise          → old-version-backend
+```
+
+Powers canary deploys, A/B tests, gradual rollouts. Indispensable.
+
+### Request rewriting
+
+```
+Strip /api prefix:  /api/users/42  →  /users/42
+Add header:         X-User-Id: ...
+Rewrite method:     POST           →  PUT
+```
+
+Backends stay clean; routing concerns stay at the LB.
+
+### TLS termination & SNI routing
+
+The LB sees the TLS handshake's Server Name Indication and
+routes to a backend based on it. One IP, many domains, many
+certs. The modern norm.
+
+### Response transformation
+
+Gzip, brotli, cache headers, security headers — added by the
+LB on the way out.
+
+### Rate limiting per route / per user
+
+```
+/login: 5 req/min per IP
+/api/*: 100 req/min per user (from auth header)
+```
+
+L4 can't see "user" — that's in the auth header. L7 can.
+
+### Authentication offload
+
+The LB validates the JWT, sets a backend header (`X-User-Id`),
+backends just trust it. Authn moves out of every service.
+
+### Path-based health checks
+
+Probe a specific URL (`GET /health/deep`) that exercises real
+code paths, not just "TCP port open." See health-checks-and-
+circuit-breaking-at-lb.
+
+### WAF / bot detection
+
+Application-layer attacks (SQL injection patterns, malicious
+user agents, brute-force scrapers) live at L7. An L4 LB can't
+inspect them.
+
+## What L4 still wins at
+
+L4 isn't legacy — it's the right tool for some jobs:
+
+- **Non-HTTP protocols**. SMTP, MQTT, custom binary, raw TCP,
+  database connections (Postgres, Redis), DNS. L7 LBs (which
+  are HTTP-shaped) can't speak these.
+- **Extremely high RPS / low latency**. L7 parsing costs CPU
+  and adds buffering latency (typically 1–5 ms). L4 forwards
+  packets in microseconds.
+- **Pass-through TLS**. The LB doesn't terminate TLS — clients
+  and backends do mTLS end-to-end. Useful for compliance and
+  zero-trust setups where the LB shouldn't see plaintext.
+- **gRPC at the front edge**. gRPC is HTTP/2 underneath, so an
+  L7 LB *can* parse it, but gRPC's long-lived streams and
+  load-balancing semantics often work better through L4 +
+  client-side balancing (or a gRPC-aware proxy like Envoy in
+  HTTP/2 mode).
+- **WebSockets and long polls**. Same story — once the
+  upgrade happens, it's just bytes, and L4 is fine.
+
+## A side-by-side comparison
+
+<Compare a="L4 load balancer" b="L7 load balancer">
+<>
+- Sees IPs, ports, TCP/UDP flags.
+- Routes by 5-tuple hash or simple algorithms.
+- No idea about HTTP paths, headers, methods.
+- Throughput: millions RPS per node, sub-ms latency.
+- Cannot do path routing, header rewriting, WAF.
+- Cannot terminate TLS (must pass through).
+- Used for: NLB, IPVS, kube-proxy iptables/eBPF mode.
+</>
+<>
+- Terminates connections, parses HTTP.
+- Routes by path, host, header, cookie, method.
+- Can rewrite requests, add headers, strip prefixes.
+- Throughput: 10K–500K RPS per node, ms-scale latency.
+- WAF, rate limiting per user, auth offload, response
+  transforms.
+- Terminates TLS (default), inspects SNI.
+- Used for: ALB, ELB Classic in HTTP mode, NGINX, Envoy,
+  HAProxy in HTTP mode, Cloudflare, Fastly.
+</>
+</Compare>
+
+## When to use which
+
+<Cheatsheet>
+| Workload | Use |
+|---|---|
+| HTTP API with multiple services | L7 (path routing) |
+| Single-protocol high-throughput backend (e.g., SMTP relay) | L4 |
+| Postgres / Redis / Cassandra in front of clients | L4 |
+| Microservices behind one hostname | L7 |
+| WebSocket service with millions of connections | L4 (or L7 if you need per-request features) |
+| gRPC service mesh | L7 with HTTP/2 support, or L4 + client-side balancing |
+| Need TLS termination | L7 |
+| Need TLS passthrough (compliance) | L4 |
+| Need WAF | L7 (or a separate WAF tier) |
+| Anti-DDoS at edge | L4 first (volumetric), L7 behind (application-layer) |
+</Cheatsheet>
+
+## The common pattern: L4 in front of L7
+
+In a serious deployment, **both** are used in sequence:
+
+```
+internet
+   │
+   ▼
+[Anycast L4]    ← DDoS absorption, SYN flood handling
+   │
+   ▼
+[L7 ALB / NGINX] ← path routing, TLS termination, WAF
+   │
+   ▼
+[backend pool]
+```
+
+The L4 layer absorbs volumetric attacks and load-balances
+across a fleet of L7 LBs. The L7 layer does the application
+work.
+
+AWS does this in their managed offerings: NLB → ALB → ECS/EKS
+is a common pattern. GCP does it with Google Front-End (L4
+anycast) → Backend Service (L7) → Pods.
+
+## Protocol-aware quirks
+
+### HTTP/2 multiplexing
+
+HTTP/2 puts many requests on one TCP connection. An L4 LB sees
+one connection and one backend — every request from a client
+hits the same backend, regardless of load.
+
+This is fine if the connection is short. For long-lived HTTP/2
+connections (gRPC clients), it becomes a real problem:
+imbalanced backends.
+
+L7 LBs that speak HTTP/2 can balance per-request despite the
+single TCP connection. Envoy and modern NGINX do this well.
+
+### TLS SNI
+
+The Server Name Indication header in the TLS handshake says
+which hostname the client wants. An L7 LB uses SNI to pick a
+cert and route. An L4 LB can also peek at SNI (it's the only
+plaintext part of TLS 1.3 handshake) to make routing decisions
+without terminating TLS — called "SNI-based L4 routing."
+
+### Proxy Protocol
+
+When an L4 LB hands off to an L7 LB (or to a backend), the
+backend loses the client's IP. **Proxy Protocol** is a header
+that the L4 LB prepends to the TCP stream:
+
+```
+PROXY TCP4 192.0.2.10 10.0.0.5 54321 443\r\n
+```
+
+Backends parse it and learn the real client IP. Without it,
+backends rate-limit and log the L4 LB's address, not the
+client's.
+
+## Latency cost
+
+L4 forwarding is essentially free — microseconds. L7
+termination + re-issue costs:
+
+- TLS handshake termination: 1–10 ms (cached session: ~1 ms).
+- HTTP parsing: tens of microseconds.
+- Routing decision: microseconds to ms (depending on rules).
+- New backend connection: 0 (pooled) to 10 ms (new TCP+TLS).
+
+A well-tuned L7 LB adds 1–5 ms p99 to a request. Acceptable
+for almost all HTTP work. A poorly-tuned one adds 50+ ms,
+mostly from TLS handshakes that aren't pooled.
+
+## Common pitfalls
+
+### Picking L7 because "L7 is more advanced"
+
+L7 is more advanced. It's also slower, more expensive, and
+breaks for non-HTTP protocols. If the workload is "raw TCP to
+a database," L7 is wrong.
+
+### Trying to do path routing in L4
+
+You can't. L4 doesn't see paths. If someone proposes
+"L4 path routing," they're confusing it with SNI-based routing
+(hostname only).
+
+### Ignoring the X-Forwarded-For chain
+
+`X-Forwarded-For` becomes a list as it passes through multiple
+proxies: `client, lb1, lb2`. Backends that read the first
+entry think the client IP is whoever set the header — easy
+to spoof. Read the **last untrusted** entry, knowing your
+proxy chain.
+
+### Forgetting WebSocket Upgrade
+
+WebSocket starts as HTTP, then upgrades to a raw TCP stream.
+L7 LBs need explicit WebSocket support to handle the Upgrade;
+otherwise the connection breaks.
+
+### Health checks at the wrong layer
+
+L4 health check (TCP open) says the process is running. The
+process might be running but unable to talk to its DB. Use L7
+health checks that exercise the real stack.
+
+## In summary
+
+- L4 = TCP/UDP forwarding, fast and protocol-agnostic.
+- L7 = HTTP-aware, slow and feature-rich.
+- L7 enables path/host/header routing, TLS termination, WAF,
+  per-user rate limiting — everything you need for a real HTTP
+  service.
+- L4 wins for non-HTTP protocols, extreme throughput, TLS
+  passthrough, and DDoS absorption.
+- Real systems use both: L4 at the edge for raw absorption,
+  L7 behind it for application routing.
+- Pay attention to TLS, HTTP/2 multiplexing, WebSocket
+  upgrades, and X-Forwarded-For — most production gotchas are
+  in those four areas.

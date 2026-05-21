@@ -1,0 +1,181 @@
+export const level = 'senior';
+
+# Cache stampede (thundering herd)
+
+A hot key expires. Thousands of requests miss the cache
+simultaneously. All of them hit the origin database. The
+database melts. The cache fills back up eventually, but in the
+meantime everything is on fire.
+
+This is the most common cache-related outage. It's preventable
+with techniques that cost almost nothing — but only if you
+remember to apply them.
+
+## How it happens
+
+```
+t=0:    cache key "homepage" expires
+t=0.01: request A misses, queries DB
+t=0.02: request B misses, queries DB (A hasn't finished)
+t=0.03: request C misses, queries DB
+...
+t=0.5:  request 5,000 misses, queries DB
+t=2.0:  A finishes, writes to cache
+t=2.1:  requests B-5000 all finish, all writing same data to cache, all hitting overloaded DB
+```
+
+For the duration of the stampede, the database serves N
+times its normal load. If N is 10×, you might survive. If
+1000×, you don't.
+
+Hot keys (homepage, popular product, viral content) make this
+worse because more concurrent requests are waiting for the
+same key.
+
+## Mitigation 1: request coalescing (single-flight)
+
+When N requests miss the same key, only **one** actually
+queries the origin. The others wait for the result.
+
+```js
+const inflight = new Map();
+
+async function get(key) {
+  const cached = await cache.get(key);
+  if (cached) return cached;
+
+  if (inflight.has(key)) return inflight.get(key);
+
+  const promise = fetchFromOrigin(key).then((value) => {
+    cache.set(key, value);
+    inflight.delete(key);
+    return value;
+  });
+  inflight.set(key, promise);
+  return promise;
+}
+```
+
+This is **per-process** coalescing. For per-cluster
+coalescing, use a Redis lock (`SET NX EX`) — only the lock
+holder queries the DB; others poll the cache.
+
+Cuts DB load by ~N during a stampede. Standard pattern.
+
+## Mitigation 2: probabilistic early expiration
+
+Instead of expiring at exactly TTL, refresh probabilistically
+**before** expiry. The closer to expiry, the more likely a
+read triggers a refresh. By the time the TTL hits, the cache
+is already warm.
+
+```js
+function shouldRefresh(remainingTTL, totalTTL) {
+  const probability = Math.exp(-3 * remainingTTL / totalTTL);
+  return Math.random() < probability;
+}
+```
+
+Approximates the **XFetch** algorithm. The probability stays
+near 0 for most of the TTL and ramps to 1 near expiration.
+
+Used by Sidekiq, Memcached community patterns. Effective when
+TTLs are long enough for the probability ramp to take effect.
+
+## Mitigation 3: lock-and-serve-stale
+
+When a key expires, the **first** request to miss takes a
+lock and queries origin. Other concurrent requests get the
+**stale** value (kept around past TTL) immediately.
+
+```js
+async function get(key) {
+  const { value, stale } = await cache.getWithStaleness(key);
+  if (value && !stale) return value;
+
+  if (await acquireLock(key, 5_000)) {
+    const fresh = await fetchFromOrigin(key);
+    await cache.set(key, fresh);
+    return fresh;
+  } else {
+    return value;
+  }
+}
+```
+
+The user sees stale (but valid) data for a few hundred ms.
+Way better than a 500 error from a melting DB.
+
+Used by Varnish (`grace` mode), Cloudflare (`stale-while-revalidate`),
+nginx proxy_cache.
+
+## Mitigation 4: refresh-ahead
+
+(See refresh-ahead-cache for the full treatment.) Proactively
+refresh hot keys *before* they expire. Background workers
+identify keys with high read rates and refresh them on a
+schedule independent of the cache TTL.
+
+Cuts stampedes to zero for the keys you cover. Doesn't help
+for the long tail of less-popular keys.
+
+## Mitigation 5: jitter TTLs
+
+If many keys are created at once with the same TTL, they all
+expire at once. The result: N stampedes simultaneously.
+
+Fix: add random jitter to TTLs.
+
+```js
+const baseTTL = 3600;
+const jitter = Math.floor(Math.random() * 300); // 0–300 sec
+await cache.set(key, value, baseTTL + jitter);
+```
+
+Spreads expiration across a 5-minute window. The origin sees
+a smooth, manageable refresh rate instead of a cliff.
+
+## Negative caching to prevent miss storms
+
+A request for a nonexistent key (`/user/99999999999`) misses
+the cache and queries the DB. The DB returns "not found." The
+cache stores nothing. Same request next time → same miss →
+same DB query. A determined client can hammer the DB with bad
+IDs.
+
+Cache the "not found" too, with a short TTL:
+
+```js
+const user = await getUserFromDB(id);
+if (!user) {
+  await cache.set(`user:${id}`, NOT_FOUND, 60); // 60 sec
+} else {
+  await cache.set(`user:${id}`, user, 3600);
+}
+```
+
+See negative-caching.
+
+## Don't let one slow key kill the cluster
+
+Even with mitigations, a slow origin query during a refresh
+takes seconds while every request blocks. Mitigations to
+mitigations:
+
+- **Timeouts on origin queries.** Worse to wait 30s than to
+  fail-fast and serve stale.
+- **Per-key concurrency limits.** Don't let 50 workers all
+  block on the same slow query.
+- **Bulkhead the DB.** Connection pool partitioned so one slow
+  query type can't starve others.
+
+## In summary
+
+- Cache stampede: hot key expires, all concurrent requests
+  miss simultaneously, origin database collapses.
+- Mitigations: request coalescing (single-flight), probabilistic
+  early refresh, lock + serve-stale, refresh-ahead, TTL
+  jitter, negative caching.
+- All are cheap; the cost of not having them is a
+  catastrophic outage on the next viral event.
+- Combine multiple mitigations — they're complementary.

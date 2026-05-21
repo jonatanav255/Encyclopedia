@@ -1,0 +1,227 @@
+export const level = 'mid';
+
+# Webhooks (architecture)
+
+The architecture view of webhooks: how to build a system
+that **delivers events from your service to thousands of
+external endpoints reliably**. This complements the
+implementer-side view at architecture/webhooks.
+
+## What you're building
+
+```
+your domain event
+   ▼
+webhook delivery service
+   ▼ (per-subscriber)
+external endpoints (configured by customers)
+```
+
+Each customer configures one or more endpoints. Each domain
+event triggers delivery to the relevant subscribers, with
+retries, signing, idempotency, and observability.
+
+## The components
+
+<Steps>
+<Step n={1} title="Subscription registry.">
+Customer endpoints, secrets, event-type filters, delivery
+preferences. Source of truth for "who gets what."
+</Step>
+<Step n={2} title="Event source.">
+Domain events from your platform (order created, payment
+succeeded, etc.).
+</Step>
+<Step n={3} title="Fanout router.">
+Reads each event; queries subscriptions; enqueues delivery
+attempts.
+</Step>
+<Step n={4} title="Delivery workers.">
+Pop the queue; sign the payload; POST to the endpoint;
+record the result.
+</Step>
+<Step n={5} title="Retry engine.">
+On failure, schedule retries with exponential backoff.
+</Step>
+<Step n={6} title="Dashboard / replay.">
+Customer-facing UI to see delivery attempts, replay failed
+events.
+</Step>
+</Steps>
+
+## Signing the payload
+
+Every webhook signed with HMAC + a per-subscriber secret:
+
+```js
+const signature = crypto.createHmac('sha256', subscriber.secret)
+  .update(timestamp + '.' + payload)
+  .digest('hex');
+
+headers['X-Signature'] = `t=${timestamp},v1=${signature}`;
+```
+
+The receiver verifies with the same secret. Prevents spoofed
+webhooks.
+
+Include a timestamp; receivers should reject events older
+than N minutes to prevent replay.
+
+## Delivery guarantees
+
+At-least-once delivery is the standard. Webhook receivers
+must be idempotent on event_id.
+
+Exactly-once is impossible over best-effort network. Don't
+promise it.
+
+## Retry policy
+
+Failure modes:
+
+- **5xx response**: retry with backoff.
+- **Timeout**: retry with backoff.
+- **4xx response**: usually permanent failure; don't retry
+  (the receiver said "your request is wrong"). Special case:
+  429 with Retry-After respects the header.
+- **Connection error**: retry; could be transient.
+
+Backoff schedule:
+
+```
+attempt 1: immediate
+attempt 2: 1 minute
+attempt 3: 5 minutes
+attempt 4: 30 minutes
+attempt 5: 2 hours
+attempt 6: 12 hours
+attempt 7: 1 day
+total window: 3 days
+```
+
+After max retries, mark as failed; surface to customer; stop
+retrying.
+
+Stripe: ~16 retries over ~72 hours. GitHub: no automatic
+retry (manual redelivery from API/UI within 3 days).
+
+## Per-subscriber rate limits
+
+A customer with a slow endpoint shouldn't slow delivery to
+fast endpoints. Per-subscriber queues with concurrency limits:
+
+```
+each subscriber: max 10 concurrent in-flight deliveries
+each subscriber: max 100 attempts/sec
+```
+
+If one subscriber falls behind, their queue grows; others
+unaffected.
+
+## Bulkheading
+
+A slow subscriber consumes a worker. Without isolation, all
+workers can end up stuck on slow subscribers. Solutions:
+
+- **Per-subscriber worker pools** (heavy).
+- **Strict per-request timeouts**: 30-second default; abort
+  and queue for retry.
+- **Connection pooling per subscriber**: bounded.
+
+## Webhook delivery at scale
+
+For high-volume systems:
+
+- **Sharded queues** by subscriber ID for fairness.
+- **Dedicated worker pools per tier** (free / paid /
+  enterprise customers).
+- **Priority queues**: critical events (payments) before
+  marketing events.
+
+## Customer-side reliability
+
+You can't control how the customer's endpoint behaves. They
+might:
+
+- Be down during a critical event.
+- Have a slow database that turns 200ms into 30s.
+- Be on an IP that gets blocked.
+- Misconfigure their secret and reject everything.
+
+Your service can't fix this; what you can do:
+
+- **Surface delivery state** to the customer. Dashboard with
+  recent attempts, success/failure rates.
+- **Manual replay API**: let them re-trigger any failed event.
+- **Backfill API**: enumerate events since a time and let
+  them request specific events.
+
+Make it possible for the customer to recover from their own
+downtime.
+
+## Webhook security beyond signing
+
+- **HTTPS-only endpoints**. Reject http:// URLs.
+- **Source IP**: publish a list of IPs your webhooks come
+  from; customers can allowlist.
+- **Replay protection**: timestamp + signature.
+- **No sensitive data in URLs**: secrets in headers; URL is
+  just routing.
+
+## Observability
+
+Every delivery attempt logged with:
+
+- Subscriber, event ID, attempt number.
+- HTTP method, URL, response code, latency.
+- Outcome (success / will retry / failed).
+
+Dashboards:
+
+- Per-subscriber success rate.
+- Latency histogram per subscriber.
+- Backlog (queued attempts not yet delivered).
+
+Alert on:
+
+- Global delivery failure rate spike.
+- Per-subscriber sustained failure rate.
+- Backlog growing without bound.
+
+## Implementation patterns
+
+- **Built on Kafka or queues**: events flow through a Kafka
+  topic; delivery workers consume.
+- **Per-subscriber consumer groups**: each subscriber has its
+  own consumer offsets; one subscriber's failure doesn't
+  affect others.
+- **Outbox pattern at source**: the domain event is written
+  atomically with the state change in the source DB; a
+  separate process publishes from the outbox. (See
+  outbox-pattern.)
+
+## When to use a service
+
+Building webhook delivery is real engineering. For most
+companies, "Svix" or "Hookdeck" or building on managed
+services (EventBridge with API destinations, Pub/Sub HTTP
+push) is cheaper than building from scratch.
+
+Build your own when:
+
+- Webhook delivery is core product (Stripe, Twilio,
+  GitHub).
+- Compliance requires control of the pipeline.
+- Existing services can't meet your scale or features.
+
+## In summary
+
+- Webhook delivery service: subscription registry, fanout,
+  workers, retries, dashboard.
+- At-least-once delivery; receivers must dedupe.
+- Sign every payload (HMAC + per-subscriber secret + timestamp).
+- Backoff: minutes → hours → days; cap at ~3 days.
+- Per-subscriber isolation: queues, rate limits, bulkheads.
+- Surface delivery state to customers; provide replay APIs.
+- Buy from Svix / Hookdeck unless webhook delivery is core
+  product.

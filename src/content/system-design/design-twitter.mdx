@@ -1,0 +1,258 @@
+export const level = 'senior';
+
+# Design Twitter / X
+
+A microblogging service: users post short content, follow other
+users, and consume a chronologically (or algorithmically) ranked
+home timeline. The interesting parts: timeline assembly at
+extreme read scale, fanout strategy, and celebrity-user
+asymmetry.
+
+## 1. Clarify the scope
+
+- Core actions: post a tweet (text + optional media), follow/unfollow,
+  view home timeline, view a user's profile timeline, like/retweet.
+- Search, DMs, ads, trending — out of scope here.
+- Strict-ordering on the timeline? Or approximate?
+- Multi-region active-active? Or one primary region?
+
+Assumptions I'd lock in: chronological timeline (ranked is a
+separate problem), single-primary region with read replicas
+globally, tweets are immutable once posted.
+
+## 2. Estimate scale
+
+```
+DAU                 = 300M
+Tweets/user/day     = 2  → 600M tweets/day
+Avg write QPS       = 600M / 10^5 = 6 000 QPS
+Peak write QPS      = ~20 000 QPS
+
+Reads/user/day      = 100 (timeline scrolls)
+Reads/day           = 30B  → avg 300 000 QPS, peak ~1M QPS
+
+Followers/user (avg)= 200; celebrities = 10M-100M
+Fanout amplification (avg) = 6K writes × 200 = 1.2M timeline writes/sec
+Celebrity event (100M followers) = 100M timeline writes per tweet
+
+Storage:
+  tweet ~300B + metadata → ~500B per tweet → 300 GB/day, ~110 TB/year
+  timeline entries (id ref) ~30B → 100B/follower → fanout storage explodes
+```
+
+The amplification is the headline: average fanout is 200x, but a
+single celebrity tweet creates 100M downstream writes. Two
+strategies don't both work; we'll need a hybrid.
+
+## 3. API
+
+```bash
+POST /tweets
+  Body: { text: string, mediaIds?: string[] }
+  Resp: { id: string, createdAt: timestamp }
+
+POST /follow         { userId }
+POST /unfollow       { userId }
+
+GET  /timeline?cursor=<opaque>&limit=20
+  Resp: { items: Tweet[], nextCursor }
+
+GET  /users/:id/tweets?cursor=&limit=20
+
+POST /tweets/:id/like
+POST /tweets/:id/retweet
+```
+
+Cursor pagination (opaque, encodes `tweetId+createdAt`). Never
+offset — offset over 100M timeline entries is unworkable.
+
+## 4. High-level design
+
+```
+[ client ] → [ edge / CDN ] → [ LB ] → [ API gateway ]
+                                          │
+       ┌──────────────────────────────────┼──────────────────────────────┐
+       ↓                                  ↓                              ↓
+[ Tweet service ]              [ Timeline service ]            [ Social-graph svc ]
+       │                                  │                              │
+       ↓                                  ↓                              ↓
+[ Tweets DB ]                  [ Timeline cache (Redis) ]    [ Followers DB ]
+(shard by userId or tweetId)   (per-user inbox list)         (shard by userId)
+       │                                  ↑
+       │                                  │
+       ↓                       [ Fanout workers ]
+   [ Object store ]                       ↑
+   (media blobs)                          │
+       │                          [ Kafka: TweetPosted topic ]
+       │
+       └─── async ──→ [ Search index ]   [ Analytics ]
+```
+
+Hot path = timeline read. Hits Redis first, falls back to DB
+assembly. Writes go through a queue to a fanout worker that
+materializes timeline entries.
+
+## 5. Data model
+
+```
+tweets {
+  id            snowflake PK     -- time-sortable
+  author_id     bigint INDEX
+  text          string
+  media_ids     string[]
+  created_at    timestamp
+}
+
+follows {
+  follower_id   bigint
+  followee_id   bigint
+  created_at    timestamp
+  PRIMARY KEY (follower_id, followee_id)
+  INDEX        (followee_id)   -- for "who follows me"
+}
+
+timeline_entries  (in Redis, per-user list)
+  key: "tl:<userId>"
+  value: list of tweetIds, capped at ~800 entries
+
+likes, retweets, mentions — separate tables; eventual count rollups.
+```
+
+Sharding: `tweets` by `author_id` (locality for "user's tweets"),
+`follows` by `follower_id` (locality for "who do I follow"),
+timelines hashed by `userId` across Redis shards.
+
+## 6. Deep dives
+
+### 6.1 Timeline strategy: fanout-on-write vs fanout-on-read
+
+<Compare a="Fanout-on-write (push)" b="Fanout-on-read (pull)">
+<>
+On tweet, write tweetId into every follower's inbox list.
+
+**Pros**: timeline reads are O(1) list-prefix fetch. Cheap and
+fast for normal users.
+
+**Cons**: a single tweet with 100M followers writes 100M
+entries. Celebrities torch the cluster.
+</>
+<>
+On tweet, do nothing extra. On timeline read, fetch user's
+followees and merge their recent tweets.
+
+**Pros**: writes are O(1). No celebrity problem on writes.
+
+**Cons**: reads are O(followees × tweets-per-followee). Most
+users follow 200+ accounts. Heavy on read path.
+</>
+</Compare>
+
+**The production answer is hybrid.** Most users: push. Celebrities
+(>10K-100K followers, threshold tunable): pull. On timeline read:
+
+```
+timeline = merge(
+  redis.lrange("tl:<userId>", 0, N),               -- pushed normal users
+  for each celebrity_followee: recent_tweets(c)    -- pulled at read time
+)
+sort by createdAt desc
+```
+
+This caps the fanout-write amplification (a celebrity tweet writes
+nothing; ordinary tweets fanout to ~200) and caps the read cost
+(merge with ~5-20 celebrities, each O(20) tweets).
+
+### 6.2 Timeline materialization
+
+For active users (logged in within last N days), maintain a
+**precomputed timeline** in Redis as a capped list of tweet IDs
+(~800 entries — enough for several pages of scroll).
+
+For dormant users, don't materialize; assemble on first request
+on read.
+
+Lifecycle:
+
+- **On follow**: backfill the new followee's recent tweets into
+  follower's list (only if the follower is active).
+- **On tweet** (non-celebrity): push tweetId into each active
+  follower's list, trim to 800.
+- **On unfollow**: lazily clean — filter the trimmed list on
+  read, fully rebuild on next eviction.
+
+### 6.3 Storing tweets
+
+`tweets` table is append-only, sharded by `author_id`. Hot:
+recent year, on fast SSD-backed nodes. Cold: tweets older than
+1-2 years rarely read; demote to cheaper storage tier or
+analytics warehouse.
+
+Snowflake-style IDs let you derive `createdAt` from the ID and
+sort timeline entries with just ID comparisons — no separate
+timestamp index needed in the hot path.
+
+### 6.4 Counters: likes, retweets, replies
+
+Per-tweet counters are write-hot on viral tweets. Two patterns:
+
+- **Sharded counter**: maintain N counters per tweet (`like_count:<id>:<shard>`),
+  random shard on increment, sum on read.
+- **Approximate counter**: use HyperLogLog or batched
+  in-memory aggregation flushed every N seconds. Acceptable for
+  display; not for exact reporting.
+
+For most reads, counters are eventual — "153K likes" doesn't need
+to be exact in real time.
+
+### 6.5 Hot tweets & timeline cache invalidation
+
+A viral tweet:
+
+- Is read millions of times in the first hour.
+- Cache it explicitly in a hot-content layer.
+- Replicate the cache entry across multiple Redis shards to
+  spread the read load (random shard selection per read).
+
+When the original author edits/deletes a tweet, we need to
+invalidate or filter. Easiest: store the tweet content
+separately (in `tweets` table); timeline entries are just IDs.
+Resolving an ID-list-to-content happens at read time, so
+deletes naturally drop missing IDs.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 200K write QPS | Single tweets shard | More shards; pre-shard by author_id |
+| 10M timeline read QPS | Redis cluster bandwidth | Geo-shard timeline service per region |
+| 1B-follower account | Fanout-on-read overload | Stronger ranking + caching; rate-limit profile reads |
+| Fanout worker backlog | Topic lag in event of viral hour | Auto-scale workers; back off non-active users first |
+| Storage on tweets | Per-region cluster size | Tier old tweets to columnar/cold; one region for write, others read replicate |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Hybrid fanout** over pure push or pull: pays a small
+  read-time merge in exchange for surviving celebrity asymmetry.
+- **Eventual counters** over exact: 100x throughput for
+  invisible UX difference on display.
+- **Snowflake IDs** over UUIDs: time-sortable and shard-routable
+  without extra index.
+- **Cursor pagination** over offset: O(1) timeline page reads
+  vs O(N) scans.
+- **Materialize for active users only**: timeline storage stays
+  bounded; cold users pay a one-time assembly cost.
+
+## In summary
+
+- Read scale dwarfs write scale by ~100x; design the read path
+  first.
+- Fanout-on-write for normal users, fanout-on-read for
+  celebrities — neither alone works at Twitter scale.
+- Materialize timeline as a capped list of tweetIDs per active
+  user; resolve to content at read time.
+- Counters need sharding or approximation; exact counts at
+  viral tweets cost more than they're worth.
+- The architecture is forced by the followers-per-user
+  distribution being heavy-tailed, not by total QPS alone.

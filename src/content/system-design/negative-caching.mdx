@@ -1,0 +1,147 @@
+export const level = 'senior';
+
+# Negative caching
+
+Caching "not found" results. Without it, a determined client
+asking for `/user/99999`, `/user/99998`, `/user/99997` …
+floods your database with point lookups that always miss the
+cache and always return null. The cache layer does nothing
+because there's no value to store.
+
+The fix: store the "not found" too, with a short TTL.
+
+## Why it matters
+
+Three real attack/error patterns it stops:
+
+### 1. Cache penetration
+
+An attacker iterates IDs that won't exist. Each request misses
+the cache and hits the DB. The DB does a full lookup, finds
+nothing, returns null. The cache stores nothing. Next request
+for that ID → same path. The cache is now useless for that
+key forever.
+
+### 2. Slow back-end errors
+
+An origin lookup that returns an error or empty result takes
+some time. Without negative caching, the next request takes
+the same time. Multiply by a high request rate and the slow
+back-end stays slow.
+
+### 3. Typos in popular URLs
+
+A bad link goes viral. Millions of requests for
+`/produc/42` (missing 't'). Without negative caching, they
+all reach origin. With it, origin sees a tiny burst, then
+the negative cache absorbs the rest.
+
+## How to implement
+
+For every read path, add a "not found" cache entry alongside
+the success path:
+
+```js
+async function getUser(id) {
+  const cached = await cache.get(`user:${id}`);
+  if (cached === NOT_FOUND) return null;
+  if (cached) return cached;
+
+  const user = await db.users.findById(id);
+  if (user) {
+    await cache.set(`user:${id}`, user, 3600);
+    return user;
+  } else {
+    await cache.set(`user:${id}`, NOT_FOUND, 60);
+    return null;
+  }
+}
+```
+
+Two TTLs:
+
+- **Positive TTL** (`user:42` exists): long (hours).
+- **Negative TTL** (`user:42` doesn't exist): short (seconds
+  to minutes).
+
+The negative TTL is shorter for two reasons:
+
+1. If the user is created in the future, you don't want the
+   cache to permanently say "no."
+2. Bad actors iterate keys at high rates; a short negative
+   TTL bounds the cache memory cost.
+
+## Choosing the negative TTL
+
+<Cheatsheet>
+| Use case | Suggested negative TTL |
+|---|---|
+| User lookup by ID | 60 seconds |
+| Product lookup | 30 seconds |
+| Permission check (might be granted) | 5–10 seconds |
+| Auth lookup (might be revoked) | 5 seconds |
+| Public profile page | 5 minutes |
+| Static asset 404 | 5 minutes (CDN-level) |
+</Cheatsheet>
+
+Rule of thumb: as short as you can tolerate. Negative caches
+that are stale cause "user just registered, app says they
+don't exist" bugs.
+
+## Bloom filters: the alternative
+
+If your key space is enormous but the set of *real* keys is
+known and finite, a Bloom filter can answer "does this key
+exist at all?" in O(1) without touching cache or DB.
+
+```js
+if (!bloomFilter.test(id)) {
+  return null; // definitely doesn't exist
+}
+// might exist; check cache/DB
+const user = await getUser(id);
+```
+
+Cassandra and HBase use bloom filters internally for SSTable
+lookups. For application-level negative caching with huge key
+spaces, a bloom filter is more memory-efficient than caching
+every miss.
+
+## Edge cases
+
+### "Not found" then created
+
+A user looks up `/user/42` (doesn't exist) → cached negative
+for 60 sec. User 42 is created at t=10. At t=11, lookup
+returns the cached null instead of the new user.
+
+Mitigation: on user creation, **explicitly purge** the
+negative cache entry. Or accept the 60-sec window.
+
+### "Not authorized" vs "not found"
+
+A user tries to access `/order/42` (exists but isn't theirs).
+The right response is often 404 to avoid leaking existence.
+But if you cache as "not found," another user *who can*
+access it might see a stale negative.
+
+Fix: cache per-user (`user:7:order:42 = NOT_FOUND`), or
+don't cache permission-gated lookups.
+
+### Cache stampede on the negative side
+
+If your negative TTL is too short, you re-stampede origin on
+expiration. Apply the same cache-stampede mitigations
+(coalescing, jitter) to negative entries.
+
+## In summary
+
+- Negative caching: store "not found" with a short TTL.
+- Stops cache-penetration attacks and burst-of-bad-URLs
+  patterns.
+- Negative TTL much shorter than positive (seconds to minutes
+  vs hours).
+- Bloom filters are an alternative for huge key spaces.
+- Watch for "exists now but cached as missing" — purge on
+  creation or accept a short window.
+- Apply stampede mitigations to negative entries too.

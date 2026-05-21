@@ -1,0 +1,316 @@
+export const level = 'senior';
+
+# Design Dropbox / Google Drive
+
+A cloud file sync service: users have a local folder; changes
+sync to the cloud and to all their other devices. Users can also
+share files/folders. Files can be large (GBs); users have many.
+The system runs at hundreds of millions of users and petabytes
+of storage.
+
+The interesting parts: efficient sync (don't re-upload unchanged
+content), conflict resolution, file metadata at scale, and
+delta updates.
+
+## 1. Clarify the scope
+
+- Upload/download files; sync local folder to cloud and across
+  devices.
+- File metadata: name, path, modified time, version history.
+- Sharing: per-file or per-folder, read-only and editable.
+- Conflict resolution when two devices change the same file.
+- Versioning: keep last N versions, or last 30 days.
+- Search by name; full-text search out of scope.
+- Real-time collaboration on file *content*: out of scope (see
+  `design-collaborative-editor`).
+
+## 2. Estimate scale
+
+```
+Users                 = 500M MAU, 150M DAU
+Files/user            = 1 000
+Total files           = 5 × 10^11 (500 billion)
+Avg file size         = 1 MB (heavy tail: many KB-sized, few GB-sized)
+Total storage         = 500 PB
+
+Daily activity:
+  Uploads/user/day    = 5
+  Downloads/user/day  = 20
+  Sync events/day     = 2B    → ~25K events/sec avg, peak 100K
+  Net new bytes/day   = 1 PB
+
+Bandwidth:
+  daily upload egress = a few Tbps; daily download = ~10x upload
+```
+
+500 PB of storage and 500 billion files is the metadata
+problem. Storing the bytes is "buy more S3"; indexing 500B file
+metadata records and serving them at 25K QPS is harder.
+
+## 3. API
+
+```bash
+# Metadata
+GET  /v1/files/:path                          -- metadata
+GET  /v1/files/list?cursor=&path=             -- list folder
+POST /v1/files/move                           { from, to }
+DELETE /v1/files/:path                        -- soft delete to trash
+
+# Upload (resumable, content-addressable)
+POST /v1/upload/start    { path, size, contentHash }
+  Resp: { uploadId, missingBlocks: [hash, hash, ...] }
+PUT  /v1/upload/:id/block { blockHash, bytes }
+POST /v1/upload/:id/commit
+
+# Download
+GET  /v1/files/:path/content   -- redirects to signed URL on object store
+
+# Sync
+GET  /v1/changes?cursor=
+  Resp: { changes: [...], nextCursor }
+
+# Sharing
+POST /v1/shares { path, recipients, permission }
+```
+
+The content-addressable upload (block hashes) is the trick that
+makes sync efficient.
+
+## 4. High-level design
+
+```
+Desktop / mobile client
+   │  (watches local folder, computes block hashes on change)
+   ↓
+[ Sync gateway ]
+   │
+   ├─→ [ Metadata service ]
+   │       │
+   │       └─→ [ Metadata DB (sharded by userId) ]
+   │
+   ├─→ [ Block service ]
+   │       │
+   │       ├─→ [ Block store (object storage) ]
+   │       └─→ [ Block index (hash → location) ]
+   │
+   └─→ [ Notification service ]   -- pushes change events to other devices
+            │
+            └─→ [ WebSocket / long-poll endpoints ]
+
+Async:
+   - file-change events → Kafka → indexers (search), thumbnailers
+   - versioning: old block refs preserved; GC on retention expiry
+```
+
+The metadata path (file/folder records) and the content path
+(actual bytes as blocks) are separate. Most "sync activity" is
+metadata only; bytes move only when content actually changes.
+
+## 5. Data model
+
+```
+files {
+  user_id       bigint
+  path          string
+  file_id       string PK  -- stable id, separate from path
+  parent_id     string?
+  size          bigint
+  content_hash  bytes       -- hash of full content, used for dedup
+  block_list    bytes[]     -- list of block hashes in order
+  version       int
+  modified_at   timestamp
+  deleted_at    timestamp NULL  -- soft delete
+  PRIMARY KEY (user_id, file_id)
+  INDEX (user_id, path)
+}
+
+blocks {
+  block_hash    bytes PK    -- content-addressable
+  size          int
+  location      string      -- object-store key
+  ref_count     int         -- for GC
+}
+
+changes {
+  user_id       bigint
+  change_id     snowflake
+  file_id       string
+  op            enum(create, modify, delete, move)
+  ts            timestamp
+  PRIMARY KEY (user_id, change_id)
+}
+
+shares {
+  share_id, owner_id, target_id, path, permission
+}
+```
+
+Sharding: `files`, `changes` by `user_id`. `blocks` globally by
+`block_hash` — deduplication is global (same file uploaded by N
+users stores one copy).
+
+## 6. Deep dives
+
+### 6.1 Block-level dedup and sync
+
+When a 100 MB file gets one byte changed, you don't want to
+re-upload 100 MB. The fix: split files into **fixed-size blocks**
+(typically 4 MB), hash each, and use **content-addressable
+storage**.
+
+<Steps>
+<Step n={1} title="Client splits file into blocks">
+4 MB chunks. Compute SHA-256 per chunk.
+</Step>
+<Step n={2} title="Client tells server its block list">
+"Here are the hashes of my 25 blocks."
+</Step>
+<Step n={3} title="Server returns missing blocks">
+"I already have 22 of them; please upload these 3."
+</Step>
+<Step n={4} title="Client uploads only the missing blocks">
+PUT to block store, content-addressed by hash.
+</Step>
+<Step n={5} title="Server commits new file metadata">
+`block_list` = [hashes]; bumps `version`.
+</Step>
+</Steps>
+
+Benefits:
+
+- **Dedup across users** — popular files (operating system
+  installers, common templates) store once.
+- **Dedup across versions** — modifying one paragraph in a doc
+  uploads ~one block, not the whole file.
+- **Resumable** — server already knows which blocks landed.
+
+### 6.2 Sync protocol
+
+Each device tracks its `cursor` (last-known change ID for the
+user). On reconnect:
+
+```
+GET /v1/changes?cursor=<last>
+→ stream of changes since cursor
+device applies each:
+  on create/modify: fetch new blocks (only the ones it doesn't have locally)
+  on delete: remove local file
+  on move: rename local file
+update local cursor on success
+```
+
+Push: when the user has any active device, the server pushes
+changes immediately. Other devices receive within seconds.
+
+### 6.3 Conflict resolution
+
+Two devices edit the same file offline, both come online. Both
+have a new version of the file.
+
+```
+file v3 → user edits on device A → v4-A
+file v3 → user edits on device B → v4-B
+device A syncs first → server stores v4-A
+device B syncs → server detects A's version differs from B's parent
+```
+
+Default policy: **keep both versions**. The original file
+becomes the "winner" (last-writer-wins by server-time); the
+loser is renamed `<filename> (conflicted copy from <device>).ext`.
+User decides manually.
+
+Why not merge? File contents are opaque — merging arbitrary
+binary files is unsafe. Real-time editors (Google Docs) have
+CRDT/OT structures *inside* their content; Dropbox doesn't.
+
+Pure metadata conflicts (moves, renames) usually resolve
+deterministically by op order.
+
+### 6.4 Metadata at scale
+
+500 billion file rows isn't a single Postgres. Sharded by
+`user_id` across N clusters. Per-user files all live on one
+shard, so listing a folder is local. Sharing breaks this purity
+(sharing user A's folder to user B touches both shards), handled
+with shared-namespace records on the recipient's shard pointing
+to the owner's file IDs.
+
+Hot user (e.g. a popular shared-folder owner): replicate metadata
+across multiple shards or split that user's namespace.
+
+### 6.5 Versioning and trash
+
+Soft-delete: deletes mark `deleted_at`. File and blocks persist
+for ~30 days (configurable). Restore is a metadata flip.
+
+Block ref-counting: each `files.block_list` ref bumps a block's
+`ref_count`. When versions expire and refs drop to 0, GC runs to
+delete the block from object storage.
+
+Avoid the easy bug: don't GC blocks too eagerly while a sync is
+mid-flight. A short grace period (`ref_count == 0 AND last_seen >
+24h ago`) catches this.
+
+### 6.6 Sharing
+
+A share is a metadata record:
+
+```
+shares { owner_id, file_id, target_user_id|target_group_id, permission, created_at }
+```
+
+When user B logs in:
+
+- List own files: query `files where user_id = B`.
+- List shared-with-me: query `shares where target = B`, join to
+  the owner's `files` rows.
+
+For sync, the shared folder appears as a normal sub-tree in B's
+namespace; changes flow as normal change events scoped to the
+share.
+
+ACL check happens at every metadata/blocks access — if the share
+is revoked, subsequent reads fail; cached content on B's local
+disk is harder to revoke (the bytes are already there).
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 1M sync events/sec | Change stream throughput | Shard by user; multiple change-stream clusters |
+| Hot file (popular template) | Block-store read on one prefix | CDN-front the block store; pin hot blocks |
+| Folder with 1M files | List API single-shard query | Pagination + lazy folder expansion in client |
+| Metadata shard hotspot | Power user (10M files) | Sub-shard their namespace; cap files per user |
+| GC backlog | Block ref-count updates | Batch ref-count changes; defer GC; async sweep |
+| Cross-user share fanout | Shares table hot for popular sharer | Replicate share record; cache at recipient side |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Block-level dedup** over whole-file upload: huge bandwidth
+  win; small bookkeeping cost in block index.
+- **Last-writer-wins + conflicted copy** over auto-merge:
+  correctness for binary files; minor UX cost.
+- **Sharded metadata by user** over single global DB:
+  near-perfect locality for the common case; sharing
+  pays a small cross-shard cost.
+- **Soft delete with grace period** over hard delete: cheap
+  undo, real cost in storage for ~30 days.
+- **Push + cursor pull hybrid**: instant sync online, eventual
+  sync after long offline periods.
+
+## In summary
+
+- Block-level content-addressable storage is the trick that
+  makes sync efficient at scale.
+- Metadata and content are separate planes — most sync activity
+  is metadata-only.
+- Sharded by user; sharing crosses shards but the common case
+  stays local.
+- Conflicts make both versions visible; merging arbitrary binary
+  content is unsafe.
+- Versioning is ref-counted blocks; GC happens async after a
+  grace period.
+- Push for live updates; pull-by-cursor for offline catch-up;
+  the cursor model makes the device-recovery story simple.

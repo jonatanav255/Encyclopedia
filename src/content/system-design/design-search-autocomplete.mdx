@@ -1,0 +1,224 @@
+export const level = 'senior';
+
+# Design search autocomplete
+
+Autocomplete suggests completions as the user types. Three
+hard constraints make it interesting:
+
+- **Latency budget under 100 ms** for every keystroke.
+- **Ranked results**, not just any match — popular first.
+- **Scale**: a search engine has billions of possible queries;
+  even a single product catalog has millions.
+
+## 1. Clarify the scope
+
+- Prefix-only matching, or also typo-tolerance?
+- Personalized (boost results the user has clicked before) or
+  global?
+- Number of suggestions: typically 5–10.
+- Cold-start: are we suggesting from the same DB as search,
+  or a separate ranked index?
+- Update freshness: minutes-old is usually fine for the suggestion
+  corpus; queries themselves are realtime.
+
+## 2. Estimate scale
+
+For a Twitter-scale system:
+
+```
+DAU                  = 200M
+Queries/user/day     = 10
+Keystrokes/query     = 8 average
+Autocomplete QPS avg = 200M × 10 × 8 / 10^5 = 160K
+Peak QPS             = ~500K
+Corpus size          = ~10M distinct phrases (top searches)
+Index size           = 10M × 64 bytes ≈ 600 MB
+```
+
+500K QPS with under-100 ms p99 on a 600 MB corpus is firmly
+a "fit in RAM, sharded" problem.
+
+## 3. API
+
+```bash
+GET /autocomplete?q=har&limit=8
+
+200 OK
+{
+  "suggestions": [
+    {"text": "harry potter",     "rank": 0.92},
+    {"text": "harvard",          "rank": 0.71},
+    {"text": "hard drive",       "rank": 0.55},
+    ...
+  ]
+}
+```
+
+`q` is the prefix typed so far. Response includes ranked
+suggestions with confidence scores.
+
+## 4. High-level design
+
+```
+client
+  ▼ (debounced 150ms; cached locally for last few prefixes)
+edge LB
+  ▼
+autocomplete service (stateless)
+  ▼
+prefix index shards (in-memory)
+  ▼
+fallback: full search index for cold queries
+```
+
+The autocomplete service is **stateless**. The prefix index
+lives in shards keyed by the first 2–3 characters of the
+prefix.
+
+## 5. Data model
+
+Two main structures: a **trie** or a **finite-state
+transducer (FST)**.
+
+### Trie
+
+Each node is a character; each path is a prefix. At each node,
+store the top-K completions sorted by rank.
+
+```js
+{
+  'h': {
+    next: { 'a': { ... }, 'e': { ... } },
+    top: [
+      {text: 'how to ...', rank: 0.95},
+      {text: 'hard drive', rank: 0.92},
+      ...
+    ]
+  },
+  ...
+}
+```
+
+A lookup is O(prefix length). The "top K" is precomputed —
+no scan at query time.
+
+Memory: ~tens of bytes per node; ~10–100 MB for 1M phrases
+depending on K.
+
+### FST
+
+A finite-state transducer encodes the trie far more
+compactly. Lucene, Elasticsearch's completion suggester, and
+many search engines use FSTs. Same lookup characteristics,
+~10× memory savings.
+
+For very large corpora (100M+ phrases), FST is the only
+practical choice.
+
+## 6. Deep dives
+
+### Indexing pipeline
+
+The completion index is built **offline** from query logs:
+
+<Steps>
+<Step n={1} title="Mine query logs.">
+Daily batch over the last N days of queries.
+</Step>
+<Step n={2} title="Aggregate by phrase + count.">
+Drop personal info, lowercase, normalize Unicode, weight by
+recency.
+</Step>
+<Step n={3} title="Build trie / FST.">
+For each phrase, insert at every node along its path; keep
+top-K per node.
+</Step>
+<Step n={4} title="Ship to autocomplete service.">
+Replicate the index to every shard's RAM. Old index continues
+serving until the swap.
+</Step>
+</Steps>
+
+A new index is published every ~1 hour for trending queries,
+every ~24 hours for the full corpus.
+
+### Realtime updates: hybrid index
+
+The offline index lags. For trending topics, you want sub-minute
+freshness. Solution: a **secondary realtime index** updated
+from a stream (Kafka of query events). At query time, merge
+results from both indexes.
+
+```
+final = topK(merge(offline_index.lookup(prefix), realtime_index.lookup(prefix)))
+```
+
+Most production autocomplete systems do exactly this.
+
+### Personalization
+
+Each user has a recent-clicks store (small KV). On suggestion,
+boost items the user has interacted with. Done at the autocomplete
+service layer, not at the index layer.
+
+```js
+const offline = await offlineIndex.lookup(prefix, 20);
+const personalBoosts = await userClickStore.get(userId);
+const ranked = rankWithBoosts(offline, personalBoosts).slice(0, 8);
+```
+
+### Sharding
+
+By prefix's first 2–3 characters. The first-character distribution
+is heavily skewed (lots of "a" and "s" queries; few "z" and "x"),
+so use a hash of the first 2–3 chars to balance.
+
+Each shard holds ~1/N of the corpus. A query is routed to the
+single shard that owns its prefix.
+
+### Typo tolerance
+
+Two approaches:
+
+- **Damerau-Levenshtein distance** ≤ 1 — generate all edits of
+  the prefix, query each against the index. Expands query cost.
+- **N-gram indexing** — index 2-grams or 3-grams; a typo only
+  affects a few n-grams, so most still match. Lucene's fuzzy
+  suggester does this.
+
+For interactive autocomplete, typo tolerance is often skipped
+because users see their typo and correct it before pressing
+enter. Search-level typo tolerance kicks in at submit.
+
+## 7. Bottlenecks and scale-ups
+
+- **Memory per shard.** Add more shards.
+- **Latency on cold prefixes.** Add a warming process that
+  reads representative prefixes on deploy.
+- **Trending lag.** Tighten the realtime stream window;
+  re-rank on every event.
+- **Index publish blast.** Roll out shard by shard; serve old
+  index during swap.
+
+## 8. Tradeoffs called out
+
+- **Offline trie vs realtime stream**: chose hybrid to balance
+  freshness and stability.
+- **In-memory FST vs disk-backed**: in-memory for latency
+  budget; cost is RAM.
+- **Per-user personalization** at the service layer, not index
+  layer: keeps index immutable and shareable.
+- **Skip typo tolerance for autocomplete**, handle at search
+  submit time.
+
+## In summary
+
+- Autocomplete is a prefix search problem with strict latency
+  budget.
+- Core data structure: trie or FST, all in RAM.
+- Build offline from query logs; merge a realtime index for
+  trending.
+- Shard by prefix; route each query to one shard.
+- Personalize at the service layer with per-user click stores.
+- Don't try to do typo tolerance in autocomplete; do it at
+  search submit.

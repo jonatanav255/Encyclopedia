@@ -1,0 +1,300 @@
+export const level = 'mid';
+
+# OLTP vs OLAP
+
+OLTP and OLAP describe two fundamentally different database
+workloads. They share the SQL surface, the word "database," and
+not much else. The internal design that makes one fast usually
+makes the other slow, which is why nearly every serious system
+ends up with both — a transactional store of record and an
+analytical store fed from it.
+
+## What each workload looks like
+
+<Compare a="OLTP — Online Transaction Processing" b="OLAP — Online Analytical Processing">
+<>
+Short, narrow queries. A query touches **few rows by primary
+key or small predicate**. Hundreds to millions of QPS, low
+latency budget (single-digit ms p50). Mostly writes and point
+reads. Data is current and mutable. Backbone of applications.
+</>
+<>
+Long, wide queries. A query touches **many rows over many
+columns**, aggregates them, groups, joins fact and dimension
+tables. Low QPS (humans run them), high data scanned. Mostly
+read-only over recent history. Data is loaded in batches or
+streams from elsewhere. Backbone of dashboards, BI, and ad-hoc
+analysis.
+</>
+</Compare>
+
+A representative OLTP query:
+
+```js
+`SELECT id, status, total
+   FROM orders
+  WHERE id = $1;`
+```
+
+A representative OLAP query:
+
+```js
+`SELECT region, date_trunc('day', placed_at) AS d,
+        sum(total), count(*), avg(line_count)
+   FROM orders
+   JOIN regions USING (region_id)
+  WHERE placed_at >= now() - interval '90 days'
+  GROUP BY region, d
+  ORDER BY region, d;`
+```
+
+The first wants the row. The second wants 90 days of every
+order, summarized.
+
+## Why one database can't easily do both well
+
+Optimizing for the OLTP query implies:
+
+- **Row-oriented storage**: the row is read as one unit.
+- **B-tree indexes** for point lookups.
+- **MVCC** for concurrent readers and writers.
+- **Small, well-cached working set** (today's hot data).
+- **Constraints**: foreign keys, uniques, transactions.
+
+Optimizing for the OLAP query implies:
+
+- **Column-oriented storage**: scan only the columns the
+  query touches.
+- **Compression**: data in a column has the same type and
+  often repeats; encodes 10–100×.
+- **Vectorized execution**: process batches of column values
+  per CPU instruction.
+- **No row-level locking** (mostly read-only).
+- **Massive parallelism**: split a query across many cores
+  and machines.
+
+Pushing a row-oriented engine to run analytical scans on
+billions of rows is possible but painful. Pushing a columnar
+engine to handle high-concurrency point updates is similarly
+painful — columnar updates require rewriting compressed blocks,
+which is expensive.
+
+## A quick comparison
+
+<Cheatsheet>
+| Property | OLTP | OLAP |
+|---|---|---|
+| Query shape | Few rows, many writes | Many rows, few writes |
+| Storage layout | Row | Column |
+| Data volume per query | KB | GB-TB |
+| Concurrency | High (1K-1M+ QPS) | Low (10-100 QPS) |
+| Latency budget | ms | seconds to minutes |
+| Indexing | B-tree, hash | Min/max, bloom, BRIN |
+| Transactions | ACID | Optional / batch-level |
+| Schema | Normalized | Star / snowflake / wide |
+| Data lifecycle | Mutable, current | Append-mostly, historical |
+| Examples | Postgres, MySQL, DynamoDB | ClickHouse, BigQuery, Snowflake, Redshift |
+</Cheatsheet>
+
+## The classic architecture
+
+```
+[OLTP store: Postgres]   ← apps write/read here
+       ↓ CDC / ETL
+[OLAP store: ClickHouse / BigQuery / Snowflake]
+       ↑ BI tools, dashboards, analysts query here
+```
+
+Two stores, one source of truth (the OLTP), and a pipeline
+that copies changes to the analytical store. Common pipeline
+implementations:
+
+- **CDC via Debezium → Kafka → ClickHouse / Snowflake**.
+- **Periodic batch ETL** (every 15 minutes or nightly) via
+  Airflow / dbt.
+- **Managed connectors**: Fivetran, Airbyte, Stitch.
+
+The analytical store lags the OLTP by seconds to hours. That's
+acceptable for dashboards and reports; not acceptable for
+"what's the current balance?"
+
+## Row store vs column store
+
+The most consequential design choice.
+
+Row storage:
+
+```
+page on disk:
+  [row1: id=1, name='a', city='NYC', age=30]
+  [row2: id=2, name='b', city='SFO', age=25]
+  ...
+```
+
+Reading row 1 is one disk read. Reading **just the cities of
+all rows** still reads every row in full — the engine pays for
+every column whether you wanted them or not.
+
+Column storage:
+
+```
+column file id:    [1, 2, 3, ...]
+column file name:  ['a', 'b', 'c', ...]
+column file city:  ['NYC', 'SFO', 'LAX', ...]
+column file age:   [30, 25, 40, ...]
+```
+
+Reading "all cities" reads exactly the city file — orders of
+magnitude less data. Aggregations like `avg(age)` read only the
+age file, and modern engines apply SIMD instructions on
+batches of values at once.
+
+The trade is symmetric: reading **a whole row** in a column
+store requires fetching from N files and assembling.
+Single-row reads are 5–50× slower than in a row store.
+
+## Specialized engines
+
+The "right" engine depends on which workload dominates.
+
+### Pure OLTP
+
+- **Postgres, MySQL, SQL Server, Oracle**: row-oriented,
+  ACID, B-tree, MVCC. Defaults of the industry.
+- **DynamoDB, Cassandra**: KV/wide-column, designed for
+  massive write throughput with predictable point lookups.
+
+### Pure OLAP
+
+- **ClickHouse**: columnar, exceptional aggregation
+  performance, weak transactional support. Open source.
+- **BigQuery, Snowflake, Redshift**: cloud-managed columnar
+  warehouses. Massive scale, pay-per-query or pay-per-cluster.
+- **DuckDB**: in-process columnar engine, embedded for local
+  analytics.
+- **Apache Druid, Pinot**: real-time analytical engines for
+  low-latency queries on streaming data.
+
+### Hybrid / HTAP (Hybrid Transactional/Analytical Processing)
+
+The promise: one system that handles both. Implementations:
+
+- **TiDB / TiFlash**: row store (TiKV) + columnar store
+  (TiFlash) under one query layer.
+- **SingleStore (MemSQL)**: dual storage.
+- **CockroachDB, Spanner**: row-based, fine for moderate
+  analytics on operational data but not for warehouse-scale.
+- **Postgres + Citus columnar**: extension that adds columnar
+  tables for analytical access.
+
+HTAP is real but immature for the largest workloads. Most
+serious analytics teams still use a dedicated warehouse.
+
+## When you can get away with one database
+
+For early-stage products, run analytical queries on the OLTP
+store directly. Common practices:
+
+- **Read replica for analytics**: a separate Postgres replica
+  used exclusively for analytical queries. Doesn't load the
+  primary; isolates blast radius.
+- **Partitioned tables**: declarative partitioning by date so
+  scans hit only relevant partitions.
+- **Materialized views**: pre-computed aggregations refreshed
+  periodically.
+
+This holds up to a few hundred GB of analytical data and ad-hoc
+queries that finish in seconds. Beyond that, you'll feel the
+column-store gap.
+
+## When you need a warehouse
+
+Move analytics out when:
+
+- Analytical scans on the OLTP replica take longer than ~30s.
+- Scans regularly read >100 GB.
+- Multiple analysts run queries concurrently and conflict.
+- Joins across "OLTP" and "events" become unwieldy.
+- The analytical schema diverges (star schema vs OLTP shape).
+
+The marginal cost of a managed warehouse (BigQuery, Snowflake)
+is small enough that most teams adopt one before they're
+forced to.
+
+## Why columnar wins at OLAP
+
+Three compounding wins:
+
+<Steps>
+<Step n={1} title="Less data read.">
+A query that uses 4 of 50 columns reads 8% of the data, not
+100%. Columnar wins by an order of magnitude before any other
+optimization.
+</Step>
+<Step n={2} title="Better compression.">
+Adjacent values in a column are the same type and often
+similar. Run-length, delta, dictionary, and bitpacking encode
+10–100×. Less data on disk, less data in cache.
+</Step>
+<Step n={3} title="Vectorized execution.">
+Process arrays of column values per CPU instruction (SIMD).
+Modern OLAP engines run 100×+ faster than row-by-row on
+aggregate-heavy queries.
+</Step>
+</Steps>
+
+See columnar storage for the full story.
+
+## Common mistakes
+
+### Running OLAP queries on the OLTP primary
+
+A 90-day aggregation locks pages, fills the buffer cache with
+cold data, and slows the application. Always use a replica or
+warehouse.
+
+### Putting "events" in the OLTP store
+
+A `clicks` table at 100M rows/day in Postgres eventually hurts
+the OLTP workload (vacuum, index size, cache pressure). Put
+events in the warehouse from the start.
+
+### Believing HTAP marketing
+
+HTAP databases exist, but most production stacks still use
+specialized engines. Match marketing to your scale before
+betting.
+
+### Treating data warehouses as databases
+
+BigQuery and Snowflake are batch query engines. Hundreds of
+concurrent OLTP-style requests is not their model. Each query
+costs CPU-seconds; abuse can be expensive.
+
+### Skipping CDC and using slow ETL
+
+A nightly ETL job that takes 6 hours means dashboards lag 6+
+hours. Modern stacks stream changes via Debezium or Fivetran
+for near-real-time.
+
+<Callout variant="info">
+The 2026 default analytical stack: Postgres as system of
+record, CDC into Kafka or directly into Snowflake/ClickHouse,
+dbt for transformations, a BI tool on top. The pieces are
+mature; the integration is the work.
+</Callout>
+
+## In summary
+
+- OLTP: few rows, many concurrent writes, low latency,
+  row-oriented, ACID. Where applications live.
+- OLAP: many rows, few concurrent queries, scan-heavy,
+  column-oriented, compressed, vectorized. Where analytics
+  lives.
+- One engine rarely serves both well at scale. HTAP exists but
+  remains niche.
+- Default architecture: OLTP store + CDC/ETL + analytical
+  warehouse. The shape of every serious data platform.
+- Start with a replica for analytics; graduate to a warehouse
+  when scans regularly take tens of seconds or read hundreds of
+  GB.

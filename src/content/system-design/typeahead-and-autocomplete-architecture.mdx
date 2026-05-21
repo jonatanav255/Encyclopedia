@@ -1,0 +1,224 @@
+export const level = 'senior';
+
+# Typeahead and autocomplete architecture
+
+The system view of "show suggestions as the user types." The
+deeper algorithmic content lives in design-search-autocomplete;
+this page focuses on the architecture, deployment, and
+operations.
+
+## Core constraints
+
+- **Per-keystroke latency under 100ms.** The user types 5
+  characters per second; each keystroke triggers a request.
+- **Stable ranking.** Suggestions don't bounce as the user
+  types.
+- **Trending updates within minutes.** A breaking story
+  appears as a suggestion.
+- **Per-user personalization** in some products.
+
+## The data flow
+
+```
+query logs (Kafka)
+   ▼
+offline aggregator (daily)        realtime aggregator (continuous)
+   ▼                                       ▼
+offline trie / FST                    recent-trends trie
+   ▼                                       ▼
+   └────────── merged at query time ──────┘
+                       ▼
+                autocomplete service (stateless, scaled)
+                       ▼
+                LB + edge cache
+                       ▼
+                client
+```
+
+Two indexes — offline (stable corpus) and realtime (trending)
+— merged at query time.
+
+## The offline pipeline
+
+Once a day (or hour), a batch job aggregates queries:
+
+<Steps>
+<Step n={1} title="Mine query logs.">
+Last N days of search queries (post-PII-removal).
+</Step>
+<Step n={2} title="Filter and normalize.">
+Drop NSFW, drop too-rare, lowercase, normalize Unicode.
+</Step>
+<Step n={3} title="Aggregate and rank.">
+Count + weight by recency / engagement. Decay older queries.
+</Step>
+<Step n={4} title="Build the trie / FST.">
+For each phrase, insert into the trie. Each node stores
+its top-K completions.
+</Step>
+<Step n={5} title="Ship to autocomplete service.">
+Replicate the index to every shard. Atomic swap to new
+version.
+</Step>
+</Steps>
+
+A daily build covers ~99% of head queries. Updated every few
+hours for hot domains.
+
+## The realtime pipeline
+
+For breaking news, the offline index lags by hours. Realtime
+covers this:
+
+- Kafka stream of recent queries.
+- Per-window aggregation (sliding 5 / 30 minutes).
+- Updates a smaller realtime trie.
+
+At query time, the autocomplete service queries **both**
+indexes and merges:
+
+```js
+const offlineResults = await offlineIndex.lookup(prefix, 20);
+const realtimeResults = await realtimeIndex.lookup(prefix, 20);
+const merged = mergeAndRerank(offlineResults, realtimeResults);
+return merged.slice(0, 8);
+```
+
+The realtime index gets a boost (recent = relevant) and
+trending phrases surface within minutes.
+
+## Sharding strategy
+
+A single shard holding 100M phrases × 5 bytes/node = 500 MB.
+Fits in RAM on one machine.
+
+If the corpus is much larger (Google-scale), shard:
+
+- **By prefix hash**: first 2-3 chars decide the shard. Skew
+  is mitigated by hashing.
+- **By region or language**: each region has its own shard.
+
+A query routes to one shard based on the prefix's hash.
+
+## Caching
+
+Aggressive caching:
+
+- **Per-prefix edge cache** (CDN): 1-5 minute TTL. Most
+  prefixes' top 10 don't change minute-to-minute.
+- **Per-prefix Redis cache**: warm cache in front of the
+  autocomplete service.
+
+Per-user personalization breaks naïve caching — keyed by
+`(prefix, user_segment)` rather than just `prefix`.
+
+## Personalization
+
+Each user has a "recent clicks" mini-store. On suggestion,
+boost items the user has clicked before.
+
+Applied at the service layer:
+
+```js
+async function suggest(prefix, userId) {
+  const candidates = await trie.lookup(prefix, 20);
+  const userClicks = await userClickStore.get(userId);
+  const personalized = rankWithBoosts(candidates, userClicks);
+  return personalized.slice(0, 8);
+}
+```
+
+Per-user clicks are tiny (few KB); fits in a fast KV store
+per user.
+
+## Debouncing on the client
+
+The client should not fire a request on every keystroke.
+Debounce ~100-200ms:
+
+```js
+let timer;
+function onInput(value) {
+  clearTimeout(timer);
+  timer = setTimeout(() => fetchSuggestions(value), 150);
+}
+```
+
+Without debounce, "iphone" fires 6 requests instead of 1.
+With it, 1 request after the user pauses typing.
+
+## Cancellation
+
+If the user keeps typing, cancel in-flight requests:
+
+```js
+let currentController;
+async function fetchSuggestions(value) {
+  currentController?.abort();
+  currentController = new AbortController();
+  return fetch('/autocomplete?q=' + value, { signal: currentController.signal });
+}
+```
+
+Otherwise stale responses arrive and clobber fresher ones.
+
+## Locale and language
+
+Different languages have different normalization, tokenization,
+stop words, and stemming.
+
+- Build per-language indexes.
+- Use the user's locale to route to the right index.
+- For multilingual users, fall back across languages.
+
+## Quality monitoring
+
+Suggestions can be embarrassing (drop-down showing offensive
+auto-completes). Mitigations:
+
+- Blocklist for offensive phrases.
+- ML classifier flagging potentially-bad suggestions before
+  shipping the index.
+- Manual review of trending suggestions (often human-in-the-loop
+  at top platforms).
+
+## Typo tolerance
+
+For each prefix, also look up "edit distance 1" variants.
+Implementations:
+
+- **Trie with fuzzy traversal**: walk the trie allowing one
+  edit.
+- **N-gram indexing**: index 2-grams; a typo only affects
+  some.
+
+In practice, typo tolerance at autocomplete is often skipped —
+users correct typos before submitting search.
+
+## Latency budget
+
+```
+client → edge LB:    30 ms (network)
+LB → service:        2 ms
+trie lookup:         1 ms
+re-rank (personalize): 5 ms
+service → client:    30 ms
+total:               68 ms
+```
+
+Anything over 100ms feels laggy to typists. Tight budget for
+every component.
+
+## In summary
+
+- Autocomplete = offline trie + realtime trie + service layer
+  with personalization.
+- Sub-100ms per keystroke budget.
+- Trie / FST in RAM; sharded by prefix at large scale.
+- Caching at edge + Redis; per-user personalization breaks
+  naïve cache.
+- Client-side debounce + cancellation save QPS.
+- Don't try to fix typos in autocomplete; fix at search
+  submit.
+- Watch quality: blocklists + ML classifiers + human review
+  for trending.

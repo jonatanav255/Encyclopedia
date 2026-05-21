@@ -1,0 +1,189 @@
+export const level = 'senior';
+
+# Consistency models overview
+
+A **consistency model** is a contract between a distributed
+data system and its clients: "if you do these operations, here's
+what you're allowed to observe." Without it, "the system is
+consistent" means nothing.
+
+The models form a hierarchy from strictest (linearizable) to
+weakest (eventual). Stronger = simpler to reason about,
+expensive to implement. Weaker = cheap and available, weirder
+behavior visible to applications.
+
+## The hierarchy
+
+<Cheatsheet>
+| Model | Strength | What it guarantees |
+|---|---|---|
+| Linearizable | Strongest | Every op appears to take effect at a single point between invocation and completion; equivalent to a single copy |
+| Sequential | Strong | All ops appear in some total order respected by every process; per-process order preserved |
+| Causal+ | Medium | Causally-related ops seen in order; concurrent ops may reorder; convergent |
+| Causal | Medium | Causally-related ops seen in order across replicas |
+| Read-your-writes | Weak | A client sees its own writes |
+| Monotonic reads | Weak | A client's reads never go backwards in time |
+| Monotonic writes | Weak | A client's writes apply in order |
+| Eventual | Weakest | If writes stop, replicas converge — eventually |
+</Cheatsheet>
+
+A system can offer **different** consistency for different
+operations. Spanner gives linearizable for default reads,
+bounded staleness for cheaper reads. DynamoDB lets you pick per
+request.
+
+## Why models matter
+
+Without picking a model explicitly, you'll get the weakest one
+the system can deliver, and your application will be subtly
+broken in ways that look like bugs:
+
+- A user updates their profile, refreshes, sees the old version
+  (no read-your-writes).
+- A counter shows 5 likes, then 4, then 5 again (no monotonic
+  reads).
+- Two users both buy "the last item in stock" (no
+  linearizability).
+- An audit log shows events in nonsensical order (no causal
+  consistency).
+
+Each of these is a real bug shape that comes from the wrong
+consistency model under the hood.
+
+## Linearizable: the gold standard
+
+The system behaves as if there's a single copy with a single
+timeline. Once a write returns success, every subsequent read
+from any client sees that write or a later one.
+
+Implementations require a **round trip to a leader** or **a
+quorum** per operation. That's why linearizable systems are
+slower and less available under partition.
+
+Used for: distributed locks, leader election, anything where
+"one source of truth" is mandatory.
+
+## Sequential: weaker but rare in practice
+
+Operations are in *some* total order; not necessarily the order
+they actually happened. Less expensive than linearizable but
+rarely chosen as a target — most "strong" systems target
+linearizable.
+
+## Causal: scales geographically
+
+Captures the happens-before relation (Lamport's definition). If
+A wrote X and B read X then wrote Y, every replica sees X
+before Y. Concurrent writes may reorder.
+
+Implementable with vector clocks or HLC. Used in geo-replicated
+systems where round-trips to a single leader are unaffordable.
+
+## Eventual: just enough
+
+Replicas converge if writes stop. No bound on how long.
+Concurrent writes need a conflict resolution rule
+(last-write-wins, CRDT merge, application-level merge).
+
+Used for: caches, presence, view counts, anything where
+"eventually right" is fine.
+
+## Session guarantees: a pragmatic middle
+
+Even with eventual consistency under the hood, the system can
+offer per-client guarantees:
+
+<Steps>
+<Step n={1} title="Read-your-writes.">
+A client always sees writes it made.
+</Step>
+<Step n={2} title="Monotonic reads.">
+A client's successive reads never go backwards in time.
+</Step>
+<Step n={3} title="Monotonic writes.">
+A client's writes apply in submission order.
+</Step>
+<Step n={4} title="Writes follow reads.">
+A write that's causally after a read appears after that read
+to others.
+</Step>
+</Steps>
+
+These cover most "what did the user just see?" cases without
+paying for full linearizability. DynamoDB, Cassandra, MongoDB
+all offer some session-guarantee mode.
+
+## Common confusions
+
+### "Strongly consistent" ≠ "ACID"
+
+ACID transactions and consistency models are orthogonal. A
+single-node Postgres is ACID and linearizable; Cassandra in
+quorum mode can be linearizable for single keys but not ACID;
+DynamoDB can be linearizable per item without multi-item
+transactions.
+
+### "Eventual consistency" ≠ "no consistency"
+
+It's a precise guarantee — replicas converge given finite
+writes. The application must tolerate temporary divergence, not
+permanent.
+
+### CAP doesn't mean "pick one model"
+
+CAP says "during a partition, choose A or C." It doesn't
+predict steady-state model. A system can be linearizable when
+healthy, refuse writes during partition (CP), or stay
+available with weaker reads during partition (AP). See pacelc
+for the more useful framing.
+
+## Mapping to common systems
+
+<Cheatsheet>
+| System | Default model |
+|---|---|
+| Single Postgres / MySQL | Linearizable (single copy) |
+| Postgres with read replicas | Linearizable on leader, eventual on replicas (bounded staleness possible) |
+| Spanner | Linearizable (TrueTime) |
+| CockroachDB | Serializable + linearizable for default reads |
+| DynamoDB | Eventual by default; linearizable with `ConsistentRead=true` |
+| Cassandra | Tunable per request (ONE/QUORUM/ALL) |
+| MongoDB | Linearizable with read concern `"linearizable"`; eventual otherwise |
+| Redis (single node) | Linearizable |
+| Redis Cluster | Eventual under failover |
+| S3 | Strong read-after-write since 2020 |
+</Cheatsheet>
+
+## Choosing a model
+
+<Compare a="When stronger pays" b="When weaker is fine">
+<>
+- Money, inventory, anything with a regulatory or financial
+  audit trail.
+- Distributed locks, leader election, configuration.
+- Read-your-writes UX where the user just acted (profile
+  edit, comment post).
+- Any join across services that needs a consistent point in
+  time.
+</>
+<>
+- Caches, view counts, like counts, presence.
+- Search indexes, recommendations, analytics rollups.
+- Cross-region replication of "cold" data.
+- Anything where "minutes-old" is acceptable to the user.
+</>
+</Compare>
+
+Don't pick one model for the whole system. Pick per operation.
+
+## In summary
+
+- Consistency models form a hierarchy from linearizable down to
+  eventual.
+- Stronger models cost latency, availability, or both.
+- Session guarantees (read-your-writes, monotonic reads) cover
+  most app-visible cases cheaply.
+- Same system, different operations, different models. The
+  honest design names a model per operation.
+- "Strongly consistent" is not synonymous with ACID; ACID is
+  about transactions, consistency models are about replication.

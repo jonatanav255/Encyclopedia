@@ -1,0 +1,192 @@
+export const level = 'senior';
+
+# Snapshots and checkpoints
+
+A **snapshot** is a point-in-time copy of system state. A
+**checkpoint** is a saved position in a stream or log from
+which processing can resume.
+
+The patterns show up everywhere: database backups, replica
+bootstrap, stream-processing recovery, container migration,
+VM live migration, RAFT/Paxos state.
+
+## Why snapshots exist
+
+Without snapshots, full system recovery requires replaying
+everything from the beginning. For a system with years of
+data, that's intractable.
+
+A snapshot lets you:
+
+- **Recover** in O(time-since-last-snapshot), not O(entire
+  history).
+- **Bootstrap** a new replica without streaming all history.
+- **Truncate** old logs once their state has been snapshotted.
+- **Roll back** to a known good state.
+
+## Two flavors
+
+### Full snapshots
+
+Capture **all state** at a point in time. Image-style.
+
+- **Database dumps** (`pg_dump`, `mysqldump`).
+- **VM/disk snapshots** at the storage layer.
+- **Filesystem snapshots** (ZFS, LVM).
+
+Slow to take; fast to restore. Good for periodic backups.
+
+### Incremental snapshots
+
+Capture **changes since the last snapshot**. Smaller.
+
+- **Differential database backups**.
+- **Block-level deltas** (CBT — Changed Block Tracking).
+- **WAL records** as the "delta" from a base snapshot.
+
+Faster to take, faster network/disk usage. Restore requires
+applying every increment.
+
+Most production systems use both: a periodic full snapshot +
+continuous incremental.
+
+## Copy-on-write vs full-copy
+
+How do you capture a consistent snapshot of a running system?
+
+### Full copy
+
+Stop writes, copy everything, resume writes. Simple; downtime
+proportional to dataset size. Unusable for large systems.
+
+### Copy-on-write (CoW)
+
+Pause writes briefly. Mark all pages as read-only. Resume.
+When a page is later modified, copy it first, then modify the
+copy. The snapshot sees the original pages.
+
+ZFS, LVM, Btrfs, RocksDB, Cassandra, Postgres physical
+backups all use CoW.
+
+Background process copies the marked pages to backup storage.
+After everything's copied, the read-only marks can be
+cleared.
+
+### Snapshot via fork (Linux)
+
+A process can fork; the child has a CoW view of the parent's
+memory. Redis uses this: BGSAVE forks; the child writes its
+memory image to disk; the parent keeps serving requests.
+
+## Checkpoints in stream processing
+
+For a stream processor maintaining state (e.g., per-key
+sliding-window aggregates), a checkpoint is a snapshot of:
+
+- The processor's state.
+- The position in the input stream up to which state was
+  computed.
+
+If the processor crashes, it restores the state from the last
+checkpoint and resumes consuming from the saved stream
+position.
+
+Flink and Kafka Streams checkpoint every N seconds (default
+~60s in Flink). The checkpoint is durable storage (S3,
+HDFS, RocksDB).
+
+Combined with exactly-once stream processing:
+
+- Checkpoint state + stream position atomically.
+- On crash, restore both atomically.
+- Replay from saved position; no duplicates.
+
+(See exactly-once-stream-processing.)
+
+## Snapshots in consensus systems
+
+Raft and Paxos clusters maintain a replicated log. Without
+snapshots, the log grows forever and new replicas would need
+all of it to catch up.
+
+A node periodically:
+
+1. Takes a snapshot of its state machine.
+2. Discards log entries that the snapshot covers.
+3. New replicas bootstrap from the snapshot + the log tail.
+
+etcd, Consul, CockroachDB, TiKV all do this.
+
+## Checkpoint frequency
+
+Too often: checkpoint overhead dominates; constant fsync.
+Too rarely: recovery time after crash is long.
+
+Typical:
+
+- **Database WAL checkpoint**: every 5-15 min, or on size
+  threshold.
+- **Stream processor**: every 30-60 sec.
+- **Raft log compaction**: every 10K entries.
+- **Filesystem journals**: continuous (each transaction).
+
+Tune for your acceptable recovery-time objective (RTO).
+
+## Snapshot consistency
+
+The snapshot must be **logically consistent** — represent the
+state at some specific time.
+
+- **Crash-consistent**: the disk contents at the moment of
+  the snapshot, like a power-off. May have in-flight
+  operations that didn't complete. Database can recover from
+  this via WAL.
+- **Application-consistent**: the application flushed buffers
+  and is in a quiescent state before the snapshot. No
+  recovery needed. Requires application cooperation
+  (`FLUSH TABLES WITH READ LOCK` in MySQL, `pg_basebackup` in
+  Postgres).
+
+VM-level snapshots are crash-consistent unless the application
+provides hooks for app-consistent.
+
+## Snapshot storage
+
+Where do snapshots live?
+
+- **Same disk**: fast but useless if the disk fails.
+- **Same datacenter, different disk/host**: protects against
+  disk loss.
+- **Different region**: protects against datacenter loss.
+- **Object storage** (S3, GCS): cheap, durable, available
+  cross-region.
+
+The 3-2-1 rule: 3 copies, 2 different media types, 1 off-site.
+
+## Recovery testing
+
+A snapshot you've never restored is a snapshot you can't
+trust. Test recovery regularly:
+
+- **Game days**: practice restoring from snapshot in a
+  staging environment.
+- **Automated**: nightly restore-to-staging from prod
+  backups.
+- **Chaos engineering**: occasionally restore in production
+  (with care).
+
+Backup processes that haven't been tested in years are
+notorious for failing exactly when needed.
+
+## In summary
+
+- Snapshot: point-in-time copy of state.
+- Checkpoint: saved position in a stream/log enabling
+  recovery.
+- Strategies: full vs incremental; copy-on-write vs full-copy;
+  app-consistent vs crash-consistent.
+- Used by databases, stream processors, consensus systems,
+  VMs, filesystems.
+- Frequency tunes recovery-time objective.
+- Store off-site (object storage); test recovery
+  regularly.

@@ -1,0 +1,261 @@
+export const level = 'senior';
+
+# Zero trust architecture
+
+"Never trust, always verify." Zero trust is the architectural
+stance that **network location is not a credential** — being
+inside the corporate VPN or the production VPC does not, by
+itself, grant access to anything. Every request authenticates,
+every request authorizes, every request encrypts in transit,
+every device proves health.
+
+It's a reaction to the failure mode of **perimeter security**:
+hardened firewall on the outside, soft chewy interior. Once an
+attacker is in (compromised laptop, leaked credential, social
+engineering), they wander the network freely. Every major
+breach in the last 15 years featured this pattern.
+
+The reference document is NIST SP 800-207 (2020). Google's
+*BeyondCorp* papers (2014–2017) are the canonical case study,
+and *Building Secure and Reliable Systems* describes the
+practitioner view.
+
+## The premise
+
+Three classical assumptions that zero trust rejects:
+
+<Compare a="Perimeter model" b="Zero trust">
+<>
+- The corporate network is trusted.
+- VPNs extend the perimeter for remote workers.
+- Production VPCs are trusted; services there talk freely.
+- "Inside" devices are healthy by virtue of being inside.
+
+Result: a perimeter breach is catastrophic. One foothold
+unlocks everything.
+</>
+<>
+- No network is trusted.
+- Every request authenticates (user + device).
+- Every request authorizes against a policy that knows the
+  resource sensitivity.
+- Device health is continuously evaluated.
+
+Result: a foothold gets you exactly what one credential
+authorizes. Lateral movement requires escalation, which is
+logged and detectable.
+</>
+</Compare>
+
+The shift is **from "is this request from inside?" to "is this
+specific user, on this specific device, allowed to access this
+specific resource, right now?"**
+
+## The five tenets (NIST 800-207)
+
+<Cheatsheet>
+| Tenet | What it means in practice |
+|---|---|
+| Resources are protected per-resource | Each service / DB / API is independently access-controlled |
+| Communication is secured regardless of network | mTLS or app-layer auth even inside the VPC |
+| Access is granted per-session | No long-lived "I'm in" state; re-authorize frequently |
+| Access is dynamic | Policy considers user, device, time, behavior, request context |
+| All assets are monitored | Continuous telemetry feeds policy decisions |
+
+</Cheatsheet>
+
+Each is a deliberate departure from "set up a firewall and
+trust what's inside it."
+
+## What you need to build it
+
+Zero trust isn't a product. It's an architecture that requires
+several pieces:
+
+<Steps>
+<Step n={1} title="Strong identity for users.">
+Phishing-resistant MFA (security keys, passkeys). SSO that
+issues short-lived tokens. No long-lived API keys for human
+access.
+</Step>
+<Step n={2} title="Strong identity for devices.">
+Every device the org owns has a certificate or hardware token.
+Endpoint posture is checked at access time — OS up to date,
+disk encrypted, EDR running.
+</Step>
+<Step n={3} title="Strong identity for services.">
+Service-to-service auth via mTLS or signed JWTs with short
+TTLs. No "trust 10.0.0.0/8." See mTLS between services.
+</Step>
+<Step n={4} title="A policy engine.">
+A central decision point that takes (user, device, resource,
+action, context) → allow / deny. Open Policy Agent, AWS IAM,
+Google BeyondCorp, in-house. Every access flows through it.
+</Step>
+<Step n={5} title="Per-application proxies / gateways.">
+The thing that enforces the policy decision. A reverse proxy
+fronting every internal app, requiring the right token.
+Browser-based access without a VPN.
+</Step>
+<Step n={6} title="Telemetry and behavior analytics.">
+Every access logged. Anomalous patterns surface — a normally
+EU-based user logging in from another continent at 3am gets
+re-authenticated or blocked.
+</Step>
+</Steps>
+
+The stack reorganizes around **identity-aware proxies** and a
+**central policy decision point** rather than network ACLs.
+
+## Identity-aware proxy
+
+The defining building block. Every internal application sits
+behind a proxy that:
+
+```
+Browser  --->  Identity-Aware Proxy  --->  App
+             (verifies user + device,
+              checks policy, mints
+              short-lived token)
+```
+
+Examples: Google's Identity-Aware Proxy (IAP), Cloudflare Access,
+AWS Verified Access, Tailscale, Pomerium, Teleport. They all
+do the same thing — replace "VPN to enter the perimeter" with
+"prove who you are to a per-app gateway."
+
+The user experience: visit an internal app's URL, get redirected
+to SSO + MFA + device check, then the app loads. No VPN, no
+"the network is the credential."
+
+## Service-to-service: mTLS or signed tokens
+
+Inside the cluster, services talk over **mutually authenticated
+TLS** or with short-lived signed JWTs. The "inside the VPC" is
+no longer enough.
+
+- **mTLS**: every service has a certificate signed by an internal
+  CA. The TLS handshake verifies both ends. A service mesh
+  (Istio, Linkerd, Consul Connect) automates issuance and
+  rotation; doing it by hand is the operational cliff most teams
+  fall off.
+- **Signed tokens**: SPIFFE / SPIRE issue a short-lived JWT-style
+  identity per workload. The receiver verifies the signature
+  against a known authority and runs an authorization policy.
+
+See mTLS between services.
+
+## Continuous evaluation
+
+A perimeter model decides at network connect time. Zero trust
+decides **on every request**, or at least frequently.
+
+Inputs to the policy can include:
+
+- User identity and group membership.
+- Device certificate and posture (recent patch, encryption on).
+- Geolocation and IP reputation.
+- Time of day (some access denied at 3am unless explicitly
+  granted).
+- Resource sensitivity (PII vs internal wiki).
+- Behavioral signals (this user usually downloads 10 MB/day; the
+  current request is 10 GB).
+
+The decision is reevaluated frequently — every request to the
+gateway, every session refresh, every elevated action. A
+device that was healthy at login and got infected at 11am loses
+access at 11am, not at logout.
+
+## What zero trust does not eliminate
+
+Common misconceptions:
+
+- **Firewalls don't go away.** Network controls are
+  defense-in-depth — they're no longer the **only** control. See
+  network segmentation.
+- **VPNs may still exist** for legacy systems that can't fit a
+  proxy. But the goal is to shrink that surface.
+- **Insider threats still exist.** An authorized user with bad
+  intent has access. Zero trust limits **scope** (each access is
+  to a specific resource, not the whole network) and improves
+  **detection** (everything is logged), but does not prevent
+  authorized misuse.
+- **Implementation matters.** A "zero trust" sticker on top of a
+  legacy network is theatre. The architecture has to be
+  enforced — every service, every access.
+
+## Migration paths
+
+A real org isn't going to flip a switch. Practical staging:
+
+<Steps>
+<Step n={1} title="Inventory.">
+List every internal app and what currently controls access (VPN
+only, IP allowlist, SSO). You can't protect what you don't
+know about.
+</Step>
+<Step n={2} title="Add SSO + MFA everywhere.">
+The cheapest, highest-impact change. Every app behind SAML or
+OIDC with phishing-resistant MFA. Even before deploying
+proxies.
+</Step>
+<Step n={3} title="Put apps behind an identity-aware proxy one at a time.">
+Start with the most sensitive (admin tools, customer data
+portals). Decommission the VPN for those apps. Keep the VPN for
+the rest.
+</Step>
+<Step n={4} title="Roll mTLS into the service mesh.">
+For service-to-service. Start with workloads that handle the
+most sensitive data.
+</Step>
+<Step n={5} title="Add device posture.">
+Once SSO + proxy is universal, layer in "device must be
+managed and patched." This is the step that takes the longest
+because it touches every employee laptop.
+</Step>
+<Step n={6} title="Decommission the VPN.">
+The last step, often years in. By the time you're here, the VPN
+is reserved for legacy apps and emergencies.
+</Step>
+</Steps>
+
+Google's BeyondCorp migration took roughly six years to declare
+"complete." Smaller orgs can do it faster but it's still
+multi-quarter work.
+
+## Costs and pitfalls
+
+- **Latency** of policy decisions on every request. A 5ms
+  decision is fine for browser apps; problematic for service
+  calls in a tight inner loop. Mesh sidecars + cached decisions
+  are the usual fix.
+- **Outage of the policy engine** is catastrophic — every
+  decision fails closed. Make it highly available; some
+  organizations cache last-known-good decisions for short
+  windows.
+- **Device posture** is operationally expensive — managing
+  device certs, EDR, patch state across an org.
+- **Vendor lock-in** is real. Most zero-trust products are
+  vendor-specific. Plan for a multi-vendor reality.
+
+<Callout variant="warning">
+Zero trust is an **architecture**, not a product. Buying a
+single SKU labeled "Zero Trust Access" gives you one piece. The
+rest — service identity, device posture, telemetry, response —
+you still have to build.
+</Callout>
+
+## In summary
+
+- Network location is not a credential.
+- Every request authenticates (user + device) and authorizes
+  against a policy.
+- Identity-aware proxies replace VPN-as-perimeter for browser
+  apps.
+- mTLS or signed workload identity replaces "inside VPC = trust"
+  for services.
+- Continuous evaluation, per request, fed by telemetry.
+- Migration is multi-year; SSO + MFA everywhere is the first
+  high-impact step.
+- The premise: containment, not prevention. A breach happens;
+  zero trust limits how far it spreads.

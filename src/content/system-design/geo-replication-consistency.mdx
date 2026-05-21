@@ -1,0 +1,173 @@
+export const level = 'staff';
+
+# Consistency in geo-replicated systems
+
+Cross-region linearizability is **unaffordable** in most
+products. The speed of light puts a hard floor of ~70–150 ms
+on a US–EU round-trip, and consensus needs at least one. That
+means a linearizable write across regions takes at minimum a
+quarter-second.
+
+So planet-scale systems pick a different consistency model and
+design the UX around its quirks.
+
+## The patterns
+
+<Cheatsheet>
+| Pattern | Consistency | Used by |
+|---|---|---|
+| Single primary region | Linearizable, but only fast in primary | Many SaaS startups |
+| Multi-region with single writer (per record) | Linearizable per record, region-local reads | Spanner directories, DynamoDB Global |
+| Multi-region read-only replicas | Linearizable writes (one region), eventual reads everywhere | Postgres + read replicas |
+| Active-active with conflict resolution | Eventual or causal+ | Cassandra multi-DC, Riak, Couchbase XDCR |
+| CRDT-based active-active | Causal+ with convergence | Redis Active-Active, Riak DT, Roshi |
+| Geo-partitioned (data lives in its region) | Linearizable per record at home, slow elsewhere | Spanner regions, CockroachDB tablespaces |
+</Cheatsheet>
+
+## Common architectures
+
+### Single primary, replicated everywhere
+
+One region writes; all others read replicas. Writes are slow
+for users outside the primary region (cross-region round-trip
+for every write) but consistency is simple.
+
+Used in classic SaaS deployments — most of your users are in
+one timezone, optimize for that.
+
+### Partition by geography
+
+Records are owned by a home region. EU users' data lives in
+EU, US users' data lives in US. Each home region runs
+linearizable writes locally; cross-region reads are slow.
+
+Used by Spanner directories, CockroachDB regional tables, many
+data-residency-driven systems (GDPR).
+
+### Multi-leader with last-write-wins
+
+Every region can write; replication is async; conflicts
+resolved by timestamp. Simple to operate, silently loses data
+on concurrent writes.
+
+Used by Cassandra multi-DC, MongoDB sharded multi-region.
+
+### CRDTs
+
+Replace conflict-resolution-via-LWW with data types whose
+merge is well-defined: counters, sets, maps. Replicas can
+diverge; merge produces a consistent result regardless of
+order.
+
+Used by Redis Active-Active, Riak Datatypes, collaborative
+editors. Costs flexibility — only a few data shapes have good
+CRDTs.
+
+## Latency budgets
+
+For each operation, ask: **does this need to cross regions?**
+
+```
+Same datacenter:         ~0.5 ms RTT
+Same region (multi-AZ):  ~1-3 ms RTT
+Cross-region (continent): ~30-50 ms RTT
+Cross-continent:         ~70-200 ms RTT
+```
+
+A linearizable write that needs Raft quorum across 3 regions
+costs ~150 ms minimum. A user-facing endpoint can't afford
+that for every request. So:
+
+- Most writes go to the closest region's leader (eventual
+  global replication).
+- Reads come from local replicas (eventual).
+- Only "critical" ops (payments, uniqueness checks) cross
+  regions.
+
+## The CAP trap
+
+A geo-replicated system is **always** partition-prone — the
+intercontinental link goes down enough that you've designed
+for it whether you realize it or not.
+
+So the real question isn't "C or A?" — it's "**under
+partition**, which writes do we refuse, and which do we
+accept with weaker consistency?" Most systems pick:
+
+- Payments / billing: refuse the write if the home region is
+  unreachable.
+- Likes, comments, presence: accept the write locally,
+  reconcile later.
+
+## Conflict resolution in practice
+
+When you accept concurrent writes, you'll get conflicts.
+Three strategies:
+
+### Last-write-wins (LWW)
+
+Pick the write with the higher timestamp. Silently drops the
+other. Works when "loss is OK" (chat presence). Catastrophic
+when "loss is data" (shopping cart items).
+
+LWW also needs synchronized clocks. NTP skew of even 100 ms
+across regions can lose recent writes systematically.
+
+### Application-level merge
+
+Surface the conflict to the application. Original Dynamo did
+this; shopping cart "merge" was the textbook example —
+union of items from both carts.
+
+Powerful but adds complexity to every endpoint that might
+conflict.
+
+### CRDTs
+
+The data type itself defines a merge. Counters add commutatively.
+Sets union. Maps merge recursively. The application sees a
+clean API; the storage layer handles convergence.
+
+Works when your data fits a CRDT shape. Doesn't work for
+arbitrary objects.
+
+## Cross-region transactions
+
+If a transaction spans regions, you pay round-trips. Three
+options:
+
+1. **Pay the latency** — Spanner does this. Works because
+   TrueTime gives tight clock bounds.
+2. **Restrict transactions to one region** — most CRUD apps
+   take this approach by partitioning data geographically.
+3. **Saga across regions** — split the transaction into a
+   sequence of single-region operations with compensating
+   actions on failure.
+
+## Designing the UX around weaker consistency
+
+Users tolerate weaker consistency if you set expectations:
+
+- **"Updates sync globally in about a minute"** banner during
+  rollout.
+- **Optimistic UI** — render the user's change immediately even
+  if it hasn't replicated yet.
+- **Causal tokens** — within a session, never go backwards.
+- **Per-feature consistency tiers** — show "$X" balance as
+  eventually consistent but block the actual transfer on
+  strong confirmation.
+
+## In summary
+
+- Cross-region linearizability costs ≥100 ms per write —
+  usually unaffordable.
+- Most planet-scale systems use causal+, eventual, or
+  geo-partitioned strong consistency.
+- Active-active needs explicit conflict resolution: LWW
+  (lossy), application merge, or CRDTs.
+- Critical writes (payments, uniqueness) can pay the
+  cross-region cost; most writes can't.
+- Partition tolerance is a given — design which writes refuse
+  vs continue under partition explicitly.
+- UX design matters: optimistic rendering + causal tokens
+  hide most of the weirdness.

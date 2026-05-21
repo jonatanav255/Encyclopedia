@@ -1,0 +1,311 @@
+export const level = 'senior';
+
+# Write-back (write-behind) cache
+
+In a write-back cache, writes go to the cache and return
+immediately. The cache asynchronously flushes the writes to
+the underlying database, batched or coalesced.
+
+```
+   write flow:
+     app → cache.set → return (DB write deferred)
+                         │
+                         ▼  later, asynchronously
+                     DB.upsert (often batched)
+
+   read flow:
+     app → cache → return
+```
+
+Write-back gives you the highest write throughput of any cache
+pattern — you write at cache speed (microseconds) instead of
+DB speed (milliseconds). The cost is **data loss risk** on
+cache failure and **complex consistency** semantics. It's the
+pattern you reach for when write throughput must exceed what a
+DB can sustain, and you can tolerate some loss or have a way
+to recover.
+
+## Why and when
+
+Write-back trades durability for throughput. A 10× write
+speedup is realistic; 100× is possible for write-heavy
+workloads with batching.
+
+Use cases:
+
+- **High-frequency event ingestion**: clickstream, telemetry,
+  metrics. Some loss in a node crash is acceptable; capturing
+  100% costs more than it's worth.
+- **Counter updates**: page views, like counts, vote tallies.
+  Batching 10 000 increments into one DB update is the
+  difference between viable and impossible.
+- **Hot session data**: rapidly-updating per-user state where
+  the source of truth can lag by seconds.
+- **Database write smoothing**: absorb bursts in cache,
+  trickle them to the DB at sustainable rate.
+
+Not for: orders, payments, anything where data loss = real
+loss. Use write-through or skip the cache.
+
+## The flush mechanism
+
+Write-back caches need a flush worker that asynchronously
+moves pending writes from cache to DB.
+
+```ts
+// pseudo-code for the worker
+async function flushLoop() {
+  while (true) {
+    const batch = await dequeue(BATCH_SIZE, BATCH_TIMEOUT);
+    if (batch.length === 0) continue;
+    await db.upsertMany(batch);
+    await markFlushed(batch);
+  }
+}
+```
+
+Three knobs:
+
+- **Batch size**: how many writes per DB call. Bigger = more
+  efficient but more loss on crash.
+- **Batch timeout**: max time to wait before flushing a partial
+  batch. Bigger = more efficient but more lag.
+- **Concurrency**: how many flush workers run in parallel.
+
+Typical defaults: batch size 100–1000, timeout 100 ms – 1 s,
+1 flush worker per shard.
+
+## Coalescing
+
+Write-back's real superpower: when the same key is written
+multiple times before flush, the cache only needs to flush the
+**latest value**.
+
+```
+T0: cache.set(user:42, { name: "Alice" })
+T1: cache.set(user:42, { name: "Alice", age: 30 })
+T2: cache.set(user:42, { name: "Alice", age: 30, city: "NYC" })
+
+flush at T3: one DB write with the T2 value
+```
+
+Compare to write-through: 3 separate DB writes. Write-back: 1.
+
+Coalescing works for **last-write-wins** values (overwrite
+semantics). Doesn't work for additive updates ("increment by
+1" then "increment by 1" then "increment by 1" → must apply
+all three to DB, or store the increment as a delta and
+sum/flush periodically).
+
+Counters are usually handled as a special case: cache stores
+the in-progress delta; flush writes `count += delta` and
+resets the delta to 0.
+
+## The data loss window
+
+The cache holds writes that haven't reached the DB yet. If the
+cache dies, those writes are lost.
+
+Loss window size:
+
+```
+loss_window = batch_size_in_time + flush_latency
+            ≈ tens of seconds in worst case
+```
+
+For most write-back workloads:
+
+- 100 ms – 1 s of normal-flush lag.
+- 5–30 s during DB slowness (writes queue up).
+- A full loss event during cache crash without persistence.
+
+Mitigations:
+
+- **Replicated cache**: Redis Sentinel or Cluster with 2+
+  replicas. A primary crash promotes a replica with the same
+  pending writes. Loss only happens if both primary and
+  replica fail.
+- **Persistence**: Redis AOF (append-only file) writes every
+  cache update to disk. Survives crashes; comes back with
+  recent writes intact. Adds latency (fsync cost) but bounds
+  loss to the fsync interval (typically 1 second).
+- **Dual write to durable queue**: instead of caching, write
+  to Kafka/Kinesis. The queue is durable; workers flush to
+  DB at their own pace. Effectively write-back where the
+  "cache" is a durable broker.
+
+The dual-write approach is increasingly the norm for serious
+high-throughput systems — it's write-back with the cache layer
+replaced by a durable event log. Loss is essentially zero.
+
+## The dirty-data problem
+
+Pending writes in the cache that haven't been flushed are
+"dirty." Two consequences:
+
+### Reads from the DB show stale data
+
+A flush worker or an analytics query reads directly from the
+DB. It misses the dirty data still queued in the cache.
+
+```
+cache: user:42 = { name: "Alice", age: 31 }  (dirty)
+DB:    user:42 = { name: "Alice", age: 30 }  (stale)
+
+analytics query against DB → sees age 30 (wrong)
+```
+
+Mitigations:
+
+- All reads go through the cache (slow for cold/analytic
+  queries).
+- Analytics reads tolerate eventual consistency.
+- Flush more often.
+- For analytics, replicate cache writes to a separate stream
+  consumed by the analytics DB.
+
+### Cache eviction can lose data
+
+If the cache evicts an entry before it's flushed, the data is
+**gone**.
+
+Solution: don't evict dirty entries. Most write-back systems
+track which entries are dirty and pin them in memory until
+flushed. This makes write-back caches harder to size — your
+hot set + your unflushed set must fit.
+
+## Read-after-write within the write-back system
+
+Inside the system, reads work fine: writers cache, readers
+read from the cache, the value is current. The DB lag is
+invisible.
+
+The issues come when something outside the cache (analytics
+DB, a different service, a CDC pipeline that tails the DB
+WAL) reads the DB. From their perspective, your data appears
+slow / delayed by the flush lag.
+
+Plan around this:
+
+- Analytics tolerate hours of lag.
+- Cross-service callers go through your API, not the DB.
+- CDC consumers expect the lag and treat it as such.
+
+## Counter-as-deltas
+
+A specific pattern for write-heavy counters:
+
+```ts
+// instead of:
+//   read DB, increment, write DB     (10 ms × N writers)
+// or:
+//   cache.incr(...) → write-through  (still 10 ms × N writers on flush)
+// use:
+
+await redis.hincrby('counters:pending', userId, 1);
+
+// flush worker, every 1 s:
+const deltas = await redis.hgetall('counters:pending');
+await redis.del('counters:pending');
+await db.applyDeltas(deltas);   // single batched UPDATE ... INCR
+```
+
+100 increments collapse to one DB write. For "like counters"
+or "page view counters" at scale, this is the only viable
+pattern. Lose 1 second of counts on cache crash → acceptable
+in almost every case.
+
+## When write-back is wrong
+
+The pattern's loss window is its defining property. If any
+of these apply, use something else:
+
+- **Financial transactions** — every write must be durable
+  before acknowledgement. Use write-through to a DB with
+  synchronous commit.
+- **Configuration changes** — admins expect the change to
+  persist. Use direct DB write.
+- **Audit logs** — by definition must capture every event.
+  Use durable queue, not a write-back cache.
+- **Idempotency state** — losing the "we processed this
+  payment" record is catastrophic. Use durable storage.
+
+## Cache as front to durable queue
+
+The modern equivalent of write-back, at scale:
+
+```
+   client → Redis (or app-tier cache) → Kafka → DB
+```
+
+Writes hit the cache (instant), are mirrored to Kafka
+(durable), and workers consume Kafka and write to the DB at
+sustainable pace. Cache loss = Kafka still has everything;
+DB just catches up.
+
+This pattern (sometimes called "command-query responsibility
+segregation with event sourcing") combines write-back's
+throughput with write-through's durability. The complexity
+is real (now you have a broker, consumers, lag monitoring),
+but for write-heavy systems it's the standard.
+
+## Common pitfalls
+
+### Treating it as a normal cache
+
+Write-back is not "write-through but faster." It has different
+failure semantics — data loss, dirty-eviction risk, dirty-DB
+read problems. Be deliberate about choosing it.
+
+### Eviction of dirty entries
+
+The single nastiest bug. The cache silently loses writes. Some
+configurations of Redis don't pin dirty entries; some custom
+caches don't track which entries are dirty. Validate this
+before going to production.
+
+### Cold reads bypassing the cache
+
+A bypass for "rare analytics" reads the DB directly. The
+analyst's report is missing 30 seconds of recent data. Either
+route all reads through the cache or document the lag
+explicitly.
+
+### No idempotency in flush
+
+If a flush partially fails and retries, you might double-apply
+the writes. Each batch should be idempotent (use upserts with
+the latest write time, or attach a version per write).
+
+### Backpressure not handled
+
+The DB slows. Pending writes accumulate in the cache. The
+cache fills. New writes are rejected or the cache crashes.
+Plan for it: monitor pending-write count; if it grows past a
+threshold, either shed write load or scale the cache.
+
+### Replication lag amplifies loss
+
+A Redis primary takes writes. Replicas lag by 100 ms. Primary
+crashes; failover picks a replica that's missing the last 100
+ms. Plus the flush hasn't run for that 100 ms. Loss window =
+replication lag + flush lag. Tighten both.
+
+## In summary
+
+- Write-back: writes hit the cache, return immediately, and
+  flush to the DB asynchronously in batches.
+- The fastest write pattern — 10–100× the throughput of
+  write-through.
+- Loss window is real: pending writes are at risk if the
+  cache fails before flush.
+- Coalescing makes write-back especially powerful for
+  rapidly-overwritten values.
+- Persistence (AOF), replication, and dual-write to a durable
+  queue mitigate loss.
+- Not for financial / audit / config data — only for high-
+  throughput, loss-tolerant workloads (counters, telemetry,
+  hot session data).
+- The modern "write-back at scale" pattern uses a durable
+  queue (Kafka) as the buffer, combining throughput with
+  durability.
