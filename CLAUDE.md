@@ -84,6 +84,36 @@ rationale, and conventions live in `PROJECT.md`.
 - `src/lib/` — content discovery, search index, copy-button helper
 - `src/App.tsx` — router + `MDXProvider` registration
 
+## Content-addition workflow that works
+
+After any batch of new MDX (>3 files), run **two agents in parallel**
+before committing:
+
+1. **Build/structural** — `pnpm build` + check `level` export on
+   line 1, single H1, no undeclared MDX components, lowercase code
+   fences (Shiki only ships `js, ts, tsx, json, bash`).
+2. **Content accuracy** — fact-check version claims ("shipped in
+   Node X", "ES202Y"), API shape, and cross-topic consistency with
+   existing files. WebSearch is fair game.
+
+This pair has caught real bugs every time it's run. Don't skip the
+content agent just because the build passes.
+
+## Gap-mining → page selection
+
+When the user says "mine these books and add what's missing":
+
+- Delegate the gap analysis to a research agent — don't try to hold
+  12 book TOCs in head.
+- The agent will return more candidates than are worth writing.
+  **Pick ~half**, not all. Quality > coverage.
+- Reject criteria: overlaps with existing topic, frontend-only when
+  audience is backend-leaning, too opinion-y to be authoritative,
+  too historical (e.g., MVC/MVP/MVVM in 2026), or only one source
+  book treats it well.
+- New topics get **questions added to the relevant `<topic>.ts`
+  bank** as part of the same commit, not deferred.
+
 ## Out of scope
 
 Anything requiring sync across devices, multi-user access, or
