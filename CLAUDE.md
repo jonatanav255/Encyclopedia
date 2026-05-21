@@ -34,11 +34,16 @@ rationale, and conventions live in `PROJECT.md`.
 
 ## Things that have already bitten — don't repeat
 
-- **Don't parse `.mdx` files via `?raw` for metadata.** The MDX plugin
-  has `enforce: 'pre'` and claims `.mdx` before Vite's raw loader.
-  We've been bitten twice. For named exports (like `level`), use
-  `import.meta.glob('...', { import: '<name>', eager: true })` —
-  pulls just that export without breaking code splitting.
+- **Don't parse `.mdx` files via `?raw` for metadata, and don't use
+  eager `import.meta.glob` over `.mdx` at all.** The MDX plugin has
+  `enforce: 'pre'` and claims `.mdx` before Vite's raw loader, so even
+  `{ import: 'level', eager: true }` drags every file through the full
+  MDX → rehype → Shiki → JSX pipeline at startup. With 562 files this
+  blew cold dev start to >20s. The current solution: the `mdxMetaPlugin`
+  in `vite.config.ts` walks `src/content` with `fs.readFile`, extracts
+  `raw` + `level` per file, and exposes them as the `virtual:mdx-meta`
+  module consumed by `src/lib/content-meta.ts`. Read metadata from there;
+  keep the page-component glob lazy (no `eager`).
 - **Layout must use `h-screen`, not `min-h-screen`.** Otherwise the
   sidebar's `overflow-y-auto` has no fixed parent height to constrain
   it, and the whole page scrolls instead of the sidebar.
@@ -49,8 +54,14 @@ rationale, and conventions live in `PROJECT.md`.
   elements (paragraphs, lists, code blocks). `<QA>` learned this the
   hard way — the header is a button, the answer is a sibling div.
 - **Shiki ships every language grammar by default**, which bloats the
-  bundle. Before deploying, restrict languages in `vite.config.ts` to
-  `['js', 'ts', 'tsx', 'json', 'bash']`.
+  bundle and slows transforms. `vite.config.ts` now pre-builds one
+  highlighter with the 17 langs actually used in MDX
+  (`bash, dockerfile, graphql, html, http, ini, js, json, jsx, nginx,
+  protobuf, pug, sh, sql, ts, tsx, yaml`) and passes it to
+  `rehype-pretty-code` via `getHighlighter`. If you add a new lang in a
+  fenced code block, add it to `SHIKI_LANGS` or it falls back to
+  `plaintext`. Don't trim this list to the old `['js','ts','tsx',
+  'json','bash']` — multiple topics rely on the others.
 - **Routes ARE middleware** in Express. They live in the same ordered
   stack with a method+path filter. `src/content/express/routing.mdx`
   teaches this explicitly. Don't redraw diagrams implying middleware
