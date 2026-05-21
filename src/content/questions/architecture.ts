@@ -34,7 +34,7 @@ export const bank: QuestionBank = {
       level: 'mid',
       question: 'Webhook handlers should respond fast. Why?',
       answer:
-        'The sender has a timeout (Stripe: 30s, GitHub: ~10s). If you take longer, they retry — sending the *same event* again, which you must dedupe, while the original is still running. Pile-up.\n\nThe pattern: in the HTTP handler, **verify signature → enqueue → respond 200**. Do the actual work in a background worker. The sender stops retrying as soon as you ack. The worker can take as long as it needs.',
+        'The sender has a timeout (Stripe: 20s, GitHub: ~10s). If you take longer, they retry — sending the *same event* again, which you must dedupe, while the original is still running. Pile-up.\n\nThe pattern: in the HTTP handler, **verify signature → enqueue → respond 200**. Do the actual work in a background worker. The sender stops retrying as soon as you ack. The worker can take as long as it needs.',
     },
     {
       level: 'mid',
