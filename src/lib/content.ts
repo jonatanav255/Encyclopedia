@@ -1,23 +1,11 @@
 import type { ComponentType } from 'react';
+import { mdxMeta } from './content-meta';
 
 type MdxModule = { default: ComponentType };
 
+// Lazy glob — Vite only transforms each MDX file when its loader is invoked
+// (i.e. when the user navigates to that page). No eager work at startup.
 const modules = import.meta.glob<MdxModule>('../content/**/*.mdx');
-// Eager `?raw` glob for the search index. The MDX rollup plugin claims `.mdx`
-// files with `enforce: 'pre'`, so the `?raw` query may not always reach Vite's
-// raw loader — we defensively coerce to string at the consumer.
-const rawSources = import.meta.glob('../content/**/*.mdx', {
-  query: '?raw',
-  import: 'default',
-  eager: true,
-}) as Record<string, unknown>;
-// Eager glob that pulls only the `level` named export from each MDX module.
-// This is a tiny payload — just a string per file — so it doesn't break code
-// splitting of the actual page components (`modules` above stays lazy).
-const levelExports = import.meta.glob('../content/**/*.mdx', {
-  import: 'level',
-  eager: true,
-}) as Record<string, unknown>;
 
 export type Level = 'junior' | 'mid' | 'senior' | 'staff';
 
@@ -48,15 +36,14 @@ export const entries: ContentEntry[] = Object.entries(modules)
     const match = path.match(/\.\.\/content\/(.+)\/(.+)\.mdx$/);
     if (!match) return null;
     const [, topic, name] = match;
-    const rawMaybe = rawSources[path];
-    const raw = typeof rawMaybe === 'string' ? rawMaybe : '';
+    const meta = mdxMeta[path];
     return {
       slug: `${topic}/${name}`,
       topic,
       name,
       title: titleCase(name),
-      level: asLevel(levelExports[path]),
-      raw,
+      level: asLevel(meta?.level),
+      raw: meta?.raw ?? '',
       load,
     } satisfies ContentEntry;
   })
