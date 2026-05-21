@@ -1,0 +1,375 @@
+export const level = 'mid';
+
+# Typing hooks
+
+Every React hook has a default inferred type that's right ~80% of the
+time and wrong in subtle ways the other 20%. This page covers the
+hook-by-hook rules.
+
+## useState
+
+```tsx
+const [count, setCount] = useState(0);          // number
+const [name, setName] = useState('');            // string
+```
+
+Inference works when the initial value is the value you'll use
+forever. It breaks when the value is `null` initially or when the
+state can hold multiple shapes:
+
+```tsx
+// Bad — TypeScript infers null, then setUser(realUser) is a type error
+const [user, setUser] = useState(null);
+
+// Good — explicitly widen
+const [user, setUser] = useState<User | null>(null);
+```
+
+Same for arrays you'll populate later:
+
+```tsx
+const [items, setItems] = useState<Item[]>([]);     // ✓
+const [items, setItems] = useState([]);             // never[] — setItems([x]) fails
+```
+
+The rule: if the initial value is *narrower* than the values the
+state will ever hold, annotate.
+
+### Lazy initialization
+
+Pass a function to avoid running expensive setup every render:
+
+```tsx
+const [tree, setTree] = useState(() => parseHugeTree(input));
+```
+
+TS infers the state type from the function's return type. Annotation
+isn't needed unless the return type itself is too narrow.
+
+### Functional setter
+
+The setter's argument is `T | ((prev: T) => T)`. The functional form
+is type-safe:
+
+```tsx
+setCount((c) => c + 1);                         // c: number
+setUser((prev) => (prev ? { ...prev, name: 'new' } : prev));
+```
+
+## useReducer
+
+The canonical pattern: discriminated-union actions plus an
+exhaustive switch.
+
+```tsx
+type State = { count: number; lastAction: string | null };
+
+type Action =
+  | { type: 'increment' }
+  | { type: 'decrement' }
+  | { type: 'set'; value: number }
+  | { type: 'reset' };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'increment':
+      return { count: state.count + 1, lastAction: 'increment' };
+    case 'decrement':
+      return { count: state.count - 1, lastAction: 'decrement' };
+    case 'set':
+      return { count: action.value, lastAction: 'set' };
+    case 'reset':
+      return { count: 0, lastAction: 'reset' };
+  }
+}
+
+function Counter() {
+  const [state, dispatch] = useReducer(reducer, { count: 0, lastAction: null });
+  return (
+    <button onClick={() => dispatch({ type: 'increment' })}>
+      {state.count}
+    </button>
+  );
+}
+```
+
+Two wins from the discriminated union:
+
+1. Inside the switch, TypeScript narrows. `action.value` only exists
+   in the `'set'` branch.
+2. `dispatch({ type: 'set' })` (missing `value`) is a compile error,
+   and `dispatch({ type: 'sett' })` is too.
+
+### Exhaustiveness with assertNever
+
+To catch "you added a new action type but forgot to handle it":
+
+```tsx
+function assertNever(x: never): never {
+  throw new Error(`Unhandled: ${JSON.stringify(x)}`);
+}
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'increment': return { ...state, count: state.count + 1 };
+    case 'decrement': return { ...state, count: state.count - 1 };
+    case 'set':       return { ...state, count: action.value };
+    case 'reset':     return { ...state, count: 0 };
+    default:          return assertNever(action);
+  }
+}
+```
+
+If you add `| { type: 'double' }` to `Action` and forget the case,
+`action` in the default branch is `{ type: 'double' }`, not `never`,
+and `assertNever` fails to compile. The bug is caught at build time.
+
+### Lazy reducer init
+
+```tsx
+useReducer(reducer, initialArg, (arg) => parseSavedState(arg));
+```
+
+Useful for hydrating from `localStorage` once.
+
+## useRef
+
+Three shapes you'll write:
+
+```tsx
+// DOM element
+const inputRef = useRef<HTMLInputElement>(null);
+
+// Mutable value the component owns
+const intervalRef = useRef<number | null>(null);
+
+// Value derived from props/state — stable across renders
+const renderCountRef = useRef(0);
+```
+
+The `null` initial value matters: with `useRef<T>(null)`,
+`current: T | null` and you must null-check. Without it,
+`useRef<T>()` infers `current: T | undefined`, which is the same idea
+in different clothing.
+
+In `@types/react` for React 19, `RefObject<T>.current` was made
+writable by default — the functional difference between
+`RefObject<T>` and `MutableRefObject<T>` is gone. Both type names
+still exist; reach for `RefObject<T>` and don't think about it.
+
+### Common DOM ref types
+
+<Cheatsheet
+  columns={['Element', 'Type']}
+  rows={[
+    ['<div>', 'HTMLDivElement'],
+    ['<input>', 'HTMLInputElement'],
+    ['<button>', 'HTMLButtonElement'],
+    ['<form>', 'HTMLFormElement'],
+    ['<canvas>', 'HTMLCanvasElement'],
+    ['<svg>', 'SVGSVGElement'],
+    ['Any element', 'HTMLElement'],
+  ]}
+/>
+
+For something you might attach to anything generic, `HTMLElement` is
+fine.
+
+## useContext (and removing the null check)
+
+Context's default value is what consumers see when there's no
+provider above. Most of the time you want "no provider = error" not
+"no provider = silently use defaults":
+
+```tsx
+// Naive version forces every consumer to null-check
+const ThemeContext = createContext<Theme | null>(null);
+
+function useTheme() {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error('useTheme must be used inside <ThemeProvider>');
+  return ctx;          // narrowed to Theme
+}
+```
+
+Wrap the `useContext` call in your own hook that asserts. Every
+consumer reads through the hook, never the context directly.
+Consumers get the typed value without dealing with the null branch.
+
+The pattern in full:
+
+```tsx
+import { createContext, useContext, useState, type ReactNode } from 'react';
+
+type Theme = { mode: 'light' | 'dark'; setMode: (m: 'light' | 'dark') => void };
+
+const ThemeContext = createContext<Theme | null>(null);
+
+export function ThemeProvider({ children }: { children: ReactNode }) {
+  const [mode, setMode] = useState<'light' | 'dark'>('dark');
+  return (
+    <ThemeContext.Provider value={{ mode, setMode }}>
+      {children}
+    </ThemeContext.Provider>
+  );
+}
+
+export function useTheme(): Theme {
+  const ctx = useContext(ThemeContext);
+  if (!ctx) throw new Error('useTheme: missing <ThemeProvider>');
+  return ctx;
+}
+```
+
+The consumer:
+
+```tsx
+function ThemeToggle() {
+  const { mode, setMode } = useTheme();    // never null
+  return <button onClick={() => setMode(mode === 'dark' ? 'light' : 'dark')}>{mode}</button>;
+}
+```
+
+## useEffect, useLayoutEffect, useMemo, useCallback
+
+These rarely need explicit types — the body's behavior determines
+everything:
+
+```tsx
+useEffect(() => {
+  const id = setTimeout(...);
+  return () => clearTimeout(id);
+}, [deps]);
+
+const sum = useMemo(() => list.reduce((a, b) => a + b, 0), [list]);
+// sum: number — inferred from the body
+
+const handleClick = useCallback((id: string) => {
+  setOpen(id);
+}, []);
+// handleClick: (id: string) => void
+```
+
+If you do annotate `useCallback`, annotate the **parameter**, not the
+function:
+
+```tsx
+// Awkward
+const fn = useCallback<(id: string) => void>((id) => { ... }, []);
+
+// Cleaner
+const fn = useCallback((id: string) => { ... }, []);
+```
+
+## Typing custom hooks
+
+The two return-shape conventions:
+
+```tsx
+// Tuple — like useState. Use when there are 2 values and order is conventional.
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = useCallback(() => setOn((v) => !v), []);
+  return [on, toggle] as const;
+}
+
+const [open, toggle] = useToggle();
+```
+
+The `as const` is essential. Without it, TypeScript infers
+`(boolean | (() => void))[]`, which is useless. With it, the return
+type is the tuple `readonly [boolean, () => void]`.
+
+```tsx
+// Object — when there are 3+ values or names matter more than order.
+function useUserSearch(query: string) {
+  const { data, error, isPending } = useQuery({ ... });
+  return { users: data, error, isPending };
+}
+
+const { users, error, isPending } = useUserSearch(q);
+```
+
+Annotate the hook's return type explicitly when it's part of a public
+API surface; let inference handle private hooks.
+
+### Hook for fetching with state
+
+A representative custom-hook signature:
+
+```tsx
+type FetchState<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: T }
+  | { status: 'error'; error: Error };
+
+function useFetch<T>(url: string): FetchState<T> {
+  const [state, setState] = useState<FetchState<T>>({ status: 'idle' });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ status: 'loading' });
+    fetch(url)
+      .then((r) => r.json() as Promise<T>)
+      .then((data) => { if (!cancelled) setState({ status: 'success', data }); })
+      .catch((error: Error) => { if (!cancelled) setState({ status: 'error', error }); });
+    return () => { cancelled = true; };
+  }, [url]);
+
+  return state;
+}
+
+// usage
+const result = useFetch<User>('/api/me');
+if (result.status === 'success') {
+  result.data.name;              // narrowed to User
+}
+```
+
+A discriminated `status` union is far better than `{ data, error,
+isLoading }` with optionals — consumers can't accidentally render
+data while loading.
+
+## Pitfalls
+
+<Compare
+  bad={`// Object inferred too narrowly — can't add new keys later
+const [opts, setOpts] = useState({ debug: false });
+setOpts({ debug: true, verbose: true });   // ✗ verbose not in inferred type`}
+  good={`type Opts = { debug: boolean; verbose?: boolean };
+const [opts, setOpts] = useState<Opts>({ debug: false });`}
+  language="tsx"
+/>
+
+<Compare
+  bad={`// Ref typed too loose — every read needs casting
+const ref = useRef(null);
+ref.current?.focus();           // ✗ never has no focus method`}
+  good={`const ref = useRef<HTMLInputElement>(null);
+ref.current?.focus();`}
+  language="tsx"
+/>
+
+<Compare
+  bad={`// Reducer return type missing — every case might return a wider shape
+function reducer(state, action) { ... }`}
+  good={`function reducer(state: State, action: Action): State { ... }`}
+  language="ts"
+/>
+
+## The discipline
+
+- Annotate `useState` when the initial value is narrower than the
+  state can hold (`null` initial, empty array, narrow literal).
+- Type reducers with a discriminated union of actions plus the
+  `assertNever` exhaustiveness pattern. The compiler catches missing
+  cases when you add new actions.
+- For DOM refs, `useRef<HTMLElementType>(null)`. For value refs,
+  inference is usually fine.
+- Wrap `useContext` in a custom hook that throws if the provider is
+  missing. Consumers get a non-null type for free.
+- For custom hooks, return tuples (with `as const`) when shape mimics
+  `useState`; return objects when there are 3+ named fields.
+- Discriminated-union state (`{ status, data }`) prevents consumers
+  from rendering data that doesn't exist yet.

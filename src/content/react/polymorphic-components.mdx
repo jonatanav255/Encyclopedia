@@ -1,0 +1,291 @@
+export const level = 'staff';
+
+# Polymorphic components
+
+A polymorphic component is one whose rendered element you can swap
+via a prop:
+
+```tsx
+<Button>Save</Button>                  // <button>
+<Button as="a" href="/settings">Settings</Button>  // <a>
+<Button as={Link} to="/profile">Profile</Button>   // <Link> from react-router
+```
+
+The pattern shows up everywhere — Chakra's `<Box as>`, Material UI's
+`component=` prop, Radix's `<Slot>` — because UIs often want one
+visual identity (a "button") that maps to different semantic
+elements (`<button>`, `<a>`, `<Link>`).
+
+It's also famously hard to type correctly. This page walks through
+the typing build-up, then shows the alternative (slots) that ducks
+the problem entirely.
+
+## The naive version
+
+```tsx
+function Box({ as: Component = 'div', ...props }: any) {
+  return <Component {...props} />;
+}
+```
+
+Works. Loses every type guarantee. The consumer can pass an `href` to
+a `<div>` and TypeScript shrugs.
+
+## Step 1: typing the element
+
+`React.ElementType` is the union of "things you can render": HTML tag
+strings, React function components, class components.
+
+```tsx
+type BoxProps<T extends React.ElementType> = {
+  as?: T;
+};
+
+function Box<T extends React.ElementType = 'div'>({
+  as,
+  ...rest
+}: BoxProps<T>) {
+  const Component = as ?? 'div';
+  return <Component {...rest} />;
+}
+```
+
+The generic `T` flows from the `as` prop. Now `as="a"` makes `T` the
+string literal `'a'`.
+
+## Step 2: pulling in the element's own props
+
+For `<Box as="a">` to accept `href`, we need to merge the props of
+the underlying element. `ComponentPropsWithoutRef<T>` does it:
+
+```tsx
+type BoxProps<T extends React.ElementType> = {
+  as?: T;
+} & Omit<React.ComponentPropsWithoutRef<T>, 'as'>;
+
+function Box<T extends React.ElementType = 'div'>({
+  as,
+  ...rest
+}: BoxProps<T>) {
+  const Component = as ?? 'div';
+  return <Component {...rest} />;
+}
+
+<Box as="a" href="/x">link</Box>     // ✓ href is valid
+<Box as="div" href="/x">div</Box>    // ✗ Type error — div has no href
+```
+
+The `Omit<..., 'as'>` is because the underlying element doesn't have
+its own `as` prop and we don't want it to collide.
+
+## Step 3: your own props
+
+Add the props the component itself owns:
+
+```tsx
+type OwnProps = {
+  variant?: 'primary' | 'secondary';
+  size?: 'sm' | 'md' | 'lg';
+};
+
+type BoxProps<T extends React.ElementType> = OwnProps & {
+  as?: T;
+} & Omit<React.ComponentPropsWithoutRef<T>, keyof OwnProps | 'as'>;
+
+function Box<T extends React.ElementType = 'div'>({
+  as,
+  variant = 'primary',
+  size = 'md',
+  ...rest
+}: BoxProps<T>) {
+  const Component = as ?? 'div';
+  const className = `box-${variant} box-${size}`;
+  return <Component className={className} {...rest} />;
+}
+```
+
+The `Omit<..., keyof OwnProps | 'as'>` prevents the element's own
+`variant`/`size` (if it had any) from clashing with ours. Without it,
+TypeScript would intersect — `variant` would have to satisfy *both*
+your type and the element's, which is usually impossible.
+
+## Step 4: ref forwarding (the hard part)
+
+In React 18 with `forwardRef`, polymorphic + ref-forwarding is the
+canonical "TS type hell" moment:
+
+```tsx
+import { forwardRef } from 'react';
+
+type PolymorphicRef<T extends React.ElementType> =
+  React.ComponentPropsWithRef<T>['ref'];
+
+type BoxProps<T extends React.ElementType> = OwnProps & {
+  as?: T;
+} & Omit<React.ComponentPropsWithRef<T>, keyof OwnProps | 'as'>;
+
+type BoxComponent = <T extends React.ElementType = 'div'>(
+  props: BoxProps<T> & { ref?: PolymorphicRef<T> },
+) => React.ReactElement | null;
+
+const Box = forwardRef(function Box<T extends React.ElementType = 'div'>(
+  { as, variant = 'primary', ...rest }: BoxProps<T>,
+  ref: PolymorphicRef<T>,
+) {
+  const Component = as ?? 'div';
+  return <Component ref={ref} className={`box-${variant}`} {...rest} />;
+}) as BoxComponent;
+```
+
+The `as BoxComponent` cast is necessary because `forwardRef`'s
+default type doesn't preserve generics. This is uncomfortable but
+standard — every component library that ships polymorphic types
+ships this incantation.
+
+**In React 19**, `ref` is a regular prop. The whole `forwardRef`
+dance disappears:
+
+```tsx
+type BoxProps<T extends React.ElementType> = OwnProps & {
+  as?: T;
+  ref?: React.ComponentPropsWithRef<T>['ref'];
+} & Omit<React.ComponentPropsWithRef<T>, keyof OwnProps | 'as' | 'ref'>;
+
+function Box<T extends React.ElementType = 'div'>({
+  as,
+  ref,
+  variant = 'primary',
+  ...rest
+}: BoxProps<T>) {
+  const Component = as ?? 'div';
+  return <Component ref={ref} className={`box-${variant}`} {...rest} />;
+}
+```
+
+Cleaner. One of the better quality-of-life wins in React 19.
+
+## The alternative: slot / asChild
+
+Radix popularized a different approach. Instead of *changing* what
+your component renders, your component renders `null` markup and
+**clones its child**, merging its props onto it.
+
+```tsx
+import * as React from 'react';
+
+type SlottableProps = {
+  asChild?: boolean;
+  children: React.ReactNode;
+} & React.ButtonHTMLAttributes<HTMLButtonElement>;
+
+function Button({ asChild, children, ...props }: SlottableProps) {
+  if (asChild && React.isValidElement(children)) {
+    const childProps = children.props as Record<string, unknown>;
+    return React.cloneElement(children, {
+      ...childProps,
+      ...props,                                       // parent props win
+      className: [childProps.className, props.className].filter(Boolean).join(' '),
+    });
+  }
+  return <button {...props}>{children}</button>;
+}
+
+<Button>Save</Button>
+<Button asChild>
+  <a href="/settings">Settings</a>     {/* link, with button styles */}
+</Button>
+<Button asChild>
+  <Link to="/profile">Profile</Link>
+</Button>
+```
+
+Why this is appealing:
+
+- **No generics.** No `ElementType`, no `ComponentPropsWithRef`, no
+  cast. The TypeScript is trivial.
+- **Consumer chooses the element directly.** No memorizing "what
+  string do I pass to `as`?"
+- **Composes with anything.** Works with `next/link`, `react-router`'s
+  `Link`, custom components — anything that accepts the props you
+  spread.
+
+The trade-offs:
+
+- **One child only.** `asChild` requires exactly one element child
+  to clone.
+- **Event/className merging needs care.** If your component already
+  has `onClick`/`className` and the child does too, the merge isn't
+  free — the example above only concatenates `className`; production
+  needs to chain both `onClick` handlers, forward refs, and pick the
+  right precedence for `data-*`. Radix's `<Slot>` does all of this;
+  rolling your own does not.
+- **Polymorphic typing is gone.** You can't statically tell "this
+  asChild Button must be an anchor."
+
+Production libraries (Radix, Ark UI, React Aria) reach for slots far
+more than `as` props in 2026.
+
+## When to pick which
+
+<Cheatsheet
+  columns={['Want', 'Pattern']}
+  rows={[
+    ['Static type-checked element-specific props (href on a link)', 'Polymorphic with `as`'],
+    ['Compose with any third-party Link / Router primitive', 'Slot / asChild'],
+    ['Library API for end users (DX matters)', 'Slot / asChild — simpler mental model'],
+    ['Internal design system, one team', 'Either — pick what your team likes'],
+    ['React 18 codebase, don\'t want forwardRef pain', 'Slot / asChild'],
+  ]}
+/>
+
+## Common typing pitfalls
+
+### Forgetting `Omit<..., 'as' | keyof OwnProps>`
+
+Without it, intersection between your `as` type and the element's
+non-existent `as` prop produces nonsense. Symptom: hovering `as`
+shows `never`.
+
+### Using `ComponentProps` instead of `ComponentPropsWithoutRef`
+
+`ComponentProps<T>` includes the `ref` prop, which intersects with
+your own ref handling badly. Use `ComponentPropsWithoutRef<T>` when
+you handle refs separately, `ComponentPropsWithRef<T>` when you
+include refs in the merged type.
+
+### Letting `as` default to a string vs a component
+
+```tsx
+function Box<T extends React.ElementType = 'div'>(...)
+```
+
+The default `= 'div'` is what makes `<Box>` (no `as`) typecheck. Drop
+it and consumers must always pass `as`.
+
+### Generic inference failing at use
+
+```tsx
+<Box as="a" href="/x" />        // T inferred as 'a' → href ok
+<Box as={Link} to="/x" />       // T inferred as typeof Link → `to` ok
+```
+
+If inference fails (TS infers `ElementType` instead of the specific
+type), the consumer loses the element-specific props. The usual
+cause: the generic isn't constrained tightly enough, or your
+`OwnProps` shape conflicts. Test the type by hovering at the call
+site.
+
+## The discipline
+
+- Don't write polymorphic components unless you've felt the pain of
+  not having them. They're complex; the value is real but specific.
+- In React 19, drop `forwardRef` from the recipe — `ref` is just a
+  prop. The typing becomes manageable.
+- Consider the slot pattern first if the use case is "I want to wrap
+  a different component sometimes." It's simpler and composes better
+  with the React ecosystem.
+- When you do build polymorphic, always `Omit` keys from the element
+  props that overlap with your own — or you'll get confusing
+  intersection errors at call sites.
+- Test the generic inference by hovering on `<YourComponent as="a"
+  />` and checking that element-specific props are valid.

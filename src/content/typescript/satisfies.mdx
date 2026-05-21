@@ -1,0 +1,259 @@
+export const level = 'mid';
+
+# satisfies
+
+The `satisfies` operator (TS 4.9+) lets you **check** a value against
+a type without **widening** the value to that type. It's the answer
+to a class of bugs where `as` and type annotations both produce the
+wrong outcome.
+
+## The motivating example
+
+You have a config object you want to validate as a `Record<string,
+Color>`, where Color is a string union:
+
+```ts
+type Color = 'red' | 'green' | 'blue';
+
+const palette = {
+  primary: 'red',
+  secondary: 'blue',
+  accent: 'green',
+};
+```
+
+Three ways to enforce that every value is a `Color`. Each has a
+problem:
+
+### Option 1: type annotation (loses precision)
+
+```ts
+const palette: Record<string, Color> = {
+  primary: 'red',
+  secondary: 'blue',
+  accent: 'green',
+};
+
+palette.primary;     // type: Color  — widened, lost the literal 'red'
+palette.unknown;     // type: Color  — accepted at the type level, undefined at runtime
+```
+
+The annotation **widens** the type. You lose two things:
+
+1. The specific literal value of each key (`'red'`, not `Color`).
+2. The set of actual keys — `palette.unknown` typechecks as `Color`
+   even though it doesn't exist.
+
+### Option 2: `as` (zero safety)
+
+```ts
+const palette = {
+  primary: 'red',
+  secondary: 'blue',
+  accent: 'green',
+} as Record<string, Color>;
+```
+
+Same widening problems, plus `as` is a coercion — TypeScript won't
+catch if you write `accent: 'orange'`. `as` says "trust me," not
+"check me."
+
+### Option 3: `satisfies` (best of both)
+
+```ts
+const palette = {
+  primary: 'red',
+  secondary: 'blue',
+  accent: 'green',
+} satisfies Record<string, Color>;
+
+palette.primary;     // type: 'red'  — narrow!
+palette.unknown;     // ✗ Property 'unknown' does not exist
+```
+
+`satisfies` says: "verify that this value satisfies that constraint,
+but **keep the precise inferred type**." Both safety properties are
+on:
+
+- Wrong value caught: `accent: 'orange'` would error.
+- Specific types preserved: hovering `palette.primary` shows `'red'`.
+- Wrong key caught: `palette.unknown` is a type error.
+
+## The mental model
+
+| Operator | "Check?" | "Widen?" |
+|---|---|---|
+| `: T` (annotation) | yes | yes |
+| `as T` (assertion) | no | yes |
+| `satisfies T` | yes | **no** |
+
+Annotation = "is this T? Treat as T." Assertion = "trust me, treat as
+T." `satisfies` = "is this T? Keep the original type."
+
+## Where it matters most
+
+### Const objects whose values you'll branch on
+
+```ts
+type Routes = Record<string, { path: string; auth: boolean }>;
+
+const routes = {
+  home:    { path: '/',        auth: false },
+  profile: { path: '/profile', auth: true  },
+  admin:   { path: '/admin',   auth: true  },
+} satisfies Routes;
+
+// Now this works:
+function visit(name: keyof typeof routes) { ... }
+visit('home');       // ✓
+visit('xyz');        // ✗ — only 'home' | 'profile' | 'admin'
+```
+
+With annotation, `name: keyof typeof routes` would be `string`. With
+`satisfies`, it's the precise key union.
+
+### Discriminated-union shape that you want both narrowed and validated
+
+```ts
+type Step =
+  | { kind: 'input';  label: string; placeholder: string }
+  | { kind: 'select'; label: string; options: string[] };
+
+const steps = [
+  { kind: 'input',  label: 'Name',  placeholder: 'Jon' },
+  { kind: 'select', label: 'Color', options: ['red', 'blue'] },
+] satisfies Step[];
+
+// steps[1].options is string[] — narrowed via the 'select' literal preserved
+```
+
+Without `satisfies`, you'd either lose the literal `kind` (annotation)
+or lose the validation (no annotation at all).
+
+### Mixed-value config
+
+```ts
+type Config = {
+  port: number;
+  host: string;
+  flags: Record<string, boolean>;
+};
+
+const config = {
+  port: 3000,
+  host: 'localhost',
+  flags: { verbose: true, debug: false },
+} satisfies Config;
+
+config.port;          // number (literal type 3000 lost here is fine — number's narrower than the constraint)
+config.flags.debug;   // false — literal preserved
+config.flags.unknown; // ✓ — Record<string, boolean> allows unknown keys
+```
+
+Note `port` here is `number`, not `3000`. That's because `Config`
+says `port: number` — `satisfies` is checking against the constraint
+but the inferred type of `3000` widens to `number` per normal
+inference rules. If you wanted the literal preserved:
+
+```ts
+const config = {
+  port: 3000,
+  host: 'localhost',
+} as const satisfies Config;
+
+config.port;     // 3000 — literal, frozen
+```
+
+Combine with `as const` when you want literal preservation
+*everywhere*.
+
+## When `satisfies` is wrong
+
+`satisfies` keeps narrow types. Sometimes you want widening.
+
+```ts
+const buttons = [
+  { id: 'save',   label: 'Save' },
+  { id: 'cancel', label: 'Cancel' },
+];
+
+// You want to push later:
+buttons.push({ id: 'delete', label: 'Delete' });   // ✓ works — type is { id: string; label: string }[]
+```
+
+If you `satisfies` this against a type that only allows the existing
+IDs (`'save' | 'cancel'`), pushing `'delete'` becomes a type error.
+When you legitimately want a mutable, growable shape, use a regular
+annotation or no annotation.
+
+## satisfies vs as const
+
+People sometimes confuse them because both "preserve narrow types."
+They do different things:
+
+```ts
+const a = { mode: 'dark' };
+// a: { mode: string }   — properties are mutable, values widened
+
+const b = { mode: 'dark' } as const;
+// b: { readonly mode: 'dark' }   — properties readonly, values narrow
+
+const c = { mode: 'dark' } satisfies { mode: 'dark' | 'light' };
+// c: { mode: 'dark' }   — properties mutable, value narrow, validated
+
+const d = { mode: 'dark' } as const satisfies { mode: 'dark' | 'light' };
+// d: { readonly mode: 'dark' }   — readonly, narrow, validated
+```
+
+Pick by what you want:
+
+- **Mutable + widened**: nothing.
+- **Mutable + narrow + validated**: `satisfies`.
+- **Readonly + narrow**: `as const`.
+- **Readonly + narrow + validated**: `as const satisfies T`.
+
+The last combo is the most common pattern in modern config files.
+
+## A real-world example: typed env
+
+```ts
+const env = {
+  NODE_ENV: process.env.NODE_ENV ?? 'development',
+  API_URL:  process.env.API_URL  ?? 'http://localhost:3000',
+  PORT:     Number(process.env.PORT ?? 3000),
+} satisfies Record<string, string | number>;
+
+env.NODE_ENV;    // string
+env.PORT;         // number
+env.MISSING;      // ✗ Property 'MISSING' does not exist
+```
+
+The constraint says "every value must be a string or number." The
+inferred types stay precise for each key, and consumers can't
+reference `env.MISSING` thinking it exists.
+
+## What it does NOT do
+
+- **Doesn't add runtime checks.** Like all TypeScript, `satisfies` is
+  erased. Validate runtime data with Zod / Valibot / Arktype.
+- **Doesn't change the value.** It's purely a compile-time
+  type-checking operator.
+- **Doesn't enforce on later mutations.** If the value is mutable,
+  reassigning `palette.primary = 'banana'` is a runtime no-op as far
+  as `satisfies` is concerned (and a type error if `Color` rules it
+  out, which is the same check that ran at the satisfies site).
+
+## The discipline
+
+- Default to `satisfies` over `as` whenever you're saying "I want to
+  validate, not coerce."
+- Default to `satisfies` over `: T` annotations on values whose
+  literal types you'll need later (config objects, route tables,
+  discriminated-union arrays).
+- Pair with `as const` (`as const satisfies T`) when you want the
+  whole structure frozen as literals.
+- Use a plain annotation when you actually want widening — e.g., when
+  the object will be mutated, or when consumers should see the
+  constraint type, not the precise inferred type.
+- `satisfies` doesn't replace runtime validation. For user input or
+  network data, you still need a parser.

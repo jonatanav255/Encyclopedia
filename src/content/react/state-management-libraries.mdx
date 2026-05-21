@@ -1,0 +1,318 @@
+export const level = 'senior';
+
+# State management libraries
+
+Once your app outgrows `useState` and `useReducer`, the question
+isn't "which library?" but **"what kind of state is this?"** The
+answer determines the tool.
+
+## The three kinds of state
+
+<Cheatsheet
+  columns={['Kind', 'Lives in', 'Tool']}
+  rows={[
+    ['Local UI', 'One component', 'useState / useReducer'],
+    ['Shared client state', 'Many components, derived from user actions', 'Zustand, Jotai, Redux Toolkit, Context'],
+    ['Server cache', 'Mirror of remote data', 'TanStack Query, SWR, Apollo, RTK Query'],
+    ['URL state', 'Query string, hash, path', 'Router + searchParams'],
+  ]}
+/>
+
+The most common "state management is hard" pain comes from treating
+**server cache as client state** — putting fetched data in Redux,
+re-fetching by hand, getting stale data after a mutation. Split it
+first, then pick libraries for what's left.
+
+## When Context alone isn't enough
+
+Context is the obvious first step beyond local state:
+
+```tsx
+type ThemeContextValue = { theme: 'dark' | 'light'; toggle: () => void };
+const ThemeContext = createContext<ThemeContextValue | null>(null);
+```
+
+It works fine for **low-frequency** values (theme, auth user, locale).
+The problem is **fanout on change**: every consumer of a context
+re-renders when *any* value in the provider changes, even if they
+only read one field.
+
+```tsx
+// Bad: any cart change re-renders every component that uses the user
+const AppContext = createContext({ user, cart, theme });
+```
+
+Mitigations, in order of effort:
+
+1. **Split the contexts.** One for user, one for cart, one for theme.
+2. **Split state and dispatch.** Two contexts: the value (changes a
+   lot) and the setter (stable forever). Consumers that only dispatch
+   never re-render.
+3. **Reach for a store.** When the shape is naturally one object with
+   many subscribers reading different slices.
+
+## Zustand — minimal external store
+
+```tsx
+import { create } from 'zustand';
+
+type CounterStore = {
+  count: number;
+  increment: () => void;
+  reset: () => void;
+};
+
+export const useCounter = create<CounterStore>((set) => ({
+  count: 0,
+  increment: () => set((s) => ({ count: s.count + 1 })),
+  reset: () => set({ count: 0 }),
+}));
+```
+
+```tsx
+function Display() {
+  const count = useCounter((s) => s.count);     // selector — re-renders only when count changes
+  return <p>{count}</p>;
+}
+
+function Buttons() {
+  const increment = useCounter((s) => s.increment); // function ref is stable
+  return <button onClick={increment}>+</button>;
+}
+```
+
+Why people pick Zustand:
+
+- **No provider** — the store is a module singleton.
+- **Selector-based subscriptions** — components subscribe to slices,
+  not the whole store. Fixes context's fanout problem.
+- **Tiny** (~1 KB). Reads like vanilla React.
+
+The trade-off: no enforced structure. Big Zustand apps need
+discipline (slices pattern, middleware) or they sprawl.
+
+## Jotai — atoms
+
+```tsx
+import { atom, useAtom } from 'jotai';
+
+const countAtom = atom(0);
+const doubledAtom = atom((get) => get(countAtom) * 2);
+
+function Counter() {
+  const [count, setCount] = useAtom(countAtom);
+  const [doubled] = useAtom(doubledAtom);
+  return (
+    <button onClick={() => setCount(count + 1)}>
+      {count} / {doubled}
+    </button>
+  );
+}
+```
+
+Atoms are tiny, independent pieces of state. Derived atoms
+auto-recompute. Subscription granularity is per-atom — no selectors
+to write.
+
+Jotai shines for **diffuse state** (form fields scattered across a
+big page, editor cell values). It struggles when state has strong
+relational structure — Redux is better there.
+
+## Redux Toolkit — for apps that benefit from rigor
+
+```tsx
+import { createSlice, configureStore, type PayloadAction } from '@reduxjs/toolkit';
+
+type CounterState = { value: number };
+
+const counter = createSlice({
+  name: 'counter',
+  initialState: { value: 0 } as CounterState,
+  reducers: {
+    incremented: (s) => { s.value += 1; },           // Immer — looks mutating, isn't
+    incrementedBy: (s, a: PayloadAction<number>) => { s.value += a.payload; },
+  },
+});
+
+export const store = configureStore({
+  reducer: { counter: counter.reducer },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+export const { incremented, incrementedBy } = counter.actions;
+```
+
+```tsx
+import { useSelector, useDispatch } from 'react-redux';
+import type { RootState, AppDispatch } from './store';
+
+function Counter() {
+  const count = useSelector((s: RootState) => s.counter.value);
+  const dispatch = useDispatch<AppDispatch>();
+  return <button onClick={() => dispatch(incremented())}>{count}</button>;
+}
+```
+
+Redux Toolkit's pitch in 2026: not "Redux is fast," but "Redux gives
+you a uniform action log, time-travel debugging, middleware hooks for
+analytics/persistence, and a structure every team member already
+knows." Pick it for large teams or apps where audit and consistency
+matter.
+
+For new small/mid projects, Zustand or Jotai typically win on
+ergonomics.
+
+<Callout variant="warn">
+**Don't put server data in Redux** (or Zustand, or Jotai). That's
+what query libraries are for. You'll end up reinventing caching,
+revalidation, and request deduplication poorly.
+</Callout>
+
+## TanStack Query — server cache, not state
+
+```tsx
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+type User = { id: string; name: string };
+
+function UserPage({ id }: { id: string }) {
+  const { data, isPending, error } = useQuery({
+    queryKey: ['user', id],
+    queryFn: (): Promise<User> => fetch(`/api/users/${id}`).then((r) => r.json()),
+  });
+
+  if (isPending) return <Spinner />;
+  if (error) return <ErrorBox error={error} />;
+  return <h1>{data.name}</h1>;
+}
+```
+
+What you get for free:
+
+- **Deduplication** — two components asking for `['user', id]` make
+  one request.
+- **Cache** — second mount returns instantly from cache, refetches in
+  background.
+- **Stale-while-revalidate** — configurable per-query.
+- **Mutations with invalidation** — change a user, mark the cache
+  stale.
+
+```tsx
+function EditName({ id }: { id: string }) {
+  const qc = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: (name: string) =>
+      fetch(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['user', id] }),
+  });
+  // …
+}
+```
+
+Every project I've seen migrate from "fetch in useEffect + put in
+Redux" to TanStack Query has deleted hundreds of lines of state
+management code. This is usually the **first** library to add, not
+the last.
+
+SWR (`useSWR`) is the same idea with a smaller API surface. Apollo
+and Relay are the same idea bolted onto GraphQL. RTK Query is the
+same idea built into Redux Toolkit.
+
+## URL as state
+
+For anything that should survive a refresh, share via copy-paste, or
+participate in browser history — put it in the URL.
+
+```tsx
+import { useSearchParams } from 'react-router-dom';
+
+function Filters() {
+  const [params, setParams] = useSearchParams();
+  const status = params.get('status') ?? 'all';
+
+  return (
+    <select
+      value={status}
+      onChange={(e) => setParams({ status: e.target.value })}
+    >
+      <option value="all">All</option>
+      <option value="active">Active</option>
+      <option value="archived">Archived</option>
+    </select>
+  );
+}
+```
+
+Pagination, sort order, filters, tabs, opened modals — these almost
+always belong in the URL. The bug-report-friendliness alone is worth
+it: "the page looks wrong, here's the URL" beats "click these six
+things in order."
+
+## The decision tree
+
+<Steps>
+  <Step title="Is it server data?">
+    Use TanStack Query / SWR / RTK Query. Don't put it in a client
+    store.
+  </Step>
+  <Step title="Does it belong in the URL?">
+    Filters, pagination, current tab, opened modal — use the router's
+    search params.
+  </Step>
+  <Step title="Is it used by one component?">
+    `useState`. Done.
+  </Step>
+  <Step title="Used by a few components in the same subtree?">
+    Lift to a common parent. Pass via props or a small context.
+  </Step>
+  <Step title="Used by many components across the tree, with fine-grained reads?">
+    External store: Zustand (minimal), Jotai (atomic), Redux Toolkit
+    (structured + tooling).
+  </Step>
+</Steps>
+
+## Common mistakes
+
+<Compare
+  bad={`// Server data in Redux
+const slice = createSlice({
+  name: 'users',
+  initialState: { list: [], loading: false, error: null },
+  reducers: {
+    fetchStart: (s) => { s.loading = true; },
+    fetchSuccess: (s, a) => { s.list = a.payload; s.loading = false; },
+    fetchFail: (s, a) => { s.error = a.payload; s.loading = false; },
+  },
+});`}
+  good={`// Use a query library
+const { data, isPending, error } = useQuery({
+  queryKey: ['users'],
+  queryFn: fetchUsers,
+});`}
+  language="ts"
+/>
+
+<Compare
+  bad={`// One big context, everyone re-renders on any change
+<AppContext.Provider value={{ user, cart, theme, notifications }}>`}
+  good={`// Split — or move to an external store with selectors
+<UserContext.Provider value={user}>
+  <CartContext.Provider value={cart}>
+    <ThemeContext.Provider value={theme}>`}
+  language="tsx"
+/>
+
+## The discipline
+
+- **Separate server cache from client state.** Different lifecycles,
+  different problems. A query library handles the server side; pick
+  a store for what's left.
+- **Use the URL** for anything shareable or that should survive
+  refresh.
+- Reach for an external store (Zustand/Jotai/RTK) when context's
+  fanout is causing real re-render pain, not preemptively.
+- The library matters less than the architecture. A clean Redux app
+  beats a messy Zustand app and vice versa.
+- Migrate incrementally. You can run TanStack Query and your existing
+  state library side by side — peel off the server data first.
