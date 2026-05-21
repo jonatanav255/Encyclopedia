@@ -1,0 +1,285 @@
+export const level = 'mid';
+
+# Forwarding refs and imperative handle
+
+A ref attached to a function component does nothing by default —
+functions don't have instances. To let a parent grab a child's DOM
+node or invoke methods on it, you need to either **forward the ref**
+(React 18) or **accept it as a prop** (React 19).
+
+## The React 19 way: ref as a prop
+
+In React 19, `ref` is just a prop. Pass it through like any other:
+
+```tsx
+type InputProps = React.InputHTMLAttributes<HTMLInputElement> & {
+  ref?: React.Ref<HTMLInputElement>;
+};
+
+function Input({ ref, ...rest }: InputProps) {
+  return <input ref={ref} {...rest} />;
+}
+
+function Form() {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+  return <Input ref={inputRef} type="text" />;
+}
+```
+
+That's the whole API. No wrapper function, no special component type,
+no second generic parameter.
+
+The shortcut for "this component is a transparent wrapper around a
+DOM element": grab the element's props type directly with
+`ComponentPropsWithRef`:
+
+```tsx
+type InputProps = React.ComponentPropsWithRef<'input'>;
+
+function Input(props: InputProps) {
+  return <input {...props} />;
+}
+```
+
+## The React 18 way: forwardRef
+
+Existing codebases (and some libraries) use `React.forwardRef`. The
+syntax is awkward but the idea is the same:
+
+```tsx
+import { forwardRef } from 'react';
+
+type InputProps = Omit<React.InputHTMLAttributes<HTMLInputElement>, 'ref'>;
+
+const Input = forwardRef<HTMLInputElement, InputProps>(
+  function Input(props, ref) {
+    return <input ref={ref} {...props} />;
+  },
+);
+```
+
+The two generics: **first the element type the ref points to, then
+the props type**. The order trips everyone up; the element type comes
+first because that's what callers see at the use site (`Ref<T>`).
+
+In React 19, `forwardRef` still works — it's not deprecated, just
+unnecessary. New code should use the prop form. Old code should be
+migrated when convenient, not preemptively.
+
+<Callout variant="tip">
+React 19 doesn't auto-migrate `forwardRef` to the prop form for you.
+A codemod (`npx types-react-codemod preset-19`) handles the type
+side; the `forwardRef` calls themselves you migrate manually or with
+ESLint's `react/no-forward-ref` if you enable it.
+</Callout>
+
+## Typing the ref
+
+The ref always points to whatever type its `current` is. The
+ergonomic helpers:
+
+```tsx
+// Reading from a DOM element
+const divRef = useRef<HTMLDivElement>(null);
+
+// Reading from another component's imperative handle
+const playerRef = useRef<VideoPlayerHandle>(null);
+
+// Generic ref accepted by a component
+type Props = { ref?: React.Ref<HTMLDivElement> };
+```
+
+`React.Ref<T>` is the union of all forms a parent might pass:
+`RefObject<T>`, `RefCallback<T>`, or `null`. That's what your
+component should accept.
+
+`React.RefObject<T>` is specifically the `useRef` object form
+(`{ current: T | null }`). Use it when you explicitly want that shape.
+
+`React.MutableRefObject<T>` was the React 18 type for refs you mutate
+yourself (timer IDs, mutable counters). In `@types/react` for
+React 19, `RefObject<T>.current` was made writable by default, so
+the functional difference is gone — `MutableRefObject<T>` still
+exists as a type name but you can reach for `RefObject<T>`
+everywhere now.
+
+## useImperativeHandle — exposing a custom API
+
+Sometimes the parent shouldn't have direct DOM access. Maybe the
+component wraps several DOM nodes and the parent only needs one
+operation ("scroll to bottom"), or maybe the parent's actions should
+go through component state.
+
+`useImperativeHandle` lets you expose a *chosen* API on the ref
+instead of the raw element.
+
+```tsx
+type VideoPlayerHandle = {
+  play: () => void;
+  pause: () => void;
+  seek: (seconds: number) => void;
+};
+
+type VideoPlayerProps = {
+  src: string;
+  ref?: React.Ref<VideoPlayerHandle>;
+};
+
+function VideoPlayer({ src, ref }: VideoPlayerProps) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    play: () => videoRef.current?.play(),
+    pause: () => videoRef.current?.pause(),
+    seek: (s) => { if (videoRef.current) videoRef.current.currentTime = s; },
+  }), []);
+
+  return <video ref={videoRef} src={src} />;
+}
+
+function App() {
+  const playerRef = useRef<VideoPlayerHandle>(null);
+  return (
+    <>
+      <VideoPlayer ref={playerRef} src="/movie.mp4" />
+      <button onClick={() => playerRef.current?.play()}>Play</button>
+      <button onClick={() => playerRef.current?.seek(0)}>Restart</button>
+    </>
+  );
+}
+```
+
+The parent only sees `play`, `pause`, `seek`. The internal `<video>`
+element is invisible. The component can swap implementations
+(switch to a custom HLS player) without changing the parent.
+
+### The deps array on useImperativeHandle
+
+The factory function captures variables from the surrounding render.
+Pass dependencies the same way you would for `useEffect`:
+
+```tsx
+useImperativeHandle(ref, () => ({
+  scrollToItem: (id: string) => {
+    const el = itemRefs.current[id];
+    el?.scrollIntoView({ behavior: 'smooth' });
+  },
+}), []);  // empty: factory references only refs, not state
+```
+
+If the factory reads state, include it in deps or your imperative
+methods will see stale values:
+
+```tsx
+useImperativeHandle(ref, () => ({
+  submit: () => save(formValues),    // captures formValues at this render
+}), [formValues]);
+```
+
+## When NOT to use refs
+
+The React docs are emphatic: **prefer declarative props over
+imperative methods**. If you find yourself reaching for `ref.play()`,
+consider `<VideoPlayer playing={isPlaying} />` instead.
+
+Imperative APIs are right when:
+
+- The operation is **fire-and-forget** with no state to track
+  (focus a field, scroll to top, trigger a download).
+- The action **must happen at a specific moment** unrelated to React
+  state (call `.focus()` after closing a modal).
+- You're integrating with a **non-React library** that exposes
+  methods (a charting lib, a video player SDK).
+
+The smell test: if you'd need to add state to your component just so
+you can pass a prop down, the imperative version is probably the
+right choice.
+
+## Common pitfalls
+
+### Passing a ref through a wrapper
+
+```tsx
+// BAD — the ref is silently ignored
+function FancyInput(props: React.ComponentProps<'input'>) {
+  return (
+    <div className="fancy">
+      <input {...props} />
+    </div>
+  );
+}
+
+const ref = useRef<HTMLInputElement>(null);
+<FancyInput ref={ref} />   // ref is null forever in React 18; type error in 19
+```
+
+The fix: forward it explicitly.
+
+```tsx
+type FancyInputProps = React.ComponentProps<'input'> & {
+  ref?: React.Ref<HTMLInputElement>;
+};
+
+function FancyInput({ ref, ...rest }: FancyInputProps) {
+  return (
+    <div className="fancy">
+      <input ref={ref} {...rest} />
+    </div>
+  );
+}
+```
+
+### Reading a ref during render
+
+```tsx
+function Bad() {
+  const ref = useRef<HTMLDivElement>(null);
+  const width = ref.current?.offsetWidth ?? 0;   // null on first render!
+  return <div ref={ref} style={{ paddingLeft: width }} />;
+}
+```
+
+Refs are set after the DOM is committed, not during render. Read them
+in an effect or event handler:
+
+```tsx
+function Good() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => { setWidth(ref.current?.offsetWidth ?? 0); }, []);
+  return <div ref={ref} style={{ paddingLeft: width }} />;
+}
+```
+
+### Callback refs
+
+The ref can also be a function. React calls it with the element on
+mount and `null` on unmount:
+
+```tsx
+<div
+  ref={(el) => {
+    if (el) measure(el);
+    return () => cleanup(el);   // React 19+: return a cleanup fn
+  }}
+/>
+```
+
+Use this when you need to react to the DOM being attached/detached
+(like calling `ResizeObserver.observe()` at the moment the element
+exists).
+
+## The discipline
+
+- React 19: take `ref` as a regular prop. Reach for `forwardRef` only
+  in 18 codebases.
+- Type DOM refs with the element type (`HTMLInputElement`); type
+  custom handles with your own interface.
+- Use `useImperativeHandle` to expose intentional methods, not the
+  raw element. The handle is your API contract; don't let the parent
+  reach past it.
+- Prefer declarative props over imperative methods. Reach for refs
+  when the action is genuinely "do this thing now, no state needed."
+- Wrappers swallow refs unless explicitly forwarded. If a consumer
+  attaches a ref, your wrapper must pass it through.

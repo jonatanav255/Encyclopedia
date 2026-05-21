@@ -1,0 +1,317 @@
+export const level = 'senior';
+
+# Composition patterns
+
+React has one mechanism for code reuse: **composition**. There's no
+inheritance, no mixins. Every "design pattern" you'll read about —
+compound components, render props, slots, higher-order components —
+is just a different shape of "pass something into a component."
+
+This page covers the four shapes that matter in modern React, in
+roughly the order you should reach for them: **children**, **compound
+components**, **render props**, and **slots**. HOCs get a brief
+appearance at the end as a thing you'll see in older code.
+
+## The mental model
+
+Every reusable component has two parts:
+
+- **Shape it owns** — markup, styles, state, behavior the consumer
+  shouldn't have to think about.
+- **Shape the consumer fills in** — content, layout choices, custom
+  rendering for specific items.
+
+The pattern you pick is just *how* the consumer fills in their part.
+
+## Children: the default
+
+```tsx
+type CardProps = {
+  title: string;
+  children: React.ReactNode;
+};
+
+function Card({ title, children }: CardProps) {
+  return (
+    <section className="card">
+      <h2>{title}</h2>
+      <div className="card-body">{children}</div>
+    </section>
+  );
+}
+
+<Card title="User">
+  <p>Name: Jon</p>
+  <button>Edit</button>
+</Card>
+```
+
+Reach for `children` first. It's the most familiar, has zero typing
+overhead, and works for ~80% of "reusable container" needs.
+
+The limit: `children` is a single hole. When you need multiple holes,
+or when the consumer's content needs context from the parent, you
+need something stronger.
+
+## Compound components
+
+When a component is really a *family* of components that share state,
+expose them as a namespace and wire them up with context.
+
+```tsx
+import { createContext, useContext, useState } from 'react';
+
+type TabsContextValue = {
+  active: string;
+  setActive: (id: string) => void;
+};
+
+const TabsContext = createContext<TabsContextValue | null>(null);
+
+function useTabs() {
+  const ctx = useContext(TabsContext);
+  if (!ctx) throw new Error('Tabs.* must be used inside <Tabs>');
+  return ctx;
+}
+
+type TabsProps = {
+  defaultActive: string;
+  children: React.ReactNode;
+};
+
+export function Tabs({ defaultActive, children }: TabsProps) {
+  const [active, setActive] = useState(defaultActive);
+  return (
+    <TabsContext.Provider value={{ active, setActive }}>
+      <div className="tabs">{children}</div>
+    </TabsContext.Provider>
+  );
+}
+
+function TabList({ children }: { children: React.ReactNode }) {
+  return <div role="tablist">{children}</div>;
+}
+
+function Tab({ id, children }: { id: string; children: React.ReactNode }) {
+  const { active, setActive } = useTabs();
+  return (
+    <button
+      role="tab"
+      aria-selected={active === id}
+      onClick={() => setActive(id)}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Panel({ id, children }: { id: string; children: React.ReactNode }) {
+  const { active } = useTabs();
+  if (active !== id) return null;
+  return <div role="tabpanel">{children}</div>;
+}
+
+Tabs.List = TabList;
+Tabs.Tab = Tab;
+Tabs.Panel = Panel;
+```
+
+```tsx
+<Tabs defaultActive="profile">
+  <Tabs.List>
+    <Tabs.Tab id="profile">Profile</Tabs.Tab>
+    <Tabs.Tab id="settings">Settings</Tabs.Tab>
+  </Tabs.List>
+  <Tabs.Panel id="profile">…</Tabs.Panel>
+  <Tabs.Panel id="settings">…</Tabs.Panel>
+</Tabs>
+```
+
+The consumer sees a coherent API surface (`Tabs.Tab`, `Tabs.Panel`).
+The wiring (which tab is active, what happens on click) is hidden in
+the context. The consumer can put anything between the tabs and
+panels — wrappers, dividers, search inputs — without breaking the
+parent's state model.
+
+This is the pattern Radix, Headless UI, and React Aria use for every
+composite widget.
+
+<Callout variant="tip">
+The `throw new Error` in `useTabs()` turns "forgot the provider" from
+a confusing render-time crash into an obvious error. Always assert on
+context that's required to be present.
+</Callout>
+
+## Render props
+
+When you need to share *behavior* and let the consumer render
+whatever they want with the result:
+
+```tsx
+type MouseProps = {
+  children: (state: { x: number; y: number }) => React.ReactNode;
+};
+
+function Mouse({ children }: MouseProps) {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  return (
+    <div
+      onMouseMove={(e) => setPos({ x: e.clientX, y: e.clientY })}
+      className="h-full w-full"
+    >
+      {children(pos)}
+    </div>
+  );
+}
+
+<Mouse>
+  {({ x, y }) => <p>({x}, {y})</p>}
+</Mouse>
+```
+
+The pattern: `children` is a function. The component computes some
+state and calls `children(state)` to let the consumer render.
+
+In 2018, render props were the canonical way to share stateful
+behavior. **Custom hooks largely replaced them** — `useMouse()` does
+the same thing without the awkward function-as-child syntax. But
+render props still beat hooks when:
+
+- The behavior must own DOM (like a measurement wrapper that needs a
+  containing element).
+- You want the consumer to receive multiple values and choose where
+  each one renders.
+- You're authoring a headless library where the boundary between
+  "behavior" and "markup" needs to be explicit at the JSX level.
+
+```tsx
+// Behavior tied to a DOM node — render prop is natural
+type SizeProps = {
+  children: (size: { width: number; height: number }) => React.ReactNode;
+};
+
+function Measure({ children }: SizeProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize({ width, height });
+    });
+    ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, []);
+
+  return <div ref={ref}>{children(size)}</div>;
+}
+```
+
+## Slots (the `asChild` pattern)
+
+The Radix-style alternative to wrapping. Instead of rendering its own
+element, a component clones its child and merges props onto it:
+
+```tsx
+type SlotProps = {
+  asChild?: boolean;
+  children: React.ReactNode;
+} & React.ButtonHTMLAttributes<HTMLButtonElement>;
+
+function Button({ asChild, children, ...props }: SlotProps) {
+  if (asChild && React.isValidElement(children)) {
+    const childProps = children.props as Record<string, unknown>;
+    return React.cloneElement(children, {
+      ...childProps,
+      ...props,                                       // parent props win
+      className: [childProps.className, props.className].filter(Boolean).join(' '),
+    });
+  }
+  return <button {...props}>{children}</button>;
+}
+
+<Button>Save</Button>                            {/* renders <button> */}
+<Button asChild>
+  <a href="/settings">Settings</a>               {/* renders <a> with button styles */}
+</Button>
+```
+
+Two wins:
+
+1. **No wrapper div.** A "Button that's actually a link" gets the
+   link semantics (right-click → open in tab, keyboard, screen
+   readers) without a sneaky `<button><a></a></button>` nest.
+2. **No `as` prop typing hell.** Polymorphic `as`-prop components
+   are notoriously hard to type (see **Polymorphic components**).
+   Slots sidestep it by saying "you pass the element you want."
+
+The naive merge above is a teaching example — even concatenating
+`className` is only half the job. Production-grade implementations
+(Radix's `<Slot>`) handle event merging (call both the child's and
+the parent's `onClick`), ref forwarding, `data-*` precedence, and
+the full ARIA story. Use `@radix-ui/react-slot` rather than rolling
+your own once you need those.
+
+## Higher-order components (legacy)
+
+A function that takes a component and returns a new one:
+
+```tsx
+function withLogging<P extends object>(
+  Component: React.ComponentType<P>,
+): React.ComponentType<P> {
+  return function Wrapped(props: P) {
+    useEffect(() => {
+      console.log('mounted:', Component.displayName ?? Component.name);
+    }, []);
+    return <Component {...props} />;
+  };
+}
+
+const LoggedButton = withLogging(Button);
+```
+
+HOCs were the dominant pattern before hooks. They have well-known
+problems: prop collisions, wrapper hell in DevTools, type erasure of
+`displayName`/`ref`/static methods. **In new code, write a custom
+hook instead** (`useLogging()` called from inside the component).
+
+You'll still encounter HOCs in:
+
+- Older Redux (`connect()`), older React Router (`withRouter`).
+- Library APIs that pre-date hooks (some animation libraries).
+- Auth wrappers (`withAuth(Page)`) — sometimes still preferred
+  because the wrapper can also gate rendering.
+
+When you see an HOC in a new codebase, ask whether a hook would be
+cleaner. Usually the answer is yes.
+
+## Picking between them
+
+<Cheatsheet
+  columns={['Need', 'Pattern']}
+  rows={[
+    ['Single content hole', 'children'],
+    ['Multiple named holes / shared state', 'Compound components'],
+    ['Share state + consumer renders freely', 'Custom hook (1st choice)'],
+    ['Same, but behavior is tied to DOM', 'Render props'],
+    ['Change the rendered element without a wrapper', 'Slot / asChild'],
+    ['Decorate a component (legacy)', 'HOC — prefer a hook'],
+  ]}
+/>
+
+## The discipline
+
+- Default to `children`. Reach for fancier patterns only when it bends.
+- Use compound components when a family of components shares state.
+  Use context for the wiring; assert on the provider in the hook.
+- Hooks replaced render props for most use cases. Render props still
+  win when behavior must own a DOM node.
+- Slots beat polymorphic `as` props when the consumer needs to swap
+  the rendered element.
+- HOCs are mostly legacy. Write a hook unless you specifically need
+  the wrapper to gate rendering.
+- Whatever pattern you pick, the rule is the same: the component owns
+  the hard part; the consumer fills in the easy part. If the consumer
+  is doing the hard part, the abstraction is wrong.

@@ -380,5 +380,53 @@ export const bank: QuestionBank = {
       answer:
         'It blocks a generic parameter from being inferred at one position while still letting it be inferred elsewhere. `pick<K extends string>(options: K[], chosen: K): K` lets `K` widen from both arguments — `pick([\'a\',\'b\'], \'d\')` widens K to `\'a\'|\'b\'|\'d\'` and the typo passes. Change to `chosen: NoInfer<K>` and `K` is inferred only from `options`; `chosen` is checked as a constraint. Common uses: default-value parameters that should match an inferred union, callback signatures that should match an earlier argument, config builders where one arg is the source of truth.',
     },
+
+    // --- typing react props/children ---
+    {
+      level: 'junior',
+      question: 'When typing a component\'s `children` prop, which type should you reach for?',
+      answer:
+        '`React.ReactNode`, almost always. It accepts strings, numbers, JSX elements, arrays, fragments, `null`, `undefined`, and booleans — everything you can render. The narrower types (`ReactElement`, `JSX.Element`) reject text-only children, multiple-children-as-fragment, and `null`, which usually isn\'t what you want. Reach for `ReactElement` only when you need a single element to `React.cloneElement` or inspect. `React.PropsWithChildren<T>` is the shorthand for "T plus optional children" if you prefer.',
+    },
+    {
+      level: 'mid',
+      question: 'How do you build a wrapper component that accepts every prop of `<button>` plus a `variant`?',
+      answer:
+        '```ts\ntype ButtonProps = {\n  variant?: \'primary\' | \'secondary\';\n} & React.ComponentPropsWithoutRef<\'button\'>;\n```\n\n`ComponentPropsWithoutRef<\'button\'>` includes every HTML attribute, every event handler, every aria/data attribute — correctly typed with `type`, `disabled`, `form`, `onClick`, etc. Beats redeclaring a subset (which loses `data-*`, `aria-*`, the full event types). The `WithoutRef` variant skips the ref prop (use `WithRef` if you\'re handling refs in the type). For non-element components, `React.ComponentProps<typeof OtherComponent>` pulls in another component\'s props the same way.',
+    },
+    {
+      level: 'mid',
+      question: 'Why do most React-TS style guides now recommend against `React.FC`?',
+      answer:
+        'Three reasons. **(1)** `React.FC` used to implicitly add an optional `children` prop, which silently broke when components that shouldn\'t accept children were updated to `@types/react` 18 (which removed the implicit `children`). **(2)** Generics on `React.FC<Props>` are awkward — you can\'t mix `<T>` parameters into the function signature cleanly. **(3)** A plain function with a typed parameter is shorter, infers defaults correctly, and gives nicer hover types: `function Greet({ name }: { name: string })` is more idiomatic than `const Greet: React.FC<{ name: string }> = ({ name }) => ...`. Not wrong, just unnecessary.',
+    },
+
+    // --- typing hooks ---
+    {
+      level: 'mid',
+      question: 'When does `useState` need an explicit type annotation?',
+      answer:
+        'When the initial value is **narrower** than the values the state can ever hold. Two common cases: (1) `useState(null)` — TS infers `null`, then `setUser(realUser)` fails. Annotate `useState<User | null>(null)`. (2) `useState([])` — TS infers `never[]`, then `setItems([x])` fails. Annotate `useState<Item[]>([])`. For "the initial value is what you\'ll always use" (`useState(0)`, `useState(\'\')`), inference is fine and explicit annotation is noise.',
+    },
+    {
+      level: 'mid',
+      question: 'How do you make `useContext` not return `undefined` everywhere?',
+      answer:
+        'Wrap `useContext` in a custom hook that asserts the provider exists, and export only the hook (not the context):\n\n```ts\nconst ThemeContext = createContext<Theme | null>(null);\n\nexport function useTheme(): Theme {\n  const ctx = useContext(ThemeContext);\n  if (!ctx) throw new Error(\'useTheme: missing <ThemeProvider>\');\n  return ctx;\n}\n```\n\nThe context\'s default is `null`, so any code that uses the raw context still has to null-check, but consumers only use `useTheme()` and get a non-null `Theme`. The throw turns "forgot the provider" from a confusing runtime crash into an obvious error message. This is the canonical TS+React context pattern.',
+    },
+    {
+      level: 'senior',
+      question: 'Why use a discriminated-union return type from a data-fetching hook instead of `{ data, error, isLoading }`?',
+      answer:
+        'Because `{ data, error, isLoading }` lets consumers do nonsense like access `data.name` while `isLoading` is true (TS sees `data: T | undefined` and forces optional chaining, but doesn\'t prevent it).\n\n```ts\ntype FetchState<T> =\n  | { status: \'loading\' }\n  | { status: \'success\'; data: T }\n  | { status: \'error\'; error: Error };\n```\n\nNow `if (state.status === \'success\') state.data.name` narrows correctly, and you literally cannot access `data` outside the success branch. The compiler enforces "you may only render data after you\'ve checked you have data." This is the single biggest API-design win from TS in React code.',
+    },
+
+    // --- as const satisfies (companion to the satisfies questions above) ---
+    {
+      level: 'senior',
+      question: 'What does `as const satisfies T` give you that either alone doesn\'t?',
+      answer:
+        '`as const` freezes the value as deeply-readonly literals (`{ readonly mode: \'dark\' }`) but doesn\'t check it against any type. `satisfies T` checks against the type while keeping the inferred (still-widened) value type. Combining them: **frozen, narrow, AND validated**. Canonical use is config/routes/enums-as-objects: `const routes = { home: { path: \'/\' }, profile: { path: \'/profile\' } } as const satisfies Record<string, { path: string }>`. You get `keyof typeof routes` = `\'home\' | \'profile\'` (precise key union), every `path` typed as its literal string, and a compile error if you forget to add `path` to a new route. The four-way matrix: annotation = check + widen, `as` = no check + widen, `satisfies` = check + narrow, `as const satisfies` = check + readonly narrow.',
+    },
   ],
 };

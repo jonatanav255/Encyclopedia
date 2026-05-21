@@ -1,0 +1,299 @@
+export const level = 'mid';
+
+# useOptimistic and useFormStatus
+
+React 19 ships three hooks that, together, replace 90% of the manual
+form plumbing of React 18: `useActionState` (covered in
+**Suspense and transitions**), `useFormStatus`, and `useOptimistic`.
+
+This page covers the latter two. They're independently useful and
+compose naturally with form actions.
+
+## useFormStatus — pending state for form children
+
+The problem `useFormStatus` solves: a deeply nested submit button
+wants to know "is the parent form currently submitting?" without prop
+drilling.
+
+```tsx
+import { useFormStatus } from 'react-dom';
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Saving…' : 'Save'}
+    </button>
+  );
+}
+
+function ProfileForm() {
+  return (
+    <form action={updateProfile}>
+      <input name="name" />
+      <input name="email" />
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+`useFormStatus` reads the state of the **nearest parent `<form>`**.
+The button doesn't take any props from the form; the connection is
+implicit through the DOM tree.
+
+The full return value:
+
+```tsx
+type FormStatus = {
+  pending: boolean;
+  data: FormData | null;        // the FormData being submitted, or null
+  method: 'get' | 'post' | null;
+  action: ((formData: FormData) => void | Promise<void>) | string | null;
+};
+```
+
+`data` is useful for showing what's in flight:
+
+```tsx
+function PendingPreview() {
+  const { pending, data } = useFormStatus();
+  if (!pending || !data) return null;
+  return <p>Saving "{data.get('name')?.toString()}"…</p>;
+}
+```
+
+### The rule that bites
+
+`useFormStatus` does **not** track the form it's called from. It
+tracks the **parent** form. So this returns `pending: false` forever:
+
+<Compare
+  bad={`function Form() {
+  const { pending } = useFormStatus();   // reads PARENT form (none), always false
+  return <form action={save}><button>Save</button></form>;
+}`}
+  good={`function SubmitButton() {
+  const { pending } = useFormStatus();   // reads the <form> above
+  return <button>{pending ? 'Saving…' : 'Save'}</button>;
+}
+
+function Form() {
+  return <form action={save}><SubmitButton /></form>;
+}`}
+  language="tsx"
+/>
+
+The hook has to be inside a component that is itself rendered inside
+a `<form>`. Same component as the `<form>` tag = no parent form = no
+status.
+
+## useOptimistic — show the future, roll back on failure
+
+The pattern: when the user submits something, immediately render the
+result as if it succeeded. If the server confirms, nothing visible
+happens. If it fails, React automatically rolls back to the real
+state.
+
+```tsx
+'use client';
+import { useOptimistic } from 'react';
+
+type Message = { id: string; text: string; sending?: boolean };
+
+function Thread({
+  messages,
+  sendMessage,
+}: {
+  messages: Message[];
+  sendMessage: (text: string) => Promise<void>;
+}) {
+  const [optimistic, addOptimistic] = useOptimistic(
+    messages,
+    (current, newText: string): Message[] => [
+      ...current,
+      { id: `tmp-${Date.now()}`, text: newText, sending: true },
+    ],
+  );
+
+  async function action(formData: FormData) {
+    const text = formData.get('text')?.toString() ?? '';
+    addOptimistic(text);
+    await sendMessage(text);
+  }
+
+  return (
+    <>
+      <ul>
+        {optimistic.map((m) => (
+          <li key={m.id} style={{ opacity: m.sending ? 0.5 : 1 }}>
+            {m.text}
+          </li>
+        ))}
+      </ul>
+      <form action={action}>
+        <input name="text" />
+        <button>Send</button>
+      </form>
+    </>
+  );
+}
+```
+
+The signature:
+
+```tsx
+const [optimisticState, addOptimistic] = useOptimistic(
+  realState,
+  reducer,    // (current, action) => next
+);
+```
+
+What React does:
+
+1. You call `addOptimistic(action)` from inside a transition (an
+   action function counts).
+2. React applies your reducer to compute the optimistic state.
+3. The component renders the optimistic state.
+4. When the action finishes (success or failure), `realState`
+   becomes whatever the parent passed in. The optimistic state is
+   automatically discarded.
+
+The crucial invariant: **`addOptimistic` only persists for the
+duration of the action**. When the action returns, you're back to
+whatever `realState` is at that moment. If your server returned the
+new message, the parent passes it down → `realState` includes it →
+visible. If the server failed, the parent doesn't update → optimistic
+update vanishes → original state visible again. No manual rollback.
+
+## Composing them
+
+A realistic form combines all three React 19 hooks. The action
+returns the new server state, `useActionState` tracks errors,
+`useOptimistic` shows the change immediately, `useFormStatus` runs
+the spinner.
+
+```tsx
+'use client';
+import { useActionState, useOptimistic } from 'react';
+import { useFormStatus } from 'react-dom';
+
+type Todo = { id: string; text: string; done: boolean };
+
+async function addTodoAction(
+  state: { todos: Todo[]; error: string | null },
+  formData: FormData,
+): Promise<{ todos: Todo[]; error: string | null }> {
+  const text = formData.get('text')?.toString().trim() ?? '';
+  if (!text) return { todos: state.todos, error: 'Text is required' };
+
+  const res = await fetch('/api/todos', { method: 'POST', body: text });
+  if (!res.ok) return { todos: state.todos, error: 'Server error' };
+
+  const created = (await res.json()) as Todo;
+  return { todos: [...state.todos, created], error: null };
+}
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return <button disabled={pending}>{pending ? '…' : 'Add'}</button>;
+}
+
+export function TodoList({ initialTodos }: { initialTodos: Todo[] }) {
+  const [state, formAction] = useActionState(addTodoAction, {
+    todos: initialTodos,
+    error: null,
+  });
+
+  const [optimisticTodos, addOptimistic] = useOptimistic(
+    state.todos,
+    (current, text: string): Todo[] => [
+      ...current,
+      { id: `tmp-${Date.now()}`, text, done: false },
+    ],
+  );
+
+  return (
+    <form
+      action={(fd) => {
+        const text = fd.get('text')?.toString() ?? '';
+        addOptimistic(text);
+        return formAction(fd);
+      }}
+    >
+      <ul>
+        {optimisticTodos.map((t) => (
+          <li key={t.id}>{t.text}</li>
+        ))}
+      </ul>
+      <input name="text" />
+      <SubmitButton />
+      {state.error && <p role="alert">{state.error}</p>}
+    </form>
+  );
+}
+```
+
+Three independent concerns, three hooks. None of them care about the
+others' state.
+
+## When NOT to use optimistic updates
+
+Optimistic UI is a trust statement: "I'm so confident this will
+succeed that I'll show the result before I know." Bad fits:
+
+- **Destructive operations.** Deleting an email and then putting it
+  back when the delete failed is jarring.
+- **Money.** A bank transfer that appears to succeed and then doesn't
+  is a support ticket.
+- **Operations with server-side validation you can't replicate.**
+  If the server might reject for reasons your client can't predict,
+  the rollback rate will be high.
+- **Slow operations.** A 30-second upload showing as "done" for 29
+  seconds and then failing trains users to distrust the UI.
+
+Good fits: likes, follows, adding items to a list, marking todos
+done, sending chat messages, voting. Things that fail rarely and
+where the rollback is gentle.
+
+## A note on the `sending` flag
+
+The example used `sending?: boolean` on the optimistic item. This is
+optional but useful for two things:
+
+1. **Distinguishing optimistic items in the UI** (the dimmed style).
+2. **Preventing user actions on items that don't exist yet.** Don't
+   let the user click "edit" on a message that hasn't been
+   acknowledged — your edit endpoint won't know the ID.
+
+```tsx
+<li key={m.id}>
+  {m.text}
+  {!m.sending && <button onClick={() => edit(m.id)}>Edit</button>}
+</li>
+```
+
+## Cheat sheet
+
+<Cheatsheet
+  columns={['Hook', 'Where', 'Reads', 'For']}
+  rows={[
+    ['useFormStatus', 'Child of <form>', 'Parent form\'s pending state', 'Submit button, spinners'],
+    ['useOptimistic', 'Anywhere', 'Real state + optimistic overlay', 'Show changes before server confirms'],
+    ['useActionState', 'Anywhere', 'Last action result + error', 'Form-level state + validation'],
+  ]}
+/>
+
+## The discipline
+
+- `useFormStatus` reads the **parent** form. Always put it in a child
+  component.
+- `useOptimistic` is automatic rollback. Don't write try/catch
+  rollback logic by hand — pass the new state through the parent and
+  let the hook reset.
+- The optimistic value only lives during the action. The reducer must
+  produce a state that's safe to render briefly and forget.
+- Don't use optimistic UI for destructive or financial actions, or
+  anywhere the rollback would be more surprising than a spinner.
+- All three React 19 form hooks compose. You can adopt them
+  individually — `useFormStatus` is the lowest-risk starting point.

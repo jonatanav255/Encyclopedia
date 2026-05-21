@@ -1,0 +1,271 @@
+export const level = 'staff';
+
+# useSyncExternalStore and tearing
+
+`useSyncExternalStore` is the API React provides for **subscribing
+component state to data that lives outside React** — a Redux store, a
+browser API like `matchMedia`, `localStorage`, the online/offline
+status. It exists specifically to make these subscriptions safe under
+concurrent rendering.
+
+If you've never written `useSyncExternalStore`, you've still benefited
+from it — Zustand, Redux v8+, and Apollo all use it under the hood.
+(Jotai is a notable exception: it intentionally uses
+`useReducer`/`useEffect` to stay compatible with `useTransition`,
+which `useSyncExternalStore` opts out of.)
+
+## What problem it solves
+
+Before concurrent rendering, a single update propagated through the
+tree top to bottom in one pass. There was exactly one moment where
+the whole tree saw the new state.
+
+React 18+ can **pause and resume** renders. A render started at time
+T can finish at time T+50ms. If an external store changes during
+that gap, parts of the tree rendered before the change show old
+values; parts rendered after show new values. The result on screen
+is inconsistent. This is called **tearing**.
+
+```tsx
+// External store
+let count = 0;
+const listeners = new Set<() => void>();
+function increment() {
+  count += 1;
+  listeners.forEach((l) => l());
+}
+
+// Naive subscription with useState + useEffect
+function Counter() {
+  const [c, setC] = useState(count);
+  useEffect(() => {
+    const fn = () => setC(count);
+    listeners.add(fn);
+    return () => { listeners.delete(fn); };
+  }, []);
+  return <p>{c}</p>;
+}
+```
+
+In concurrent mode, two `<Counter />` instances rendering in the same
+transaction can disagree about `count`. One reads the snapshot
+before `increment()` fires, the other reads after.
+
+## The fix: useSyncExternalStore
+
+```tsx
+import { useSyncExternalStore } from 'react';
+
+function subscribe(callback: () => void) {
+  listeners.add(callback);
+  return () => { listeners.delete(callback); };
+}
+
+function getSnapshot() {
+  return count;
+}
+
+function Counter() {
+  const c = useSyncExternalStore(subscribe, getSnapshot);
+  return <p>{c}</p>;
+}
+```
+
+The three pieces:
+
+- **`subscribe(cb)`** — wires `cb` up to fire whenever the store
+  changes. Returns an unsubscribe function.
+- **`getSnapshot()`** — returns the current value, synchronously.
+- **`getServerSnapshot()`** (optional 3rd arg) — same, for SSR. If
+  omitted on the server, React errors.
+
+React calls `getSnapshot()` at the start of every render and
+guarantees the whole tree sees the **same value** for the whole pass.
+If the store changes mid-render, React re-renders from scratch.
+
+## The snapshot identity rule
+
+The most common bug: returning a new object every call.
+
+```tsx
+// BAD — new object every render, infinite loop
+function getSnapshot() {
+  return { count, name };
+}
+```
+
+React detects "did the snapshot change?" with `Object.is`. A fresh
+object is never `Object.is`-equal to the previous one, so React
+thinks the store changed every render → re-render → fresh object →
+infinite loop. React logs `Warning: The result of getSnapshot should
+be cached to avoid an infinite loop` as a warning — it doesn't stop
+the loop, you still freeze the tab.
+
+The fix: return a stable reference. Either cache it in the store, or
+**subscribe to a slice with `useSyncExternalStoreWithSelector`**:
+
+```tsx
+import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/with-selector';
+
+const state = useSyncExternalStoreWithSelector(
+  subscribe,
+  () => store.getState(),
+  () => store.getState(),     // server snapshot
+  (s) => ({ count: s.count, name: s.name }),
+  shallowEqual,
+);
+```
+
+The selector + equality function lets the store hold the full state
+object stably while the component picks out only the slice it cares
+about, with a custom equality check.
+
+This is what Redux's `useSelector` does internally.
+
+## Browser APIs as external stores
+
+The real-world use case in app code (not library code) is wrapping
+browser APIs.
+
+### `matchMedia`
+
+```tsx
+export function useMediaQuery(query: string): boolean {
+  const subscribe = useCallback(
+    (callback: () => void) => {
+      const mql = window.matchMedia(query);
+      mql.addEventListener('change', callback);
+      return () => mql.removeEventListener('change', callback);
+    },
+    [query],
+  );
+
+  const getSnapshot = useCallback(
+    () => window.matchMedia(query).matches,
+    [query],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+}
+
+// usage
+function Layout() {
+  const isMobile = useMediaQuery('(max-width: 640px)');
+  return isMobile ? <MobileNav /> : <DesktopNav />;
+}
+```
+
+The `useCallback`s matter: `useSyncExternalStore` re-subscribes
+whenever the `subscribe` reference changes. If you defined
+`subscribe` inline, every render would unsubscribe and resubscribe.
+
+### Online status
+
+```tsx
+function subscribeOnline(callback: () => void) {
+  window.addEventListener('online', callback);
+  window.addEventListener('offline', callback);
+  return () => {
+    window.removeEventListener('online', callback);
+    window.removeEventListener('offline', callback);
+  };
+}
+
+export function useOnlineStatus(): boolean {
+  return useSyncExternalStore(
+    subscribeOnline,
+    () => navigator.onLine,
+    () => true,
+  );
+}
+```
+
+### `localStorage` (with `storage` events)
+
+```tsx
+function subscribeStorage(callback: () => void) {
+  window.addEventListener('storage', callback);
+  return () => window.removeEventListener('storage', callback);
+}
+
+export function useLocalStorage<T>(key: string, fallback: T): T {
+  return useSyncExternalStore(
+    subscribeStorage,
+    () => {
+      const raw = window.localStorage.getItem(key);
+      return raw === null ? fallback : (JSON.parse(raw) as T);
+    },
+    () => fallback,
+  );
+}
+```
+
+The `storage` event fires only for changes from **other tabs**, not
+the current one. For same-tab writes, broadcast manually or use the
+`BroadcastChannel` API.
+
+<Callout variant="warn">
+The `useLocalStorage` snippet above parses JSON on every render. In
+real code, cache the parsed value and invalidate on the `storage`
+event, otherwise you'll pay a JSON.parse on each component render.
+</Callout>
+
+## When NOT to use it
+
+Don't reach for `useSyncExternalStore` when:
+
+- The data is owned by React — use `useState`/`useReducer`.
+- You're storing UI state across components — use a state library
+  that already wraps `useSyncExternalStore`, not the raw API.
+- The "subscription" is to a fetch — use a query library
+  (TanStack Query, SWR). These are not external stores; they're
+  caches of remote data.
+
+`useSyncExternalStore` is a low-level primitive. Most app code never
+calls it directly.
+
+## SSR and hydration
+
+If the page server-renders, you must provide the third argument
+(`getServerSnapshot`). The contract: the snapshot returned on the
+server **must match the first snapshot returned on the client**, or
+hydration errors fire.
+
+For browser-only APIs, the server snapshot is whatever default makes
+sense:
+
+```tsx
+useSyncExternalStore(
+  subscribeOnline,
+  () => navigator.onLine,
+  () => true,           // assume online on the server — first client paint will correct if wrong
+);
+```
+
+A mismatch logs a hydration error and the client snapshot wins. For
+APIs where being wrong for one frame matters (theme, locale), pass
+them as initial props from the server instead.
+
+## Quick checklist
+
+<Cheatsheet
+  columns={['Symptom', 'Cause', 'Fix']}
+  rows={[
+    ['"getSnapshot should be cached" warning', 'Returning fresh object', 'Cache in the store, or use the with-selector variant'],
+    ['Hydration mismatch on mount', 'Server snapshot ≠ first client snapshot', 'Pass real initial value via props, or accept the flash'],
+    ['Components disagree about value', 'You used useEffect+useState instead of useSyncExternalStore', 'Switch to useSyncExternalStore'],
+    ['No re-render on store change', 'subscribe() doesn\'t actually call the callback', 'Verify the event you\'re listening on'],
+  ]}
+/>
+
+## The discipline
+
+- **Don't roll your own subscriptions** to an external store with
+  `useEffect` + `useState` — that's the API that exists to prevent
+  tearing, use it.
+- Return a stable snapshot. If your store doesn't already cache
+  objects, use the with-selector variant.
+- Always pass `getServerSnapshot` if you SSR.
+- Most of the time you'll use a library that wraps this — Zustand,
+  Redux, Jotai. You'll only write `useSyncExternalStore` directly
+  when bridging a browser API or a non-React data source.

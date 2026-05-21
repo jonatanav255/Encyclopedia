@@ -258,5 +258,77 @@ export const bank: QuestionBank = {
       answer:
         '**1. Open the React DevTools Profiler.** Record an interaction. Look at the flamegraph for slow components (long render bars) and components rendering when they shouldn\'t (highlight "rendered" without prop change). The "Ranked" view shows worst offenders.\n\n**2. Common culprits**:\n- **Unnecessary re-renders**: inline objects/functions passed as props defeating `React.memo`. Stabilize with `useMemo`/`useCallback` or hoist outside the component.\n- **Large list re-rendering**: every item re-renders on any state change. Memoize each row (`React.memo(Row)`) with stable item refs.\n- **Context overuse**: a context value at the root causes every consumer to re-render on any change. Split into smaller contexts or use a selector-based state library.\n- **Heavy synchronous work in render**: filter/sort of huge arrays on every render. Move to `useMemo` with stable deps.\n- **Effects firing on every render**: missing `useEffect` dep array or unstable deps.\n\n**3. Concurrent features for "unavoidable" slowness**:\n- `useTransition` for state updates that trigger expensive renders.\n- `useDeferredValue` to lag a value (search input → list filter).\n- `Suspense` boundaries for code-splitting heavy components.\n\n**4. Long lists**: virtualize with `@tanstack/react-virtual` or `react-window`. Only render visible rows.\n\n**5. Network**: if lag is "click → 500ms wait for data," that\'s a data-fetching problem. TanStack Query with optimistic mutations makes interactions feel instant.\n\n**6. Profiler in production builds**: dev mode is slower; always profile a production build for real numbers.\n\nThe most common root cause: prop instability defeating memoization. The fastest fix: profile, find one hot component, stabilize its inputs.',
     },
+
+    // --- composition patterns ---
+    {
+      level: 'mid',
+      question: 'What\'s a compound component, and why use one instead of a configuration prop?',
+      answer:
+        'A **compound component** is a family of components that share state through context — `<Tabs>` with `<Tabs.List>`, `<Tabs.Tab>`, `<Tabs.Panel>`. The parent owns "which tab is active"; the children read it through a context. Compared to a config-prop API (`<Tabs items={[{ id, label, content }]} />`), compound components let the consumer interleave arbitrary markup between tabs and panels (a search input, a divider, an icon) without the parent component needing to know about every variation. The wiring is hidden, the layout is open. Radix, Headless UI, and React Aria all use this pattern for composite widgets.',
+    },
+    {
+      level: 'senior',
+      question: 'Render props vs custom hooks — when does the render-prop pattern still win?',
+      answer:
+        'When the behavior is **tied to a DOM node**. A `<Measure>` component that uses `ResizeObserver` on a wrapper element naturally takes the form `<Measure>{({ width }) => ...}</Measure>` — the consumer\'s content needs to live inside the measured wrapper. A hook (`const { ref, width } = useMeasure()`) requires the consumer to wire the `ref` to the right element. For pure behavior (`useToggle`, `useDebounce`, `useLocalStorage`), hooks are cleaner. Render props also win for headless libraries where the boundary between "behavior" and "markup" needs to be explicit at the JSX level for type clarity.',
+    },
+
+    // --- state management libraries ---
+    {
+      level: 'mid',
+      question: 'You\'re building a SaaS app. Where does your fetched API data belong?',
+      answer:
+        'In a **server-cache library** — TanStack Query, SWR, RTK Query — not in Redux/Zustand/context. Server data has its own lifecycle: stale-while-revalidate, refetch on focus, deduplication, cache invalidation on mutation. Building those features yourself in client-state stores reinvents the wheel poorly. The split is: server cache for remote data, client state library for UI state (modals, drafts, cross-component flags), URL for shareable state (filters, pagination, current tab). The first library to add to a new project is almost always TanStack Query, not Redux.',
+    },
+    {
+      level: 'senior',
+      question: 'Context is causing too many re-renders. What are your options, in order?',
+      answer:
+        '**1. Split the context.** One per concern (user, cart, theme). Consumers of `theme` no longer re-render when `cart` changes.\n\n**2. Split state and dispatch.** Two contexts in one provider: the value (changes often) and the setter (stable forever). Components that only call `dispatch` never re-render.\n\n**3. Memoize the value object.** `<Ctx.Provider value={useMemo(() => ({ user, setUser }), [user])}>`. Prevents a new object every render.\n\n**4. Move to a store with selectors.** Zustand, Jotai, Redux. Components subscribe to specific slices via selectors and only re-render when *their* slice changes. This is the right answer once you have many consumers reading different fields from one large value — context fundamentally can\'t do fine-grained subscriptions.',
+    },
+
+    // --- useSyncExternalStore ---
+    {
+      level: 'staff',
+      question: 'What is "tearing" in React 18+, and what API fixes it?',
+      answer:
+        '**Tearing** is when different parts of the UI render with different values for the same external state, because concurrent rendering can pause and resume. A component rendered before the store changed sees the old value; one rendered after sees the new value. The result is visually inconsistent.\n\n`useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot?)` fixes it. React guarantees the whole tree sees the same snapshot for a given render pass, even under concurrent rendering. If the store changes mid-render, React restarts the render with the new snapshot. This is why Redux v8+ and Zustand moved to `useSyncExternalStore` internally — the old "subscribe in useEffect, setState on change" pattern is unsafe under concurrent rendering. (Jotai is the notable holdout — it sticks with `useReducer`/`useEffect` because `useSyncExternalStore` deopts out of `useTransition` time-slicing.)\n\nMost app code uses libraries that wrap it. You\'d write it directly only when bridging a browser API (`matchMedia`, online/offline, `localStorage` with `storage` events) or non-React data source.',
+    },
+
+    // --- useOptimistic / useFormStatus ---
+    {
+      level: 'mid',
+      question: 'How does `useOptimistic` differ from manually managing a "pending" state?',
+      answer:
+        '`useOptimistic` is **automatic rollback**. You provide a reducer `(current, action) => next`; React renders the optimistic state during the action and reverts to the real state when the action finishes. If the action succeeds and the parent updates real state to match, the transition is seamless. If it fails, the optimistic value disappears and the original state is visible again — no manual try/catch rollback. The mental model: `useOptimistic` only persists for the duration of the action. Outside that window, you always see the truth.',
+    },
+    {
+      level: 'mid',
+      question: 'Why does `useFormStatus()` return `pending: false` inside the form component itself?',
+      answer:
+        '`useFormStatus` reads the **parent** form\'s state, not the form it\'s called from. If you call it in the same component that renders `<form>`, there\'s no parent form above and it returns `pending: false` forever. The fix is to move the hook into a child component (`<SubmitButton>`) that renders inside the `<form>`. This is intentional — it means children can read form status without prop drilling, but it bites everyone the first time they use it.',
+    },
+
+    // --- forwarding refs / useImperativeHandle ---
+    {
+      level: 'mid',
+      question: 'A consumer passes a ref to your wrapper component and it\'s always null. What\'s wrong?',
+      answer:
+        '**Refs don\'t pass through automatically.** A function component receives a `ref` either as a regular prop (React 19) or via `forwardRef` (React 18). If your component doesn\'t explicitly forward the ref to the underlying DOM element, the ref is silently dropped (React 18) or rejected by TypeScript (React 19). Fix: in React 19, accept `ref` as a prop and pass it to the element; in React 18, wrap the component in `forwardRef`. Either way, the underlying `<input>` (or whatever) needs `ref={ref}` for the consumer\'s ref to point at something real.',
+    },
+    {
+      level: 'senior',
+      question: 'When would you use `useImperativeHandle` over just forwarding a DOM ref?',
+      answer:
+        'When the parent shouldn\'t have full DOM access. `useImperativeHandle` exposes a **chosen API** instead of the raw element — `{ play, pause, seek }` for a video player, `{ scrollToBottom, focus }` for a chat panel. The wins: (1) the component owns its DOM and can swap implementations (HLS player → custom) without changing the parent, (2) the parent can\'t do things you didn\'t intend (`.style.display = "none"`), (3) the API contract is explicit and typed.\n\nDon\'t use it for "just need to focus" — pass the DOM ref through. Use it when you have multiple coordinated DOM elements and want to expose intentional verbs over them.',
+    },
+
+    // --- polymorphic components ---
+    {
+      level: 'staff',
+      question: 'Why is the `as` prop hard to type, and what\'s the alternative?',
+      answer:
+        'The `as` prop ("render this component as a `<button>` or an `<a>`") requires the props type to depend on the value of `as`. That needs a generic, `React.ComponentPropsWithoutRef<T>` to merge in the element\'s native props, `Omit` to prevent collisions with the component\'s own props, and (in React 18) a `forwardRef` cast incantation because `forwardRef` doesn\'t preserve generics by default. It works but it\'s gnarly.\n\nThe alternative is **slots / `asChild`** (Radix-style): instead of changing what your component renders, the consumer passes the element they want as a child and your component clones it, merging props. `<Button asChild><a href="...">x</a></Button>` becomes an `<a>` with button styles. No generics, no `forwardRef` cast, composes with `next/link` and `react-router`\'s `Link` out of the box. The trade-off: you can\'t statically guarantee "this asChild Button must be an anchor." Most 2026 design systems pick slots over polymorphic.',
+    },
   ],
 };
