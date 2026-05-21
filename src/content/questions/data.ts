@@ -140,5 +140,45 @@ export const bank: QuestionBank = {
       answer:
         '**Two-tier cache**: per-process LRU (1–5s TTL) for hottest keys + Redis cluster for shared cache. App reads LRU → Redis → DB. Writes go to DB first, then invalidate the cache key. The brief window where readers see stale (< LRU TTL) is the consistency trade-off you accept for performance.\n\n**Stricter alternative**: **versioned keys**. Each entity has a `version` counter; cache key includes it (`user:42:v17`). On write, atomically bump the version in DB and let the old cache key expire naturally. Readers always look up `current_version`, then cache key for that version → no stale reads possible.\n\n**Strictest** (read-your-writes): for the user who just wrote, route their reads to the primary (or skip cache for a short window after a write — set a per-user "recent write" timestamp in their session). Other users tolerate eventual consistency.\n\n**Stampede protection**: probabilistic early refresh (refresh at 80% of TTL with small chance) or single-flight Redis lock (one rebuilds; others wait + read result).\n\n**Failure**: if Redis is down, serve from DB with a concurrency cap (so DB doesn\'t collapse under cache-miss load).\n\n**Observability**: hit ratio per layer, miss latency, stampede counts, memory eviction rate.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What\'s the difference between `WHERE` and `HAVING` in SQL?',
+      answer:
+        '`WHERE` filters rows **before** aggregation. `HAVING` filters groups **after** aggregation (so it can use aggregate functions like `COUNT`, `SUM`). Example: `SELECT country, COUNT(*) FROM users WHERE active = true GROUP BY country HAVING COUNT(*) > 100` — `WHERE active = true` excludes inactive users; `HAVING COUNT(*) > 100` only shows countries with > 100 active users.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'You\'re joining two large tables and the query is slow. What\'s the first thing to check?',
+      answer:
+        '`EXPLAIN ANALYZE` the query (Postgres) or `EXPLAIN` (MySQL). Look for: **sequential scans** on large tables (need an index?), **nested loop joins** where a hash join would be faster (missing index on the join column?), **estimated vs actual rows** way off (need `ANALYZE` to refresh statistics?). The single most common fix: add an index on the foreign key column you\'re joining on. Without it, Postgres scans the entire table for each join.',
+    },
+    {
+      level: 'mid',
+      question: 'Why is `SELECT *` discouraged in production code?',
+      answer:
+        'Three reasons. (1) **Schema fragility**: adding a column changes what your query returns; consumer code that destructures rows breaks silently. (2) **Network and memory**: you pull bytes for columns you don\'t use — wasteful on wide tables. (3) **Index-only scans defeated**: if your query selects only indexed columns, Postgres can answer from the index without touching the table; `SELECT *` always hits the table. List columns explicitly: `SELECT id, name, email FROM users`. Boring; correct.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'When would you reach for a NoSQL database over Postgres?',
+      answer:
+        'Specific use cases, not "we need NoSQL because it scales." (1) **Document stores** (MongoDB, Firestore) when your data is genuinely document-shaped and the schema varies per record. (2) **Wide-column** (Cassandra, ScyllaDB) for write-heavy workloads at huge scale with simple queries — time-series, event logs. (3) **Key-value** (Redis, DynamoDB) for low-latency lookups on known keys. (4) **Graph** (Neo4j) for graph-traversal queries that would be N joins in SQL. For 90% of CRUD apps, Postgres with JSONB columns covers the "I need flexible schemas" case without giving up transactions, joins, and SQL.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'A 2TB Postgres database needs zero-downtime migration to add a non-null column with a default. Walk through.',
+      answer:
+        '**Don\'t** run `ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT \'pending\'` blindly. Pre-Postgres 11, this rewrote every row holding an exclusive lock — hours of downtime.\n\n**Postgres 11+** has a fast path: adding a NOT NULL column with a *constant* default is instant (uses the default lazily). Check first: on PG 11+, this is metadata-only.\n\n**For non-constant defaults or older PG**, multi-step:\n\n1. **Add nullable column**: `ALTER TABLE users ADD COLUMN status TEXT`. Fast — metadata only.\n2. **Backfill in batches**: `UPDATE users SET status = \'pending\' WHERE status IS NULL AND id BETWEEN 1 AND 10000`. Loop with sleep. Avoid one giant transaction.\n3. **Code deploys** to write status on all new rows.\n4. **Add NOT NULL via CHECK constraint**: `ALTER TABLE users ADD CONSTRAINT users_status_not_null CHECK (status IS NOT NULL) NOT VALID`. Instant.\n5. **Validate in background**: `ALTER TABLE users VALIDATE CONSTRAINT users_status_not_null`. Scans table without blocking writes.\n6. **In PG 12+**, once the CHECK is validated, you can promote to a column-level NOT NULL cheaply.\n\n**Monitor**: lock waits (`pg_stat_activity` with `wait_event_type = Lock`), replication lag (the backfill generates WAL).\n\n**For index creation**: always `CREATE INDEX CONCURRENTLY` — builds without exclusive lock.\n\n**Reversibility**: rollback plan at each step. Test on a production-sized replica first.',
+    },
   ],
 };

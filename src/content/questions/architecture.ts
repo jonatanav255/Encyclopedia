@@ -116,5 +116,51 @@ export const bank: QuestionBank = {
       answer:
         '**Choreography**: each service listens for events, acts, publishes new events. "Order placed" → Inventory reserves → publishes "Inventory reserved" → Payment charges → publishes "Payment succeeded" → Shipping ships. No central coordinator.\n\n**Pros**: decentralized, services don\'t know about each other, easy to add a new step.\n**Cons**: the workflow is implicit. Tracing it requires reading many services. Compensations (rollback when later steps fail) get tangled — who reverses what?\n\n**Orchestration**: a central coordinator drives the flow. Like a state machine with explicit transitions. Tools: **Temporal**, **AWS Step Functions**, **Camunda**.\n\n**Pros**: the workflow is explicit, debuggable, testable. Rollback logic lives in one place. Long-running workflows (days, weeks) handled correctly.\n**Cons**: the coordinator is a coupling point and an operational concern.\n\n**Honest recommendation**: orchestration for anything with > 3 steps, money, or rollback semantics. Choreography for simple "fanout to N reactions" without coordination. Most teams start choreographed and migrate to orchestration when they hit a hairy bug or compliance audit.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What\'s the difference between PUT and PATCH?',
+      answer:
+        '**PUT** replaces the entire resource — send all fields, missing ones get cleared. Idempotent: same PUT twice has the same effect as once. **PATCH** applies a partial update — send only the fields you want to change. Not strictly idempotent (depends on the patch format; JSON Merge Patch is idempotent, JSON Patch with array ops isn\'t). In practice, most APIs use PATCH for partial updates and ignore PUT.',
+    },
+    {
+      level: 'junior',
+      question: 'When should you return 401 vs 403?',
+      answer:
+        '**401 Unauthorized**: "I don\'t know who you are." The credentials are missing or invalid — the client should authenticate (log in). Include a `WWW-Authenticate` header.\n\n**403 Forbidden**: "I know who you are, but you can\'t do this." The user is authenticated but lacks permission. Don\'t hint at whether the resource exists (use 404 instead if even existence is sensitive).\n\nThe naming is unfortunate — 401 is about authentication, 403 is about authorization.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'A REST endpoint needs to perform two side effects atomically. The naïve solution is a database transaction wrapping both. What goes wrong if one side effect is an external API call?',
+      answer:
+        'Database transactions cover the DB — they can\'t roll back an external API call. If you `BEGIN; UPDATE db; await stripe.charge(...); COMMIT`, the Stripe charge happens regardless of whether you commit. Rollback leaves the user charged with no order record. Solutions: (1) **outbox pattern** — write to DB + outbox in one transaction; a worker reads outbox and calls Stripe with idempotency keys. (2) **saga** — explicit compensating action (refund) if a later step fails. Either way: never wrap external calls inside DB transactions.',
+    },
+    {
+      level: 'mid',
+      question: 'Why do retries need exponential backoff with jitter?',
+      answer:
+        '**Exponential backoff** (delay = base × 2^attempt) gives the downstream time to recover — a slammed server can\'t recover if every client retries instantly. **Jitter** (delay = base × 2^attempt + random(0, delay)) prevents synchronized retry storms. Without jitter, every client retries at exactly the same intervals, creating "thundering herd" spikes — the moment the server comes back, it gets crushed again. AWS recommends "full jitter": `delay = random(0, base × 2^attempt)`.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'Design API versioning for a service consumed by 100+ external clients.',
+      answer:
+        '**URL-based** (`/v1/users`, `/v2/users`) is the most-recommended option for external APIs. Pros: explicit, browser-friendly, easy to route, easy to deprecate (return 410 Gone on old versions). Cons: smells un-RESTful purists ignore. Pin minor versions in changelogs, not URLs (`v1.4` stays `v1`).\n\n**Header-based** (`Accept: application/vnd.example.v2+json`) is cleaner architecturally but hostile to browsers/curl. Use for internal APIs.\n\n**Operational discipline**: support at least 2 major versions concurrently. Announce deprecations 6–12 months ahead with sunset dates. Track usage per version — don\'t kill a version with active consumers. Provide migration guides. For breaking changes within a version, add new fields (additive) and never remove or repurpose. Reach for a major version bump only when truly breaking.\n\n**For SDKs**: pin the API version in the SDK release. SDK v3 talks to API v2; users upgrade SDKs at their own pace.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'How would you migrate a system from synchronous request/response to event-driven without big-bang downtime?',
+      answer:
+        '**Phase 1 — dual-publish.** When the source service handles a request synchronously, *also* publish an event to the broker. Consumers don\'t exist yet; events accumulate (or get dropped if the topic has retention 0). No behavior change.\n\n**Phase 2 — schema & validation.** Treat the event as a public contract. Add a schema (Zod, Protobuf, Avro). Run schema validation in dev and warn in prod.\n\n**Phase 3 — first consumer.** Implement a downstream consumer that subscribes to the topic. Initially, the consumer\'s work is also done synchronously inside the request handler — the event-driven path is a shadow. Compare outputs in tests / logs. Catch discrepancies.\n\n**Phase 4 — cut over one operation.** For a specific use case (sending a welcome email, updating a search index), remove the synchronous path; the consumer is now the source of truth for that side effect.\n\n**Phase 5 — repeat per operation.** Each consumer moves independently. No global cutover. Monitor: dead-letter depth, end-to-end latency, lag.\n\n**Throughout**: idempotency on consumers (at-least-once delivery), observability (trace IDs propagate across events), and backwards compatibility on schemas (additive changes only). The migration takes weeks to months but never breaks production.',
+    },
   ],
 };

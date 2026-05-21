@@ -88,5 +88,39 @@ export const bank: QuestionBank = {
       answer:
         '**Timeout** — every request needs one. `undici` `bodyTimeout`/`headersTimeout`, or `AbortController` with `setTimeout`. Default: 5–10s total. Set lower if it\'s a hot path.\n\n**Retries** — only for idempotent methods (GET/PUT/DELETE) or with idempotency keys (POST). Exponential backoff with jitter: `delay = base * 2^attempt + random(0, base)`. Cap retries at 3–5; cap delay at ~30s. Honor `Retry-After`.\n\n**Circuit breaker** — track recent failure rate; when above threshold, open the circuit and fail fast without calling. Half-open after a cooldown to test recovery. `opossum` is the standard Node library. Prevents cascading failure when the upstream is fully down.\n\n**Bulkhead / concurrency limit** — bound in-flight requests to the upstream so one slow downstream doesn\'t consume all your sockets.\n\n**Connection pooling** — `undici.Pool` or `Agent` with `keepAlive`. Avoid the per-request TCP+TLS handshake.\n\n**Caching** — for read-heavy data, cache responses with `stale-while-revalidate` semantics. The fastest call is the one you don\'t make.\n\n**Observability** — per-request: status, latency, attempt count. Per-window: success rate, p99 latency, circuit state. Alert on success rate dropping below SLO.\n\n**Hygiene**: distinct user-agent identifying your service; client request ID propagated for trace correlation; verbose errors logged with enough context to reproduce.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What does the `Host` header do, and why does HTTP/1.1 require it?',
+      answer:
+        '`Host: example.com` tells the server which domain the request is for. Required because **multiple sites can share one IP** (virtual hosting) — the server reads `Host` to decide which site\'s config to use. Without it, the server can\'t know which of N hosted sites should handle the request. HTTP/2 replaces it with the `:authority` pseudo-header but the concept is the same.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'A client sends `Accept-Encoding: gzip, br`. What should the server do?',
+      answer:
+        'Pick one encoding (usually brotli if supported, else gzip), compress the response, and set `Content-Encoding: br` (or `gzip`) plus `Vary: Accept-Encoding`. The `Vary` header tells caches to store a separate copy per encoding — without it, a CDN can serve gzipped content to a client that only accepts brotli. Don\'t compress already-compressed content (images, videos, zip files) — wasted CPU, no size win.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'Walk through what happens during a TLS 1.3 handshake.',
+      answer:
+        '1. **ClientHello**: client sends supported ciphers, TLS versions, a random nonce, and (TLS 1.3) a key share for ECDHE. Optionally early-data (0-RTT) and SNI to indicate the hostname.\n2. **ServerHello**: server picks the cipher, sends its own key share + nonce. The shared secret is derived immediately via ECDHE — no round-trip needed.\n3. **Server certificate + Finished**: server sends its cert chain (encrypted!), signed proof of possession, and a Finished message (HMAC over the handshake so far).\n4. **Client Finished**: client verifies the cert chain, sends Finished.\n5. **Application data flows** — encrypted with the derived session keys.\n\n**1-RTT total** in 1.3 (vs 2-RTT in 1.2). With **session resumption** (PSK from a previous handshake), can be 0-RTT — application data sent in the first packet. 0-RTT is risky for non-idempotent requests (replayable), so it\'s opt-in.\n\n**Modern improvements**: handshake is encrypted earlier (cert isn\'t visible to passive observers), perfect forward secrecy is mandatory (every session uses ephemeral keys), weak ciphers are removed.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a global edge architecture for an API with users worldwide.',
+      answer:
+        '**Anycast routing**: one IP, advertised from many locations. Clients reach the geographically nearest POP. Cloudflare, Fastly, AWS Global Accelerator provide this.\n\n**Edge POPs**: terminate TLS at the edge (lower latency for handshakes). Run JS at the edge for personalization, A/B tests, auth checks (Cloudflare Workers, Vercel Edge, Fastly Compute@Edge).\n\n**Cache layers**: at the edge, cache public responses aggressively with `Cache-Control: public, s-maxage=...` and `Vary` headers for negotiation. CDN handles ~95% of hits; origin sees only the tail.\n\n**Origin in 1–3 regions**, behind cloud LBs. The edge POP routes cache misses to the nearest origin via the cloud\'s private backbone.\n\n**Data layer**: read replicas in each origin region. Writes go to the primary (one region). For low-latency reads anywhere, eventually-consistent replicas suffice. For strict consistency, accept the WAN latency to the primary.\n\n**Real-time**: WebSockets / SSE terminate at the nearest POP; the POP holds the persistent connection, fans out via a global broker (Redis pub/sub with WAN replication, or a managed real-time service).\n\n**Observability**: distributed tracing with W3C `traceparent` propagating from edge → POP → origin. Latency dashboards split by geography. SLO budgets per region.\n\n**Failure modes**: if a POP goes down, anycast routes to the next-nearest. If a region\'s origin goes down, the LB fails over (DNS or BGP). Test with chaos engineering — randomly kill a region in staging.\n\n**Cost**: edge bandwidth dominates. Optimize cache hit rate (95%+ target), compress aggressively, monitor bandwidth per route.',
+    },
   ],
 };

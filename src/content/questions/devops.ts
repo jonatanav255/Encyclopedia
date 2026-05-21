@@ -116,5 +116,39 @@ export const bank: QuestionBank = {
       answer:
         'These solve the same problem at different layers.\n\n**PM2**: Node-specific, quick setup, built-in cluster mode + log aggregation. Good for single-VM hobby projects or small production setups. Showing its age in 2026 — most teams have moved to containers.\n\n**systemd**: Linux-native init system. Standard tooling, cgroup-based resource limits, security hardening (`ProtectSystem`, `NoNewPrivileges`), journald log integration, watchdog support. The right choice for "I own this VM and want OS-grade supervision." Used heavily in self-hosted setups.\n\n**Kubernetes (or ECS/Cloud Run/Fly)**: container orchestrator handles process supervision, autoscaling, rolling deploys, health-check-driven eviction, declarative infra. The right choice for any cloud-native deployment. No PM2 or systemd inside the container — duplicate supervision is just confusion.\n\n**Decision rule**:\n- Hobby / single VM → PM2.\n- Production VM(s) → systemd.\n- Cloud / multi-instance / autoscaled → containers + orchestrator.\n- Serverless (Lambda, Workers, Cloud Run jobs) → no process manager; platform is one.\n\nPick **one layer**. Stacking PM2 inside containers inside k8s is "Inception" — operational complexity without payoff.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What\'s the difference between a Dockerfile `CMD` and `ENTRYPOINT`?',
+      answer:
+        '**`ENTRYPOINT`** sets the executable that always runs. **`CMD`** sets the default arguments (or default command if there\'s no entrypoint). With both, the container runs `<ENTRYPOINT> <CMD>` — and `docker run image arg1 arg2` overrides the CMD, passing `arg1 arg2` as arguments to the entrypoint. Common pattern: `ENTRYPOINT ["node"]` + `CMD ["dist/index.js"]` lets users override the entry script while keeping `node` as the executable.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why use multi-stage Docker builds?',
+      answer:
+        'Build dependencies (compilers, dev packages, source code) shouldn\'t end up in the production image. Multi-stage builds let you `FROM node:22 AS builder` with all the tools, `RUN pnpm build`, then `FROM node:22-slim AS runtime` and `COPY --from=builder /app/dist ./dist`. Final image has only what runs in production. Result: smaller image (200MB vs 1GB+), smaller attack surface, faster deploys. Standard practice for Node/Go/Rust services.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'How do you handle secrets in a Kubernetes deployment?',
+      answer:
+        '**Don\'t put them in env vars in the Deployment manifest** — those are visible in the manifest, in git, in `kubectl describe`. Three layered options:\n\n1. **Kubernetes Secrets** (base64-encoded, not encrypted by default). Bare minimum — enable encryption at rest in etcd. Mount as files (`volumeMounts`) or env vars.\n2. **External secrets operator** (External Secrets Operator, Sealed Secrets) — fetches from a real secret manager (AWS Secrets Manager, Vault, GCP Secret Manager) and syncs into k8s Secrets. Source of truth lives outside the cluster.\n3. **Workload identity** (IRSA on EKS, Workload Identity on GKE) — pods authenticate to the cloud directly and fetch secrets at startup. No k8s Secret at all.\n\nProduction setup: workload identity + secret manager. Validate secrets at app startup (Zod schema). Rotate periodically with grace periods. Never log them. Audit access.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a deployment pipeline that supports both fast feedback and safe production releases.',
+      answer:
+        '**Stage 1 — PR**: lint, typecheck, unit tests, build container. Fast (~5 min). Block merge on failure.\n\n**Stage 2 — staging**: on merge to main, deploy to staging environment automatically. Integration tests + smoke tests run there. If they fail, alert; don\'t auto-rollback (it\'s staging).\n\n**Stage 3 — production canary**: deploy to production for 1–5% of traffic. Argo Rollouts / Flagger watches SLIs (error rate, latency, saturation) for 10–30 min. If within tolerance, promote.\n\n**Stage 4 — gradual rollout**: 5% → 25% → 50% → 100%, with bake time at each step. Auto-rollback if SLIs degrade. Manual promotion gate if the change is risky (new database query, schema change).\n\n**Stage 5 — observability**: every deploy emits a marker in metrics/traces. On-call gets a dashboard showing "what changed at this deploy." Post-deploy, watch error budget burn for 24h.\n\n**Database migrations**: backward-compatible only (add nullable column, deploy code that reads both shapes, deploy code that writes new shape, drop old column — across multiple deploys). Never destructive in the same deploy as code that uses the new shape.\n\n**Feature flags**: separate deploys from releases. Ship code disabled; flip on per cohort. Rollback by flipping the flag, no redeploy needed.\n\n**Tooling**: GitHub Actions / GitLab CI for build, ArgoCD/Flux for GitOps deploys, Argo Rollouts/Flagger for canary, OpenTelemetry for observability, LaunchDarkly/Unleash for flags. Total cycle time from merge to 100%: 2–6 hours depending on bake times.',
+    },
   ],
 };

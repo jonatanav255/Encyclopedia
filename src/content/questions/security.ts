@@ -82,5 +82,39 @@ export const bank: QuestionBank = {
       answer:
         '**Storage**: managed KMS-backed secret store (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager). Never commit secrets — git history is forever. `.env.example` lists names; the real values live in the manager.\n\n**Access control**: IAM policies per environment (dev/staging/prod) and per service. Production secrets are reachable only by production services\' IAM roles. Engineers get short-lived access via break-glass procedures, logged.\n\n**Retrieval**:\n- **At startup**: app fetches secrets, validates with Zod schema, fails fast if anything\'s missing or malformed. No fallback to defaults for production secrets.\n- **Caching**: in-memory only, never persisted to disk. Refresh on a schedule (5–15 min) so rotation propagates.\n- **No environment variables for sensitive values** if possible — they leak via `/proc`, debug logs, error reports. Inject directly into the app from the manager.\n\n**Rotation**:\n- Database creds: managed rotation that updates the secret + the DB user atomically. App polls for new value and re-establishes connections gracefully.\n- API keys: pair-rotate (issue new, deploy code that uses new, revoke old after grace period). Avoid downtime windows.\n- Cryptographic keys: support a keyring (multiple valid keys). Rotate by adding the new, switching default, removing the old later. See "JWT key rotation."\n\n**Audit**:\n- Every secret access logged with caller identity, timestamp, secret name.\n- Alerts on unusual access patterns (volume spikes, new caller identities).\n\n**Incident response**:\n- Pre-built playbook: revoke compromised secret, identify blast radius (what\'s authenticated by this key?), rotate dependent secrets, force-logout users if a session key was involved.\n- Practice it. Quarterly drills.\n\n**Anti-patterns to ban via lint/review**: `process.env.SECRET` outside of bootstrap, hard-coded literals in test files, secrets in Dockerfile `ENV`, secrets in CI logs (`echo $TOKEN`).',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What\'s the difference between authentication and authorization?',
+      answer:
+        '**Authentication** is "who are you?" — verifying identity via password, token, certificate, biometric. **Authorization** is "what can you do?" — checking permissions for a specific action. You authenticate once at login; you authorize on every protected action. A common shorthand: "authn = identity, authz = permission." Implementation-wise, authn produces a session/token; authz reads it and checks rules against the requested resource.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why is HTTPS not enough — what does HSTS add?',
+      answer:
+        '**HTTPS** means *if* the user reaches the HTTPS URL, it\'s encrypted. But the first request is often HTTP (typed bare URL, clicked old link, server redirects to HTTPS). That first HTTP request is interceptable. **HSTS** (`Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`) tells browsers "for this domain, ALWAYS use HTTPS, even if the user types `http://`." After the first HTTPS visit, the browser remembers; the HTTP downgrade attack vector closes. `preload` submits your domain to a browser-baked-in list so even the first visit is HTTPS-only.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'You discover a dependency in your `package.json` has been compromised in a recent release. What\'s your response?',
+      answer:
+        '**Immediate**: pin the lockfile to a known-safe version (or remove the dep). Force a CI rebuild from a clean state. Verify production isn\'t running the compromised version — check deployed image digests.\n\n**Assess blast radius**: what did the package have access to? In Node, any code has full process access by default — assume it could read `process.env`, write to disk, make network calls. If your app handles secrets, rotate every secret the process touched: database passwords, API keys, JWT signing keys, OAuth client secrets.\n\n**Audit logs**: look for anomalous outbound network calls, unexpected file writes, unusual DB queries during the compromised version\'s runtime window. Many supply-chain attacks exfiltrate to attacker-controlled domains.\n\n**Notify users** if user data may have been exposed — most jurisdictions require breach disclosure for PII.\n\n**Prevent recurrence**: enable `--permission` (Node) or container-level filesystem restrictions to limit what compromised deps can do. Use Socket/Snyk for passive supply-chain monitoring. Adopt `pnpm install --ignore-scripts` by default; allowlist specific packages that need postinstall scripts.\n\n**Post-mortem**: how did the compromised version land in your lockfile? Auto-merge of minor versions without review? Lack of dep diff in PRs? Tighten the process — the technical fix is fast; the process change prevents the next one.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design end-to-end authentication for a web app + native mobile + third-party API integrations.',
+      answer:
+        '**Web app (browser, same domain)**: OAuth/OIDC if you outsource auth, else opaque session tokens in HttpOnly + SameSite=Strict cookies. Cookies handle CSRF via SameSite + double-submit token. JWT in localStorage is the wrong choice — XSS = total compromise.\n\n**Native mobile**: PKCE-protected OAuth flow opening a system browser (not embedded webview). Refresh token stored in OS keychain (iOS Keychain, Android Keystore). Access token short-lived (~15 min); refresh in background.\n\n**Third-party API integrations** (your customers integrating with you): OAuth 2.0 with PKCE if their app acts on behalf of users; client credentials grant for server-to-server. Issue per-app credentials with revocable scopes. Rate limit per app, not per IP.\n\n**Token format**: opaque tokens stored server-side (Redis) for cookie sessions — easy revocation. JWT for stateless API tokens with short TTL + refresh — accept revocation complexity for scaling.\n\n**Key management**: JWT signing keys via a keyring (kid-based), rotated quarterly. Public keys exposed at `/.well-known/jwks.json`.\n\n**Multi-factor**: TOTP (Google Authenticator) standard; WebAuthn (passkeys) for the modern path. SMS as fallback only — SIM swapping risk.\n\n**Session management**: device list per user, revoke individual sessions, force-logout on password change. Session ID rotation on privilege elevation.\n\n**Cross-cutting**: structured audit log of every auth event (login, logout, failed attempt, token revoke, MFA enroll, password change). Anomaly detection — login from new geography, unusual hours, multiple failures.\n\n**For 2026**, increasingly: passkeys (WebAuthn) as primary, passwords optional. Industry direction is "phishing-resistant by default."',
+    },
   ],
 };

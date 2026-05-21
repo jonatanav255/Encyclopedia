@@ -206,5 +206,51 @@ export const bank: QuestionBank = {
       answer:
         'Two main techniques. **Generic interface + keyof**:\n\n```ts\ninterface EventMap {\n  click: { x: number; y: number };\n  hover: { target: string };\n}\n\nclass Emitter<M> {\n  on<K extends keyof M>(name: K, handler: (data: M[K]) => void) { ... }\n  emit<K extends keyof M>(name: K, data: M[K]) { ... }\n}\n\nconst e = new Emitter<EventMap>();\ne.on(\'click\', (data) => data.x);   // data is typed { x: number; y: number }\n```\n\nThe map maps event names to payload types. `keyof M` enumerates event names; `M[K]` looks up the payload. Consumers get autocomplete on `name` and typed `data` in the handler.\n\nFor union-shaped payloads where the payload type varies based on the discriminant:\n\n```ts\ntype Event =\n  | { type: \'click\'; x: number; y: number }\n  | { type: \'hover\'; target: string };\n\nfunction handle<E extends Event>(e: E) { /* discriminated narrowing inside */ }\n```\n\nFor consumer ergonomics, the `Map` approach is cleaner. For library internals that switch on type, the discriminated union is better. Many libraries (Node\'s `EventEmitter`, TypedEmitter, mitt) use generic-map approaches. Pair with template literal types for typed name patterns (`on\\`user.${string}\\``).',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What does the `?` after a property name in an interface mean?',
+      answer:
+        '`name?: string` means the property is **optional** — it might be present or absent. The compiler treats it as `name: string | undefined`. You must narrow before using: `if (user.name) { user.name.toUpperCase() }`. Different from `name: string | undefined` only in that an optional property can be **omitted entirely** when constructing the object; the explicit union form requires you to pass `undefined`.',
+    },
+    {
+      level: 'junior',
+      question: 'What\'s the difference between `interface` and `type`?',
+      answer:
+        'For object shapes, mostly interchangeable. **`interface`** supports declaration merging (`interface User {}` declared twice combines), uses `extends`, traditionally preferred for object contracts. **`type`** supports unions (`type X = A | B`), intersections, tuples, mapped types, conditional types — things `interface` can\'t do. Convention: `interface` for object shapes you\'ll extend, `type` for unions and computed types. Modern codebases often use `type` for everything for consistency.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why does `as` sometimes silently break your code?',
+      answer:
+        '`as` is a **type assertion** — you\'re telling the compiler "trust me, this is type X" without runtime validation. If you\'re wrong, you\'ll see runtime errors that the type system promised you wouldn\'t happen. Example: `const user = data as User` after `JSON.parse(input)` — if the JSON doesn\'t actually match `User`, your typed code crashes when accessing `user.name.toUpperCase()`. Use `as` rarely; prefer runtime validation (Zod) that returns a typed value after verification.',
+    },
+    {
+      level: 'mid',
+      question: 'What does `satisfies` do that `as` doesn\'t?',
+      answer:
+        '`satisfies` **checks** that a value matches a type without changing its inferred type. `as` casts (potentially lying). Example: `const config = { port: 3000, host: "localhost" } satisfies Config` — TypeScript verifies the literal matches `Config`, but `config.port` stays typed as the literal `3000` (not widened to `number`). With `as Config`, you\'d lose the literal types and the compiler wouldn\'t catch missing fields. `satisfies` (TS 4.9+) is the "validation without widening" tool you wanted before.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'A generic function loses information about which specific overload was called. How do you fix it?',
+      answer:
+        'Use **conditional return types** that depend on the input. Instead of overloads (which lose info), encode the relationship: `function find<T extends string | number>(query: T): T extends string ? User : User[]`. The return type is computed from the input. Caller sees: `find("jon")` returns `User`, `find(42)` returns `User[]`. The compiler picks the right branch based on the actual argument type. Cleaner than overloads, with no implementation-signature mismatch. Trade-off: harder to read; reach for it when overloads pile up.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Your codebase\'s `tsc` typecheck takes 3 minutes. How do you cut it?',
+      answer:
+        '**Profile first**: `tsc --extendedDiagnostics` shows time per phase. `tsc --generateTrace ./trace` writes a Chrome-tracing-compatible profile — load in `chrome://tracing` to see expensive types.\n\n**Common wins**:\n\n1. **`skipLibCheck: true`** — skips type-checking of `.d.ts` files in `node_modules`. Usually safe; recovers 30-60s on large projects.\n2. **`incremental: true`** + `.tsbuildinfo` — second runs only re-check changed files. Cuts iteration to seconds.\n3. **`isolatedModules: true`** + bundler emit (esbuild/swc) — TypeScript only does type-checking, not transpilation. Splits the work.\n4. **Project references** for monorepos — independent compilation per package, parallel.\n5. **Remove deeply recursive types** — `infer`-heavy types with unbounded recursion blow up. Cache intermediate types via `type Alias = ComplexThing<T>` (TS memoizes named aliases).\n6. **`noEmit: true` in CI** — separate type-check job from build (which uses esbuild). Run in parallel.\n7. **Check `paths`** in tsconfig — overly broad mappings make every import resolve through huge candidate lists.\n\n**For library deps**: a single big-types package (`@types/lodash` historically) can dominate. `skipLibCheck` masks; pinning to specific submodule imports (`lodash/get`) helps tree-shaking but not type-check time.\n\n**Target**: type-check + build in CI under 1 minute for a 50k-line codebase is achievable. If you\'re past 5 minutes, project references usually win.',
+    },
   ],
 };

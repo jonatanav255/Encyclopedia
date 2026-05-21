@@ -254,5 +254,51 @@ export const bank: QuestionBank = {
       answer:
         '**For**: a `Proxy`-based emitter lets consumers write `emitter.userSignedUp.emit(user)` and `emitter.userSignedUp.on(handler)` — the proxy generates each event\'s API lazily. Cleaner API surface, no string-typo bugs, TypeScript can declare the shape of available events. Used by some modern libraries (event-emitter-like APIs in test mocks, RxJS-style typed event streams).\n\n**Against**: the Proxy adds overhead per access; static type generation is more complex; debugging is harder (stack traces show through the proxy); the implicit "generate handler bag on first access" can lead to memory holding stale event keys. For high-volume internal eventing, the built-in `EventEmitter` is simpler and faster.\n\nFor library APIs aimed at developer ergonomics where event volumes are modest (UI events, lifecycle hooks), Proxy-backed event objects are a clean choice. For service-internal pub/sub at scale, the plain emitter wins.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'Why does `typeof null` return `"object"`?',
+      answer:
+        'A bug from JavaScript\'s earliest days that became part of the spec. Original values were tagged in memory with a type bit; `null` was the all-zeros pointer, which collided with the object type tag. By the time the bug was found, fixing it would break the web. So it stays. Use `value === null` to check for null specifically; use `value == null` to catch both null and undefined.',
+    },
+    {
+      level: 'junior',
+      question: 'What\'s the difference between `==` and `===`?',
+      answer:
+        '`===` checks **strict equality** — same type AND same value. `==` checks **loose equality** — coerces types before comparing. `0 == "0"` is true (string coerced to number); `0 === "0"` is false. Loose equality has surprising rules (`null == undefined` but `null !== 0`; `[] == false` but `[] !== false`). Use `===` always except the one idiom: `x == null` to check for null OR undefined together.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'How would you deep-clone an object in modern JavaScript?',
+      answer:
+        '`structuredClone(obj)` — built into the runtime, handles cycles, dates, regexps, typed arrays, sets, maps. The right answer for 2026. Older patterns: `JSON.parse(JSON.stringify(obj))` works for plain JSON-safe data but loses functions, undefined values, Symbols, Dates (becomes string), Maps/Sets, and throws on cycles. `_.cloneDeep` (lodash) is heavier but handles more cases. For React state, prefer **shallow clones with spread** (`{...obj, name: "new"}`) — cheaper and avoids the "deep clone destroys referential equality everywhere" perf trap.',
+    },
+    {
+      level: 'mid',
+      question: 'When does `await` inside a loop hurt performance?',
+      answer:
+        'When the iterations are independent. `for (const id of ids) { await fetch(...) }` runs requests **serially** — N times the latency. If the requests don\'t depend on each other, use `await Promise.all(ids.map(id => fetch(...)))` to fire them in parallel — total time is just the slowest one. Watch for: rate limits (too many parallel may get throttled — use `p-limit` for bounded concurrency); order dependence (if iteration N+1 needs the result of N, you must await sequentially).',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'A function in a tight loop allocates a new object per iteration. What\'s the performance impact?',
+      answer:
+        'Two effects. (1) **GC pressure**: each allocation grows the young generation; eventually triggers a minor GC pause. Many small allocations = frequent pauses = jitter in latency-sensitive code. (2) **Hidden class transitions**: if objects vary in shape (added properties in different orders), V8 can\'t optimize property access — accesses fall back to slow paths.\n\nFixes: (1) **Object pooling** — reuse a small pool of pre-allocated objects (`const pool = []`). Common in game engines. (2) **Stable shapes** — initialize all properties in the same order, don\'t delete properties. (3) **Avoid object creation in the hot loop** — pass scalars or reuse the same object as a scratch buffer. For most app code, GC is fine; only profile-confirmed hot paths need this attention.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a request-deduplication layer for a JavaScript SDK that makes thousands of API calls per minute.',
+      answer:
+        '**Goal**: identical concurrent requests should hit the API once. Subsequent identical requests within a short window (~50-500ms) reuse the in-flight or recently-resolved promise.\n\n**Implementation sketch**:\n\n```js\nconst inflight = new Map();\nconst recent = new LRUCache({ max: 500, ttl: 200 });\n\nasync function fetchDedup(url, options) {\n  const key = `${url}::${JSON.stringify(options)}`;\n  if (recent.has(key)) return recent.get(key);\n  if (inflight.has(key)) return inflight.get(key);\n  const promise = fetch(url, options).then(r => r.json());\n  inflight.set(key, promise);\n  try {\n    const result = await promise;\n    recent.set(key, result);\n    return result;\n  } finally {\n    inflight.delete(key);\n  }\n}\n```\n\n**Key decisions**:\n- **Cache key**: URL + serialized options. Order-stable serialization required (sort object keys).\n- **In-flight Map**: deduplicates concurrent requests during a fetch.\n- **Recent LRU**: deduplicates near-instant repeated calls (debounces "click button twice").\n- **TTL ~200ms**: balances "feels instant when repeated" vs "shows fresh data on user retry."\n\n**For mutations**: dedupe by `Idempotency-Key` header from the caller, not by URL — POST `/charges` should not silently return a cached result.\n\n**Failed requests** shouldn\'t be cached (retry might succeed). Honor `AbortSignal` to cancel both the request and clear the in-flight entry.\n\n**Comparable libraries**: TanStack Query implements this internally; SWR\'s deduper does the same. For a custom SDK, this 20-line version is enough.',
+    },
   ],
 };

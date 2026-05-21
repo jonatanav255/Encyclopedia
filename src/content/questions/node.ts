@@ -282,5 +282,39 @@ export const bank: QuestionBank = {
       answer:
         '**1. Catalogue the events.** Each `emitter.emit(\'name\', payload)` becomes a candidate contract. Document who emits and who listens — the implicit interfaces between modules.\n\n**2. Add explicit schemas.** Migrate each event payload to a Zod/Protobuf schema. Now changes are visible; consumers stop silently breaking on producer changes.\n\n**3. Move emitter to abstraction.** Replace direct `events.emit` / `.on` with a thin `bus.publish` / `bus.subscribe` interface. Implementation is still in-process EventEmitter.\n\n**4. Swap to a broker per event.** Identify candidates: events with multiple listeners, async listeners, or owners in different modules. Move those to a broker (Redis Streams, NATS, Kafka). In-process emitter stays for fast in-module pub/sub.\n\n**5. Add idempotency.** Network = at-least-once delivery. Every consumer dedups by event ID.\n\n**6. Carve services out.** Now that an event is broker-backed and schema\'d, the consumer can be extracted to its own service. Producer doesn\'t care.\n\n**Throughout**: traces propagated via OpenTelemetry; dead-letter queues monitored; broker dashboards. The migration is incremental — you ship working code at every step, you never freeze features.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What does `node --watch` do?',
+      answer:
+        'Built-in file watcher (Node 20+) — restarts the process when the entry file or any of its imports change. Replaces `nodemon` for most use cases. Combine with `--env-file=.env` (Node 20.6+) to load environment variables and you have a no-deps dev loop: `node --watch --env-file=.env src/index.js`. For TypeScript directly: `node --watch --experimental-strip-types src/index.ts`.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'You see "EMFILE: too many open files" in a Node service. What\'s happening?',
+      answer:
+        'The process hit the OS limit for open file descriptors (default ~1024 on Linux). Either a real leak — files/sockets opened without close — or a legitimate workload exceeding the limit. **Diagnose**: `lsof -p <pid>` (or `ls /proc/<pid>/fd | wc -l`) to see what\'s open. Look for accumulating sockets, log files, or DB connections.\n\n**Fixes**: (1) Close what you open — `try/finally` for files, proper connection pooling. (2) Raise the limit (`ulimit -n 65536` or systemd `LimitNOFILE=65536`). (3) For HTTP clients, use undici with a connection pool — don\'t open per-request connections. (4) Use stream pipelines (`stream.pipeline`) so streams clean up on error instead of leaking file descriptors.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'When would you use `child_process.fork` vs `spawn` vs `worker_threads`?',
+      answer:
+        '**`spawn`** — generic process launch. Use for shelling out to external binaries (`ffmpeg`, `git`, `curl`). Streams stdio. No JS-specific features.\n\n**`fork`** — spawn another Node script with a built-in `process.send`/`message` IPC channel. Use for "Node helper process" (worker farm without thread sharing, or sandboxing to avoid one Node\'s crash bringing down the parent). Each fork has its own memory.\n\n**`worker_threads`** — V8 isolates in the same process. Use for CPU-bound JS work that would block the event loop (image processing, parsing huge JSON, cryptography). Shared memory possible via `SharedArrayBuffer`; transfer ownership of Buffers without copying. Lower overhead than `fork` (no separate OS process).\n\n**Decision tree**: external program → `spawn`. CPU-bound JS → `worker_threads`. Need OS-level isolation or want to run a different JS file as a separate Node process → `fork`.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design observability for a Node service from scratch.',
+      answer:
+        '**Three pillars: logs, metrics, traces.**\n\n**Logs**: structured JSON via Pino. One line per significant event with correlated request ID, trace ID, span ID, user ID. Log levels: ERROR (page someone), WARN (investigate), INFO (audit trail), DEBUG (off by default). Ship to centralized aggregator (Loki, Datadog, CloudWatch). Don\'t log secrets; don\'t log every request body.\n\n**Metrics**: Prometheus-format histogram + counter + gauge. Per route: request rate, error rate, latency p50/p95/p99, in-flight count. Per dependency: external call latency, error rate, retry count. Per resource: event-loop lag (`perf_hooks.monitorEventLoopDelay`), heap used, GC pause duration, open connections. Export at `/metrics`; scrape every 15s.\n\n**Traces**: OpenTelemetry SDK with auto-instrumentation for HTTP, Express, undici, DB drivers. Custom spans for business operations. W3C `traceparent` propagation across services. Tail-based sampling at the OTel Collector — keep all errors, 100% of slow requests, 10% of normal traffic.\n\n**SLOs**: define a few user-visible objectives (e.g., "p99 home-page latency < 500ms over 28 days at 99.5% achievement"). Compute error budget from SLO. Alert on **multi-window burn rate**: paging if you\'ll exhaust the budget in 1 hour at current rate; ticketing if in 6 hours. No raw threshold alerts ("p99 > X" pages constantly during normal noise).\n\n**Runbooks**: every page links to a runbook with dashboard + first investigation steps + escalation contacts.\n\n**Cost**: log volume dominates. Sampling, retention tiers, structured-only (no free-text dumps) keep it manageable. Trace cost via tail-sampling is bounded by collector capacity, not service volume.\n\n**Tooling stack** (2026 default): OpenTelemetry SDK → Collector → Prometheus + Loki + Tempo (self-hosted) or Datadog/Honeycomb/New Relic (hosted). Grafana for dashboards. PagerDuty for paging.\n\n**Discipline**: observability is a build-time concern, not a "we\'ll add it later." Wire from day one; tune over time.',
+    },
   ],
 };

@@ -224,5 +224,39 @@ export const bank: QuestionBank = {
       answer:
         '**Server components fetch directly.** No `useEffect`, no client cache for initial data: `export default async function Page() { const user = await db.users.findById(id); return <UserView user={user} />; }`. The server fetches; the result streams to the client; first paint shows real data.\n\n**Suspense for streaming.** Wrap each independent section in `<Suspense fallback={<Skeleton />}>` so fast sections render first, slow ones replace skeletons as data arrives. Avoid a single root spinner.\n\n**Client-side TanStack Query** for interactive data (real-time updates, polling, optimistic mutations, infinite scroll). Initial state hydrated from server fetch via `HydrationBoundary`; client-side from then on.\n\n**Server actions for mutations.** `\'use server\'` functions called from `<form action={...}>` or via the typed RPC pattern. Skip the JSON-API layer for internal use.\n\n**`revalidatePath` / `revalidateTag`** after mutations to invalidate server-rendered pages; TanStack Query\'s invalidate for client-side caches. Two cache layers; both need explicit invalidation.\n\n**Edge cases**: stale-while-revalidate for slow but tolerable data; aggressive caching on truly static (CDN-friendly) routes; long-running streaming responses (LLM token streams) via SSE outside of the RSC layer.\n\nThe result: SEO-friendly server rendering + interactive client behavior, with one data layer per concern and no rendering waterfalls.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'Why does React require a `key` prop on list items?',
+      answer:
+        'React reconciles lists by matching items between renders via `key`. With stable keys, React knows "this item moved from position 3 to position 7" and just moves the DOM node — state and focus stay with the item. Without `key` (or with `key={index}` on a reorderable list), React matches by position — reordering looks like "every item changed," which destroys input state, focus, animations. Always use a stable ID from the data (`item.id`), never the array index for reorderable lists.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'Why doesn\'t `useState` update the state immediately when called?',
+      answer:
+        'React schedules the update; the current render finishes with the *old* state, then React re-renders with the new state. This is by design — multiple `setState` calls in the same handler batch into one re-render. If you need the new value inside the same function, either use the value you passed (`setCount(prev + 1); console.log(prev + 1)`) or pass an updater function (`setCount(p => p + 1)`) which receives the latest queued state. Reading state through the variable from the previous render gives the old value.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'What problem does React Context solve, and where does it fall apart?',
+      answer:
+        'Context **avoids prop drilling** — you can put a value at the top of the tree and any descendant reads it without passing through every level. Great for theme, current user, locale.\n\n**Where it falls apart**: every consumer of the context re-renders when the context value changes, even if they only care about one field. Stuffing a big state object into context = unnecessary re-renders everywhere on every update. For app-wide state with many fields, reach for a state library (Zustand, Jotai) that supports selectors — components subscribe to specific slices and only re-render when *their* slice changes.\n\nRule of thumb: context for static-ish app config (theme, current user, locale), state libraries for frequently-changing app state.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Diagnose a React app where every interaction feels laggy. Walk through.',
+      answer:
+        '**1. Open the React DevTools Profiler.** Record an interaction. Look at the flamegraph for slow components (long render bars) and components rendering when they shouldn\'t (highlight "rendered" without prop change). The "Ranked" view shows worst offenders.\n\n**2. Common culprits**:\n- **Unnecessary re-renders**: inline objects/functions passed as props defeating `React.memo`. Stabilize with `useMemo`/`useCallback` or hoist outside the component.\n- **Large list re-rendering**: every item re-renders on any state change. Memoize each row (`React.memo(Row)`) with stable item refs.\n- **Context overuse**: a context value at the root causes every consumer to re-render on any change. Split into smaller contexts or use a selector-based state library.\n- **Heavy synchronous work in render**: filter/sort of huge arrays on every render. Move to `useMemo` with stable deps.\n- **Effects firing on every render**: missing `useEffect` dep array or unstable deps.\n\n**3. Concurrent features for "unavoidable" slowness**:\n- `useTransition` for state updates that trigger expensive renders.\n- `useDeferredValue` to lag a value (search input → list filter).\n- `Suspense` boundaries for code-splitting heavy components.\n\n**4. Long lists**: virtualize with `@tanstack/react-virtual` or `react-window`. Only render visible rows.\n\n**5. Network**: if lag is "click → 500ms wait for data," that\'s a data-fetching problem. TanStack Query with optimistic mutations makes interactions feel instant.\n\n**6. Profiler in production builds**: dev mode is slower; always profile a production build for real numbers.\n\nThe most common root cause: prop instability defeating memoization. The fastest fix: profile, find one hot component, stabilize its inputs.',
+    },
   ],
 };

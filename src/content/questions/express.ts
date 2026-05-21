@@ -352,5 +352,39 @@ export const bank: QuestionBank = {
       answer:
         '**1. Label modules** by feature without moving files yet — auth, billing, users, orders. Surface implicit boundaries.\n\n**2. Per-module router**: `modules/<feature>/router.ts` exports an Express Router. Move that feature\'s routes; mount via `app.use(\'/feature\', router)`.\n\n**3. Extract service layer**: thin routers call functions in `service.ts`. Service has no `req`/`res` — pure TypeScript, callable from CLI, worker, tests.\n\n**4. Schemas at the seam**: `schemas.ts` with Zod for input/output; types derived via `z.infer`. Routers parse; services trust.\n\n**5. Module public API**: `index.ts` re-exports the router, service functions, and types. Other modules import from there, never internal files. ESLint rule enforces.\n\n**6. Per-module errors**: `errors.ts` defines `UserNotFoundError extends HttpError(404)`. App-level error middleware translates HttpError → response.\n\n**7. Data ownership**: each module owns its tables; cross-module data goes through the public API. The hardest step — schema review touches everyone.\n\n**8. Optional extract**: only after boundaries are enforced and proven, consider lifting a module to its own service. Cost vs payoff — usually not worth it until team/scale demands it.\n\nThroughout: existing tests stay green; new tests at the service layer (no Express); incremental PRs, never a big-bang rewrite. The result is a monolith you can grow without it growing painful.',
     },
+
+    // --- additional questions ---
+
+    // junior
+    {
+      level: 'junior',
+      question: 'What does `app.use(express.json())` do?',
+      answer:
+        'Middleware that parses incoming requests with `Content-Type: application/json` and exposes the parsed body as `req.body`. Without it, `req.body` is `undefined` for JSON requests. Pair with a size limit (`express.json({ limit: \'100kb\' })`) to prevent OOM from oversized requests. For form-encoded bodies, use `express.urlencoded({ extended: true })`. Place these before your routes; they only run when their content type matches.',
+    },
+
+    // mid
+    {
+      level: 'mid',
+      question: 'How do you handle `async` errors in Express?',
+      answer:
+        '**Express 5+**: async errors are caught automatically — throw inside an async handler and they flow to your error middleware. Just write `async (req, res) => { throw new HttpError(404) }`.\n\n**Express 4**: async errors bypass the framework. Either wrap each handler with `try/catch + next(err)`, install `express-async-errors` (a patch that monkey-patches Express 4 to handle them), or use the `asyncHandler(fn)` wrapper pattern: `app.get(\'/\', asyncHandler(async (req, res) => {...}))`. The wrapper attaches `.catch(next)` to the returned promise.\n\nUpgrade to Express 5 if you can — the boilerplate is gone.',
+    },
+
+    // senior
+    {
+      level: 'senior',
+      question: 'A user reports your Express endpoint returns 400 with an unhelpful error message. How do you improve the response shape?',
+      answer:
+        'Standardize on a **structured error response**: `{ "error": { "code": "VALIDATION_FAILED", "message": "...", "fields": [{ "field": "email", "issue": "invalid format" }] } }`. The `code` is machine-readable (stable across versions); `message` is human-readable (can change); `fields` lists field-level issues for forms.\n\n**Wire it via a custom error class** + 4-arg error middleware: `class HttpError extends Error { constructor(status, code, message, fields?) {} }`. Throwing `new HttpError(400, \'VALIDATION_FAILED\', \'...\', issues)` lets the middleware extract everything.\n\n**Pair with Zod**: in validation, transform Zod issues into the `fields` array. Consumers get a consistent shape regardless of which validator raised the error.\n\n**For 5xx errors**: include a `requestId` so users can quote it when they report bugs and you can find their logs immediately. Don\'t expose stack traces in production — log them server-side, return a generic message.\n\n**Document the shape** in your API docs as part of the contract — clients can write one error handler that works for every endpoint.',
+    },
+
+    // staff
+    {
+      level: 'staff',
+      question: 'Design a request-tracing system for an Express service that integrates with downstream services.',
+      answer:
+        '**Standard**: W3C Trace Context. Every request gets a `traceparent` header — propagated from the client or generated at the edge. Format: `version-traceId-spanId-flags`.\n\n**Per-request setup**: middleware reads incoming `traceparent`; if missing, generates a new trace ID. Creates a span for the request. Stores trace/span IDs in `AsyncLocalStorage` so downstream code can access without prop-drilling.\n\n**Span attributes**: HTTP method, route, status, latency, user ID, tenant ID, error class. Don\'t put PII or full bodies. Span events for significant moments (cache hit/miss, retry attempt).\n\n**Downstream propagation**: every outgoing HTTP call adds `traceparent` automatically (undici interceptor or wrapper). DB queries: most modern ORM tracers attach to the active span automatically. Queue producers inject `traceparent` into message metadata; consumers extract on receive.\n\n**Logs**: pino reads trace/span IDs from ALS and includes them in every log line — one click in your log UI takes you to the trace.\n\n**Implementation**: OpenTelemetry SDK + auto-instrumentation handles 90% of this. Custom spans for business operations (`tracer.startActiveSpan(\'charge.process\', span => {...})`).\n\n**Sampling**: at high volume, 100% trace export is expensive. Tail-sampling at the OTel Collector (keep all errors, slow requests, 5-10% of normal) is the production pattern.\n\n**Backend**: Jaeger / Tempo / Honeycomb / Datadog APM. Choose based on cost and existing infra. All accept OTLP.\n\nDistributed tracing pays off the moment you have > 2 services. The "where did this 800ms come from?" question becomes a 30-second click instead of a 30-minute log-grep session.',
+    },
   ],
 };
