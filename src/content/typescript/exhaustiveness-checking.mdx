@@ -1,0 +1,191 @@
+export const level = 'mid';
+
+# Exhaustiveness checking
+
+The single most underused safety pattern in TypeScript: get the
+compiler to fail your build when you add a new variant to a union
+and forget to handle it somewhere. The mechanism is `never` plus a
+`switch` (or equivalent), and the cost is one tiny helper.
+
+## The problem it solves
+
+```ts
+type Event =
+  | { type: 'click'; x: number; y: number }
+  | { type: 'scroll'; delta: number };
+
+function handle(e: Event) {
+  switch (e.type) {
+    case 'click':  return click(e.x, e.y);
+    case 'scroll': return scroll(e.delta);
+  }
+}
+```
+
+A teammate adds a new variant six months later:
+
+```ts
+type Event =
+  | { type: 'click'; x: number; y: number }
+  | { type: 'scroll'; delta: number }
+  | { type: 'keydown'; key: string };
+```
+
+`handle` still compiles. It silently returns `undefined` for keydown
+events. You learn about it from a bug report.
+
+The fix is to make the compiler refuse to compile the old `handle`
+until you add the new case.
+
+## `assertNever` — the pattern
+
+```ts
+function assertNever(x: never): never {
+  throw new Error(`Unhandled case: ${JSON.stringify(x)}`);
+}
+
+function handle(e: Event) {
+  switch (e.type) {
+    case 'click':  return click(e.x, e.y);
+    case 'scroll': return scroll(e.delta);
+    default:       return assertNever(e);
+  }
+}
+```
+
+Inside `default`, TypeScript has narrowed `e` to `never` — every
+variant should have been handled by an earlier case. If you add
+`'keydown'` to the union without a case here, `e` is no longer
+`never` and `assertNever(e)` fails to compile:
+
+```
+Argument of type '{ type: "keydown"; key: string }' is not
+assignable to parameter of type 'never'.
+```
+
+The error points at the exact spot you forgot to handle. Build
+breaks. You fix it. No bug report.
+
+## Why `never`
+
+`never` is the empty type — the type with **no values**. The only
+thing assignable to `never` is `never` itself. By the time control
+reaches `default`, every case has been handled, so the variable
+*should* be of type "no variants left" = `never`. If it isn't, the
+union grew without you noticing.
+
+This is the most useful application of `never` in normal application
+code. See `unions-intersections.mdx` for the type-theoretic
+background.
+
+## Beyond switch
+
+The same pattern works for any branching construct that can be
+exhausted. With `if/else`:
+
+```ts
+function handle(e: Event) {
+  if (e.type === 'click')  return click(e.x, e.y);
+  if (e.type === 'scroll') return scroll(e.delta);
+  return assertNever(e);   // 👈 same guarantee
+}
+```
+
+With a lookup table — slightly trickier because TS can't follow
+the table's structure as cleanly:
+
+```ts
+const handlers: { [K in Event['type']]: (e: Extract<Event, { type: K }>) => void } = {
+  click:  (e) => click(e.x, e.y),
+  scroll: (e) => scroll(e.delta),
+};
+
+function handle(e: Event) {
+  handlers[e.type](e as never);   // cast needed; safety comes from the mapped type
+}
+```
+
+Add a variant and the `handlers` object fails to type — missing
+key. Same guarantee, different mechanism. The `as never` at the
+call site is the price of using a table instead of a switch; the
+mapped-type definition is what enforces completeness.
+
+## Throw vs return
+
+Two reasonable shapes for `assertNever`:
+
+```ts
+function assertNever(x: never): never { throw new Error(...); }   // runtime crash
+function assertNever(_x: never): void {}                            // silent
+```
+
+The throwing version is the standard. If the impossible somehow
+happens at runtime (data from a wire format that bypassed your
+parser, a `JSON.parse` that returned an off-spec shape), you find
+out loudly instead of silently producing wrong results. The
+silent version is safer for code that must keep running (a
+serverless function processing a batch) but harder to debug —
+prefer logging + metrics over silence.
+
+## With discriminated unions
+
+The pattern shines on **discriminated** unions — every variant
+shares a common literal-typed field that narrows them:
+
+```ts
+type Result<T> =
+  | { ok: true;  value: T }
+  | { ok: false; error: string };
+
+function unwrap<T>(r: Result<T>): T {
+  if (r.ok) return r.value;
+  throw new Error(r.error);
+}
+
+function format<T>(r: Result<T>): string {
+  switch (r.ok) {
+    case true:  return String(r.value);
+    case false: return `Error: ${r.error}`;
+    // exhaustive — no default needed because TS sees both cases
+  }
+}
+```
+
+For boolean-discriminated unions the compiler can sometimes verify
+exhaustiveness without `assertNever`, but adding it never hurts
+and protects future variants. (Yes, a `Result` won't grow new cases
+— but `RequestState` with `loading | success | error | retrying`
+will.)
+
+## Common mistakes
+
+- **Skipping `default` because "all cases are covered."** They are
+  today. They won't be when someone adds a variant. The
+  `assertNever` line is the future-proofing.
+- **Falling through cases.** `case 'a':` without `return`/`break`
+  falls through. TS catches some of this with `noFallthroughCasesInSwitch`
+  in `tsconfig` — turn it on.
+- **Using `string` as the discriminator type.** A discriminator
+  should be a literal type (`'click' | 'scroll'`), not `string`.
+  Otherwise TS can't narrow on it.
+- **Discriminator named differently across variants.** Use a
+  consistent field name (`type`, `kind`, `_tag`) — switching
+  between them breaks narrowing.
+- **`assertNever` with `(_: never): void`** instead of
+  `: never`. The `: never` return type makes the function usable
+  in positions that require a definite branch (early return,
+  ternary), and signals "this never returns normally" to the
+  caller.
+
+## When NOT to use it
+
+- **One-shot non-extensible unions.** `'asc' | 'desc'` for sort
+  order isn't going to grow. The ceremony is more than the savings.
+- **Open enums conceptually.** If new variants come from runtime
+  data (a string field whose values aren't predetermined), the
+  union is wrong — use a parser at the boundary and reject
+  unknowns.
+
+For application unions that *can* grow (event types, error kinds,
+state machines, command types) — and they nearly all can —
+exhaustiveness is the cheapest insurance TS offers.

@@ -1,0 +1,230 @@
+export const level = 'senior';
+
+# Testing types
+
+Runtime tests check that your code does the right thing. Type
+tests check that your *types* do the right thing — generic helpers
+infer correctly, conditional types narrow as expected, library
+overloads pick the right signature, refactors don't silently widen
+to `any`. For library code and any non-trivial generic, type tests
+are the only way to catch type-level regressions before users do.
+
+## The problem
+
+```ts
+function first<T>(arr: T[]): T | undefined {
+  return arr[0];
+}
+
+const x = first([1, 2, 3]);   // type: number | undefined
+```
+
+`x: number | undefined` is what you want. Six months later, someone
+changes the implementation:
+
+```ts
+function first<T>(arr: T[]): T {     // 👈 dropped the | undefined
+  return arr[0]!;
+}
+```
+
+Still compiles. Existing callers that were checking `if (x !== undefined)`
+look pointless to the linter now. Subtle correctness regression,
+no runtime test catches it, no error appears.
+
+A type test would have caught it.
+
+## Two flavors of type tests
+
+### `@ts-expect-error` — assert a line should fail
+
+```ts
+function add(a: number, b: number): number {
+  return a + b;
+}
+
+// @ts-expect-error — strings aren't numbers
+add('1', 2);
+```
+
+If the line *fails to typecheck*, the comment is consumed silently.
+If the line *typechecks unexpectedly*, the `@ts-expect-error`
+becomes an error ("Unused @ts-expect-error directive"). Effectively
+a one-line assertion that "this is supposed to be a type error."
+
+Use for testing negative cases — "the API should reject this input."
+
+### `expect-type` / `tsd` — equality and assignability assertions
+
+```ts
+import { expectTypeOf } from 'expect-type';
+
+expectTypeOf(first([1, 2, 3])).toEqualTypeOf<number | undefined>();
+expectTypeOf<Awaited<Promise<string>>>().toEqualTypeOf<string>();
+expectTypeOf<Partial<{ a: 1; b: 2 }>>().toMatchTypeOf<{ a?: 1 }>();
+```
+
+`expect-type` (the modern standard) gives you typed assertions over
+types and expressions. Failures show up as type errors at the
+assertion line, with reasonable messages. Zero runtime cost — it's
+all in the type system.
+
+Alternative: **`tsd`** runs as a CLI and validates a `.test-d.ts`
+file. Useful for libraries published to npm; the test file is
+shipped or kept alongside the source.
+
+## What to test
+
+The targets that catch real regressions:
+
+### Generic inference
+
+```ts
+expectTypeOf(first<number>([1, 2])).toEqualTypeOf<number | undefined>();
+expectTypeOf(first(['a', 'b'])).toEqualTypeOf<string | undefined>();
+expectTypeOf(first<number>([])).toEqualTypeOf<number | undefined>();
+```
+
+If `T` infers wrong, downstream callers get wrong types. Hard to
+catch without a test.
+
+### Conditional types
+
+```ts
+type IsArray<T> = T extends readonly unknown[] ? true : false;
+
+expectTypeOf<IsArray<number[]>>().toEqualTypeOf<true>();
+expectTypeOf<IsArray<readonly string[]>>().toEqualTypeOf<true>();
+expectTypeOf<IsArray<string>>().toEqualTypeOf<false>();
+expectTypeOf<IsArray<never>>().toEqualTypeOf<never>();  // distribution edge case
+```
+
+Conditional types over unions distribute (see `conditional-types.mdx`).
+The `never` case in particular is a frequent source of "my type
+collapses to never when given the empty union" bugs.
+
+### Overloads
+
+```ts
+function get(key: 'name'): string;
+function get(key: 'age'):  number;
+function get(key: string): unknown;
+function get(key: string): unknown { /* ... */ }
+
+expectTypeOf(get('name')).toEqualTypeOf<string>();
+expectTypeOf(get('age')).toEqualTypeOf<number>();
+expectTypeOf(get('other')).toEqualTypeOf<unknown>();
+```
+
+Overload order matters; reordering can silently change which
+signature TS picks. Tests pin the contract.
+
+### Library boundaries
+
+```ts
+import { Component } from 'my-library';
+
+expectTypeOf<Component>().toHaveProperty('render');
+expectTypeOf<Component['render']>().parameters.toEqualTypeOf<[Props]>();
+expectTypeOf<Component['render']>().returns.toEqualTypeOf<JSX.Element>();
+```
+
+If a library bump changes the type, tests fail at the import site
+before runtime.
+
+## Negative tests with `@ts-expect-error`
+
+```ts
+const validUser: User = { id: '1', email: 'a@b.c' };
+
+// @ts-expect-error — missing email
+const invalid1: User = { id: '1' };
+
+// @ts-expect-error — extra property
+const invalid2: User = { id: '1', email: 'a@b.c', admin: true };
+```
+
+These verify your types **reject** invalid usage. A `User` type
+that accidentally widens (`admin?: boolean`) makes the second
+`@ts-expect-error` fail loudly.
+
+Beware: `@ts-expect-error` consumes **any** error on the next line.
+If the line had two issues and you fixed one, the comment still
+swallows the other. Pair with a comment explaining *which* error
+you're asserting, or use `@ts-expect-error: missing email` (the
+trailing text is ignored by TS but humans read it).
+
+## Where to put them
+
+Three reasonable layouts:
+
+1. **Inline in source** — for small projects, `@ts-expect-error`
+   sprinkled near the code it documents.
+2. **`*.test-d.ts` files** — colocated with sources, picked up by
+   `tsd`. Standard for published packages.
+3. **Dedicated `types/` directory** — for a project with lots of
+   type tests, mirror the source structure under `types/`.
+
+Vitest, Jest, and `@arethetypeswrong/cli` all integrate
+`expect-type` style assertions. Most test runners will run files
+that contain only type-level assertions because they typecheck the
+file as part of the run.
+
+## Speed considerations
+
+Type tests run at typecheck time. Adding 500 of them adds
+typecheck time. For a fast feedback loop:
+
+- Keep type tests in their own files (separate `tsconfig` if
+  needed) so the main build doesn't pay the cost.
+- Use `--incremental` and persistent `*.tsbuildinfo` (see
+  `project-references.mdx`).
+- For very heavy generics, the test itself can be slow — measure
+  with `--extendedDiagnostics`.
+
+A library with 50 type tests adds `<1s` to a clean build. A library
+with 1000 deep generic tests can add 30s. Worth the cost in both
+cases; just be aware.
+
+## What NOT to test
+
+- **Trivial annotations.** `expectTypeOf(42).toEqualTypeOf<number>()`
+  proves nothing.
+- **Types fully derived from a schema.** If `User = z.infer<typeof S>`,
+  testing `User` is testing your library.
+- **Implementation details.** Test the public surface; private
+  internal types can change.
+- **Behavior, in a type test.** Use a runtime test for runtime
+  behavior. Type tests catch type changes, not value changes.
+
+## The mental model
+
+- **Runtime tests** = "does the code do the right thing at runtime?"
+- **Type tests** = "do the types describe the code accurately?"
+
+You need both. A function that returns the wrong thing fails runtime
+tests; a function that returns the right thing with a wrong type
+annotation only fails type tests. The latter is sneakier because
+the error surfaces in *callers*, often weeks later, often as
+`undefined is not a function`.
+
+For application code that mostly uses types instead of producing
+them, runtime tests dominate. For library code, infrastructure
+helpers, type-level utilities — type tests are essential and cheap.
+
+## Common mistakes
+
+- **Asserting subtype when you mean equal.** `toMatchTypeOf` allows
+  the actual to be a *subtype* (extra properties OK); `toEqualTypeOf`
+  requires exact equality. Mix them up and the test passes for
+  wrong reasons.
+- **`@ts-expect-error` with no comment.** Future-you can't tell
+  what error you meant to assert. Always annotate inline.
+- **Testing types you don't own.** Tests on `lib.dom.d.ts` are
+  brittle and add no value.
+- **One test per type instead of one suite per module.** Bundle
+  related assertions; failures land closer to the problem.
+- **Skipping type tests because "the compiler will catch it."**
+  The compiler catches what you don't write *and* the type is
+  wrong about. Type tests catch what you *do* write and the type
+  is wrong about.

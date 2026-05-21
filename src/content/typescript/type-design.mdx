@@ -1,0 +1,331 @@
+export const level = 'senior';
+
+# Type design
+
+Choosing the right *shape* of a type matters more than knowing
+every advanced feature. A well-designed type catches bugs at
+compile time, reads well in IDE hover tooltips, and survives
+refactors. A badly designed type accepts invalid states, drifts
+from reality, and forces every consumer to write defensive checks.
+
+This page collects the senior-level type-design principles from
+*Effective TypeScript* and similar canon, distilled to what
+actually matters in modern app code.
+
+## Make illegal states unrepresentable
+
+The single most valuable principle. If a combination of fields
+can't logically exist, design the type so it *can't be constructed*.
+
+### Before
+
+```ts
+type Request = {
+  state: 'loading' | 'success' | 'error';
+  data?: User;
+  error?: string;
+};
+```
+
+This type *allows* `{ state: 'success', error: 'oops' }` and
+`{ state: 'error', data: { ... } }` — combinations that make no
+sense. Every consumer has to defensively check `state` before
+trusting `data` or `error`.
+
+### After
+
+```ts
+type Request =
+  | { state: 'loading' }
+  | { state: 'success'; data: User }
+  | { state: 'error';   error: string };
+```
+
+Now `data` exists *only* when the state is `success`, `error`
+exists *only* when the state is `error`, and the combinations that
+were nonsense before are unrepresentable. Consumers narrow once
+via `state` and get full type safety inside the branch.
+
+The cost is two extra `| { ... }` lines. The benefit is
+removing an entire class of bugs without writing a single check.
+
+### Recurring shape: tagged unions for state
+
+Anywhere you have "thing is in one of N modes, each mode has
+different associated data," use a discriminated union:
+
+- Form state: idle / submitting / submitted / failed
+- Resource: not-loaded / loading / loaded / errored
+- Auth: anonymous / pending / authenticated
+- Result: ok / err
+
+Pair with exhaustiveness checking (`exhaustiveness-checking.mdx`)
+for the full benefit.
+
+## Prefer unions of interfaces over interfaces of unions
+
+```ts
+// ❌ interface of unions — every field's union is independent
+interface Layer {
+  type: 'fill' | 'line' | 'point';
+  fillColor?: string;       // only meaningful when type === 'fill'
+  strokeWidth?: number;     // only for 'line'
+  radius?: number;          // only for 'point'
+}
+
+// ✅ union of interfaces — fields are coupled to the discriminant
+type Layer =
+  | { type: 'fill';  fillColor: string }
+  | { type: 'line';  strokeWidth: number }
+  | { type: 'point'; radius: number };
+```
+
+The first form lets every field be `undefined` independently. The
+second couples them. Same idea as "make illegal states
+unrepresentable," scaled up to structural design.
+
+## Liberal in, strict out
+
+Take **wide** input types; return **narrow** output types. This is
+the type-level version of Postel's Law.
+
+```ts
+// ✅ takes anything iterable, returns a concrete array
+function toArray<T>(input: Iterable<T>): T[] { ... }
+
+// ❌ requires T[], returns the same T[] type
+function unique<T>(input: T[]): T[] { ... }
+```
+
+Calling `unique` with a `Set` or generator forces conversion at
+the call site. Calling `toArray(set)` works. For the return, you
+want `T[]` — not `Iterable<T>` — because callers need `.length`,
+`.map`, etc.
+
+The principle applies to interfaces too:
+
+```ts
+// ✅ accept Partial inputs, return complete outputs
+function updateUser(input: Partial<User>): User { ... }
+```
+
+Callers can pass any subset; recipients get the full type. Don't
+flip this — taking `User` and returning `Partial<User>` forces
+every consumer to handle missing fields.
+
+## Push null/undefined to the perimeter
+
+Don't sprinkle `| null` through every field. Validate at the
+boundary, then types are clean internally.
+
+```ts
+// ❌ every field defensive
+type User = {
+  id:     string;
+  email:  string | null;
+  name:   string | null | undefined;
+  bio:    string | null;
+};
+
+// ✅ narrowed at the boundary
+type User = {
+  id:    string;
+  email: string;
+  name:  string;
+  bio:   string;
+};
+
+function loadUser(raw: unknown): User | null {
+  const parsed = UserSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+```
+
+The `null`-ness lives in the function return, not in the type. Code
+that has a `User` *has* an email and a name. No `user.email!` or
+`user.email ?? ''` everywhere.
+
+When a field really is optional (a `bio` users may not set), use
+`?:` — that's a different signal ("not provided") than `null`
+("explicitly empty"). Pick one convention per codebase.
+
+## Name types in domain language
+
+```ts
+// ❌ structural mush
+function chargeCustomer(c: {
+  id: string;
+  email: string;
+  amount: number;
+}): { id: string; status: string };
+
+// ✅ named domain types
+function chargeCustomer(c: Customer): Charge;
+```
+
+The structural type works — TS accepts any object with the right
+fields. But the named version tells the reader what the parameter
+*means*, shows up nicely in IDE tooltips, and gives a stable handle
+to refactor against. Naming is the cheap part of design.
+
+Sub-rule: **brand IDs**. A `Customer`'s id and an `Order`'s id
+are both strings, but you don't want one passed where the other is
+expected. Branded types catch the mix at compile time. See
+`branded-types.mdx`.
+
+## Avoid `Object`, `{}`, and `Function`
+
+```ts
+// ❌ near-useless
+function f(x: Object) { ... }    // accepts everything except null/undefined
+function g(x: {}) { ... }         // same — `{}` means "any non-nullish"
+function h(fn: Function) { ... }  // accepts anything callable, returns any
+```
+
+`Object` and `{}` are top-types-but-not-quite. They allow any
+property access (returning the wrong type) without warning. `Function`
+is even worse — calls are allowed with any arguments and return
+`any`.
+
+The right alternatives:
+
+```ts
+function f(x: object) { ... }              // non-null object (not primitives)
+function f(x: unknown) { ... }              // truly anything
+function h(fn: (...a: unknown[]) => unknown) { ... }   // generic callable
+```
+
+## Don't expose more than you need
+
+Library types are a contract. Every exposed field is a thing
+consumers can rely on, which means every change to that field is a
+breaking change.
+
+```ts
+// ❌ leaks implementation
+export class HttpClient {
+  public retryCount = 0;
+  public lastResponse: Response | null = null;
+  public cache: Map<string, Response> = new Map();
+  fetch(url: string): Promise<Response> { ... }
+}
+
+// ✅ minimal public surface
+export class HttpClient {
+  #retryCount = 0;
+  #lastResponse: Response | null = null;
+  #cache = new Map<string, Response>();
+  fetch(url: string): Promise<Response> { ... }
+}
+```
+
+The second version has the same behavior but no implementation
+fields in the public type. You can swap `Map` for an LRU, drop
+`lastResponse`, change retry semantics — none of it breaks
+consumers.
+
+The same applies to type exports: export only what consumers should
+use. Internal helpers stay internal.
+
+## Tighten loose return types
+
+```ts
+// ❌ widens to string
+function statusFor(code: number) {
+  if (code < 300) return 'ok';
+  if (code < 500) return 'client-error';
+  return 'server-error';
+}
+// inferred: (code: number) => string
+
+// ✅ explicit narrow return
+type Status = 'ok' | 'client-error' | 'server-error';
+function statusFor(code: number): Status {
+  if (code < 300) return 'ok';
+  if (code < 500) return 'client-error';
+  return 'server-error';
+}
+```
+
+Without the annotation, the inferred return is `string` — callers
+can't `switch` on `status` exhaustively because `string` has
+infinite cases. Annotating with the union restores narrow info,
+and the compiler verifies the implementation actually returns
+those values.
+
+Same idea: a `Color = '#FF0000' | '#00FF00' | '#0000FF'` annotation
+on a function returning literals.
+
+## Don't repeat type information
+
+```ts
+// ❌ types declared twice
+interface User {
+  id:    string;
+  email: string;
+}
+function loadUser(): { id: string; email: string } { ... }
+
+// ✅ single source
+function loadUser(): User { ... }
+
+// ✅ even better — derive
+const User = z.object({ id: z.string(), email: z.string() });
+type User = z.infer<typeof User>;
+```
+
+Repeated type declarations drift. Always have one source — an
+interface, a schema, a class — and derive the rest from it.
+
+## Distinguish data from operations
+
+If a type carries methods (`save()`, `validate()`), it's modeling
+behavior. If it's plain fields, it's modeling data. Mixing them is
+fine in OO-heavy codebases (NestJS entities), but the convention
+should be consistent. Plain data types are easier to validate,
+clone, serialize, send over the wire.
+
+```ts
+// data
+type User = { id: string; email: string; ... };
+
+// operations live elsewhere
+function saveUser(u: User): Promise<void> { ... }
+function validateUser(u: User): boolean { ... }
+```
+
+This separation makes data layer, business layer, and presentation
+layer clearer than "the User object knows how to save itself."
+
+## When to use a class vs a type
+
+| | Use class | Use type/interface |
+| --- | --- | --- |
+| Behavior + state | yes | no |
+| Plain data shape | no | yes |
+| Polymorphism (`instanceof`) | yes | no |
+| ORM/framework requires it | yes | no |
+| Wire-format / DTO | no | yes |
+| Easy to clone/serialize | no | yes |
+
+See `classes-in-ts.mdx`.
+
+## Common mistakes
+
+- **Modeling optional state with `?:` *and* nullable.** Pick one. A
+  field that's "missing" vs "null" should have a defined meaning;
+  most codebases don't need both.
+- **`any` in a public API.** Every consumer inherits the loss.
+  `unknown` at least forces them to narrow.
+- **Returning union types where a discriminated union would be
+  clearer.** `number | string` is a worse return than
+  `{ type: 'count', n } | { type: 'name', s }`.
+- **Exposing class fields that should be private.** Once shipped,
+  removing a public field is a breaking change.
+- **Naming types after frameworks instead of domain.** `UserDto`,
+  `UserVm`, `UserEntity`, `UserModel` for the same user is layered
+  cargo-culting. Pick what each layer *means* for the domain, or
+  use one name and let context disambiguate.
+- **Letting `tsconfig` `strict: false`** in a serious project. The
+  whole design vocabulary above assumes the compiler enforces it.
+  Without strict, types are decoration.

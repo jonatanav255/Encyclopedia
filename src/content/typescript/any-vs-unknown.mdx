@@ -1,0 +1,250 @@
+export const level = 'senior';
+
+# `any` vs `unknown`
+
+`any` is the type system's escape hatch. `unknown` is the type
+system's frontier guard. They both accept "anything" coming in;
+they differ entirely on what you can *do* with that anything
+afterward. The discipline of preferring `unknown` is one of the
+few cheap habits that prevents a whole class of bugs.
+
+## What each means
+
+**`any`** turns the type checker off for this value. Any property
+exists. Any call is allowed. Any assignment compiles.
+
+```ts
+const x: any = JSON.parse(input);
+x.foo.bar.baz();         // compiles
+x.toUpperCase().length;   // compiles
+const n: number = x;     // compiles
+```
+
+**`unknown`** says "I have a value, but I make no claims about its
+type." You can hold it, pass it around, and reassign it — but you
+can't *use* it (no property access, no calls) until you narrow it.
+
+```ts
+const x: unknown = JSON.parse(input);
+x.foo;                   // 🚫 Object is of type 'unknown'
+const n: number = x;     // 🚫 Type 'unknown' is not assignable
+if (typeof x === 'object' && x && 'foo' in x) {
+  // x is narrowed here
+}
+```
+
+## The danger of `any`
+
+`any` is **contagious**. Any expression containing an `any` is
+itself `any`:
+
+```ts
+const u: any = JSON.parse(input);
+const arr = [u, 'safe'];           // string[]? No. any[].
+const result = arr.map((x) => x);  // any[], even though .map types it as <U>(...) => U[]
+```
+
+One `any` upstream pollutes everything downstream. After enough of
+them you have a TypeScript codebase that's functionally JavaScript.
+The compiler still runs. It just stops catching anything.
+
+Worse, `any` is assignable **to** any type:
+
+```ts
+const u: any = 'hello';
+const n: number = u;     // compiles fine
+const f: () => void = u; // also fine
+```
+
+Anywhere `any` flows in, type safety flows out. The compiler will
+let you assign a string to a `number` variable without complaint,
+which then explodes at runtime.
+
+## The discipline with `unknown`
+
+`unknown` forces you to **prove** what the value is before using it.
+The prove step is a type guard, an assertion, or a parser:
+
+```ts
+function processInput(raw: unknown) {
+  if (typeof raw === 'string') {
+    raw.toUpperCase();   // narrowed to string
+  }
+
+  if (typeof raw === 'object' && raw !== null && 'id' in raw && typeof raw.id === 'string') {
+    raw.id;              // narrowed
+  }
+}
+```
+
+The narrowing is verbose. That verbosity is the point — it's a
+running tally of "things I've checked." When the proof gets long,
+you reach for a parser (see below).
+
+## Where `unknown` is the right type
+
+- **`JSON.parse` returns.** The wire format isn't guaranteed.
+- **`catch` clause variables.** As of TS 4.4 with `useUnknownInCatchVariables`,
+  `catch (e)` infers `e: unknown` instead of `any`.
+- **Anything off a network/disk boundary.** External I/O can't be
+  trusted at the type level.
+- **Generic registry values.** Storing `Map<string, unknown>` and
+  letting each call site narrow.
+
+```ts
+try {
+  riskyThing();
+} catch (e) {            // e: unknown
+  if (e instanceof Error) console.error(e.message);
+  else console.error(String(e));
+}
+```
+
+## When `any` is genuinely the right answer
+
+`any` isn't always wrong. It's wrong when used **broadly** to
+silence the checker. Used in a **narrow, well-typed wrapper**, it's
+fine:
+
+```ts
+function deepGet(obj: any, path: string[]): unknown {
+  return path.reduce<any>((acc, key) => acc?.[key], obj);
+}
+```
+
+The `any` is contained — input and output types are typed honestly,
+the inside is dynamic by necessity. Callers don't see `any` leak.
+This is the "type the contract, not the body" pattern.
+
+Other defensible uses:
+
+- **Migrating JS to TS.** Tactical `any` is better than `as` lies.
+  See `migrating-js-to-ts.mdx`.
+- **Truly polymorphic adapters** where no generic can express the
+  shape (rare).
+- **Library types where the upstream API is genuinely `any`.**
+  Don't pretend to type something the runtime doesn't constrain.
+
+The rule: `any` should be **noticed**. A grep for `any` in your
+codebase should turn up a small list of intentional spots, not be a
+hopeless task.
+
+## `unknown` at the perimeter
+
+The pattern that's worth internalizing:
+
+```ts
+function loadUser(raw: unknown): User {
+  // narrow + validate at the boundary
+  if (!isUser(raw)) throw new Error('bad user payload');
+  return raw;
+}
+
+function isUser(x: unknown): x is User {
+  return typeof x === 'object'
+      && x !== null
+      && 'id' in x && typeof x.id === 'string'
+      && 'email' in x && typeof x.email === 'string';
+}
+
+// elsewhere
+const u = loadUser(await res.json());
+u.id;   // narrowed and trusted
+```
+
+The boundary takes `unknown`, validates, and returns `User`.
+Everything downstream gets the strong type. The "is this really a
+User?" question is asked exactly once, in the right place.
+
+For non-trivial shapes, replace the hand-rolled `isUser` with a
+parser library — Zod, Valibot, ArkType. They give you the type
+guard for free from a schema and produce clear error messages. See
+`runtime-validation.mdx`.
+
+## `any` vs `unknown` in generics
+
+`<T = unknown>` is usually a better default than `<T = any>`:
+
+```ts
+type Maybe<T = unknown> = { value: T };
+
+const m: Maybe = JSON.parse(input);
+m.value.foo;              // 🚫 forces narrowing
+```
+
+vs.
+
+```ts
+type MaybeAny<T = any> = { value: T };
+const m: MaybeAny = JSON.parse(input);
+m.value.foo;              // 😐 silently any
+```
+
+The `unknown` default forces consumers to specify or narrow. The
+`any` default makes the type alias a slow leak.
+
+## Spotting hidden `any`
+
+`any` often sneaks in without you writing the word:
+
+```ts
+// implicit any — only catches with noImplicitAny: true
+function f(x) { return x + 1; }
+
+// type from untyped library
+import legacy from 'some-legacy-lib';   // returns any without types
+
+// JSON.parse / Response.json()
+const data = JSON.parse(s);             // any (still — lib.es5 has never typed it unknown)
+const data2 = await res.json();         // also any — type with a parser at the boundary
+
+// catch clauses
+try {} catch (e) { e.foo }              // e is any unless useUnknownInCatchVariables
+
+// type assertions through any
+const x = (something as any) as User;
+```
+
+In a serious TS codebase, `strict: true` is not optional:
+
+```json
+{
+  "strict": true   // turns on noImplicitAny, useUnknownInCatchVariables, and more
+}
+```
+
+`strict` already implies `useUnknownInCatchVariables`. List it
+separately only if you opt out of full strict (you shouldn't, but
+some legacy codebases do).
+
+Tools like **`type-coverage`** can flag what percentage of your
+expressions are typed (vs `any`). For libraries and shared modules,
+≥99% is a reasonable target; for app code, ≥95% catches drift.
+
+## The mental model
+
+- **`any`** = "stop checking" — a code smell unless the scope is
+  tiny.
+- **`unknown`** = "check before using" — the right answer at any
+  boundary where the type isn't guaranteed.
+
+When you're tempted to write `any`, write `unknown` and let the
+type errors tell you what you actually need to know about the
+value.
+
+## Common mistakes
+
+- **`x as any as T`** to silence an assignment. You've lied to the
+  type system twice. The runtime hasn't changed; the bug is just
+  invisible until it explodes.
+- **`Function` instead of `(...args: unknown[]) => unknown`.** The
+  `Function` type allows any call and returns `any`. It's almost
+  always wrong.
+- **Casting `unknown` straight to `T` without a guard.** That's
+  `any` in slow motion.
+- **Returning `any` from a typed function** because the implementation
+  uses `any` internally. The return type is part of the contract;
+  type it honestly.
+- **Skipping `useUnknownInCatchVariables`.** Without it, `catch (e)`
+  is `any` and the safety story is broken at the most error-prone
+  boundary in the codebase.

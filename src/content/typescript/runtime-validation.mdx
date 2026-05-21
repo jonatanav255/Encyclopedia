@@ -1,0 +1,317 @@
+export const level = 'mid';
+
+# Runtime validation
+
+`type-vs-runtime.mdx` covers the conceptual gap: TypeScript types
+don't exist at runtime. This page is the **playbook**. When data
+enters your system from outside — HTTP body, query string, env var,
+file, message queue, third-party API — TypeScript believes whatever
+you tell it. The runtime hasn't read your `.d.ts` files. A `User`
+type annotation on a raw `JSON.parse` result is a lie that compiles.
+
+The fix is to validate at the boundary with a parser library, then
+trust the type internally.
+
+## The shape of the problem
+
+```ts
+// Express handler
+app.post('/users', (req, res) => {
+  const user: User = req.body;        // 🚫 a lie that compiles
+  await db.users.insert(user);
+});
+```
+
+`req.body` is `any`. The annotation does nothing. Whatever the
+client sent goes into your DB:
+
+- Missing required fields → `null` everywhere
+- Wrong types (number where string expected) → silent corruption
+- Extra fields → pollution, possible security holes
+- Hostile shapes (`__proto__`, `constructor`) → prototype pollution
+
+This is the most common source of "TypeScript catches nothing at
+runtime" surprise.
+
+## The pattern
+
+**Parse at the perimeter. Trust internally.**
+
+```ts
+import { z } from 'zod';
+
+const User = z.object({
+  email: z.email(),                            // top-level in Zod v4
+  name:  z.string().min(1).max(100),
+  age:   z.number().int().nonnegative().optional(),
+});
+type User = z.infer<typeof User>;     // 👈 derived from the schema
+
+app.post('/users', (req, res) => {
+  const parsed = User.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json(parsed.error);
+  await db.users.insert(parsed.data); // 👈 typed as User, validated
+});
+```
+
+The schema is the single source of truth. The TypeScript type is
+*derived from* the schema, not declared alongside it. Drift is
+impossible — change the schema and the type changes too.
+
+## Choosing a library (early 2026)
+
+The current trinity for runtime validation in TS:
+
+| | Zod | Valibot | ArkType |
+| --- | --- | --- | --- |
+| Bundle | small (Zod v4 ~14 KB min / ~5 KB gz; Zod Mini ~2 KB gz) | tiny (tree-shakes to ~1–2 KB for typical schemas) | small |
+| API style | method chaining | pipe-style functions | TypeScript-syntax-inspired |
+| Errors | rich, structured | structured | structured |
+| TS inference | excellent | excellent | excellent + fast |
+| Async refinements | yes | yes | yes |
+| Maturity | mature (2020+) | newer (2023+) | newer (2023+) |
+
+**Defaults to reach for in 2026:**
+
+- **Backend Node service** — Zod. Mature, ecosystem-rich, fine
+  bundle.
+- **Bundle-sensitive frontend / edge runtime** — Valibot.
+- **Heavy type-level work** — ArkType (its parser-as-types story is
+  exceptional).
+
+The patterns below use Zod v4 for familiarity but apply to all three.
+(Zod v4 moved validators like `.email()`/`.url()`/`.uuid()` from
+method chains on `z.string()` to top-level `z.email()`/`z.url()`/
+`z.uuid()`. The chained forms are deprecated but still work.)
+
+## At the HTTP boundary
+
+```ts
+const CreateUser = z.object({
+  email: z.email(),
+  name:  z.string(),
+});
+
+app.post('/users', (req, res, next) => {
+  try {
+    const body = CreateUser.parse(req.body);   // throws on invalid
+    const u = await db.users.insert(body);
+    res.status(201).json(u);
+  } catch (e) {
+    next(e);
+  }
+});
+```
+
+`parse` throws on invalid input — works with Express 5's automatic
+async error forwarding. `safeParse` returns a discriminated union
+(`{ success: true, data } | { success: false, error }`) for code
+that prefers branching to throwing.
+
+For query strings:
+
+```ts
+const Query = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  size: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+const { page, size } = Query.parse(req.query);
+```
+
+`z.coerce.number()` converts the string `"42"` to a number — query
+params are always strings on the wire, and the schema doing the
+coercion keeps the trusted type clean.
+
+## At the environment boundary
+
+```ts
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'production', 'test']),
+  PORT:     z.coerce.number().int().positive(),
+  DATABASE_URL: z.url(),
+  REDIS_URL:    z.url().optional(),
+});
+
+export const env = Env.parse(process.env);   // 💥 fail fast at boot
+```
+
+The cost is zero — runs once at startup. The value is enormous —
+the entire app sees `env.PORT` as `number`, `env.DATABASE_URL` as
+`string`, missing/invalid env vars cause a loud crash on the
+process that's still in `dev`/`docker logs` reach.
+
+## At the third-party API boundary
+
+```ts
+const StripeCharge = z.object({
+  id: z.string(),
+  amount: z.number().int(),
+  currency: z.string().length(3),
+  status: z.enum(['succeeded', 'pending', 'failed']),
+});
+
+const res = await fetch(`https://api.stripe.com/v1/charges/${id}`);
+const data = await res.json();                // unknown
+const charge = StripeCharge.parse(data);      // trusted
+```
+
+Even for trusted partners, parse. APIs change, fields disappear,
+new statuses appear. Catching that at the parse boundary — with a
+clear "this field was missing" error — beats catching it three
+function calls deep with a `TypeError: cannot read properties of undefined`.
+
+## Inferring TS types from schemas
+
+```ts
+const User = z.object({
+  email: z.string(),
+  name:  z.string(),
+  meta:  z.object({ verified: z.boolean() }),
+});
+
+type User = z.infer<typeof User>;
+// type User = { email: string; name: string; meta: { verified: boolean } }
+```
+
+`z.infer<typeof S>` walks the schema and produces the equivalent
+TS type. **Always derive the type from the schema, never declare
+both.** If the schema and a hand-written interface drift, the
+interface lies and the parser is the only source of truth.
+
+For the input *before* coercion/transforms vs. output *after*:
+
+```ts
+const Coerced = z.object({ n: z.coerce.number() });
+type In  = z.input<typeof Coerced>;    // { n: string | number | ... }
+type Out = z.output<typeof Coerced>;   // { n: number }
+type T   = z.infer<typeof Coerced>;    // same as output
+```
+
+The input/output distinction matters at API boundaries where the
+wire type differs from what handlers use.
+
+## Composing schemas
+
+```ts
+const ID = z.uuid();
+
+const BaseEntity = z.object({
+  id: ID,
+  createdAt: z.coerce.date(),
+});
+
+const User = BaseEntity.extend({
+  email: z.email(),
+});
+
+// Discriminated union
+const Event = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('click'),  x: z.number(), y: z.number() }),
+  z.object({ type: z.literal('scroll'), delta: z.number() }),
+]);
+
+type Event = z.infer<typeof Event>;   // proper discriminated union
+```
+
+`discriminatedUnion` is much faster than `union` for tagged
+variants — it uses the discriminator for direct dispatch instead of
+trying every member. Use it whenever the variants share a literal
+discriminator.
+
+## Custom refinements
+
+```ts
+const Password = z.string()
+  .min(8)
+  .refine((s) => /[A-Z]/.test(s), 'must contain uppercase')
+  .refine((s) => /[0-9]/.test(s), 'must contain digit');
+
+const PasswordChange = z.object({
+  current: Password,
+  next:    Password,
+}).refine((d) => d.current !== d.next, {
+  message: 'new password must differ',
+  path:    ['next'],
+});
+```
+
+`refine` adds runtime checks the type system can't express. `path`
+attaches errors to a specific field for nice error reporting.
+
+## Async refinements (with care)
+
+```ts
+const Email = z.email().refine(
+  async (e) => !await isEmailTaken(e),
+  'email already in use',
+);
+
+await Email.parseAsync(input);   // 👈 must use Async variant
+```
+
+Async checks are powerful but slow — they fire on every parse.
+Reach for them only when the check truly can't happen later. For a
+"is this email taken" check, doing it after parsing (in the
+handler, before insert) is often clearer than baking it into the
+schema.
+
+## What NOT to validate this way
+
+- **Internal function arguments.** Types are enough. Don't parse a
+  `User` you just constructed from a parsed `User`.
+- **Database query results from a typed ORM** (Prisma, Kysely,
+  Drizzle). The ORM types are derived from the schema; double
+  validation is wasted CPU.
+- **Hot loops.** Parsing has cost. If you're validating 1M records
+  per second, batch-validate at ingest, then trust internally.
+- **JSON.stringify output.** That's the *outbound* direction; the
+  type system already enforced the shape.
+
+The boundary is "untrusted source → my code." Internal boundaries
+don't need re-validation.
+
+## Error reporting
+
+```ts
+const result = User.safeParse(input);
+if (!result.success) {
+  // result.error.issues: { path, message, code }[]
+  res.status(400).json({
+    errors: result.error.issues.map((i) => ({
+      field: i.path.join('.'),
+      msg:   i.message,
+    })),
+  });
+}
+```
+
+Each issue has `path` (array of keys/indices), `message` (human
+text), `code` (machine-readable). Map this to your API's error
+format. Don't return the raw `error.message` to clients — it can
+leak schema details and is hard to consume.
+
+## What about classes and DTOs?
+
+Some libraries (class-validator with class-transformer, TypeBox,
+`io-ts`) take a class-decorator approach. For a NestJS-heavy stack,
+class-validator pairs naturally; for everything else, Zod/Valibot
+are simpler and don't pull in `reflect-metadata`. The parser-style
+libraries also produce JSON Schema for OpenAPI generation, which
+is its own win.
+
+## Common mistakes
+
+- **Annotating `req.body as User`.** Doesn't validate; the lie just
+  compiles. Always parse.
+- **Hand-writing a TS type *and* a Zod schema for the same shape.**
+  They drift. Always `z.infer`.
+- **Catching parse errors silently.** A 400 is the right response;
+  swallowing it makes debugging bad requests impossible.
+- **Parsing the same data twice on the same path.** Pick a layer
+  (middleware vs handler) and stick to it.
+- **No schema for env vars.** This is the easiest one to add and
+  fails the loudest in production when an env var is missing or
+  malformed.
+- **Coercing types deep inside business logic** instead of at the
+  boundary. Untyped data shouldn't reach business code at all.

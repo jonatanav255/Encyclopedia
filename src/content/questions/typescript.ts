@@ -252,5 +252,133 @@ export const bank: QuestionBank = {
       answer:
         '**Profile first**: `tsc --extendedDiagnostics` shows time per phase. `tsc --generateTrace ./trace` writes a Chrome-tracing-compatible profile — load in `chrome://tracing` to see expensive types.\n\n**Common wins**:\n\n1. **`skipLibCheck: true`** — skips type-checking of `.d.ts` files in `node_modules`. Usually safe; recovers 30-60s on large projects.\n2. **`incremental: true`** + `.tsbuildinfo` — second runs only re-check changed files. Cuts iteration to seconds.\n3. **`isolatedModules: true`** + bundler emit (esbuild/swc) — TypeScript only does type-checking, not transpilation. Splits the work.\n4. **Project references** for monorepos — independent compilation per package, parallel.\n5. **Remove deeply recursive types** — `infer`-heavy types with unbounded recursion blow up. Cache intermediate types via `type Alias = ComplexThing<T>` (TS memoizes named aliases).\n6. **`noEmit: true` in CI** — separate type-check job from build (which uses esbuild). Run in parallel.\n7. **Check `paths`** in tsconfig — overly broad mappings make every import resolve through huge candidate lists.\n\n**For library deps**: a single big-types package (`@types/lodash` historically) can dominate. `skipLibCheck` masks; pinning to specific submodule imports (`lodash/get`) helps tree-shaking but not type-check time.\n\n**Target**: type-check + build in CI under 1 minute for a 50k-line codebase is achievable. If you\'re past 5 minutes, project references usually win.',
     },
+
+    // --- exhaustiveness checking ---
+    {
+      level: 'mid',
+      question: 'What\'s `assertNever` for and why does it work?',
+      answer:
+        'It\'s a helper that makes the compiler fail when you add a new variant to a discriminated union and forget to handle it somewhere: `function assertNever(x: never): never { throw new Error(...) }`. Inside the `default` of a switch on the discriminant, TS narrows the variable to `never` if every case was handled. Adding a new variant means the variable is no longer `never`, so `assertNever(e)` fails to compile — pointing at the exact place you forgot to handle. The cheapest form of insurance TS offers for unions that can grow (event types, error kinds, state machines).',
+    },
+    {
+      level: 'senior',
+      question: 'Why does this still compile even after you add a new event variant? `switch (e.type) { case \'click\': ...; case \'scroll\': ...; }`',
+      answer:
+        'No `default` branch, so the switch silently falls through for unknown variants and the function returns `undefined`. Two protections: (1) **`assertNever` in the default** — narrows `e` to `never`; adding a new variant breaks the build. (2) **`noFallthroughCasesInSwitch` in tsconfig** — catches missing `break`/`return` between cases. Both are nearly free and catch a class of bugs that type checking otherwise misses.',
+    },
+
+    // --- any vs unknown ---
+    {
+      level: 'mid',
+      question: 'Why prefer `unknown` over `any` for a `JSON.parse` result?',
+      answer:
+        '`any` turns the type checker off for that value — anything compiles, including writing the result into a `User`-typed variable without checking. `unknown` says "I have a value but make no claims about its type"; you can\'t access properties or call it until you narrow with a type guard. The verbosity is the point: it forces you to validate at the boundary instead of trusting wire data. Combine with `useUnknownInCatchVariables: true` so `catch (e)` is also `unknown` — the other most-error-prone boundary in the codebase.',
+    },
+    {
+      level: 'senior',
+      question: 'When is `any` actually the right choice in a TS codebase?',
+      answer:
+        'When it\'s **narrow and contained**: a single function body uses `any` internally (e.g., a `deepGet(obj: any, path: string[]): unknown` traversal) but its public signature is typed honestly. Other defensible uses: tactical `any` during JS→TS migration (better than `as` lies), truly polymorphic adapters where no generic can express the shape, and library types where the upstream API is genuinely untyped. The rule: `any` should be *noticed* — grepping for it should produce a small intentional list, not a hopeless flood. Public surfaces and shared types should never leak `any`.',
+    },
+
+    // --- satisfies ---
+    {
+      level: 'mid',
+      question: 'When does `satisfies` beat a type annotation on an object literal?',
+      answer:
+        'When you want the compiler to **check** the value against a type *and* keep the value\'s **inferred narrow type**. `const routes: Routes = { ... }` widens to `Routes` — you lose which keys actually exist and the precise per-key value types. `const routes = { ... } satisfies Routes` checks the conformance but keeps the literal\'s narrow type — typos like `routes.profil` fail, and individual handlers retain their narrow argument types. Use `satisfies` for lookup tables, palettes, discriminated-union handler maps, and config objects with required-plus-extra fields.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s the difference between `as T`, `: T`, and `satisfies T`?',
+      answer:
+        '`as T` is a **type assertion** — "I know better than you, trust me." No verification, just a relabel. `: T` is an **annotation** — verifies the expression and widens the variable\'s type to `T`. `satisfies T` is **verification without widening** — checks the expression conforms to `T`, but keeps the variable typed as its narrow inferred shape. Default to `satisfies` for literals; reach for `as` only when you genuinely know more than the compiler (typed wrappers around untyped sources, post-validation narrowing).',
+    },
+
+    // --- classes in TS ---
+    {
+      level: 'mid',
+      question: 'What\'s the difference between TS `private` and JS `#private` fields?',
+      answer:
+        '`private` is a **compile-time check only** — TS strips it, so `(obj as any).x` works at runtime. `#x` is **enforced by the JS engine** — accessing it from outside the class is a TypeError. TS understands `#` fully (narrowing, brand checks, etc.). Prefer `#` for new code unless you need (a) `protected` (subclass access — `#` is per-class only), or (b) library types where you want compile-time hiding but subclasses still need access. Otherwise `#` is stronger, runtime-safe, and standard JS.',
+    },
+    {
+      level: 'senior',
+      question: 'Why use `this` as a return type on a chainable method?',
+      answer:
+        'It preserves the **concrete subclass** through fluent chains. `where(...): QueryBuilder` returns the base class — call `.byEmail()` on the result and it\'s not there. `where(...): this` returns whatever the actual receiver was; subclass methods stay accessible: `userQuery.where(...).byEmail(...).limit(...)`. This is how query builders, jQuery-style APIs, and most fluent DSLs preserve type info through chains. Pair with `parameter properties` to keep DTOs tight: `constructor(public id: string, private password: string) {}`.',
+    },
+
+    // --- runtime validation ---
+    {
+      level: 'mid',
+      question: 'You annotate `req.body as User` in your Express handler. Why is this dangerous?',
+      answer:
+        '`req.body` is `any`. The annotation is a *lie that compiles* — TS believes you, the runtime doesn\'t know. If the client sends missing fields, wrong types, extra fields, or hostile shapes (`__proto__`), they all flow into your DB without complaint. Fix: parse with a schema library (Zod/Valibot/ArkType) at the boundary. `const body = UserSchema.parse(req.body)` validates the runtime data and returns it typed. Combine with `type User = z.infer<typeof UserSchema>` so the type derives from the schema — no drift possible.',
+    },
+    {
+      level: 'senior',
+      question: 'When would you choose Valibot or ArkType over Zod in 2026?',
+      answer:
+        '**Valibot** when bundle size matters (frontend, edge runtime) — its pipe-style modular API tree-shakes to ~5 KB vs Zod\'s ~50 KB minified. **ArkType** when you do heavy type-level work — its parser-as-types approach gives excellent inference performance and TypeScript-syntax-inspired schemas. **Zod** stays the default for backend Node services: mature, broad ecosystem (Express middleware, OpenAPI generators, tRPC, Drizzle integrations), no real bundle constraint server-side. All three give equivalent type inference and structured errors; the choice is bundle + ergonomics, not capabilities.',
+    },
+
+    // --- testing types ---
+    {
+      level: 'senior',
+      question: 'When should you write type-level tests?',
+      answer:
+        'For **library code, generic helpers, and conditional/mapped types** — anywhere a refactor could silently widen, narrow, or change inference without breaking runtime tests. Tools: `expect-type` (`expectTypeOf(x).toEqualTypeOf<T>()`) for positive assertions, `@ts-expect-error` for "this line should fail to typecheck." For application code that mostly *uses* types instead of producing them, runtime tests dominate and type tests add little. The cost is real (typecheck time), so don\'t test trivial annotations or types fully derived from a schema — test the parts where inference can change without anyone noticing.',
+    },
+
+    // --- type design ---
+    {
+      level: 'senior',
+      question: 'What does "make illegal states unrepresentable" mean and how do you apply it?',
+      answer:
+        'Design types so combinations that can\'t logically coexist are impossible to construct. `{ state: \'loading\' | \'success\' | \'error\'; data?: User; error?: string }` *allows* `{ state: \'success\', error: \'oops\' }` — nonsense. Replace with a discriminated union: `{ state: \'loading\' } | { state: \'success\'; data: User } | { state: \'error\'; error: string }`. Now the fields exist only when the state warrants them; consumers narrow once and get full safety. The principle applies to any "thing has mode + per-mode data" — form state, resource loading, auth flows, command types. Cost: a few extra `|` lines. Benefit: eliminating an entire class of "should never happen" bugs.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s wrong with returning `Partial<User>` from `loadUser`?',
+      answer:
+        'It violates "liberal in, strict out." Inputs should be *wide* (accept partials, accept any iterable) so calling is easy; outputs should be *narrow* (return concrete fully-populated types) so consumers don\'t have to defensively check every field. `loadUser(): Partial<User>` forces every caller to write `user.email ?? \'\'` everywhere — the missing-field handling spreads through the codebase. Better: `loadUser(): User | null` — the absence lives in the return type itself, not in every field of a present user.',
+    },
+
+    // --- error handling ---
+    {
+      level: 'mid',
+      question: 'You have `try { ... } catch (e) { e.message }` and TS complains. Why?',
+      answer:
+        '`useUnknownInCatchVariables: true` (default in `strict` since TS 4.4) types `e` as `unknown`. JS allows `throw \'string\'`, `throw 42`, `throw null` — anything can land in a catch. Forces you to narrow: `if (e instanceof Error) console.error(e.message); else console.error(String(e))`. Don\'t fix it by turning the flag off — `any` in the catch clause defeats the safety story at the most error-prone boundary in the codebase. Either narrow, or define custom Error subclasses and `instanceof`-check them.',
+    },
+    {
+      level: 'senior',
+      question: 'When should you return a `Result<T, E>` instead of throwing?',
+      answer:
+        '**Throw** for unexpected failures (DB down, OOM, programmer errors) and code paths the caller can\'t reasonably handle. **Return Result** for *expected* failure modes: validation errors, domain operations with known failure kinds (`charge` → `card-declined | insufficient-funds`), code crossing an async/non-throw boundary (workers, queue consumers, serverless handlers returning JSON). The Result type makes the failure modes part of the contract and enables exhaustive handling via discriminated unions. Mixing is fine: return Result for the expected case, throw for "DB on fire." Just be clear about which.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s wrong with `throw new Error(\'something failed\')` inside a catch?',
+      answer:
+        'It loses the original error\'s stack, fields, and identity — debugging gets much harder. Use `throw new Error(\'something failed\', { cause: e })` (ES2022) to preserve the chain. Stack traces show both layers, `instanceof` still works on the cause, and structured logging can walk `e.cause` to root. If you don\'t need to add context, just `throw e;` — rethrowing is cheaper and clearer than wrapping for no reason.',
+    },
+
+    // --- narrowing aliasing ---
+    {
+      level: 'senior',
+      question: 'You narrowed `r.user` to non-null, but inside a callback TS says it could be null again. Why?',
+      answer:
+        'Narrowing on a **property** holds only as long as TS can prove no reassignment happened — and inside callbacks, after function calls that could see `r`, or across `await`, the narrowing expires. The compiler can\'t prove `r.user` wasn\'t reassigned between the check and the callback. Fix: alias to a **local const** — `const user = r.user; if (user !== null) { ... later(() => user.email) }`. A local `const` is provably immutable for the function\'s lifetime, so narrowing survives closures and async hops. The rule: **narrow the local, not the property**.',
+    },
+
+    // --- NoInfer / Prettify ---
+    {
+      level: 'senior',
+      question: 'What does `NoInfer<T>` (TS 5.4+) solve?',
+      answer:
+        'It blocks a generic parameter from being inferred at one position while still letting it be inferred elsewhere. `pick<K extends string>(options: K[], chosen: K): K` lets `K` widen from both arguments — `pick([\'a\',\'b\'], \'d\')` widens K to `\'a\'|\'b\'|\'d\'` and the typo passes. Change to `chosen: NoInfer<K>` and `K` is inferred only from `options`; `chosen` is checked as a constraint. Common uses: default-value parameters that should match an inferred union, callback signatures that should match an earlier argument, config builders where one arg is the source of truth.',
+    },
   ],
 };

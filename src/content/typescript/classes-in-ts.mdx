@@ -1,0 +1,369 @@
+export const level = 'mid';
+
+# Classes in TypeScript
+
+JS classes are covered in `javascript/classes-deep.mdx`. This page
+is about what TypeScript adds *on top* — access modifiers,
+`readonly`, parameter properties, abstract classes, `implements` vs
+`extends`, `this` typing, and the surprisingly important distinction
+between a class as a **type** and a class as a **value**.
+
+## A class is two things at once
+
+```ts
+class User {
+  constructor(public name: string) {}
+}
+
+const u: User = new User('jon');   // `User` as a type
+const ctor = User;                  // `User` as a value
+```
+
+After `class User {}`, the name `User` lives in two namespaces:
+
+- **Type position:** `User` is the type of instances (everything on
+  the prototype + instance properties).
+- **Value position:** `User` is the constructor function itself.
+
+Most of the time you don't care. When you do (passing constructors
+around, generics over classes), the distinction matters:
+
+```ts
+type ConstructorOf<T> = new (...args: any[]) => T;
+
+function create<T>(C: ConstructorOf<T>, ...args: ConstructorParameters<ConstructorOf<T>>): T {
+  return new C(...args);
+}
+```
+
+`ConstructorOf<T>` is the type of `C` as a *value*; `T` is the
+class as a *type*. They're related but distinct.
+
+## Access modifiers
+
+```ts
+class Account {
+  public  id: string;     // default — visible everywhere
+  private balance: number; // only this class
+  protected userId: string;// this class + subclasses
+}
+```
+
+**These are compile-time only.** TS strips them; the JS output has
+no enforcement:
+
+```ts
+const a = new Account();
+(a as any).balance;       // 🟢 runtime — works
+a['balance' as 'balance'];// 🟢 runtime — also works
+```
+
+For *runtime* privacy use JS `#private` fields (see
+`javascript/classes-deep.mdx`):
+
+```ts
+class Account {
+  #balance = 0;            // enforced by the engine
+  deposit(n: number) { this.#balance += n; }
+}
+```
+
+TS understands `#private` fully — narrowing, brand checks, the
+works. Prefer `#` for new code unless you need:
+
+- **Compile-time inheritance access** (`protected` doesn't exist
+  for `#`).
+- **Library types where consumers shouldn't see the field but you
+  still want subclass access.**
+
+Otherwise `#` is stronger and standard JS.
+
+## `readonly`
+
+```ts
+class Point {
+  readonly x: number;
+  readonly y: number;
+  constructor(x: number, y: number) {
+    this.x = x;          // ok in constructor
+    this.y = y;
+  }
+  move(dx: number) {
+    this.x += dx;        // 🚫 Cannot assign to 'x' because it is read-only
+  }
+}
+```
+
+`readonly` blocks **assignment after construction**, at the type
+level only. It doesn't deep-freeze; nested mutation isn't
+prevented:
+
+```ts
+class Container {
+  readonly items: number[] = [];
+}
+new Container().items.push(1);   // 🟢 — the binding is readonly, not the array
+```
+
+For runtime immutability use `Object.freeze`. For deep readonly
+*types*, see `immutability` patterns or hand-roll a `DeepReadonly<T>`.
+
+## Parameter properties
+
+A shorthand that does declaration + assignment in one:
+
+```ts
+class User {
+  constructor(
+    public id: string,
+    public name: string,
+    private password: string,
+  ) {}
+}
+
+// equivalent to
+class User {
+  public id: string;
+  public name: string;
+  private password: string;
+  constructor(id: string, name: string, password: string) {
+    this.id = id;
+    this.name = name;
+    this.password = password;
+  }
+}
+```
+
+A real conciseness win for DTOs and value objects. Caveats:
+
+- **Only works on access modifiers** (`public`/`private`/`protected`/`readonly`).
+  Without a modifier, the parameter is a regular parameter and
+  doesn't become a field.
+- **Can mix with `readonly`:** `constructor(public readonly id: string)`.
+- **The `useDefineForClassFields` flag** (default `true` when
+  `target` is ES2022 or newer, `false` otherwise) affects how these
+  are initialized — they're set via `[[Define]]` in the constructor,
+  not via `[[Set]]`, which matters if a parent class has a setter
+  for the same name. If you target older ES, flip it on explicitly.
+
+## `abstract` classes
+
+```ts
+abstract class Shape {
+  abstract area(): number;
+  describe() { return `area = ${this.area()}`; }
+}
+
+class Circle extends Shape {
+  constructor(public r: number) { super(); }
+  area() { return Math.PI * this.r ** 2; }
+}
+
+new Shape();    // 🚫 Cannot create an instance of an abstract class
+new Circle();   // ✅
+```
+
+`abstract` is a TS-only modifier that:
+
+- Blocks `new` on the class itself.
+- Lets you declare `abstract` methods/properties that subclasses
+  *must* implement.
+- Lets you call `this.abstractMethod()` from concrete methods —
+  classic template-method pattern.
+
+If you find yourself reaching for `abstract`, also consider
+**interfaces** — most cases want a contract, not partial
+inheritance.
+
+## `implements` vs `extends`
+
+```ts
+interface Logger {
+  log(msg: string): void;
+}
+
+class ConsoleLogger implements Logger {
+  log(msg: string) { console.log(msg); }
+}
+
+class TimestampedLogger extends ConsoleLogger {
+  log(msg: string) { super.log(`[${Date.now()}] ${msg}`); }
+}
+```
+
+- **`implements`** is a *check* — verify this class satisfies a
+  type. No runtime effect. The class doesn't inherit anything; it
+  just promises to have the shape. Multiple `implements` clauses
+  are allowed.
+- **`extends`** is *inheritance* — methods, fields, prototype chain.
+  Only one parent. Affects runtime.
+
+A common pattern: `implements` for typed boundaries, `extends` for
+code reuse. Don't `extends` when you really mean "I'm a subtype" —
+that's `implements`.
+
+### Gotcha: `implements` doesn't infer
+
+```ts
+interface Greeter {
+  greet(name: string): void;
+}
+
+class Hello implements Greeter {
+  greet(name) {            // 🚫 implicit 'any' for `name`
+    console.log(`hi ${name}`);
+  }
+}
+```
+
+`implements` checks, it doesn't infer parameter types from the
+interface. Annotate the method signature, or use a type-alias
+function-property form.
+
+## `this` typing in methods
+
+By default, `this` inside a method is typed as the class:
+
+```ts
+class Counter {
+  n = 0;
+  inc() { this.n++; return this; }
+}
+
+new Counter().inc().inc();   // fine
+```
+
+But if the method is detached, `this` can be anything:
+
+```ts
+const inc = new Counter().inc;
+inc();                        // runtime error — `this` is undefined
+```
+
+You can require a specific `this` type at compile time:
+
+```ts
+class Counter {
+  n = 0;
+  inc(this: Counter) { this.n++; return this; }
+}
+```
+
+Now `inc()` (detached) fails to typecheck. The `this` parameter is
+**erased at runtime** — it's purely a type-level constraint.
+
+## Polymorphic `this`
+
+`this` as a return type lets methods return "the concrete subclass":
+
+```ts
+class QueryBuilder {
+  where(cond: string): this { /* ... */ return this; }
+  limit(n: number): this { /* ... */ return this; }
+}
+
+class UserQuery extends QueryBuilder {
+  byEmail(e: string): this { /* ... */ return this; }
+}
+
+new UserQuery().where('active').byEmail('a@b.c').limit(10);
+// chain stays UserQuery — `this` is the concrete subtype
+```
+
+If you used `: QueryBuilder` instead of `: this`, the chain would
+narrow to `QueryBuilder` after `where`, losing `byEmail`. `this`
+preserves the subtype through chains — exactly what fluent builders
+want.
+
+## Static side typing
+
+The static side of a class is its own type:
+
+```ts
+class Validator {
+  static check(x: unknown): boolean { return true; }
+}
+
+type ValidatorClass = typeof Validator;
+const v: ValidatorClass = Validator;
+v.check('hi');
+```
+
+`typeof Class` is the static side (constructor + statics). `Class`
+is the instance side. Used for dependency injection of class
+identity, plugin registries, etc.
+
+## Mixins (TS)
+
+```ts
+type Constructor<T = {}> = new (...args: any[]) => T;
+
+function Timestamped<T extends Constructor>(Base: T) {
+  return class extends Base {
+    createdAt = new Date();
+  };
+}
+
+class User { name = 'jon'; }
+class TimestampedUser extends Timestamped(User) {}
+
+new TimestampedUser().createdAt;   // Date
+```
+
+The TS type system tracks the merged shape automatically as long
+as the mixin uses `extends Base` and the `Constructor` bound.
+Useful, but be aware: mixins fight with `private`/`#` fields (the
+mixin class can't reach the base's private state), and stack
+traces get awkward.
+
+## DI patterns
+
+Most DI in TS uses:
+
+- **Constructor injection** + parameter properties — the
+  hand-rolled, 0-dep, type-safe approach. Common in Express/Fastify
+  apps.
+- **Decorators** (`@injectable`, `@inject(TOKEN)`) — InversifyJS,
+  tsyringe. Stage 3 decorators shipped in TS 5.0 (March 2023, new
+  syntax), but most established DI libraries still use the legacy
+  `experimentalDecorators` form; migration is in progress as of
+  2026. See `decorators.mdx`.
+
+For most backend services, plain constructor injection scales further
+than people expect. Frameworks (NestJS) wrap classes heavily with
+decorators; that's a framework choice, not a TS requirement.
+
+## When NOT to use a class
+
+- **Pure data shapes** — use a `type`/`interface` and plain
+  objects.
+- **A bag of functions** — use a module with `export function`s.
+- **One-off factory output** — a function returning an object is
+  smaller, has real `#` privacy via closure, and doesn't pull in
+  `new`/`this` ceremony.
+- **Just to organize code** — files and modules are the
+  organization unit.
+
+Use classes when:
+
+- Real polymorphism (multiple implementations of one interface).
+- Shared instance methods you'd otherwise duplicate.
+- Interop with code that expects `instanceof`.
+- Frameworks that demand them (NestJS, TypeORM entities).
+
+## Common mistakes
+
+- **Treating `private` as a security boundary.** It's compile-time
+  only. Use `#` for runtime.
+- **Returning `QueryBuilder` instead of `this`** from chainable
+  methods — kills polymorphism for subclasses.
+- **Subclassing built-ins** (`Array`, `Error`) without understanding
+  the `Symbol.species` and `__proto__` resetting gotchas — see the
+  JS classes page.
+- **Implementing both `interface` shape *and* extending a class
+  with the same shape** — duplication. Pick one.
+- **Heavy abstract-class hierarchies** when interfaces would do.
+  TS structural typing makes interface-based design cheaper than in
+  Java/C#; don't import OOP ceremony you don't need.
+- **`public static abstract`** — illegal, but people try it. Statics
+  aren't inherited via the abstract mechanism.

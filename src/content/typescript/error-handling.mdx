@@ -1,0 +1,340 @@
+export const level = 'mid';
+
+# Error handling in TypeScript
+
+TypeScript inherits JS's exception model — `throw` anything, `catch`
+anything — and adds nothing to enforce error types. A function
+signature says it returns `User`; it might throw five different
+errors and you'd only know by reading the body. This page covers
+the patterns that recover some safety: typing caught errors,
+custom Error classes, exhaustive error unions, and when to use
+Result-style returns instead.
+
+## `catch` clauses and `unknown`
+
+Pre-TS 4.4, `catch (e)` typed `e` as `any`. As of TS 4.4 with
+`useUnknownInCatchVariables: true` (default with `strict`), it's
+`unknown`:
+
+```ts
+try {
+  riskyThing();
+} catch (e) {
+  console.error(e.message);   // 🚫 'e' is of type 'unknown'
+}
+```
+
+This is correct — anything can be thrown in JS (`throw 'string'`,
+`throw 42`, `throw null` are all legal). The compiler forces you to
+narrow before using:
+
+```ts
+try {
+  riskyThing();
+} catch (e) {
+  if (e instanceof Error) console.error(e.message);
+  else console.error(String(e));
+}
+```
+
+If your codebase has `useUnknownInCatchVariables: false`, fix that
+before reading further. The catch type is the one place JS lets
+genuinely arbitrary values appear, and `any` here defeats the
+entire type-safety story.
+
+## Custom `Error` subclasses
+
+```ts
+class NotFoundError extends Error {
+  constructor(public resource: string, public id: string) {
+    super(`${resource} ${id} not found`);
+    this.name = 'NotFoundError';
+  }
+}
+
+class ValidationError extends Error {
+  constructor(public issues: { path: string; msg: string }[]) {
+    super('validation failed');
+    this.name = 'ValidationError';
+  }
+}
+```
+
+Two reasons to subclass:
+
+- **Carry structured data** alongside the message (the `resource`,
+  `id`, `issues` above). Stack traces don't preserve fields.
+- **Allow `instanceof` checks** so callers can branch on error
+  *kind*, not error *message* text.
+
+```ts
+try {
+  await loadUser(id);
+} catch (e) {
+  if (e instanceof NotFoundError)   return res.status(404).end();
+  if (e instanceof ValidationError) return res.status(400).json(e.issues);
+  throw e;   // unknown error — let it bubble
+}
+```
+
+**Always set `this.name`** in the constructor — without it,
+serialized errors say `"Error"` everywhere and stack-trace tooling
+can't tell what kind of error it was.
+
+### The `cause` field (ES2022)
+
+For wrapping a lower-level error in a higher-level one:
+
+```ts
+try {
+  await db.query(...);
+} catch (e) {
+  throw new ServiceError('failed to load user', { cause: e });
+}
+```
+
+`new Error(message, { cause: originalError })` is standard since
+ES2022. Stack traces show both layers. Don't drop the original by
+just constructing `new ServiceError(...)` — losing the inner error
+is the most common debugging-pain pattern in services.
+
+## Exhaustive error unions (function-level)
+
+Most realistic functions have a small, known set of failure modes.
+You can document them with a union type the caller must handle:
+
+```ts
+type LoadError =
+  | { kind: 'not-found'; id: string }
+  | { kind: 'forbidden'; userId: string }
+  | { kind: 'db-down' };
+
+type Result<T, E> =
+  | { ok: true;  value: T }
+  | { ok: false; error: E };
+
+function loadUser(id: string): Promise<Result<User, LoadError>> { ... }
+```
+
+The caller pattern-matches and gets exhaustiveness checking:
+
+```ts
+const r = await loadUser(id);
+if (!r.ok) {
+  switch (r.error.kind) {
+    case 'not-found': return res.status(404).end();
+    case 'forbidden': return res.status(403).end();
+    case 'db-down':   return res.status(503).end();
+    default: return assertNever(r.error);
+  }
+}
+useUser(r.value);
+```
+
+Add a new error case to `LoadError` and the caller fails to compile
+until it's handled. See `exhaustiveness-checking.mdx`.
+
+## When Result, when throw
+
+Both patterns work; they suit different problems:
+
+| | `throw` | `Result<T, E>` |
+| --- | --- | --- |
+| Reads naturally for *unexpected* failures | yes | no |
+| Forces caller to handle the failure | no | yes |
+| Stack trace included | yes | only if `error` is an Error |
+| Composes well in pipelines | poorly | yes |
+| Plays with `async`/`await` | yes (auto-forward) | yes (in the value) |
+| Type system tracks failure modes | no | yes |
+
+**Use `throw`** for:
+
+- Truly exceptional cases (DB down, OOM, programmer errors).
+- Code paths the caller can't reasonably handle (just unwind).
+- Boundaries the framework expects throws (Express middleware,
+  test assertions).
+
+**Use `Result`** for:
+
+- Validation failures (you *expect* invalid input).
+- Domain operations with multiple known failure modes
+  (`charge` → `card-declined | insufficient-funds | rate-limited`).
+- Code that crosses an async/non-throw boundary (a worker, a queue
+  consumer, a serverless handler returning JSON).
+
+Mixing is fine: a function returns `Result<User, ValidationError>`
+for the expected case, and *throws* for "DB on fire." Be clear in
+the function's contract about which it does.
+
+## Async errors
+
+`async` functions wrap throws as rejected promises automatically.
+A `catch` around `await` works as expected:
+
+```ts
+async function go() {
+  try {
+    const u = await loadUser('1');
+  } catch (e) {       // e: unknown
+    if (e instanceof NotFoundError) { ... }
+  }
+}
+```
+
+Without `await`, you only catch the synchronous part:
+
+```ts
+async function go() {
+  try {
+    const p = loadUser('1');   // p is a rejected promise; throw didn't happen yet
+  } catch {}                    // never runs
+  await p;                      // throws here — uncaught
+}
+```
+
+Always `await` inside the try block.
+
+For Express specifically, **Express 5 forwards rejected promises to
+error middleware automatically**. No more `wrap()` helpers; just
+`throw` from your async handlers. See
+`express/express-5-migration.mdx`.
+
+## Don't lose the inner error
+
+The worst pattern in error handling:
+
+```ts
+try {
+  await something();
+} catch (e) {
+  throw new Error('something failed');   // 💥 lost the original
+}
+```
+
+The new error has no stack, no cause, no field-level info. Three
+ways to preserve:
+
+```ts
+// 1. cause field (preferred — ES2022)
+throw new Error('something failed', { cause: e });
+
+// 2. re-throw the original (if you don't need to add context)
+throw e;
+
+// 3. log + rethrow (avoid — duplicates in two places)
+log.error('something failed', e);
+throw e;
+```
+
+Pick `cause` for "I want to add context"; rethrow when you don't.
+Never silently swallow.
+
+## Typing `Error.prototype.cause`
+
+```ts
+function rootCause(e: unknown): unknown {
+  if (e instanceof Error && e.cause) return rootCause(e.cause);
+  return e;
+}
+```
+
+`cause` is typed `unknown` in lib.es2022, which is correct (it
+could be anything). Walk it carefully.
+
+## Errors crossing serialization
+
+When errors travel over the wire (worker `postMessage`, HTTP
+response, queue), the `Error` class is lost — structured-clone
+preserves `message`, `name`, `stack`, `cause` but rebuilds them as
+plain `Error` instances. Custom fields survive only if you
+explicitly serialize:
+
+```ts
+class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+  toJSON() {
+    return { name: this.name, message: this.message, status: this.status };
+  }
+}
+```
+
+The `toJSON` is called by `JSON.stringify`. Without it, you get
+`{}` because `Error` properties are non-enumerable.
+
+For Result types crossing the wire, you control the shape — that's
+one of their advantages.
+
+## Anti-patterns
+
+### Catching only to log
+
+```ts
+try {
+  await thing();
+} catch (e) {
+  log.error('thing failed', e);
+  throw e;     // ok if you really want to log here, but...
+}
+```
+
+If the caller also logs, you have duplicate entries. If they
+re-throw, the original log site lost context. Log at the boundary
+that knows enough to act (HTTP layer for HTTP errors, worker layer
+for worker errors), not at every internal call.
+
+### `throw new Error(JSON.stringify(...))`
+
+Stack traces with a serialized blob as message are awful to grep
+and unactionable. Use a custom Error class with fields and proper
+serialization.
+
+### Type-narrowing by message text
+
+```ts
+catch (e) {
+  if (e instanceof Error && e.message.includes('not found')) { ... }
+}
+```
+
+Message text changes. Use `instanceof` on a custom class, or attach
+a code:
+
+```ts
+catch (e) {
+  if (e instanceof DbError && e.code === '23505') { ... }
+}
+```
+
+### Re-throwing with a new Error of the same class
+
+```ts
+catch (e) {
+  if (e instanceof Error) throw new Error(e.message);   // 💥 stack reset
+}
+```
+
+Throws away the original stack. `throw e;` or `throw new SomeError('...', { cause: e })`.
+
+## Common mistakes
+
+- **Treating `catch (e: any)`** as the default. Turn on
+  `useUnknownInCatchVariables`. Force the narrow.
+- **Not setting `this.name`** in custom Error classes. Tooling
+  can't distinguish kinds; serialized errors are useless.
+- **Forgetting to `await` in try blocks.** The throw happens on the
+  rejected promise, not on the assignment.
+- **Returning `Result<T, Error>` with `Error` being plain `Error`.**
+  Losing all of `Result`'s type-level value. The whole point is to
+  union the *kinds*.
+- **Throwing across an async boundary that doesn't catch.** Worker
+  `postMessage`, queue consumer, serverless handler — the
+  framework may swallow or reformat the error in confusing ways.
+  Return `Result` at those boundaries.
+- **Wrapping every operation in try/catch.** Most code shouldn't
+  need to. Let errors bubble to a boundary that knows how to
+  handle them (request handler, top-level supervisor). Defensive
+  try/catch everywhere is noise that hides where the real handling
+  is.

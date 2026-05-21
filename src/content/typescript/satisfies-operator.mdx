@@ -1,0 +1,237 @@
+export const level = 'mid';
+
+# The `satisfies` operator
+
+TS 4.9 added one feature that genuinely changed daily idiom:
+`satisfies`. It solves a problem you've hit a hundred times —
+"I want this value to conform to a type *and* keep its precise
+inferred type" — that no combination of `as`, type annotation,
+and `as const` could express together.
+
+## The problem `satisfies` solves
+
+You write a config:
+
+```ts
+type RouteHandler = (req: Request) => Response;
+type Routes = Record<string, RouteHandler>;
+
+const routes: Routes = {
+  home:   () => new Response('home'),
+  health: () => new Response('ok'),
+};
+
+routes.home;     // type: RouteHandler — fine
+routes.profile;  // type: RouteHandler — also fine, but profile doesn't exist!
+```
+
+The annotation `: Routes` widens the value to the type. You lose
+the precise *which keys actually exist* information. Spelling
+`routes.profil` (typo) compiles.
+
+Alternative — drop the annotation:
+
+```ts
+const routes = {
+  home:   () => new Response('home'),
+  health: () => new Response('ok'),
+};
+routes.profile;   // 🚫 caught — keys are exact
+```
+
+…but now there's no check that the values conform to `RouteHandler`.
+Add `home: 42` by accident and the compiler doesn't blink.
+
+`satisfies` gives you both:
+
+```ts
+const routes = {
+  home:   () => new Response('home'),
+  health: () => new Response('ok'),
+} satisfies Routes;
+
+routes.home;     // type: () => Response (inferred, narrow)
+routes.profile;  // 🚫 Property 'profile' does not exist
+// add `home: 42` → 🚫 Type '42' is not assignable to type 'RouteHandler'
+```
+
+The expression is **checked** against `Routes` but the variable
+keeps its **inferred** type with all the per-key detail. This is
+exactly the right answer.
+
+## How it works
+
+`satisfies` is a *type assertion that flows backwards*. It tells
+the compiler: "verify this expression is assignable to the type,
+but type the expression as itself, not as the type." No runtime
+effect — it's erased like all type-level syntax.
+
+```ts
+const x = expr satisfies T;
+// reads as: typecheck(expr, T); typeof x = typeof expr
+```
+
+Compare to annotation:
+
+```ts
+const x: T = expr;
+// reads as: typecheck(expr, T); typeof x = T
+```
+
+The annotation **widens** to `T`. `satisfies` **doesn't**.
+
+## When `satisfies` is the right tool
+
+### Object literals you want narrow + checked
+
+```ts
+const palette = {
+  primary:   '#3366ff',
+  secondary: '#9933ff',
+  accent:    '#ff6600',
+} satisfies Record<string, `#${string}`>;
+
+palette.primary;   // type: '#3366ff' (literal), not just string
+```
+
+The value type is enforced (hex string), the key set stays exact,
+and the literal values are preserved (useful for downstream
+indexing into types).
+
+### Lookup tables for discriminated unions
+
+```ts
+type Event = { type: 'click' } | { type: 'scroll' } | { type: 'key' };
+
+const handlers = {
+  click:  (e: Event & { type: 'click'  }) => {},
+  scroll: (e: Event & { type: 'scroll' }) => {},
+  key:    (e: Event & { type: 'key'    }) => {},
+} satisfies Record<Event['type'], (e: Event) => void>;
+```
+
+Forgetting a key fails to typecheck. Adding an unknown key fails.
+The handlers preserve their narrow argument types.
+
+### Configs with required-but-typed extras
+
+```ts
+type Config = { host: string; port: number };
+
+const config = {
+  host: 'localhost',
+  port: 3000,
+  debug: true,         // 👈 not in Config, but kept
+} satisfies Config;
+
+config.debug;          // type: boolean — preserved
+config.port;           // type: number — Config's type
+```
+
+Annotation would either reject `debug` or require widening `Config`.
+`satisfies` lets you have extension fields while still validating
+the required ones.
+
+## `satisfies` vs `as`
+
+`as` is **assertion** — "I know better than you, trust me." No
+check, no narrowing benefit. `satisfies` is **verification** —
+"check that I'm right, but type me as I am." Almost any use of `as`
+on an object literal is better as `satisfies`:
+
+```ts
+// before
+const routes = { home: () => res } as Routes;        // unchecked
+
+// after
+const routes = { home: () => res } satisfies Routes; // checked
+```
+
+The exception is type assertions across narrowing boundaries —
+`unknown as User` after a parse check — where `satisfies` doesn't
+help because `unknown` isn't assignable to `User`. That's still
+`as`'s job (or a real validator).
+
+## `satisfies` vs annotation
+
+| | Annotation `: T` | `satisfies T` |
+| --- | --- | --- |
+| Checks the value | yes | yes |
+| Catches extra keys | yes (excess prop check) | yes |
+| Variable type is `T` | yes (widened) | no — kept narrow |
+| Preserves literal values | no | yes |
+| Per-key precise types | no | yes |
+| Catches typos at use site | no — `T`'s keys, not the literal's | yes |
+
+If you need the variable typed as `T` everywhere downstream (a
+function returning `Routes` from a factory, etc.), annotation is
+right. If you want the precise inferred type, `satisfies` is.
+
+## `satisfies` plus `as const`
+
+These compose, in this order:
+
+```ts
+const palette = {
+  primary:   '#3366ff',
+  secondary: '#9933ff',
+} as const satisfies Record<string, string>;
+
+palette.primary;   // type: '#3366ff' — readonly literal
+```
+
+`as const` deeply freezes the literal and produces the narrowest
+possible type. `satisfies` then checks that frozen shape against
+the type. The combination is the standard for "exact, immutable,
+verified" lookup tables.
+
+Order matters — `satisfies T as const` doesn't compile. `as const`
+requires its operand to be a literal expression (string, number,
+array, or object literal), and the result of `satisfies` isn't
+one. Always `as const satisfies T`.
+
+## `satisfies` in function returns
+
+You can use it as the last expression of a function for the same
+purpose:
+
+```ts
+function buildRoutes() {
+  return {
+    home:   () => res,
+    health: () => res,
+  } satisfies Routes;
+}
+
+buildRoutes().home;   // inferred narrowly
+```
+
+Equivalent to applying `satisfies` to the local `const` and
+returning. Useful when the function doesn't need to declare a
+narrower return type explicitly.
+
+## When NOT to use `satisfies`
+
+- **You actually want the wider type.** A function returning a
+  `Logger` interface, not "this specific logger." Use annotation.
+- **The type doesn't narrow further than itself.** For
+  `number satisfies number`, you've added syntax for nothing.
+- **At I/O boundaries with `unknown`.** `satisfies` can't bridge
+  `unknown → T`. Use a parser.
+
+## Common mistakes
+
+- **Confusing `satisfies` with `as`.** `as` lies; `satisfies`
+  verifies. Default to `satisfies` and reach for `as` only when
+  you genuinely know more than the compiler.
+- **Adding `: T` *and* `satisfies T`.** The annotation wins; the
+  `satisfies` is dead. Pick one.
+- **Order with `as const`.** `as const satisfies T` works.
+  `satisfies T as const` reads but the `as const` is on the wrong
+  side of the verification.
+- **Using it everywhere reflexively.** `satisfies` is for when the
+  *inferred* type adds value over the constraint type. If they're
+  the same, just annotate.
+- **Forgetting that errors land on the value side.** A failed
+  `satisfies` underlines the literal, not the type. Read the
+  diagnostic from the literal up.
