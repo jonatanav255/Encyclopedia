@@ -1,0 +1,240 @@
+export const level = 'junior';
+
+# Latency numbers every engineer should know
+
+Jeff Dean's "numbers everyone should know" table, slightly
+updated. The exact values move with hardware; the **ratios** are
+what matter and are stable across decades.
+
+The point of memorizing them: every architectural choice has a
+latency cost, and you can spot bad designs in seconds when you
+know the orders of magnitude.
+
+## The table
+
+<Cheatsheet>
+| Operation | Latency | Notes |
+|---|---|---|
+| L1 cache reference | ~1 ns | |
+| Branch mispredict | ~3 ns | |
+| L2 cache reference | ~4 ns | |
+| Mutex lock/unlock | ~17 ns | uncontended |
+| L3 cache reference | ~30 ns | |
+| Main memory reference (DRAM) | ~100 ns | |
+| Compress 1 KB with zstd | ~2 µs | depends on level |
+| Send 1 KB over 1 Gbps network | ~10 µs | |
+| Read 1 MB sequentially from DRAM | ~3 µs | |
+| SSD random 4 KB read | ~16 µs | NVMe; SATA ~100 µs |
+| Read 1 MB sequentially from NVMe SSD | ~50 µs | |
+| Round trip within same datacenter | ~500 µs | LAN |
+| Read 1 MB sequentially from disk (HDD) | ~5 ms | |
+| HDD seek | ~3-10 ms | |
+| Round trip US East ↔ US West | ~70 ms | |
+| Round trip US ↔ Europe | ~100 ms | |
+| Round trip US ↔ Asia | ~150-200 ms | |
+| TCP retransmit timeout | ~200 ms | typical |
+| Wall-clock blink of an eye | ~100 ms | |
+</Cheatsheet>
+
+If you can't recall a specific number, you can almost always
+**derive** it. Bytes/sec × payload size → seconds. Distance ÷
+speed of light × 2 → round-trip floor.
+
+## The five orders of magnitude
+
+If you remember nothing else, remember these five tiers. Each is
+~100x slower than the one above it.
+
+<Steps>
+<Step n={1} title="CPU cache (1-30 ns)">
+The CPU's own scratch pad. Hits here are essentially free. If
+your tight loop fits in L1, you can do billions of ops per
+second per core.
+</Step>
+<Step n={2} title="Main memory (100 ns)">
+DRAM. About 100x slower than L1. Hashmap lookups, JIT inline
+caches, in-process data structures. Still ~10M ops/sec/core.
+</Step>
+<Step n={3} title="Local SSD (10-100 µs)">
+About 100-1 000x slower than RAM. NVMe is at the low end; SATA
+SSDs at the high end. Modern databases assume SSD as a baseline.
+</Step>
+<Step n={4} title="LAN round-trip (~500 µs)">
+A single network hop. Includes serialization, kernel network
+stack, switch latency. Already 5 000x a memory reference. One
+LAN call per request is normal; ten is a smell.
+</Step>
+<Step n={5} title="WAN round-trip (50-200 ms)">
+Cross-region. About 100 000x a memory reference. This is where
+"add caching" stops being optional and starts being existential.
+</Step>
+</Steps>
+
+The full ladder spans 8 orders of magnitude: 1 ns to 200 ms. A
+single architecture diagram can hide all of them; knowing where
+each arrow lives on the ladder is the senior engineer's superpower.
+
+## What the ratios imply
+
+### Memory beats disk by 100x; SSD beats HDD by 100x
+
+Caches exist because of this. The reason Redis is fast is mostly
+that "no disk in the request path." The reason database indexes
+exist is to convert a 5 ms disk seek into a 100 µs SSD read.
+
+### LAN round-trip = ~5 000x a memory reference
+
+A microservice call inside the same datacenter is "free" only by
+comparison to WAN. Compared to in-process function call, it's
+catastrophic. Splitting a tight inner loop across a service
+boundary turns a 1 µs operation into a 500 µs operation — a 500x
+regression.
+
+This is the math behind "don't make microservices on the hot
+path."
+
+### Cross-region = ~150 000x a memory reference
+
+Multi-region active-active sounds simple. The math says
+otherwise: if a write needs to be acknowledged by another region,
+each write costs ~100 ms minimum. That eats the entire user-facing
+latency budget.
+
+This is the math behind **regional sticky** designs (writes go
+to one region, others replicate async) and behind why
+linearizability across regions is so expensive.
+
+### The speed of light is a hard floor
+
+Light in fiber covers ~200 km/ms. A round-trip US-East ↔
+Frankfurt is ~12 000 km, which gives ~60 ms one-way and ~120 ms
+round-trip as the **physical minimum**. No software wizardry
+beats that. Edge computing exists to put work closer to the user
+and skip this floor.
+
+## What this means in practice
+
+<Compare a="In the request path" b="Out of the request path">
+<>
+You have a strict latency budget (say, 200 ms total). Every
+network hop costs you ~1 ms intra-DC; every disk seek costs
+~10 ms HDD or ~0.1 ms SSD. Cross-region calls (~100 ms) effectively
+eat the whole budget — you can do **one**. Cache where possible;
+denormalize; precompute.
+</>
+<>
+Async work has a much looser budget — seconds to minutes are
+acceptable. Cross-region replication, batch jobs, analytics
+queries, video transcoding. Move anything you can to async to
+keep the request-path budget intact.
+</>
+</Compare>
+
+The first rule of latency engineering: **what's not on the request
+path is much cheaper**. Most "make it faster" wins come from
+moving work out of the request path entirely, not from speeding
+up the request path.
+
+## Building a latency budget
+
+For any user-facing operation, sum the components.
+
+```
+Example: API call returning a personalized feed.
+
+  Edge / TLS handshake (cached)       ...    5 ms
+  LB → API server                     ...    1 ms
+  API server CPU (parse, validate)    ...    2 ms
+  Cache lookup (Redis, LAN)           ...    1 ms
+  DB query (cache miss path)          ...   10 ms
+  API server CPU (render, serialize)  ...    3 ms
+  API → LB → client (one RTT)         ...   10 ms
+  ---------------------------------------------
+  Total p99 budget                    ...  ~32 ms
+```
+
+If the target is 100 ms, you have ~3x headroom for variance and
+tail latency. If the target is 30 ms, you're at the budget and
+something has to come out.
+
+A well-built service has a documented budget per request type.
+Without one, you can't tell whether 80 ms is "fine" or "broken."
+
+## Tail latency
+
+p50 isn't useful for sizing. p99 is. p99.9 is what users actually
+feel when they make 100 calls per page load. The math:
+
+```
+P(at least one slow call out of N) = 1 - (1 - p)^N
+where p = fraction of calls that are slow.
+```
+
+A single 1% slow rate (p99 = bad) becomes 63% across 100 calls.
+This is why **fan-out queries are tail-latency amplifiers** — if
+your feed touches 50 backends, your p99 user latency is dominated
+by the slowest backend per request, not the average.
+
+Designs to fight tail latency:
+
+- **Hedged requests** — send the same query to 2 replicas, take
+  the first response.
+- **Tied requests** — send to replica A; if not back in X ms,
+  also send to replica B, cancel whichever loses.
+- **Backup-on-timeout** — same idea, less aggressive.
+- **Fewer hops** — reducing the number of dependencies in the
+  request path is the single biggest lever.
+
+## Common misuses of these numbers
+
+### "Network is fast, just add a service"
+
+Network is fast **compared to disk**, slow compared to memory.
+Adding one service hop costs ~1 ms; adding 10 costs ~10 ms. Both
+sound small until you add tail amplification (some of those calls
+will be at p99) and serialization.
+
+### "It's just one cross-region call"
+
+One cross-region call is 100 ms. That's half a user's "feels
+instant" budget. If a feature needs one cross-region call **per
+request**, the feature isn't fast. It's a 100 ms feature.
+
+### "We'll cache it"
+
+Caching converts a disk-tier latency to a memory-tier latency
+**on cache hits**. On cache misses, latency is unchanged plus
+the cache-lookup cost. The math depends entirely on hit ratio —
+quoting just "we cache" without a hit-ratio target is not an
+optimization.
+
+## A practical drill
+
+In any design review, ask:
+
+- "What's the latency budget for this operation?"
+- "Where in the budget does each component live?"
+- "Which arrow on this diagram is the slowest?"
+- "What's our p99, not our average?"
+- "What happens to p99 when one downstream is slow?"
+
+If the design doc can't answer these, the latency story isn't
+real yet.
+
+<Callout variant="info">
+You don't need to know the exact ns figure for L2 cache. You
+need to know L2 is faster than RAM, RAM is faster than SSD,
+SSD is faster than HDD, intra-DC is faster than cross-region,
+and each gap is ~100x. That's enough to ship.
+</Callout>
+
+## In summary
+
+- The five tiers: CPU cache → RAM → SSD → LAN → WAN, each ~100x
+  the previous.
+- Memorize 10⁵ seconds/day, ~500 µs intra-DC, ~100 ms cross-region.
+- Speed of light bounds cross-region latency at ~10 ms per
+  1 000 km one-way.
+- Tail latency dominates user experience when calls fan out.
+- The cheapest latency optimization is moving work off the
+  request path entirely.

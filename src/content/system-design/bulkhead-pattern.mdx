@@ -1,0 +1,184 @@
+export const level = 'senior';
+
+# Bulkhead pattern
+
+Borrowed from ships: bulkheads partition the hull so that
+flooding in one section doesn't sink the ship. In software:
+**partition resources** (threads, connections, memory) so
+that exhaustion in one section doesn't take down everything.
+
+Where circuit breakers handle "this dependency is failing,"
+bulkheads handle "this dependency is slow but not failing —
+don't let it consume all my capacity."
+
+## The shape
+
+Without bulkhead:
+
+```
+client requests → service pool of 100 threads → many downstreams
+                       │
+                       └─ if downstream X is slow,
+                          eventually all 100 threads block on X,
+                          everything else fails too
+```
+
+With bulkhead:
+
+```
+client requests → router
+                    ├─ pool of 30 threads → downstream X
+                    ├─ pool of 30 threads → downstream Y
+                    └─ pool of 40 threads → downstream Z
+```
+
+X being slow exhausts only its 30 threads. Y and Z keep
+working.
+
+## Common implementations
+
+### Per-dependency thread pools
+
+Hystrix (deprecated now, but the pattern lives on in
+resilience4j and similar libraries) popularized this. Each
+downstream gets its own thread pool with a fixed size.
+
+```js
+const xPool = new ThreadPool({ max: 30 });
+const yPool = new ThreadPool({ max: 30 });
+
+async function callX(req) {
+  return xPool.submit(() => downstreamX.call(req));
+}
+```
+
+If X is slow, the pool fills up; new X requests get rejected
+fast. Y's pool is independent.
+
+### Per-dependency connection pools
+
+For HTTP/gRPC clients, separate connection pools per downstream.
+A slow downstream can't starve other clients of TCP
+connections.
+
+```js
+const xClient = new HttpClient({ connectionPool: 50, target: 'x.svc' });
+const yClient = new HttpClient({ connectionPool: 50, target: 'y.svc' });
+```
+
+### Tenant-level bulkheads (multi-tenancy)
+
+For multi-tenant systems, prevent one tenant's heavy traffic
+from starving others:
+
+- Per-tenant rate limit + concurrency cap.
+- Per-tenant queue with bounded depth.
+- Per-tenant database connection allotment.
+
+This is the difference between "noisy neighbor" being a
+nuisance and being an outage.
+
+### Compute bulkheads in Kubernetes
+
+In K8s, resource requests + limits per pod create bulkheads:
+
+- A pod with `cpu: 1000m, memory: 2Gi` can't consume more
+  than that, no matter what other pods are doing.
+- Different services on the same node don't compete for
+  resources unboundedly.
+
+### Process-level bulkheads
+
+Separate processes (microservices, sidecars) are bulkheads.
+A crash in one doesn't take down another. The blast radius
+of OOM, panic, GC pause is bounded.
+
+## Choosing pool sizes
+
+How many threads / connections per dependency?
+
+A rule of thumb (Little's Law):
+
+```
+required pool size ≈ peak QPS × p99 latency
+```
+
+Downstream X handles 100 QPS with 200ms p99 → ~20 in-flight
+requests at peak → pool size 30 (with headroom).
+
+Too small: rejecting valid traffic during normal load.
+Too large: defeats the bulkhead — one slow downstream can
+consume "all" capacity again.
+
+## Bulkhead + circuit breaker
+
+The two complement each other:
+
+- **Bulkhead** caps the *resources* one downstream can
+  consume.
+- **Circuit breaker** stops calling the downstream when it's
+  visibly broken.
+
+Without bulkhead: a slow but not-failing downstream consumes
+threads forever. Breaker doesn't trip because it's "succeeding"
+(eventually).
+
+Without breaker: a fast-failing downstream fills its pool with
+in-flight requests, all of which fail. Bulkhead protects
+others; breaker would skip them entirely.
+
+Use both.
+
+## Anti-bulkheads to avoid
+
+### Shared DB connection pool across all queries
+
+Every query type shares the same pool. A slow analytical
+query starves the OLTP traffic. Classic outage.
+
+Fix: separate pools for different query types, or use
+PgBouncer with categorized clients.
+
+### Async tasks on the main thread pool
+
+Background jobs (image resize, email sending) on the same
+thread pool as web requests. Heavy background work starves
+the web.
+
+Fix: dedicated background workers; web threads handle only
+fast requests.
+
+### Single Redis for cache + locks + rate-limits
+
+When Redis slows down, all three suffer. Cache misses cascade
+into DB load; locks time out and double-execute; rate limits
+fail open and let abuse through.
+
+Fix: multiple Redis instances, one per purpose.
+
+## Bulkheads have a cost
+
+- **Higher steady-state resource use.** You'd be more
+  efficient if one pool could absorb whatever load arrives.
+- **Tuning per pool.** Each pool needs its own size, alerts,
+  scaling logic.
+- **Cross-pool failures still happen.** A bulkhead in your
+  service doesn't help if the database (shared) goes down.
+
+For small services, a single thread pool is fine. The
+pattern pays off when the cost of one downstream taking
+everything down outweighs the cost of partition overhead.
+
+## In summary
+
+- Bulkhead: partition resources so one failing/slow dependency
+  doesn't starve everything.
+- Implementations: per-dependency thread pools, connection
+  pools, queues, K8s resource limits, separate processes.
+- Pool size ≈ peak QPS × p99 latency, with headroom.
+- Pair with circuit breaker — they handle different failure
+  modes.
+- Watch for shared resources (shared DB pool, shared Redis,
+  shared thread pool) that hide bulkhead violations.
+- Costs are real (resource overhead, tuning); use when
+  isolation matters.

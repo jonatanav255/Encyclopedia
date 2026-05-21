@@ -1,0 +1,153 @@
+export const level = 'senior';
+
+# Split brain
+
+When a network partition divides a cluster, and **both halves
+believe they're the authoritative one**, the system has split
+brain. Both halves accept writes. Both halves drift. When the
+partition heals, the data conflicts in ways nothing in the
+system can resolve.
+
+Split brain is the most expensive distributed-systems bug.
+Money, inventory, identity, sessions — anything stateful can
+be silently corrupted.
+
+## The setup
+
+A 6-node cluster. Network drops between nodes 1-3 and 4-6:
+
+```
+[1, 2, 3]  ←×→  [4, 5, 6]
+```
+
+Each side can see its peers but not the other side. From each
+side's perspective, the other three nodes are "dead."
+
+If the cluster's logic is "elect a new leader if the current
+one is dead," both halves elect a leader. Now there are two
+leaders. Both accept writes. Both think they're correct.
+
+## Prevention 1: quorum
+
+The simplest fix. Require a **majority** (more than half) of
+nodes to agree before making any consistency-affecting
+decision.
+
+In a 6-node cluster, that's 4. In a 3-node, it's 2. In a
+5-node, it's 3.
+
+If the partition splits 3:3, neither side has majority. Both
+sides refuse to elect a leader. The system is unavailable
+during the partition — but **not corrupted**.
+
+If the partition splits 4:2, the 4-side keeps operating; the
+2-side refuses to write. When the partition heals, the 2-side
+catches up.
+
+Used by: Raft, Paxos, etcd, Consul, Kafka KRaft, MongoDB
+replica sets, every modern consensus system.
+
+## Prevention 2: STONITH (fencing)
+
+"Shoot The Other Node In The Head." When you decide to take
+over, physically force the old node offline before proceeding.
+
+Methods:
+
+- **IPMI / BMC**: send a power-off command to the old node's
+  out-of-band management.
+- **iSCSI / SAN fencing**: revoke its access to shared
+  storage.
+- **Network fencing**: revoke its VPC/SDN rules.
+
+Used in HA clusters (Pacemaker, RHCS) when shared storage is
+involved. Brutal, reliable, hard to operate.
+
+## Prevention 3: fencing tokens
+
+A monotonically increasing ID handed out by a coordination
+service. Every storage operation must include the current
+token. The storage layer rejects operations with an old token.
+
+```
+Client A acquires lock, gets token=42.
+Client A is paused (GC, freeze).
+Client B notices A's lease expired, acquires lock, gets token=43.
+Client A wakes up, sends write with token=42.
+Storage rejects: "current token is 43, your 42 is stale."
+```
+
+Used by Spanner, MillWheel, FoundationDB. Works even if the
+old leader doesn't know it's been demoted.
+
+## Why "just use a watchdog timer" doesn't work
+
+Naïve idea: each node times out and shuts itself off if it
+can't reach the cluster. But:
+
+- The node's clock might be wrong.
+- The node might be doing GC and miss the timeout signal.
+- The node might be running on a hypervisor that paused it.
+- The node thinks it's dead but storage hasn't disowned it.
+
+Anything that depends on "the bad node will voluntarily go
+quiet" is unreliable. Use quorum + fencing.
+
+## Real-world split-brain incidents
+
+Documented incidents include:
+
+- **Redis Sentinel + virtual machines**: a paused VM resumes
+  thinking it's still leader; new writes both there and on
+  the new leader → permanent divergence.
+- **etcd majority disagreement after manual cluster split**:
+  operators sometimes "force quorum" on the smaller half;
+  later merges produce data loss.
+- **Cassandra schema disagreements**: schema gossip can result
+  in different schemas on different sides of a partition.
+- **HA Postgres with shared storage and no fencing**: both
+  sides write to the same files; corruption.
+
+The common pattern: **someone assumed a heartbeat timeout
+meant the other side was actually dead.** It rarely is. It's
+just not reachable from here.
+
+## Detection in practice
+
+You can't reliably *prevent* split brain from happening, but
+you can detect it after the fact:
+
+- Compare write-ahead logs across nodes after a partition;
+  flag divergent writes.
+- Run reconciliation jobs that scan for "same key, different
+  value, both committed."
+- Page operators on any unexpected leadership election.
+
+Detection is much cheaper than prevention. But for stateful
+systems, you still need prevention — by the time you detect,
+the data is wrong.
+
+## The CAP framing
+
+Split brain is the failure mode CAP exists to talk about.
+Under partition, you pick:
+
+- **CP**: refuse to operate on the minority side. No split
+  brain, but unavailable on that side.
+- **AP**: keep operating on both sides. Available everywhere,
+  but split brain (data divergence) is now your problem.
+
+There's no "skip CAP" option for systems that replicate state.
+
+## In summary
+
+- Split brain: both sides of a partitioned cluster believe
+  they're authoritative; both write; data diverges.
+- Worst-case bug in stateful distributed systems.
+- Prevent with: quorum (majority decision), STONITH (force
+  the old node off), fencing tokens (monotonic IDs at the
+  storage layer).
+- "Watchdog timeout" alone is unreliable — the node might be
+  paused, not dead.
+- Always design partition behavior explicitly: CP (refuse) or
+  AP (reconcile later, with a known cost).

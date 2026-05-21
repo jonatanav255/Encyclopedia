@@ -1,0 +1,231 @@
+export const level = 'senior';
+
+# USE method (utilization, saturation, errors)
+
+The USE method is Brendan Gregg's diagnostic checklist for
+**resources**: for every resource, measure Utilization,
+Saturation, and Errors. If any of the three is anomalous, you
+have your bottleneck — or at least the next thing to investigate.
+
+It's the resource-side complement to RED. RED tells you the
+**service is slow**; USE tells you which **resource is
+exhausted**. Together they cover most performance pathologies.
+
+## The three signals
+
+<Cheatsheet>
+| Signal | Definition | Why |
+|---|---|---|
+| Utilization | % of time (or capacity) the resource is busy | High utilization ≈ near a cliff |
+| Saturation | Queued/blocked work waiting on the resource | The bottleneck **signal** |
+| Errors | Error events from the resource itself | Often the root cause; cheap to count |
+
+</Cheatsheet>
+
+A subtle point: **utilization is a comfort metric, saturation is
+the leading indicator**. A CPU at 95% utilization with no run
+queue is fine. A CPU at 60% utilization with a run queue of 100
+is on fire — there's contention you're not seeing in the
+utilization number.
+
+## Saturation is the one most people miss
+
+The trio is sometimes confused because utilization and
+saturation feel related. The difference:
+
+<Compare a="Utilization" b="Saturation">
+<>
+**How busy is the resource?** A measure of capacity used. CPU
+at 80% utilization is using 80% of available cycles. Disk at
+60% means 60% of IO time is consumed.
+
+Plateaus at 100%. Cannot tell you what's waiting.
+</>
+<>
+**How much extra work is queued?** A measure of pressure beyond
+the resource's capacity. Linux run queue depth, network TCP
+retransmits, disk avgqu-sz, memory paging.
+
+Has no upper bound. Tells you the resource is **bottlenecking
+the system**, not just busy.
+</>
+</Compare>
+
+CPU at 100% utilization with run queue depth 1 means "fully
+used, fine." CPU at 100% with run queue depth 50 means "fully
+used, 50 threads are waiting for a turn — the system is in
+contention." Same utilization; very different stories.
+
+## The resource list
+
+Apply USE to every resource on the host. Brendan Gregg's
+canonical list:
+
+<Cheatsheet>
+| Resource | Util | Saturation | Errors |
+|---|---|---|---|
+| CPU | `mpstat` `%usr+%sys` | Run queue length (`vmstat r`) | Hardware errors (rare) |
+| Memory | RSS / total | Swap activity, page faults | OOM kills |
+| Disk IO | `iostat %util` | `avgqu-sz`, `await` | `iostat err`, SMART |
+| Disk space | `df` | (n/a) | Write failures |
+| Network IO | `nicstat`, `sar -n DEV` | `netstat` retransmits, drops | Interface errors |
+| File descriptors | open / ulimit | (n/a) | `EMFILE` errors |
+| TCP connections | active / limit | accept queue overflow | RST, retransmits |
+
+</Cheatsheet>
+
+For applications you add resources of your own: **DB connection
+pool**, **thread pool**, **queue depth**, **goroutine count**.
+The same trio applies: pool in use / pool size = utilization,
+waiters = saturation, acquire-failures = errors.
+
+## Application-level USE
+
+Most production incidents are application-resource exhaustion,
+not host-resource exhaustion. Instrument:
+
+```js
+// DB connection pool
+poolUtilization.set({}, pool.usedConnections / pool.totalSize);
+poolSaturation.set({}, pool.waitingClients);
+poolErrors.inc({ kind: 'acquire_timeout' });
+
+// Worker queue
+queueUtilization.set({}, busyWorkers / totalWorkers);
+queueSaturation.set({}, pendingJobs);
+queueErrors.inc({ kind: 'rejected' });
+```
+
+A common pattern: the host CPU and memory look fine, but the
+**connection pool saturation** is climbing. Requests are queueing
+on a 10-connection pool while the Postgres host has plenty of
+capacity. USE on the pool finds it; USE on the host doesn't.
+
+## The procedure
+
+The point of USE is not the data — it's the **checklist**. When
+something is slow, you walk through every resource and ask:
+
+<Steps>
+<Step n={1} title="Pick the resource.">
+Start with the obvious — CPU on the slow service. Then move to
+memory, disk, network, app-level pools. Don't skip; you'll find
+the answer in the one you skipped.
+</Step>
+<Step n={2} title="Check utilization.">
+At a normal level for the current load? If unusually high,
+note it but don't jump to conclusions.
+</Step>
+<Step n={3} title="Check saturation.">
+Is there a queue? Are processes waiting? **This is usually
+where the answer lives.**
+</Step>
+<Step n={4} title="Check errors.">
+Are there error events from this resource? Even a low rate of
+errors can correlate with the bottleneck.
+</Step>
+<Step n={5} title="If any are anomalous, dig deeper. Otherwise move to the next resource.">
+Don't get attached to your hypothesis. Run the whole checklist
+once; let the data point you.
+</Step>
+</Steps>
+
+The discipline of checking **every resource** is what catches
+the surprising bottlenecks. The disk IO USE check is what finds
+a runaway logfile filling the data partition.
+
+## A worked example
+
+Alert: p99 latency for a service climbed from 80ms to 800ms over
+10 minutes. RED dashboard confirms.
+
+- **Service CPU**: 45% util, run queue 1.2. Normal.
+- **Service memory**: 60% used, no swap, no page faults. Normal.
+- **Disk**: 12% util, avgqu-sz 0.5. Normal.
+- **Network**: 200 Mb/s, no retransmits. Normal.
+- **DB connection pool**: 100% util, 80 waiters, 0 errors. **Found it.**
+- **DB host CPU**: 38% util, run queue 2. Fine.
+- **DB query latency**: p99 went from 5ms to 400ms.
+
+The pool is saturated because the DB is slow. Drilling further:
+the DB isn't CPU-bound — it's lock contention from a long
+transaction. The chain `pool saturation → DB latency → lock
+contention` was uncovered in order by walking USE.
+
+## USE for cloud / Kubernetes
+
+The mapping changes; the method doesn't. For a Kubernetes pod:
+
+<Cheatsheet>
+| Resource | Util | Saturation | Errors |
+|---|---|---|---|
+| CPU | `container_cpu_usage_seconds_total` | Throttling (`container_cpu_cfs_throttled`) | (rare) |
+| Memory | `container_memory_working_set_bytes` | OOMKills | `container_memory_failures_total` |
+| Network | bytes/sec | TCP queue, retransmits | drops |
+| Pod ephemeral disk | bytes / quota | (n/a) | evictions |
+
+</Cheatsheet>
+
+CFS throttling is the cgroup-era equivalent of run queue: even at
+low utilization a CPU-limited container can be throttled and
+appear slow. USE catches this; raw utilization misses it.
+
+## RED + USE together
+
+The clean split:
+
+- **RED for services** — request-shaped things. Per-endpoint.
+- **USE for resources** — CPU, memory, disk, network, pools,
+  queues. Per-resource.
+
+They share an incident: RED's latency-and-error spike happens
+**because** some USE somewhere is saturated. The two dashboards
+together let you trace from symptom to bottleneck.
+
+## When USE is hard
+
+- **Cloud-managed services** (RDS, ElastiCache) — you don't have
+  full OS visibility. You're limited to whatever the provider
+  exposes (CPUUtilization, FreeableMemory, ConnectionCount).
+  Treat what they give you as your USE proxy.
+- **Serverless** — per-invocation resources are ephemeral; the
+  USE shift is toward **concurrency limits**, **cold starts**,
+  and **provider-level throttles**.
+- **Distributed resources** — when the resource is the network
+  itself, partition health, region failover, tail latency
+  between hosts. USE generalizes but the inputs are sparse.
+
+<Callout variant="note">
+USE is the spiritual companion of Brendan Gregg's *Systems
+Performance* book. The book walks every layer of a Linux
+host through the lens of USE. Worth reading once even if you
+never run a bare host yourself — the concepts transfer to
+containers, VMs, and cloud abstractions.
+</Callout>
+
+## Common mistakes
+
+- **Reading utilization without saturation**. The classic CPU
+  trap: 70% utilization with run queue 50 is in trouble; the
+  utilization number lies.
+- **Skipping application-level resources**. Connection pools,
+  thread pools, worker queues — most production incidents are
+  here, not at the OS layer.
+- **Confusing limits with capacity**. Container CPU limit 1
+  means CFS will throttle past 1 core, regardless of host
+  utilization.
+- **Per-host instead of per-resource-type**. A 100-node fleet
+  has one bottleneck on average; you find it by graphing each
+  resource type **across hosts**, not each host.
+
+## In summary
+
+- For every resource: graph utilization, saturation, and errors.
+- Saturation is the leading indicator, not utilization.
+- Walk every resource — host, container, application — when
+  triaging.
+- App-level pools (DB connections, workers) cause more incidents
+  than CPU/memory ever will.
+- RED + USE compose: services through RED, resources through USE.
+- The method is the discipline. The numbers come from whatever
+  tooling you have.

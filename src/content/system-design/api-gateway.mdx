@@ -1,0 +1,260 @@
+export const level = 'mid';
+
+# API gateway
+
+An API gateway is the **single edge entry point** for clients into a
+backend system. It handles concerns that don't belong in each
+service: authentication, rate limiting, routing, protocol translation,
+request transformation, response caching, observability.
+
+It's useful — and it's the most common over-engineering trap in
+backend architecture.
+
+## The shape
+
+```
+[clients]
+   ↓ HTTPS
+[API gateway]
+   ├─ authn (JWT, OAuth, mTLS)
+   ├─ rate limit / quota
+   ├─ routing → service A
+   ├─        → service B
+   └─        → service C
+```
+
+Everything outside talks to the gateway. The gateway is the only
+thing that talks to the services.
+
+Common implementations: **Kong**, **AWS API Gateway**, **Apigee**,
+**Tyk**, **Envoy** (raw), **NGINX**, **Cloudflare Workers** with
+custom routing.
+
+## What it actually does
+
+The honest list, from Geewax's *API Design Patterns* and Continuous
+API Management:
+
+<Cheatsheet>
+| Concern | Why at the gateway |
+|---|---|
+| TLS termination | Don't make every service do TLS. |
+| Authentication | Validate JWT/session once; services trust the gateway. |
+| Authorization (coarse) | "This token has scope `orders:read`." Fine-grained authz still lives in the service. |
+| Rate limiting | Per-client global limits before traffic hits services. |
+| Routing | `/api/v2/orders/*` → orders service. |
+| Protocol translation | Public REST/HTTP → internal gRPC. |
+| Request/response shaping | Strip internal fields, add headers, mask PII at the edge. |
+| Caching | Cache idempotent GETs near the edge. |
+| Observability | Uniform access logs, RED metrics, request IDs. |
+| API key management | Rotate, revoke, scope at the gateway. |
+</Cheatsheet>
+
+If you have 10+ services and 3+ client platforms, doing this in each
+service is duplication. The gateway centralizes it.
+
+## When you actually need one
+
+Three signs from real teams:
+
+<Steps>
+<Step n={1} title="More than one client platform.">
+Web, mobile, partner APIs, internal services. Each needs slightly
+different auth, rate limits, caching. A gateway is where those
+differences live.
+</Step>
+<Step n={2} title="More than ~5 services exposed externally.">
+Below that, a load balancer with path-based routing is enough. Above
+it, you start wanting per-route policy, versioning, key management.
+</Step>
+<Step n={3} title="External developers.">
+Anyone outside the company hits your API. Now you need API keys,
+quotas, usage analytics, sandboxes — the things gateways exist for.
+</Step>
+</Steps>
+
+If none of these apply, you do not need an API gateway. You need a
+load balancer with TLS, maybe a small reverse proxy. Don't run Kong
+to serve one app for one team.
+
+## What goes in the gateway, what stays in services
+
+The line matters. Get it wrong and the gateway becomes a god-object
+that owns business logic. From Continuous API Management:
+
+<Compare a="Gateway responsibility" b="Service responsibility">
+<>
+- TLS, authn, request ID, rate limit, route, log.
+- Format translation (gRPC ↔ REST, JSON ↔ protobuf).
+- Coarse authz: "this caller has this scope."
+- Edge caching for GETs.
+- API key issuance and revocation.
+- Coarse traffic shaping (canary by header/percentage).
+</>
+<>
+- Business logic, validation, domain rules.
+- Fine-grained authz: "this user owns this order."
+- Data persistence and transaction.
+- Pagination, sorting, filtering.
+- Domain events and saga orchestration.
+- Anything resembling a "business rule."
+</>
+</Compare>
+
+The gateway is a **policy plane**, not a service. Keep its logic
+declarative; if you find yourself writing real code there, it's
+already going wrong.
+
+## Where it becomes a bottleneck
+
+The gateway is the single edge entry. That's its strength and its
+biggest risk:
+
+### Availability bottleneck
+
+Gateway down → everything is down. It must be at least as available
+as your most-available service. Multi-AZ, multi-region, fronted by
+a load balancer or DNS-based failover.
+
+### Performance bottleneck
+
+Every request adds gateway latency: TLS termination, policy
+evaluation, sometimes a body re-parse. At p50 it's a few ms; at p99
+under load it can be 50+ ms if the gateway is undersized. Capacity-
+plan separately from services.
+
+### Configuration bottleneck
+
+If every service deploy requires a gateway config change merged by
+the platform team, the gateway becomes a deploy chokepoint. Push
+config ownership to service teams (GitOps, declarative route
+manifests) so they self-serve.
+
+### Coupling bottleneck
+
+A gateway that knows about every service's payload shape is tightly
+coupled to all of them. Schema changes propagate through gateway
+config. Keep gateway routing **shallow**: route by path, don't
+inspect bodies.
+
+### Cost bottleneck
+
+Managed gateways charge per request. At high QPS this can dominate
+the bill. AWS API Gateway has surprised many teams; benchmark before
+committing.
+
+## API gateway vs reverse proxy vs load balancer
+
+These are not the same:
+
+<Cheatsheet>
+| Layer | Job | Examples |
+|---|---|---|
+| L4 load balancer | TCP-level distribution. | AWS NLB, kube-proxy. |
+| L7 load balancer | HTTP routing by path/header. | AWS ALB, NGINX, Envoy raw. |
+| Reverse proxy | HTTP termination, basic routing, caching. | NGINX, HAProxy, Caddy. |
+| API gateway | All of the above plus policy: authn, rate limit, key management, transformations, analytics. | Kong, AWS API Gateway, Apigee. |
+</Cheatsheet>
+
+A reverse proxy with auth plugins is often enough — and 10× simpler
+to operate than a full gateway.
+
+## BFF vs API gateway
+
+A common confusion: is a Backend-For-Frontend the same as an API
+gateway?
+
+```
+API gateway:     one for the whole platform; protocol/policy plane.
+BFF:             one per client channel; aggregates and shapes data
+                 for that client.
+```
+
+They can coexist: clients hit the BFF; BFF calls services through
+the gateway (or directly). See **Backend for frontend (BFF)** for
+the data-shaping perspective.
+
+## Common anti-patterns
+
+### Smart gateway, dumb services
+
+Validation, enrichment, business rules in gateway plugins. Now the
+gateway is a service nobody owns and nobody can change. Move it back
+into services.
+
+### Per-team plugin sprawl
+
+Five teams write five Lua scripts on Kong to add headers, log
+specific events, transform errors. The gateway becomes a forest of
+ad-hoc plugins. Standardize plugins centrally; deny custom plugins by
+default.
+
+### Mixing concerns: edge and internal
+
+The gateway routes external client traffic. Then someone routes
+internal service-to-service traffic through it "because policy is
+already there." Now east-west traffic goes through your north-south
+bottleneck. Use service mesh (or direct calls) for internal; gateway
+for external.
+
+### Body-aware routing
+
+The gateway parses the request body to decide where to route. Now
+gateway perf is body-size-bound, and gateway config knows your
+schema. Route on path, method, and headers only.
+
+### No backend for the gateway
+
+The gateway is the front door but no one owns it. Six months in,
+no one knows the policy plane or how to upgrade Kong. Treat the
+gateway as a real service with on-call, dashboards, and capacity
+plans.
+
+## Patterns that work
+
+A few from Geewax and Continuous API Management:
+
+### Versioning at the gateway
+
+Public API versions (`/v1/`, `/v2/`) routed to different service
+versions. Deprecation policy lives in the gateway: 410-Gone responses,
+sunset headers, deprecation warnings. See **API versioning at scale**.
+
+### Coarse authz, fine authz
+
+Gateway checks "the token is valid and has the `orders` scope."
+Service checks "this user owns this specific order." Don't try to
+put fine-grained per-resource authz in the gateway — you'll leak
+domain knowledge upward.
+
+### Edge caching for idempotent GETs
+
+Cache GET responses for short TTLs at the gateway. Invalidate via
+cache-control headers from the service. This is the cheapest win;
+many gateways do it well out of the box.
+
+### Per-client rate limiting
+
+`X-API-Key` → quota. JWT subject → user-level rate limit. IP →
+basic abuse protection. Three tiers at the gateway cover most needs.
+See **Rate limiting**.
+
+<Callout variant="info">
+Start with a load balancer or reverse proxy. Adopt a gateway when
+you have a specific need (external developers, multiple client
+platforms, key management at scale). Don't run Kong because a blog
+said you should.
+</Callout>
+
+## In summary
+
+- An API gateway centralizes edge concerns: TLS, authn, rate limit,
+  routing, key management, observability.
+- Useful when you have multiple client platforms, many services, or
+  external developers; over-engineering otherwise.
+- Keep it as a policy plane: declarative config, no business logic.
+  Plugin sprawl turns the gateway into an unowned service.
+- It's a single edge entry — plan availability, performance, and cost
+  separately; treat the gateway as a first-class service.
+- Don't confuse with reverse proxy, load balancer, BFF, or service
+  mesh. They overlap but are not interchangeable.

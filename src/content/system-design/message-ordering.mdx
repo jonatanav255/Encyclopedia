@@ -1,0 +1,253 @@
+export const level = 'senior';
+
+# Message ordering
+
+"Just process events in order" is the single most common
+under-specified requirement in distributed systems. There are
+three useful orderings, and only one of them scales.
+
+- **No ordering**: messages arrive in whatever sequence the
+  network delivers.
+- **Per-partition (per-key) ordering**: messages with the same
+  key arrive in the order they were produced.
+- **Global / total ordering**: every message in the system is
+  delivered in one universal sequence.
+
+If a junior asks for "ordering," they usually mean global. If a
+senior asks for ordering, they specify a partition key. The
+difference is the difference between "scales to a million writes
+per second" and "scales to one machine."
+
+## Why global ordering doesn't scale
+
+A total order requires a single point of serialization. Every
+message has to pass through one node, get a sequence number, and
+then propagate. That node is your throughput ceiling and your
+single point of failure.
+
+```
+producer A ─┐
+producer B ─┼─→ [single serializer] → ordered stream
+producer C ─┘
+```
+
+A single Kafka partition is roughly capped at ~tens of MB/s.
+That's plenty for most subsystems. It's nothing for a global
+stream of every user's events on a busy product.
+
+Total ordering is also fundamentally **at odds with
+availability**. If the serializer is partitioned from a producer,
+either you stop accepting writes or you violate the order. CAP
+applies.
+
+The mature posture: **total order is rarely what you actually
+need**. Per-entity order almost always is.
+
+## Per-partition ordering
+
+The compromise that works. Partition the stream by a key, and
+within each partition you get a strict, durable order. Across
+partitions, no promises.
+
+```
+key = user_id
+
+user 42's events  → partition 3 (ordered)
+user 99's events  → partition 7 (ordered)
+user 100's events → partition 3 (ordered, interleaved with user 42)
+```
+
+Kafka, Kinesis, Pulsar, and Pub/Sub Lite all use this model.
+
+Two consequences:
+
+1. **Order is preserved per key**, not across keys. For "process
+   user 42's actions in the order they happened," set the
+   partition key to the user ID.
+2. **One partition is consumed by one consumer in a group.** If
+   user 42 is hot, that one consumer is the bottleneck — see
+   **Partitions and consumer groups** for the rebalancing
+   consequences.
+
+The right partition key answers: **at what granularity do I need
+order?** For an e-commerce app:
+
+<Cheatsheet>
+| Domain stream | Natural partition key | Rationale |
+|---|---|---|
+| Order events | order_id | All events for one order are ordered |
+| User actions | user_id | All actions for one user are ordered |
+| Inventory updates | sku | All updates to one item are ordered |
+| Account ledger | account_id | All postings to one account are ordered |
+| Audit log (no per-key need) | round-robin | Maximizes throughput, accept arbitrary order |
+</Cheatsheet>
+
+Choose the smallest entity that actually needs in-order updates.
+"Order events by user_id" is wrong if two of that user's orders
+must each be internally ordered but can interleave with the
+other.
+
+## What about FIFO queues?
+
+Some brokers offer queue-shaped FIFO ordering. SQS FIFO, RabbitMQ
+with a single consumer.
+
+**SQS FIFO**: messages are ordered within a "message group ID"
+(same idea as a Kafka partition key). Throughput is capped at
+**3000 messages/sec per FIFO queue with high-throughput mode,
+300/sec without** as of 2024. Standard SQS gives best-effort
+order with much higher throughput.
+
+**RabbitMQ**: a classic queue with one consumer is ordered.
+Add a second consumer and order goes out the window
+(prefetched messages can be processed concurrently).
+
+For most workloads at scale, FIFO queues are too slow. Kafka-style
+partitioned logs are the answer.
+
+## What breaks ordering
+
+Even with a partitioned log, ordering can be silently violated by
+the consumer.
+
+### Concurrent processing within a partition
+
+```js
+// Bug: parallel processing of one partition
+consumer.run({
+  eachMessage: async ({ message }) => {
+    // fires before previous handler resolves
+    void process(message);
+  },
+});
+```
+
+`eachMessage` should be `await`ed. Returning early lets KafkaJS
+start the next message before the previous completes — and now
+your order is "whichever Promise finishes first."
+
+Fix: do the work in the handler, return only when done.
+
+### Retries that don't preserve order
+
+A handler that throws and retries: the next message in line might
+process before the failing one succeeds. If your consumer is
+"retry forever in a loop, blocking the partition," ordering
+holds. If it's "send to retry topic, continue," ordering is gone
+for the failing key.
+
+Two postures:
+
+- **Stop-the-world per key**: retry the failed message until it
+  succeeds or hits DLQ. Partition stalls.
+- **Sidetrack and continue**: failed message goes to a retry
+  topic; the partition advances. Faster recovery, weaker order.
+
+Pick deliberately. Most teams want stop-the-world for ordered
+domains (ledgers, state machines) and sidetrack for "best
+effort" domains (notifications).
+
+### Rebalancing during in-flight messages
+
+When a consumer leaves the group, its partitions are reassigned.
+If a message was being processed but not yet committed, the new
+consumer re-processes it — usually fine (at-least-once) — but
+during the gap, the next message in that partition is being
+prefetched by another consumer. Bad consumer code can process
+out of order.
+
+Modern clients handle this with **eager** or **cooperative
+sticky** rebalancing (KIP-429). Stick with library defaults
+unless you've measured the rebalance cost.
+
+### Producers retrying without idempotency
+
+```
+producer sends msg A → broker ack lost → producer retries
+                                       → broker gets A again
+                                       → broker stores: A, B, A
+```
+
+Two copies of A, one of them after B. Order broken within the
+partition.
+
+Fix: **idempotent producer**. Kafka's idempotent producer (and
+the new transactional producer) attaches a sequence number; the
+broker rejects out-of-sequence repeats and preserves order.
+
+```js
+const producer = kafka.producer({ idempotent: true });
+```
+
+Always on for production Kafka.
+
+## Ordering vs concurrency
+
+There's a fundamental trade-off: **the more parallelism you want,
+the less global order you keep**.
+
+<Compare a="More partitions" b="Fewer partitions">
+<>
+- Higher max throughput
+- More consumer parallelism in a group
+- Tighter latency under load
+- Harder to add/remove later (rebalances large data)
+- Looser ordering granularity (more keys spread across)
+</>
+<>
+- Lower max throughput
+- Fewer parallel consumers
+- Easier per-key ordering reasoning
+- Better fit when one key has heavy traffic
+- Risk of partition hot spots
+</>
+</Compare>
+
+A useful rule of thumb (DDIA-aligned): **partitions = peak
+parallelism you'd ever want for that topic, times 2–3 for
+headroom**. Doubling is cheap; halving is painful.
+
+## Causal order
+
+A weaker form than total order but stronger than per-partition.
+"If A caused B, A appears before B in the stream." Achievable via
+**vector clocks** or **causal tokens** — each event carries a
+reference to the events it depends on.
+
+Most application code doesn't need causal ordering as a protocol
+feature. When you do (collaborative editing, multi-leader
+replication with conflict resolution), CRDTs and operational
+transformation are the tools, not the broker.
+
+## Pitfalls
+
+<Callout variant="warning">
+**"We need exact global order."** Push back. Ask **what
+question** the ordering answers. Usually it's "all events for
+one entity in order" — which is per-key, not global.
+</Callout>
+
+<Callout variant="warning">
+**Round-robin partition key for ordered streams.** Defaulting to
+`null` key in KafkaJS sends to a random partition, destroying
+per-entity order. Always set a key for ordered domains.
+</Callout>
+
+<Callout variant="warning">
+**Repartitioning after launch.** Changing the partition count
+moves keys to different partitions. In-flight events are now in
+two streams. Tools like Kafka Streams' co-partitioning assume a
+stable layout. Plan partitions for scale at the start.
+</Callout>
+
+## In summary
+
+- **Global order doesn't scale.** A single serializer is a
+  single bottleneck and a single point of failure.
+- **Per-partition order is the practical default.** Pick a key
+  at the granularity ordering matters.
+- **Watch for parallelism inside the handler** — async
+  processing without await silently re-orders.
+- **Idempotent producers** preserve order under retry.
+- **More partitions = more throughput, looser ordering**. Pick
+  consciously; doubling is cheap, halving is not.

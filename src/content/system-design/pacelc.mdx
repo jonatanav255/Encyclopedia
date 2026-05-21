@@ -1,0 +1,286 @@
+export const level = 'senior';
+
+# PACELC
+
+CAP describes what a system does during a partition. PACELC,
+introduced by Daniel Abadi, points out the obvious omission:
+**most of the time, there is no partition** — and even then,
+distributed systems still trade between consistency and
+latency. PACELC names that trade, and it matches how real
+systems actually behave.
+
+## The statement
+
+> **If** there is a **P**artition, the system chooses between
+> **A**vailability and **C**onsistency.
+>
+> **E**lse, the system chooses between **L**atency and
+> **C**onsistency.
+
+In short: **PA/EL** or **PC/EC**, with combinations possible
+(PA/EC, PC/EL).
+
+The PAC half is just CAP. The EL/EC half is what's new — and
+what makes PACELC the better framework for everyday design.
+
+## Why latency matters even without partitions
+
+Consider an ostensibly strong-consistent global database. A
+write must:
+
+1. Reach the leader.
+2. Wait for a quorum of replicas to acknowledge (Paxos/Raft).
+3. Apply.
+4. Return.
+
+If those replicas are across continents, each round trip is
+~100ms. Every write pays this cost. There's no partition;
+there's just **the cost of consensus across distance**.
+
+Alternatively, the system could accept the write locally and
+replicate asynchronously, returning in 1ms but accepting that
+the read on a different continent might briefly return stale
+data. That's the **latency vs consistency** trade — entirely
+independent of partitions.
+
+## How systems map to PACELC
+
+<Cheatsheet>
+| System | Partition behavior | No-partition trade |
+|---|---|---|
+| Cassandra (default) | PA — accept writes, reconcile | EL — fast reads, eventual within DC |
+| DynamoDB (default eventual reads) | PA | EL |
+| DynamoDB (strong reads) | PC | EC |
+| Spanner | PC — minority unavailable | EC — sync replication, slow writes |
+| CockroachDB | PC | EC (configurable) |
+| MongoDB (majority writeConcern) | PC | EC |
+| MongoDB (w:1, eventual reads) | PA | EL |
+| Postgres (sync replication) | PC | EC |
+| Postgres (async replication, default) | PA-leaning | EL — primary commits without waiting |
+| Riak | PA | EL |
+| Redis (default async replication) | PA | EL |
+| Kafka (acks=all + min.insync.replicas) | PC | EC |
+</Cheatsheet>
+
+Two interesting observations:
+
+- **Spanner and CockroachDB are PC/EC** — strong consistency
+  everywhere, paying the latency cost always. Designed for
+  workloads that need correctness more than speed.
+- **Cassandra and DynamoDB are PA/EL** — availability + low
+  latency, accepting eventual consistency. Designed for
+  workloads where staleness is tolerable but downtime is not.
+
+Most operational decisions in distributed systems boil down to
+where on this 2×2 you want each piece of data.
+
+## The four combinations
+
+### PA/EL — Always available, always fast
+
+Examples: Cassandra default, DynamoDB eventual reads, Riak.
+
+- During partition: every node accepts writes; conflicts later.
+- No partition: writes return as fast as the local replica
+  acks; reads can hit any replica.
+
+Best for: write-heavy workloads where stale reads are
+acceptable (analytics, telemetry, social feeds, leaderboards,
+session state, presence).
+
+Cost: reads are eventually consistent; conflicts require
+application logic (CRDTs, LWW, sibling merge).
+
+### PC/EC — Always consistent
+
+Examples: Spanner, CockroachDB, Postgres sync, Kafka acks=all.
+
+- During partition: minority side rejects writes; majority
+  continues.
+- No partition: every write waits for quorum acknowledgement.
+
+Best for: financial, regulatory, inventory, identity, anywhere
+correctness dominates.
+
+Cost: writes are slow (consensus round trips); minority
+partitions are unavailable.
+
+### PA/EC — Available under partition, consistent otherwise
+
+Examples: harder to find as a default — possible
+configurations of MongoDB and certain mixed setups.
+
+- During partition: accept writes on multiple sides; reconcile.
+- No partition: synchronous consensus.
+
+This combination is unusual because if you accept eventual
+consistency under partition, you usually accept it always.
+Mixed configurations exist; pure PA/EC is rare.
+
+### PC/EL — Consistent under partition, fast otherwise
+
+Examples: many real systems sit here informally. Postgres with
+async replication + manual failover is **roughly** PC during
+partition (operators promote carefully) and EL otherwise (no
+sync write penalty).
+
+Common in practice but rarely an explicit design goal.
+
+## Why PACELC matters for design
+
+Three concrete things PACELC clarifies that CAP doesn't:
+
+<Steps>
+<Step n={1} title="Most of your time is E, not P.">
+Partitions are rare events. Latency-vs-consistency trade-offs
+apply to every read and write under normal operation. The "E"
+side dominates the design.
+</Step>
+<Step n={2} title="Cross-region cost is consistency cost.">
+Synchronous replication across continents is choosing EC, and
+the cost is measured in 100ms+ added to every write. Many
+"slow writes" complaints are actually "we chose EC and didn't
+realize the price."
+</Step>
+<Step n={3} title="The data choice is per-table.">
+A single application can have an EC table (orders, payments)
+and an EL table (analytics events, audit logs). Multi-store
+architectures naturally implement this.
+</Step>
+</Steps>
+
+## Trade-offs you can tune
+
+PACELC isn't a binary choice; engines expose knobs.
+
+### Tunable consistency in Cassandra / DynamoDB
+
+```js
+// Cassandra: per-write consistency level
+`INSERT INTO users (...) VALUES (...)
+   USING CONSISTENCY QUORUM;`
+```
+
+- `ONE`: write to any one replica, fast, EL.
+- `QUORUM`: write to a quorum, slower, EC for that write.
+- `ALL`: every replica must ack, slowest, fully consistent.
+
+The same column family can be written and read at different
+consistency levels by different code paths.
+
+### Read concerns in MongoDB
+
+- `local`: read from any replica, fast, eventual.
+- `majority`: only return data committed by majority,
+  slower, consistent.
+- `linearizable`: linearizable reads (after writes), slowest.
+
+### Postgres replicas
+
+- Reads from the primary: fully consistent, costs primary's
+  CPU.
+- Reads from sync replicas: consistent at receipt, slight lag.
+- Reads from async replicas: cheaper but stale.
+
+Each read can choose the right replica per query type.
+
+## A useful mental model
+
+Think of every database as having two dials:
+
+```
+[ async ........ sync ]   replication style
+[ local ........ global ] read consistency
+```
+
+Top-left = PA/EL. Bottom-right = PC/EC. Most engines let you
+choose per write or per read, not just per cluster.
+
+The interview question "is this CP or AP?" misses that the
+right answer is often **"both, configured per query."**
+
+## Where the trade-offs really bite
+
+Three real-world patterns where PACELC clarifies things:
+
+### Cross-region writes
+
+A multi-region app with strong consistency cross-region pays
+~100ms per write to the farthest region. For a write-heavy
+flow (placing orders), this becomes the dominant latency.
+
+Choices:
+
+- Accept the latency (PC/EC, Spanner-style).
+- Pin each user's writes to one region (PA/EL within region,
+  PC across regions via async). Most products land here.
+- Move from cross-region to **regional partitions** (each
+  region owns its users' data; no global writes).
+
+### Session consistency
+
+User writes a comment; immediately reads the page; expects to
+see it.
+
+If reads go to async replicas (EL), it might be missing.
+Solutions:
+
+- **Read-your-writes**: route the user's reads to the primary
+  for N seconds after a write.
+- **Causally consistent reads**: track last-write timestamp
+  per session; route to a replica caught up to it.
+
+Both are session-level consistency, not global. PACELC
+implicitly assumes you might mix.
+
+### Stale-tolerant denormalized views
+
+A search index updated via CDC lags the primary by seconds.
+The system is PA/EL at the search layer, PC/EC at the OLTP
+layer. The combined system is consistent within each store and
+eventually consistent across.
+
+This isn't a flaw; it's the design.
+
+## Pitfalls
+
+### Choosing PC/EC by default for everything
+
+Strong consistency feels safer. The cost is latency that
+makes the product feel slow. Use EC for invariants; use EL
+for everything else.
+
+### Mixing EC and EL inadvertently
+
+If the application reads from the primary for some queries
+and replicas for others, behavior depends on which path
+the request took. Document the consistency contract per
+endpoint.
+
+### Believing "we don't have partitions"
+
+You do. Even within one datacenter, top-of-rack switches fail,
+network cards drop packets, GC pauses look like partitions.
+Plan for partition behavior; PACELC says nothing about
+frequency.
+
+### Forgetting failover is "during partition"
+
+A leader fails; the new leader is elected; old leader thinks
+it's still leader for a few seconds. That window is a
+partition with respect to writes. PC systems reject writes
+during it; AP systems accept and reconcile.
+
+## In summary
+
+- PACELC extends CAP: even without a partition, distributed
+  systems trade **latency vs consistency**.
+- The four combinations: PA/EL (fast + eventual), PC/EC
+  (slow + strong), and the mixed PA/EC and PC/EL.
+- Spanner / CockroachDB / MongoDB-majority sit at PC/EC;
+  Cassandra / DynamoDB-eventual sit at PA/EL.
+- Tunable engines let you choose per write and per read —
+  often the right approach.
+- Use PC/EC for invariants and PA/EL for everything else.
+  Mix consciously, document per dataset, and never assume
+  partitions are rare.

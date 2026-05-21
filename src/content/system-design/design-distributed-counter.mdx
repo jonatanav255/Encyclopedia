@@ -1,0 +1,197 @@
+export const level = 'senior';
+
+# Design a distributed counter
+
+The "like button at scale" problem. One row in a relational
+DB serializes every write through a single lock. Twitter's
+"X-Mas Spirit" tweet getting a million likes in a minute would
+make that row's row-lock the entire bottleneck.
+
+The trick: stop pretending it's one counter.
+
+## 1. Clarify the scope
+
+- Approximate counts OK between rollups, or exact at read?
+- Single global counter, or per-entity (per-post, per-video)?
+- Read frequency: every page load, or once a minute?
+- Multi-region writes?
+- Total count or per-time-window (e.g., trending in last hour)?
+
+Default: per-entity, approximate-ish on read with sub-second
+eventual exact, multi-region writes accepted.
+
+## 2. Estimate scale
+
+```
+DAU = 500M, events/user/day = 50 → 25B events/day
+Avg QPS = 300K; peak = 3M (during viral spikes)
+Entities = 10B (every post that ever existed)
+```
+
+3M concurrent writes on the same key is impossible on any
+single shard. Even 1K writes/sec on the same row in Postgres
+chokes. Need to distribute.
+
+## 3. API
+
+```bash
+POST /counter/<entity>/increment
+  Body: { by: 1 }
+  Returns: { approx_count: 123456 }
+
+GET /counter/<entity>
+  Returns: { count: 123456 }
+```
+
+`approx_count` returned on increment is fast; exact count
+returned on read does a sum across shards.
+
+## 4. High-level design
+
+```
+client → write API
+            ▼
+       Kafka topic (event stream)
+            ▼
+   sharded counter workers (N=64 per entity)
+            ▼
+   counter shards (Redis or in-memory)
+            ▼
+   periodic aggregator → durable store (Postgres / DynamoDB)
+```
+
+Two paths: a fast write path through Kafka + sharded
+counters, and a periodic rollup to durable storage.
+
+## 5. Data model
+
+Each entity has **N sub-counters**:
+
+```
+counter:<entity>:<shard_id>  -> integer
+```
+
+Write path: client increment hashes the request to one of N
+shards. The shard does an atomic increment (Redis INCR or
+in-memory counter).
+
+Read path: `SUM` all N sub-counters for the entity.
+
+```js
+// Write
+const shard = hashToShard(requestId, N);
+await redis.incr(`counter:post:${postId}:${shard}`);
+
+// Read
+const counts = await redis.mget(
+  Array.from({length: N}, (_, i) => `counter:post:${postId}:${i}`)
+);
+const total = counts.reduce((a, b) => a + Number(b), 0);
+```
+
+N = 64–256 typically. Higher N → more write throughput per
+entity, more read fan-out.
+
+## 6. Deep dives
+
+### Choosing N (shard count)
+
+If max write QPS per entity is W, and one shard handles up to
+S writes/sec, then N ≥ W/S.
+
+For Redis (~100K ops/sec per instance) and a viral tweet at
+1M likes/sec: N ≥ 10 shards just to keep up. In practice use
+N=64 or 256 to give headroom.
+
+For most entities (low-traffic), the same N is overkill but
+costs almost nothing — empty Redis keys take a few bytes.
+
+### Read amplification
+
+A read does N MGETs. With N=64 and a single Redis cluster,
+that's 64 keys per read — still well under 1ms. With N=256
+across multiple shards, the read fan-out becomes meaningful;
+cache the aggregate.
+
+### Caching the aggregate
+
+For a hot entity, cache the SUM with a 1-second TTL:
+
+```js
+async function getCount(postId) {
+  const cached = await cache.get(`count_agg:${postId}`);
+  if (cached) return cached;
+  const total = await sumShards(postId);
+  await cache.set(`count_agg:${postId}`, total, 1);
+  return total;
+}
+```
+
+Reduces reads from N per request to ~1 per second per entity.
+
+### Durability
+
+Redis can crash. To not lose counts:
+
+- Mirror writes to a Kafka topic; the durable store is built
+  from the topic.
+- Periodic snapshot: a worker reads all shards and writes the
+  aggregate to Postgres every minute.
+- On Redis loss, replay the Kafka log into Redis to recover.
+
+### Multi-region
+
+Per-region counter shards; periodic aggregator sums across
+regions:
+
+```
+us-west: counter:post:42:[0..63]  (regional total: 100K)
+us-east: counter:post:42:[0..63]  (regional total: 80K)
+eu:     counter:post:42:[0..63]  (regional total: 30K)
+        global total = 210K
+```
+
+Within-region: low-latency increment. Cross-region: lag is
+fine; users see slightly stale global count.
+
+### CRDT alternative
+
+A counter is a textbook CRDT — the G-counter. Increments
+commute, so concurrent updates from different replicas merge
+correctly. Riak, Redis Active-Active, and several other systems
+offer CRDT counters as a primitive — replace the sharded
+counter implementation with that and you get geo-distribution
+for free.
+
+## 7. Bottlenecks and scale-ups
+
+- **Single super-hot entity → increase N for just that entity.**
+  Adaptive sharding: most entities use N=16, popular ones use
+  N=256.
+- **Redis hot shard → spread across multiple Redis clusters.**
+- **Read fan-out latency → cache the aggregate per-second.**
+- **Long tail of inactive entities → archive shards to disk;
+  rehydrate on read.**
+
+## 8. Tradeoffs called out
+
+- **N sub-counters vs single row**: chose distribution; the
+  cost is read fan-out.
+- **Eventual consistency on global count**: chose for cross-region;
+  per-region is consistent.
+- **Mirror to Kafka for durability**: chose log-as-truth so
+  Redis crashes don't lose data.
+- **CRDT counters as a future move**: not required, but
+  simplifies multi-region if your stack supports it.
+
+## In summary
+
+- Distributed counter: split one logical counter into N
+  sub-counters per entity.
+- Writes hash to one sub-counter; reads SUM across all N.
+- Cache the aggregate for read amplification.
+- Persist via Kafka log for durability; periodic rollup to a
+  source-of-truth store.
+- Multi-region by replicating the pattern per region.
+- CRDT G-counters are the natural fit if the storage supports
+  them.

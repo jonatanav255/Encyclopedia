@@ -1,0 +1,263 @@
+export const level = 'senior';
+
+# The shared-database antipattern
+
+Two services writing the same tables is **microservices in name
+only**. The schema becomes the de facto API; every column rename
+ripples; transactions span services without ACID; ownership is
+unclear. Newman puts it bluntly in *Building Microservices*: a shared
+database is the single biggest predictor that microservices won't
+work for you.
+
+The fix is slow but well-trodden: extract the data, one service at a
+time, with care.
+
+## What "shared" means
+
+Several flavours, in increasing severity:
+
+<Cheatsheet>
+| Flavor | Description | Bad? |
+|---|---|---|
+| Read-only access to another service's table | Service A SELECTs from B's tables. | Yes. Schema is the API. |
+| Direct write to another service's table | Service A writes to B's tables. | Worse. No invariants enforced. |
+| Both services own the same table | Both write; both read. No clear owner. | Worst. Schema changes are political. |
+| Single database, many schemas per service | One DB instance, one schema per service, no cross-schema access. | Acceptable transitional state. |
+| Schema-per-service via foreign keys | Cross-schema FKs enforce structure. | Acceptable but limits independence. |
+</Cheatsheet>
+
+The last two are tolerable as intermediate states. The first three
+are the antipattern.
+
+## Why it's so bad
+
+Five concrete costs:
+
+### Schema becomes a contract you can't change
+
+The columns are the API. A rename, a type change, a NOT NULL added —
+all break readers. You can't refactor the schema without coordinating
+across every service that reads it. Effectively the schema is frozen.
+
+### No encapsulation of invariants
+
+The owning service has business rules: "orders cannot be modified
+after shipment," "balance cannot go negative." If another service
+writes the tables directly, it bypasses every rule. Bugs become
+silent data corruption.
+
+### Cross-service ACID
+
+Two services updating the same DB can use one transaction — and now
+they're not really separate services. Or they update independently
+and lose atomicity. Either you're a monolith or you have data races.
+
+### Ownership goes fuzzy
+
+Who handles schema migrations? Who's paged when the DB is slow?
+Whose dashboards count? Whose backup policy applies? Without clear
+ownership, all of these decay.
+
+### It defeats the whole point
+
+You can't deploy independently if the schema is shared. You can't
+scale data independently. You can't even move databases. The
+microservices premium is paid; the microservices benefit is not.
+
+## Why teams end up here
+
+Not because they want to. Three usual paths:
+
+```
+1. Extracted a service quickly; "we'll deal with the DB later."
+   → Years pass. DB is still shared.
+
+2. Convenience: "service B needs three fields from service A; just
+   let it read the table." → A year later, every service reads
+   service A's tables.
+
+3. Reporting/analytics: "we need cross-service joins for dashboards."
+   → A dashboards-only data warehouse turns into operational reads.
+```
+
+Each path is locally rational and globally destructive.
+
+## The migration
+
+Newman's playbook for unwinding a shared DB. The end state: one
+owner per table, all access via API, no other service touches the
+underlying storage.
+
+<Steps>
+<Step n={1} title="Identify the owner of each table.">
+For each table, name the one service that *should* own its writes.
+Usually the one whose domain it most belongs to. If unclear, the
+decomposition is unclear — fix that first (see Service decomposition
+strategies).
+</Step>
+<Step n={2} title="Inventory all current access.">
+For each table, list every service that reads or writes it.
+Instrument if needed. You'll find access patterns nobody remembers.
+</Step>
+<Step n={3} title="Define APIs for current access patterns.">
+For each external read or write, design the API the owner will
+expose. Often: a read endpoint, a write endpoint, sometimes an event
+the consumer subscribes to.
+</Step>
+<Step n={4} title="Stand up the API on the owner.">
+The owner still reads/writes the shared table, but now also exposes
+its own API. Other services can call the API or read directly — both
+work for now.
+</Step>
+<Step n={5} title="Migrate readers to the API, one at a time.">
+For each consuming service: switch from direct DB read to API call.
+Verify; ship. Continue until no service reads the table directly
+except the owner.
+</Step>
+<Step n={6} title="Migrate writers to the API.">
+Same, for writes. Often harder because writers may have used
+transactional consistency. Plan idempotency and saga compensations
+where needed.
+</Step>
+<Step n={7} title="Move the table to its own database.">
+Once only the owner uses it, extract it physically: own DB, own
+credentials, own backup policy. Now the boundary is real.
+</Step>
+<Step n={8} title="Repeat per table.">
+The order matters: start with the lowest-traffic, leaf-most tables.
+The shared-DB knot unwinds gradually.
+</Step>
+</Steps>
+
+This takes months for a real system. Schedule it; staff it; track
+it as a project.
+
+## Tools for the transition
+
+### Change data capture (CDC)
+
+CDC reads the database's transaction log and emits change events
+(`INSERT`, `UPDATE`, `DELETE`). Tools: **Debezium**, **AWS DMS**,
+**Maxwell**, native Postgres logical replication.
+
+Use it to:
+
+- Replicate from the shared DB to the owner's new DB during
+  migration (the new DB is a real-time copy until you cut over).
+- Feed events to consumers that previously read tables directly —
+  they subscribe to events instead.
+- Build read models for services that need cross-service joins
+  (handled outside operational DBs).
+
+CDC is the most useful tool in this whole migration. It lets you
+move the source of truth without a flag-day cutover.
+
+### Dual writes (carefully)
+
+During migration: the owner writes to both the shared DB and its
+new owned DB. Once parity is established, switch reads to the new
+DB; stop writing to the shared one.
+
+Dual writes can desync (one write succeeds, the other fails). Use
+**outbox** pattern: write the data and an outbox event in one
+transaction; a separate process replays the outbox to the second
+destination. CDC is usually a better answer than ad-hoc dual writes.
+
+### API extraction
+
+When the cross-service access pattern doesn't justify CDC, just
+expose an API on the owner and migrate consumers. The fewest moving
+parts; the slowest for high-volume access patterns.
+
+### Read replicas with strict policy
+
+Short-term, give other services a read-only **replica** of the
+shared DB with a strict policy: "no writes, this is going away."
+Buys time without permitting writes to spread. The replica is
+deletable; the shared DB is not.
+
+## A worked example
+
+A monolith with `orders`, `payments`, `customers`, `inventory` tables
+in one Postgres. Three services have grown around it but all read
+each others' tables.
+
+Plan:
+
+```
+- Identify owners: orders → OrderSvc, payments → PaymentSvc,
+  customers → CustomerSvc, inventory → InventorySvc.
+- Inventory reads from `orders` for reservation logic. Define API:
+  GET /orders/:id/items.
+- OrderSvc reads from `customers` for shipping addresses. Define:
+  GET /customers/:id/shipping-address.
+- PaymentSvc writes to `orders` directly when payment captured.
+  Change to: PaymentSvc publishes PaymentCaptured event; OrderSvc
+  consumes and updates its own state.
+- Migrate reads first (easier). Then events for writes.
+- Use CDC to replicate to per-service DBs during migration.
+- Cut writes over per table. Drop the table from shared DB once
+  fully owned.
+```
+
+This is months of work. Each step is ship-able and reversible.
+
+## What to do in the meantime
+
+While the migration is in flight, draw firm lines:
+
+- **No new direct DB access across services.** Code review enforces.
+- **Document existing access.** Catalog the bad parts; nothing new
+  joins the list.
+- **No new tables in the shared DB.** New tables go to owned DBs;
+  new services own their data from day one.
+- **Schema changes go through the owner.** Even today's bad shared
+  schema gets an owner per table so changes route through one team.
+
+These prevent the rot from continuing while you fix what's already
+broken.
+
+## Reporting and analytics: the exception
+
+The argument for shared DB access is often "we need cross-service
+joins for reports." That's real — and not what operational services
+should do.
+
+The right answer: **a separate analytical store** (warehouse,
+lakehouse) fed by CDC or ETL from each service's owned DB. Reports
+query the warehouse. Operational services never run analytical
+joins.
+
+```
+[service A DB] ─┐
+[service B DB] ─┼─ CDC/ETL → [warehouse] → reports/BI
+[service C DB] ─┘
+```
+
+This is a clean pattern: operational services keep their own DBs,
+reports get the joins they need, neither blocks the other.
+
+<Callout variant="warning">
+A shared database is not a transitional state you can stay in. It
+quietly removes every benefit of having separate services. Either
+unwind it deliberately or accept that you have one application with
+a confusing deploy story.
+</Callout>
+
+## In summary
+
+- Two services writing the same tables is a microservice in name
+  only. Schema becomes the API; invariants can't be enforced;
+  transactions span services; ownership is fuzzy.
+- Tolerable transitional states: one DB instance with schema-per-
+  service (no cross-schema access). Everything else is the
+  antipattern.
+- Migration: identify owners, expose APIs/events, migrate consumers
+  one at a time, then physically split the data. Months of work.
+- Use **CDC** for live replication during migration; **outbox** for
+  dual-write consistency; read replicas as a holding pattern.
+- Analytics and cross-service reporting belong in a separate
+  warehouse, never in operational DBs.
+- Until the migration completes, prevent the rot from continuing:
+  no new shared access, no new tables, schema changes through the
+  owner.

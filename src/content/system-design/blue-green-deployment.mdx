@@ -1,0 +1,249 @@
+export const level = 'mid';
+
+# Blue-green deployment
+
+Two production environments — **blue** and **green** — running
+the same application at different versions. At any moment, the
+load balancer points to one (blue, say). To deploy, bring up
+the new version in green, run any final checks, then **switch
+the load balancer** to green. If anything is wrong, switch
+back to blue. Both environments stay live; one is just unused.
+
+The promise: **instant rollback**. The cost: **two full
+environments** running at peak capacity, and a coupling problem
+when the two share state.
+
+## The mechanics
+
+```
+                                    +----------+
+                  +---> blue (v1)<--|          |
+                  |                  | LB / DNS |
+                  +---> green (v2)<-|          |
+                                    +----------+
+                       active = blue
+```
+
+A deploy:
+
+<Steps>
+<Step n={1} title="Stand up the new version in green.">
+Identical infrastructure, new application version. Run health
+checks against green directly, before any user traffic.
+</Step>
+<Step n={2} title="Run smoke tests against green.">
+Synthetic transactions, internal-only requests. If green
+fails, abort — no users affected.
+</Step>
+<Step n={3} title="Switch the load balancer.">
+Update the target group / DNS / weighted routing so green
+takes all traffic. Blue keeps running, idle.
+</Step>
+<Step n={4} title="Monitor for the first few minutes.">
+Error rates, latency, business metrics. If green is bad,
+**switch back to blue**. The rollback is one configuration
+change, seconds.
+</Step>
+<Step n={5} title="Decommission blue eventually.">
+After confidence (an hour, a day), tear blue down or roll it
+forward to be the new "blue" for next deploy.
+</Step>
+</Steps>
+
+The cutover is **atomic from the user's perspective** — there's
+no rolling window where some users are on v1 and some on v2.
+
+## Why it's appealing
+
+- **Rollback in seconds.** No re-deploying old binaries, no
+  spinning up old infra. The old version is right there,
+  warm.
+- **Pre-traffic verification.** Smoke tests against green
+  before any user sees it.
+- **Predictable cutover.** One LB change. Not 100 pods rolling
+  on a schedule.
+- **Simple mental model.** "Old here, new there, switch."
+
+For stateless services with no schema migration, blue-green is a
+clean default.
+
+## The state problem
+
+The cleanness evaporates the moment state is involved. Two
+sub-problems:
+
+### Database schema
+
+Green needs the new schema; blue may still need the old. If
+green pushes a `DROP COLUMN`, blue (still running, in case of
+rollback) breaks.
+
+The discipline is **backward-compatible migrations** — the
+schema works for both versions. The pattern:
+
+<Steps>
+<Step n={1} title="Expand the schema first, no app change.">
+Add the new column. Old app ignores it. Deploy.
+</Step>
+<Step n={2} title="Deploy the new app.">
+Now both versions can read the new schema. New version
+writes to the new column.
+</Step>
+<Step n={3} title="Backfill if needed.">
+Migrate old data to the new shape.
+</Step>
+<Step n={4} title="Contract the schema later.">
+Once you're confident you'll never rollback, drop the old
+column.
+</Step>
+</Steps>
+
+This is **expand-then-contract** (also called "additive
+migrations"). It's required for blue-green; it's also required
+for canary, rolling, and any other deploy with overlap.
+
+### In-flight data
+
+If users wrote data through green and you rollback to blue,
+blue may not know how to read what green wrote. If green's
+schema is a superset, this is OK; if green introduced new
+formats blue can't parse, you've created a forward-only
+migration. Rollback is no longer free.
+
+This is the most underrated cost of blue-green: **rollback after
+write-side changes is rarely instant**. The button still works;
+the consequences require careful planning.
+
+## Cost: two of everything
+
+A blue-green system runs both environments at peak capacity, at
+least during the cutover window. The instantaneous cost is **2×
+infrastructure**.
+
+You can reduce this:
+
+- **Run blue at full capacity, green smaller**. Scale green up
+  during the cutover, scale blue down after. But you lose the
+  "instant rollback" property — blue is now too small to handle
+  full traffic alone.
+- **Tear blue down quickly**. As soon as you're confident,
+  destroy blue. Reduces idle cost, increases rollback pain.
+- **Reuse for the next deploy**. Today's blue becomes
+  tomorrow's green. Always two; never four.
+
+For workloads where the cost is small, full blue-green is the
+clean default. For workloads where 2× infra is millions a
+year, consider canary instead.
+
+## Stateful services: harder
+
+A relational database can't be blue-green-ed the way a
+stateless service can. The data is **the** state; you can't
+just "switch back" to last week's snapshot.
+
+The practical answer: **separate stateless and stateful
+layers**.
+
+```
+LB → [ blue stateless app v1 ] ←→ shared DB (one)
+LB → [ green stateless app v2 ] ←→ shared DB (one)
+```
+
+Blue and green talk to the **same** database. Schema is
+backward-compatible (expand-then-contract). The "instant
+rollback" applies to the **application code**, not the data.
+
+For data migrations themselves, you use other techniques —
+shadow writes, dual-write phases, online schema change tools
+(pt-osc, gh-ost, Spanner schema rollout).
+
+## Cutover mechanics
+
+The "switch the load balancer" step varies:
+
+<Cheatsheet>
+| Mechanism | How | Cutover time | Caveats |
+|---|---|---|---|
+| LB target group swap | Move targets between groups | Seconds | Active connections drain |
+| Weighted routing | 0% → 100% over seconds/minutes | Bounded | Effectively a fast canary |
+| DNS swap | Change A/CNAME | Minutes to hours | TTL caching means uneven cutover |
+| Service mesh routing | Mesh policy change | Sub-second | Sticky sessions complicate |
+| Kubernetes service selector | Update selector to point to new pods | Seconds | Works for in-cluster traffic |
+
+</Cheatsheet>
+
+DNS cutover is the slowest and most error-prone — clients with
+cached resolvers stay on blue long after the official switch.
+For anything user-facing, prefer LB target swap or service mesh.
+
+## Blue-green vs canary
+
+The trade-off:
+
+<Compare a="Blue-green" b="Canary">
+<>
+**All-or-nothing cutover.** All users on v1, then all on v2.
+- Pros: predictable, simple, atomic.
+- Cons: 100% of users hit a bug if one exists; needs 2×
+  infrastructure during cutover.
+- Best for: backend services with no user-visible regression
+  risk, infrequent deploys, strict transaction semantics.
+</>
+<>
+**Gradual exposure.** 1% of users on v2, then 5%, then 25%,
+then 100%.
+- Pros: only 1% of users hit a bug initially; can compare v1
+  vs v2 metrics directly.
+- Cons: state-management is the same problem; partial-rollout
+  bugs are subtle.
+- Best for: user-facing services where you can A/B compare on
+  the fly.
+</>
+</Compare>
+
+In practice, **canary subsumes blue-green** for most modern
+workloads. Blue-green is still right for backend services where
+1% traffic isn't a meaningful test.
+
+See canary deployment and deployment strategies compared.
+
+## Operational gotchas
+
+- **Connection draining.** When the LB switches off blue, active
+  HTTP connections to blue need to finish. Configure drain
+  timeout — 30 seconds is common.
+- **Caches.** Green's caches are cold at the start. The
+  first minute after cutover may be slower as caches warm.
+  Pre-warm by replaying some traffic.
+- **Sticky sessions.** If sessions are sticky to a pod, the
+  cutover violates stickiness. Either make sessions
+  stateless or accept session loss.
+- **Background workers.** Workers blue-green just like web
+  servers — but in-flight jobs may need different handling. A
+  job started on blue may need to complete on blue, not
+  green.
+- **External integrations.** Webhooks, callbacks, and
+  third-party services may have stale routing.
+
+<Callout variant="info">
+Blue-green works **brilliantly** for the well-understood case:
+stateless service, backward-compatible schema, idempotent
+operations, sub-minute deploys. It works **poorly** when state
+diverges between blue and green or when rollback after writes
+is needed. Know which world you're in.
+</Callout>
+
+## In summary
+
+- Two identical environments; cutover by load balancer.
+- Instant rollback for **application code**; not for **data**.
+- Requires backward-compatible schemas (expand-then-contract).
+- Costs 2× infrastructure during cutover; less if you tear
+  down old quickly.
+- DNS cutover is slow and lossy — prefer LB-level switching.
+- Canary is the better default for most user-facing services
+  today; blue-green is still right for backend, infrequent,
+  transactional services.
+- The "blue-green" label sometimes hides the real complexity —
+  most of the work is in the migration plan, not the
+  cutover.

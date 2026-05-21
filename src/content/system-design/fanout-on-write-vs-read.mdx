@@ -1,0 +1,252 @@
+export const level = 'senior';
+
+# Fan-out on write vs read
+
+The classic newsfeed problem in one diagram: when user A posts,
+how does it land in the feeds of A's followers? Two answers,
+each catastrophically wrong for the other's case.
+
+- **Fan-out on write (push)**: when A posts, write the post ID
+  to every follower's inbox. Reads are O(1) — just read the
+  inbox.
+- **Fan-out on read (pull)**: when A's follower opens their
+  feed, read posts from every account they follow and merge.
+  Writes are O(1); reads are O(N follows).
+
+Both work. They scale differently. Real systems use both.
+
+## The trade-off table
+
+<Cheatsheet>
+| Property | Fan-out on write | Fan-out on read |
+|---|---|---|
+| Write cost per post | O(followers) | O(1) |
+| Read cost per feed view | O(1) | O(follows) |
+| Storage | High (post replicated per follower) | Low (post stored once) |
+| Latency to feed | "Eventually visible" | Fresh on read |
+| Bad for | Celebrity accounts (millions of followers) | Power users (huge follow counts) |
+| Good for | Read-heavy, low follow counts | Write-heavy, high follow counts |
+| Personalization | Hard (re-ranked per follower) | Easy (computed at read time) |
+</Cheatsheet>
+
+## Fan-out on write (push)
+
+When A posts:
+
+```
+post P → for each follower F of A:
+            inbox[F].push(P)
+```
+
+When F opens their feed:
+
+```
+feed = inbox[F]   // already assembled
+```
+
+The feed read is constant-time and constant-cost. The write
+pays for it: A with 1000 followers triggers 1000 inbox inserts.
+
+For most users, that's fine. 1000 inserts to a key-value store
+takes ~100ms total in a batch. The web tier kicks off the
+fan-out asynchronously and returns; the user doesn't wait for
+it.
+
+### Where push breaks: celebrities
+
+Taylor Swift has 280M followers (Twitter, 2024). One post → 280M
+inbox inserts. At 100 µs per insert, that's eight hours of
+write work. Even parallelized across 100 workers, that's five
+minutes of inbox churn for one tweet.
+
+Meanwhile, those 280M followers all open their app to read the
+tweet — but their inboxes haven't received it yet. The feed
+shows it inconsistently. The data store gets hammered.
+
+This is the **celebrity problem**. Pure push doesn't work for
+accounts with massive follower counts.
+
+## Fan-out on read (pull)
+
+When A posts:
+
+```
+post P → posts[A].insert(P)   // one write
+```
+
+When F opens their feed:
+
+```
+feed = for each account A in follows[F]:
+           posts[A].recent()
+       merge_sort_by_time()
+```
+
+The write is constant-time. The read pays — N follows means N
+queries (or one big query with `IN`), then merge by timestamp.
+
+### Where pull breaks: power users
+
+A user who follows 5000 accounts. Opening their feed = 5000
+sub-queries. Even at 1 ms each, that's 5 seconds of latency.
+
+Plus you can't precompute personalization easily — every read
+runs the full merge + ranking pipeline.
+
+## The hybrid: push for most, pull for celebs
+
+The trick the big systems landed on: **push for normal accounts,
+pull for celebrities**. When F reads their feed:
+
+```
+feed = inbox[F]                          // push results
+     + for each celeb A that F follows:
+           posts[A].recent()             // pull results
+     merge_sort_by_time()
+```
+
+The threshold is a tunable. "Celebrity" = "> 100k followers" or
+"> 1M followers" depending on storage budget. Below the
+threshold: push into follower inboxes. Above: don't push, let
+followers pull at read time.
+
+The merge at read is small — most users follow few or zero
+celebs. The push remains O(reasonable-followers) per post.
+
+This is what Twitter described in their early architecture
+talks. Facebook, Instagram, and TikTok all converged on
+something similar: **hybrid fanout with a high-follower cutoff**.
+
+## Costs of each model
+
+### Push storage
+
+Each post is replicated to every follower's inbox. If A has 500
+followers and posts 10 times today, that's 5000 inbox rows for
+A's one day of posting. Multiply by all users.
+
+Storage per inbox row is small (a post ID + timestamp + metadata,
+maybe 50 bytes). With 100M users × 200 posts in their inbox
+average = 20B rows × 50 B = 1 TB just for inboxes. Manageable
+but not free.
+
+Inboxes are usually capped at a window (last 1000 posts, last
+7 days) to bound size.
+
+### Pull database load
+
+Every feed view = N follow queries. A platform with 100M DAU
+each scrolling once = 100M feed renders × 200 average follows =
+20B follow-query reads/day.
+
+That's serious DB load. Caching helps (cache "user A's recent
+posts" for K seconds, served from Redis), but you've added a
+cache invalidation problem (see Cache invalidation).
+
+## Where the diff lives
+
+The push model puts work on the **write path**: write costs scale
+with follower counts. The pull model puts work on the **read
+path**: read costs scale with follow counts.
+
+You pick based on the asymmetry of your workload:
+
+- **Read-heavy, follow-count-bounded** (Twitter-style, where
+  almost everyone has < 1000 follows): push.
+- **Write-heavy or unbounded fans** (Mastodon-style with
+  federated push-anywhere, or domain events): pull or hybrid.
+- **Mixed**: hybrid.
+
+## Time-bounded reads
+
+A useful optimization for either model: **the feed is the
+recent past, not all history**. Inboxes only hold the last K
+posts per user; pull queries only return the last D days.
+
+```js
+// Pull-style with time window
+const feed = await posts.find({
+  authorId: { $in: follows },
+  createdAt: { $gt: nowMinusDays(2) },
+}).sort({ createdAt: -1 }).limit(50);
+```
+
+This caps both storage (inboxes) and query cost (pull).
+Deep-scrolling history is a separate, slower path: "show me posts
+from last month" hits a cold-tier store, not the hot path.
+
+## Materialized timelines
+
+A variation: the feed is a **materialized view** of the join
+between `posts` and `follows`, maintained by a stream processor.
+
+```
+[posts stream] ┐
+               ├→ stream join on follows → [feed materialized view]
+[follows stream] ┘
+```
+
+Each follower's timeline is continuously updated as posts arrive.
+At read time, it's a single lookup. Conceptually push, but
+implemented as a streaming pipeline rather than per-post
+fanouts.
+
+This is roughly what Kafka Streams or Flink-based feeds look
+like. See **Materialized views** and **Stream-table duality**
+for the underlying machinery.
+
+## Personalization complications
+
+Modern feeds aren't time-ordered — they're ranked by relevance,
+recency, engagement, and personal interest. The fanout model
+interacts:
+
+- **Push**: each follower's inbox can be pre-ranked at insert
+  time. But changing the ranking model means re-ranking every
+  inbox.
+- **Pull**: ranking is computed at read time. Easy to iterate on
+  the model. Pays read latency for the privilege.
+
+Most modern systems use a **two-stage** approach: push assembles
+the candidate set (fanout); a model re-ranks at read time. The
+fanout decision is about candidate generation, not final order.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Pure push at all scales.** A celebrity follower count will
+break the write path. Always have a "don't push above N
+followers" rule from the start.
+</Callout>
+
+<Callout variant="warning">
+**Pure pull at all scales.** Reads will become unbearable as
+average follow counts climb. Cache aggressively or add a push
+path for hot accounts.
+</Callout>
+
+<Callout variant="warning">
+**Hot key on the follow lookup.** "Who follows celeb C?" is a
+common query that can be a single huge row. Shard the follow
+graph; pre-compute follower counts; serve a fanout count from
+a separate counter rather than the full set.
+</Callout>
+
+<Callout variant="warning">
+**Inbox-as-source-of-truth.** Inboxes are derived data. Treat
+them as a cache. If they're lost, rebuild from the posts log.
+Designing as a primary store leads to "we have to migrate the
+inboxes" pain on every schema change.
+</Callout>
+
+## In summary
+
+- **Push (fan-out on write)**: O(followers) write, O(1) read.
+  Cheap reads, expensive for celebs.
+- **Pull (fan-out on read)**: O(1) write, O(follows) read. Easy
+  personalization, expensive for power users.
+- **Hybrid**: push for normal accounts, pull for celebrities.
+  The production answer at every social platform.
+- **Cap inbox depth, cap pull time window** — feeds are recent,
+  history is cold-tier.
+- **Treat inboxes as a cache**, derived from the post log.

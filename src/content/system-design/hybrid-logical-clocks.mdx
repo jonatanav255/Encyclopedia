@@ -1,0 +1,141 @@
+export const level = 'staff';
+
+# Hybrid logical clocks (HLC)
+
+A clock that combines **physical time** (NTP, machine wall
+clock) and a **logical counter** to give timestamps that are:
+
+- **Always increasing** within a process (monotonic).
+- **Causality-preserving** across processes (Lamport-style).
+- **Aligned with wall clock** (humans recognize them).
+- **Bounded size** — one (physical, counter) pair, not a
+  vector.
+
+Used by CockroachDB, MongoDB, YugabyteDB. The pragmatic
+sweet spot between vector clocks (exact but unbounded) and
+wall clocks (compact but lying).
+
+## The algorithm
+
+Each HLC value is a pair `(phys, logical)` where `phys`
+roughly tracks NTP time and `logical` breaks ties.
+
+<Steps>
+<Step n={1} title="On local event:">
+Read current wall clock `pt`. Compute `phys' = max(phys, pt)`.
+If `phys' == phys`: increment `logical`. Else: reset `logical = 0`.
+</Step>
+<Step n={2} title="On message send:">
+Run the local-event update first, then attach the current
+HLC `(phys, logical)`.
+</Step>
+<Step n={3} title="On message receive with HLC `(p, l)`:">
+Read `pt`. Compute `phys' = max(phys, p, pt)`.
+If `phys' == phys == p`: `logical = max(logical, l) + 1`.
+If `phys' == phys`: `logical += 1`.
+If `phys' == p`: `logical = l + 1`.
+Else (phys' == pt): `logical = 0`.
+</Step>
+</Steps>
+
+In words: take the max of "what I last saw" + "what was sent
+to me" + "wall clock now," and break ties with the logical
+counter.
+
+## Properties
+
+- **Bounded skew from wall time.** `phys` stays within the
+  clock-skew bound from real time. If NTP keeps machines
+  within 50 ms, HLC values do too.
+- **Captures happens-before.** If A happens before B, then
+  `HLC(A) < HLC(B)` (lexicographic compare).
+- **Constant size.** A single 64-bit `phys` + a few bits for
+  `logical`. Ships in 64-128 bits, vs vector clocks that grow
+  with replica count.
+
+## Why this beats both alternatives
+
+<Compare a="Vector clocks" b="HLC">
+<>
+Detect exact concurrency. Size grows with replicas. Don't
+match wall time — debugging is opaque.
+</>
+<>
+Approximate concurrency (within clock skew). Constant size.
+Match wall time — `2026-05-21T10:42:17.421` is a real
+timestamp. Logs and traces line up across nodes.
+</>
+</Compare>
+
+<Compare a="Wall clocks (NTP)" b="HLC">
+<>
+Cheap. Can go backwards (NTP adjustments). Two events at
+"same time" indistinguishable. Lose causality.
+</>
+<>
+Monotonic. Two events get distinct HLCs even at same
+physical instant. Causality preserved.
+</>
+</Compare>
+
+## How CockroachDB uses HLC
+
+Every transaction gets an HLC at start. Every key version is
+tagged with the HLC of the writing transaction. A read at HLC
+T sees all versions with HLC ≤ T.
+
+This gives serializable transactions across the cluster
+without consensus on every read — the HLC ordering is enough
+for MVCC.
+
+A key clever bit: if a transaction reads a value newer than
+its own HLC, the system advances the reading transaction's
+HLC. This guarantees "read-your-writes" and helps maintain
+monotonic reads across replicas.
+
+## How MongoDB uses HLC
+
+MongoDB replica sets use HLC ("cluster time") attached to
+every operation. Causal consistency reads include the client's
+last-seen cluster time; the secondary blocks the read until
+its applied oplog reaches that time.
+
+This is the implementation of MongoDB causal-consistency mode:
+HLC tokens give cross-region read-your-writes without forcing
+linearizability.
+
+## Limitations
+
+- **Clock skew bounds the precision.** If two machines'
+  wall clocks differ by 500 ms, HLC events that "should" be
+  ordered by causality but happened within 500 ms might get
+  reordered.
+- **Not a substitute for consensus.** HLC orders events; it
+  doesn't durably replicate them. You still need Raft/Paxos
+  to agree on the log.
+- **NTP skew can spike.** A bad NTP sync that jumps the clock
+  forward can spike the HLC `phys` and require the cluster
+  to catch up.
+
+## Spanner vs HLC
+
+Spanner uses TrueTime — atomic clocks + GPS — instead of HLC.
+TrueTime gives a tight **uncertainty bound** (typically under 10 ms)
+on the real time of any event. Spanner waits out the
+uncertainty before commit, getting strict linearizability.
+
+HLC trades this hardware (and the wait) for software-only
+operation at the cost of precision. Most non-Google systems
+choose HLC.
+
+## In summary
+
+- HLC: (physical, logical) pair combining wall clock and a
+  Lamport-style counter.
+- Monotonic, causality-preserving, bounded size, aligned with
+  real time.
+- Used by CockroachDB, MongoDB, YugabyteDB.
+- The pragmatic replacement for vector clocks in most modern
+  geo-distributed databases.
+- Precision bounded by NTP skew; not a substitute for
+  consensus.

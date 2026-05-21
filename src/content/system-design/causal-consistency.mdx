@@ -1,0 +1,122 @@
+export const level = 'senior';
+
+# Causal consistency
+
+If event A **causally precedes** event B, every replica sees A
+before B. Concurrent events (neither caused the other) may be
+seen in any order.
+
+This is the sweet spot for geo-replicated systems: strong
+enough that "comment appears after the post it replies to,"
+weak enough to allow async replication and stay available
+under partition.
+
+## What "causal" means precisely
+
+Lamport's happens-before relation:
+
+- A happens before B if A and B are by the same process and A
+  came first.
+- A happens before B if A sent a message that B received.
+- A happens before C if A happens before B and B happens
+  before C (transitive).
+
+Two events that aren't related by happens-before are
+**concurrent**. The system can return them to readers in any
+order — but never violate a happens-before pair.
+
+## Implementation: vector clocks or HLC
+
+You need a way to detect happens-before across replicas.
+
+- **Vector clocks**: each replica maintains a counter per
+  replica. A write tags the value with its current vector.
+  Comparing two vectors tells you whether one happened before
+  the other, or they're concurrent.
+- **Hybrid logical clocks (HLC)**: combine physical time with a
+  logical counter. Smaller and easier to reason about for
+  developers; used by CockroachDB, MongoDB.
+
+Either way, replicas don't need to coordinate per-write — they
+can ship writes asynchronously and resolve order on read.
+
+## What it gives the application
+
+- **Reply-after-post.** A user posts, then replies. Every
+  reader sees the post before the reply.
+- **Comment threads.** A reply that references comment #5 will
+  never appear at a replica that hasn't seen #5 yet.
+- **Read-your-writes** for a single session (if your client
+  carries its vector clock).
+
+## What it doesn't give
+
+- **No real-time ordering.** Two unrelated writes by different
+  users can appear in any order at different replicas.
+- **No cross-key transactions.** Causal consistency is per
+  object (or per causal chain), not over arbitrary multi-key
+  writes.
+- **Concurrent updates need conflict resolution.** Two users
+  edit the same record at the same time → vector clocks tell
+  you it happened but not how to merge. CRDTs, LWW, or
+  application logic must decide.
+
+## Causal+ (causal with convergence)
+
+Plain causal allows replicas to permanently disagree on
+concurrent operations. **Causal+** adds: replicas must
+eventually agree on a single value for concurrent writes —
+typically via a deterministic merge function.
+
+Most "causal consistency" systems in production are really
+causal+. COPS, Eiger, MongoDB causal consistency mode.
+
+## Where it sits in the hierarchy
+
+<Cheatsheet>
+| Model | Cost | What it gives |
+|---|---|---|
+| Linearizable | Round-trip to consensus | Single timeline |
+| Causal+ | Vector clock overhead, no coord | Happens-before + convergence |
+| Eventual | Async ship, no order tracking | Eventually-the-same |
+</Cheatsheet>
+
+Causal sits between linearizable and eventual. Crucially, it's
+**available under partition** — replicas can keep accepting
+writes when disconnected, then merge later — so it doesn't
+trip CAP.
+
+## Where it's used
+
+- **MongoDB**'s causal consistency mode (introduced in 3.6) for
+  multi-document operations across sharded clusters.
+- **CosmosDB** offers it as a tunable level.
+- **Riak** historically (Dynamo-derived) gave causal
+  consistency via vector clocks.
+- **COPS / Eiger** — research systems that demonstrated causal+
+  at planetary scale.
+- **Collaborative editors** (Google Docs, Figma) use
+  causal+ semantics under CRDTs.
+
+## A failure mode to watch for
+
+Causal consistency doesn't extend across applications. If user
+A posts via service X and replies via service Y, and X and Y
+don't share a vector clock or token, the reply can appear
+before the post at a replica that processes Y's events first.
+
+The fix: **session tokens**. Client carries a causal token
+forward across services; each service blocks reads until its
+replicas have caught up to the token.
+
+## In summary
+
+- Causal consistency: happens-before is preserved everywhere;
+  concurrent ops are flexible.
+- Implemented via vector clocks or HLC.
+- Available under partition — unlike linearizable.
+- Causal+ adds convergence; almost always what people mean.
+- Concurrent updates still need a merge rule (CRDTs, LWW, or
+  app logic).
+- Works across a single application's writes; needs session
+  tokens to compose across services.

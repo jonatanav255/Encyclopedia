@@ -1,0 +1,315 @@
+export const level = 'staff';
+
+# Exactly-once stream processing
+
+The term gets thrown around as if it were a single broker
+feature. It isn't. End-to-end exactly-once in a stream pipeline
+is the **emergent property** of three things combined:
+
+1. **Idempotent / transactional producers** at the source.
+2. **Atomic state + offset commits** in the processor.
+3. **Idempotent or transactional sinks** at the output.
+
+Miss any one, and what you have is at-least-once with a marketing
+description. With all three, you have a pipeline that produces
+identical results regardless of crashes, retries, or replays.
+
+This is the senior-engineering version of "Kafka does
+exactly-once" — true within Kafka, easy to break the moment your
+data leaves Kafka.
+
+## The problem, end-to-end
+
+A pipeline reads from Kafka, computes a windowed aggregate,
+writes to a database:
+
+```
+[Kafka topic] → [processor (state + windowing)] → [DB sink]
+```
+
+Failure points:
+
+- Processor crashes after writing to DB but before committing
+  consumer offset → on restart, same input replayed → duplicate
+  DB write.
+- Processor crashes after committing offset but before writing
+  to DB → on restart, input skipped → lost write.
+- Source produces two copies of the same record (producer
+  retry) → counted twice.
+- Window state restored from checkpoint but it's slightly behind
+  the offset → in-flight events processed twice.
+
+Each failure is fixable in isolation. Exactly-once requires
+fixing all of them, atomically.
+
+## Component 1: idempotent / transactional source
+
+If the source can emit duplicates, no amount of downstream
+care fixes it. Two mechanisms:
+
+### Idempotent producer (Kafka)
+
+The producer attaches a per-producer sequence number plus an
+epoch. The broker rejects out-of-sequence or duplicate writes.
+On a retry, the broker recognizes "I already have this" and
+dedupes.
+
+```js
+const producer = kafka.producer({ idempotent: true });
+```
+
+This is on by default in newer KafkaJS / Confluent libraries.
+It protects against **producer retries**, not against
+application-level resends — if your code calls `producer.send`
+twice with the same data, both are stored.
+
+### Transactional producer
+
+Multiple writes (to multiple topics) commit atomically via a
+two-phase commit at the broker. Combined with consumer-side
+`isolation.level=read_committed`, consumers only see committed
+records.
+
+```js
+await producer.transaction(async (tx) => {
+  await tx.send({ topic: 't1', messages });
+  await tx.send({ topic: 't2', messages });
+});
+```
+
+Together, idempotent + transactional gives **exactly-once
+producer semantics within Kafka**.
+
+## Component 2: atomic state + offset commits
+
+Within the stream processor, state and consumer offsets must
+commit **atomically** with sink writes. Otherwise, on restart,
+state and offsets disagree.
+
+### Flink: distributed snapshots (Chandy-Lamport)
+
+Flink takes consistent checkpoints across the entire pipeline.
+A checkpoint includes:
+
+- Source offsets for each Kafka partition.
+- Window state and operator state.
+- Pending sink writes (in a two-phase commit with sinks that
+  support it).
+
+On restart, Flink restores from the last successful checkpoint.
+Sources rewind to the offsets in the checkpoint; state is
+restored exactly as it was; pending sink writes either commit
+(if the broker side was committed) or roll back.
+
+Configure:
+
+```js
+// Flink-ish pseudocode
+env.enableCheckpointing(60_000, EXACTLY_ONCE);
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30_000);
+```
+
+This gives **end-to-end exactly-once** between Kafka source and
+Kafka sink, or to any sink with a two-phase commit
+implementation.
+
+### Kafka Streams: transactions on offsets
+
+Kafka Streams uses Kafka's transaction support to atomically:
+
+1. Read from input partitions.
+2. Update state stores (changelog topics also in the
+   transaction).
+3. Write to output topics.
+4. Commit consumer offsets.
+
+All four are one Kafka transaction. Crash anywhere → the whole
+transaction aborts; restart re-runs from the previous committed
+offset.
+
+```js
+// Kafka Streams config
+StreamsConfig.PROCESSING_GUARANTEE_CONFIG = 'exactly_once_v2';
+```
+
+Pure Kafka-to-Kafka exactly-once with no external moving parts.
+
+### Spark Structured Streaming
+
+Spark's mechanism is different: idempotent batch sinks
+identified by **batch IDs**. Each micro-batch is identified;
+sinks that support upsert can dedupe. Not transactional in
+the same sense as Flink/Kafka Streams.
+
+## Component 3: idempotent or transactional sinks
+
+The hardest piece in practice. Whatever you write to must accept
+the same write multiple times without compounding.
+
+### Idempotent sinks
+
+The sink applies a unique key to each record and ignores
+duplicates. Examples:
+
+- **Upsert with unique key**: `INSERT ... ON CONFLICT DO
+  NOTHING`. Works for "record exists or not."
+- **Compaction-keyed Kafka topic**: keyed records compact down
+  to one per key.
+- **Object storage with deterministic filenames**: a write to
+  `output/window-2026-05-20-10-15.parquet` overwrites the
+  previous one if rewound.
+
+For aggregates, the sink must support **idempotent updates**:
+
+```js
+// Pseudocode
+INSERT INTO counts (key, window, count)
+VALUES ('userA', '10:00', 12)
+ON CONFLICT (key, window) DO UPDATE
+  SET count = excluded.count;
+```
+
+Each replay of the same windowed result overwrites, doesn't
+accumulate.
+
+**This requires accumulating panes** (see Watermarks). With
+discarding panes, each emission is a delta; replays double the
+delta.
+
+### Transactional sinks
+
+The sink commits its write **atomically** with the processor's
+state. Two-phase commit:
+
+1. Processor pre-commits to sink (write but don't make visible).
+2. Processor checkpoints state including the pre-commit token.
+3. Processor signals sink to commit.
+
+If a crash happens between steps 2 and 3, the restarted processor
+sees the pre-commit token, knows the sink either committed (in
+which case it commits again, idempotent) or didn't (rolls back).
+
+Flink supports this via `TwoPhaseCommitSinkFunction`. Sinks
+that participate: Kafka, JDBC databases with XA support, AWS
+Kinesis Firehose with idempotent batches, file systems via
+staging directories.
+
+Sinks that **don't** support it: most HTTP APIs, most SaaS
+sinks, most no-SQL stores without strong transaction support.
+For those, you fall back to idempotent.
+
+## What "Kafka exactly-once" actually covers
+
+Confluent's marketing "Kafka exactly-once semantics (EOS)" gives
+**Kafka-to-Kafka** exactly-once. That includes:
+
+- Idempotent producer (deduped retries).
+- Transactional producer (atomic multi-topic writes).
+- Transactional consumer offset commits.
+- Read-committed consumers.
+
+What it **does not** cover:
+
+- Writes to anything that isn't a Kafka topic (DB, HTTP API,
+  S3 without the right connector).
+- Anything that depends on **wall-clock time** (a retry at a
+  later time may produce a different result).
+- Non-deterministic operators (random sampling, calls to
+  external services with side effects).
+
+For non-Kafka sinks, you need either an idempotent sink or a
+Kafka-Connect connector with exactly-once support.
+
+## Determinism is a prerequisite
+
+Replay-based exactly-once assumes **deterministic computation**.
+Same input → same output. If your processor calls
+`Math.random()` or fetches an external API mid-stream, replays
+produce different results.
+
+Workarounds:
+
+- **Externalize non-determinism**: precompute random seeds and
+  include them in events.
+- **Cache external calls**: dedupe on a key derived from input.
+- **Side-effect through a transactional outbox**: writes to
+  external systems go through Kafka, which is transactional.
+
+Operators with non-deterministic external calls are the most
+common cause of "we have exactly-once but our data is wrong."
+
+## End-to-end checklist
+
+<Steps>
+<Step n={1} title="Source is idempotent or transactional.">
+Kafka with idempotent producer + transactions. SQS standard is
+not; SQS FIFO with deduplication tokens is.
+</Step>
+<Step n={2} title="Processor commits state + offsets atomically.">
+Flink with `EXACTLY_ONCE` checkpointing, Kafka Streams with
+`exactly_once_v2`, or Spark with idempotent batch IDs.
+</Step>
+<Step n={3} title="Sink is idempotent or two-phase commit.">
+Upsert with deterministic keys, append-only with deterministic
+filenames, or Kafka-to-Kafka.
+</Step>
+<Step n={4} title="Computation is deterministic.">
+No non-deterministic external calls; non-determinism in the
+input itself, not the processor.
+</Step>
+<Step n={5} title="Operate the configuration.">
+Monitor for transaction aborts, watch for the "uncommitted
+records growing" sign of a broken sink, plan for the latency
+cost of EOS (typically 2-5x default).
+</Step>
+</Steps>
+
+## The cost
+
+Exactly-once isn't free:
+
+- **Throughput**: Kafka transactions add overhead. Typical
+  measured cost: 30-50% throughput reduction vs at-least-once.
+- **Latency**: transaction commits add 10-100ms per batch.
+- **Operational complexity**: more configuration, more failure
+  modes, harder debugging when something goes wrong.
+
+For most pipelines (analytics, dashboards, ML features), the
+right answer is **at-least-once + idempotent sinks**. Pay the
+exactly-once cost only when duplicates create unbounded business
+consequences (billing, ledger, regulatory).
+
+## Pitfalls
+
+<Callout variant="warning">
+**Claiming EOS without enabling it.** Defaults are at-least-once
+in every system. Explicit configuration required.
+</Callout>
+
+<Callout variant="warning">
+**Non-deterministic processor with EOS.** Replays give different
+results. EOS guarantees "exactly once," not "the same result
+each time."
+</Callout>
+
+<Callout variant="warning">
+**Non-idempotent sink with EOS.** EOS within the pipeline; the
+sink doubles. Need both.
+</Callout>
+
+<Callout variant="warning">
+**Checkpoints too infrequent.** A 1-hour checkpoint interval
+means restart replays an hour of input. State + sink writes had
+better cope.
+</Callout>
+
+## In summary
+
+- **Exactly-once is end-to-end**, not a broker feature.
+- **Three components: source, processor state+offset, sink.**
+  All must combine.
+- **Kafka EOS** covers Kafka-to-Kafka. Cross-system EOS requires
+  two-phase commit sinks or idempotent application logic.
+- **Deterministic computation** is a prerequisite.
+- **At-least-once + idempotent sinks** is the right default for
+  most pipelines. Reserve true EOS for ledger-class workloads.

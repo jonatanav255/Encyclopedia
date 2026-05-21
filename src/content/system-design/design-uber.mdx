@@ -1,0 +1,284 @@
+export const level = 'senior';
+
+# Design Uber / Lyft
+
+A real-time ride-hailing service: riders request a trip from
+location A to B, the system finds a nearby available driver,
+both parties see live location updates, the trip executes and is
+charged. The interesting parts: geo-spatial indexing,
+match-making, real-time location streams, and pricing.
+
+## 1. Clarify the scope
+
+- Core flows: request ride, match driver, live tracking, complete
+  trip, fare + payment.
+- Surge pricing: in scope (it shapes the architecture).
+- Driver onboarding, food delivery (Eats), bikes/scooters: out
+  of scope.
+- ETA computation: use a routing/maps service as a black box.
+- Single city/country, then expanded to global? Start global,
+  per-region sharding.
+
+## 2. Estimate scale
+
+```
+Active riders (peak hour) = 10M
+Active drivers (peak)     = 1M
+Driver location pings     = 1 per 4s per online driver
+                          = 1M / 4 = 250 000 pings/sec
+Trip requests/day         = 10M  → ~100/s avg, 1 000/s peak
+Concurrent live trips     = ~500 000
+
+Storage:
+  trips (one row per trip)      = ~50M new trips/year × 2 KB = 100 GB
+  location pings (raw)          = 250K/s × 86 400s = ~20B/day = ~10 TB/day raw
+  retain raw 30 days, downsample after
+```
+
+The location stream is the dominant ingest workload (~250K
+writes/sec) and forces a streaming pipeline + geo-indexed cache,
+not a relational primary.
+
+## 3. API
+
+```bash
+# Rider
+POST /v1/rides
+  Body: { pickup: {lat,lng}, dropoff: {lat,lng}, productType }
+  Resp: { rideId, etaSec, estimatedFare }
+
+GET  /v1/rides/:id           -- includes current status, driver, location
+DELETE /v1/rides/:id         -- cancel
+
+# Driver
+POST /v1/driver/location     { lat, lng, heading, speed, ts }
+POST /v1/driver/availability { online: bool }
+
+# Both
+GET  /v1/rides/:id/stream    -- SSE/WebSocket for live updates
+```
+
+Driver location ingest is the high-QPS path; everything else is
+moderate. Live updates are best-effort with a WebSocket per
+active session.
+
+## 4. High-level design
+
+```
+Driver app ──pings──→ [ Location ingest svc ] ──→ [ Kafka: locations topic ]
+                                                       │
+                                                       ↓
+                                          [ Geo-index service ]
+                                          (in-mem grid / quadtree / S2)
+                                                       │
+Rider app                                              │
+   │                                                   │
+   ↓                                                   │
+[ Trip request svc ]  ── match query ──→ [ Match service ] ──→ chooses driver
+   │                                                   │
+   │                                                   ↓
+   │                                          [ Trip lifecycle svc ]
+   │                                                   │
+   │           ┌───────────────────────────────────────┴───────────────┐
+   │           ↓                                                       ↓
+   │   [ Trips DB (Postgres, sharded by city) ]          [ Pub/Sub for live updates ]
+   │           │                                                       │
+   │           ↓                                                       ↓
+   │   [ Pricing / surge svc ]                              [ WebSocket gateway ]
+   │           │                                                       │
+   ↓           ↓                                                       ↓
+[ Payments ]   [ Surge map cache ]                          rider + driver clients
+```
+
+Per-region (typically per-metro-area) deployment. Each region has
+its own geo-index, trip DB shard, and dispatch loop. Cross-region
+calls are rare (cross-border ride, fraud lookups).
+
+## 5. Data model
+
+```
+trips {
+  id              uuid PK
+  rider_id        bigint INDEX
+  driver_id       bigint INDEX
+  pickup          point      -- PostGIS geography
+  dropoff         point
+  status          enum(requested, matched, en_route, arrived, in_trip, completed, cancelled)
+  fare_cents      int
+  created_at, updated_at
+  PARTITION BY hash(region_id)
+}
+
+driver_state (Redis)
+  key: "driver:<id>" → { lat, lng, status, productType, lastSeen }
+
+geo_index (in-process / Redis Geo)
+  S2 cell id → set of driverIds in cell, expires on stale ping
+```
+
+Trip data is moderate-volume; relational + sharded by region.
+Driver locations are write-heavy and ephemeral; Redis with TTL
+on entries.
+
+## 6. Deep dives
+
+### 6.1 Geo-indexing: how do we find "nearby"?
+
+You need: "given a pickup point and a 2 km radius, list
+available drivers."
+
+<Cheatsheet>
+| Approach | Idea | Pro | Con |
+|---|---|---|---|
+| Naïve | Scan all drivers, filter by haversine distance | Trivial | O(N) per query — dies at 1M drivers |
+| Geohash | Encode lat/lng to base32 string; prefix-match neighbors | Easy index keys in any KV | Boundary issues; coarse buckets |
+| Quadtree | Recursive 2D space split | Dynamic resolution | Tricky concurrent updates |
+| S2 / H3 | Hierarchical spherical cells (Google S2, Uber H3) | Production standard; uniform; level-based | More math; libraries required |
+</Cheatsheet>
+
+**Production choice: S2 or H3.** Hexagonal (H3) avoids
+geohash's "drivers across a boundary are far in index, near in
+reality" problem. Each driver lives in one cell at a given
+resolution; "nearby" = union of the driver's cell + its 6
+neighbors at level L.
+
+The geo-index is **in-memory per region**, repopulated from the
+location stream. Lookups: O(cells) where cells ≈ 7-37 depending
+on the radius.
+
+### 6.2 Driver location ingestion
+
+250K location writes/sec is hot. The pipeline:
+
+```
+driver app → HTTPS → [ ingest ] → batch (5-second window) → [ Kafka topic ]
+                                                                ↓
+                                                       [ geo-index updater ]
+                                                                ↓
+                                              [ Redis Geo / in-mem grid ]
+```
+
+Why not write to the geo-index directly? Backpressure during
+spikes; preserves event order; allows replay.
+
+Throttle: don't accept pings more than once per ~2 seconds per
+driver. Drop pings that are < threshold movement (driver
+stationary). These two filters cut ~70% of pings.
+
+### 6.3 Matching
+
+The match service runs per metro per second:
+
+<Steps>
+<Step n={1} title="On trip request, find candidates">
+Query geo-index for available drivers within an expanding
+radius (start ~1 km, grow until N candidates or max radius).
+</Step>
+<Step n={2} title="Filter candidates">
+Drop drivers not matching `productType`, with poor ratings,
+already in a trip, or outside time-to-pickup limits.
+</Step>
+<Step n={3} title="Rank by ETA + cost">
+Real-time ETA from routing service. Rank by composite of ETA,
+driver rating, surge effect on driver earnings. Top-K candidates.
+</Step>
+<Step n={4} title="Offer to top driver">
+Send offer to driver app with ~10-15s acceptance timeout. If
+rejected/timeout, offer next candidate.
+</Step>
+<Step n={5} title="On accept, lock the trip">
+Atomic state transition (`requested → matched`). Driver-state
+flips to "on trip." Other concurrent match attempts get the
+next candidate.
+</Step>
+</Steps>
+
+### 6.4 Live updates
+
+Both rider and driver need each other's location during the
+trip. WebSocket (or push notification fallback):
+
+```
+[ trip stream ] → [ pub/sub topic per tripId ] ← rider WS
+                                              ← driver WS
+
+driver location ping → fanned to trip topic if in active trip
+                       (subset of location pings)
+```
+
+Don't reuse the heavy location ingest pipeline for live UI
+updates; fanout from geo-index only for the active-trip slice.
+
+### 6.5 Surge pricing
+
+Per-cell, per-product price multiplier updated every ~30s based
+on **(open requests in cell) / (available drivers in cell)**.
+
+```
+surge[cell][product] = clip( f(demand/supply), 1.0, 5.0 )
+```
+
+Compute by streaming aggregation (Flink / Spark Structured
+Streaming) over the location + request topics. Surge map served
+from cache; recomputed every cycle.
+
+At request time, the pricing service reads the current surge
+multiplier for the rider's pickup cell, applies it to the base
+fare estimate, and shows it. The number is locked at trip-accept
+time (the rider doesn't pay for surge that started mid-trip).
+
+### 6.6 Idempotency & money
+
+Trip creation, payment authorization, and final charge must be
+idempotent. Each carries a `requestId`. Sagas (compensating
+transactions) coordinate trip + payment:
+
+- Create trip → authorize card hold → assign driver.
+- If authorization fails, cancel the trip.
+- If trip cancels, void the hold.
+- On completion, capture the charge.
+
+See `Payment system` for the deeper version.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 2.5M location pings/s | Single Kafka partition / ingest service | Partition by region+driverId; multiple ingest pods |
+| Geo-index latency | Single in-mem instance per region | Shard by S2 cell; replicate read |
+| Match-loop latency | Sync ETA calls to routing | Pre-cache cell-level ETAs; async-ETA refinement |
+| WebSocket fanout | Single gateway saturating | Sharded WS gateway by tripId; per-trip pub/sub |
+| Surge compute lag | Window aggregation slow | More streaming workers; pre-aggregate at edge |
+| Trip DB writes | Single shard hot during event | Pre-partition by region+hour; archive completed trips |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Per-region sharding** over single global cluster: cross-region
+  ride-share is rare; local autonomy huge win on latency.
+- **In-memory geo-index** over PostGIS query per request: 100x
+  faster, at the cost of having to repopulate after restarts
+  from Kafka.
+- **Async ingest pipeline** for locations vs sync writes:
+  bursts smoothed; live UI updates use a separate fanout, not
+  the ingest topic.
+- **Idempotent trip + saga for payment**: complexity for
+  correctness; non-negotiable for money.
+- **H3 (hex)** over geohash: production-grade for variable
+  density urban areas.
+
+## In summary
+
+- 250K location-pings/sec is the dominant ingest workload;
+  build a streaming pipeline, not a write-heavy DB.
+- S2 or H3 cells + in-memory index per region; "nearby" is
+  cell-union, not radius scan.
+- Match loop = candidate gen → filter → rank → offer with
+  timeout; concurrency handled by atomic state transitions.
+- Surge map computed by streaming aggregation per cell; lock
+  multiplier at acceptance.
+- Live updates via per-trip pub/sub fed from the location
+  pipeline, not the ingest path.
+- Money path is idempotent with a saga; trip and payment are
+  independent services.

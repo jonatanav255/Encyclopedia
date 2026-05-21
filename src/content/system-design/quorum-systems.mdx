@@ -1,0 +1,142 @@
+export const level = 'senior';
+
+# Quorum systems (R+W>N)
+
+A way to get useful consistency out of a leaderless replicated
+system without paying for consensus on every operation.
+
+Pick three numbers:
+
+- **N** — replicas per key.
+- **W** — replicas a write must acknowledge before success.
+- **R** — replicas a read must contact before returning.
+
+If **R + W > N**, every read's replicas overlap with every
+write's replicas. The read is guaranteed to see at least one
+copy of the latest write. That's the quorum invariant.
+
+## The classic settings
+
+<Cheatsheet>
+| Setting | Behavior | Use case |
+|---|---|---|
+| N=3, W=2, R=2 | Default Dynamo-style; majority quorum | General balanced workloads |
+| N=3, W=3, R=1 | Slow writes, fast reads, all replicas always agree | Read-heavy with rare writes |
+| N=3, W=1, R=3 | Fast writes, slow reads | Write-heavy logging |
+| N=3, W=1, R=1 | No quorum — eventual consistency | Caches, presence |
+| N=5, W=3, R=3 | Majority of 5; tolerates 2 node failures | Critical data |
+</Cheatsheet>
+
+The trade-off: higher W means slower writes but more durable.
+Higher R means slower reads but more consistent.
+
+## How a read picks a winner
+
+When R replicas return potentially different values, the
+coordinator picks the one with the highest timestamp (or
+vector clock). The other replicas are then **read-repaired** —
+their stale value is overwritten with the newer one.
+
+Three failure modes here:
+
+### 1. Clock skew
+
+LWW requires synchronized clocks. NTP skew of even tens of
+milliseconds can lose recent writes systematically across
+regions.
+
+Mitigation: HLC or strict NTP discipline on the cluster.
+
+### 2. Tie-breaking ambiguity
+
+Two replicas have values with the same timestamp. Different
+implementations break ties differently — by node ID, by
+arrival order, by some deterministic rule. Surprises possible.
+
+### 3. Concurrent writes
+
+Two writes happen "at the same time" (vector clocks
+incomparable). Quorum can't tell you which wins; the
+application or the data type must merge them.
+
+## Sloppy quorum and hinted handoff
+
+What if a replica is unreachable but you still want to write?
+
+**Sloppy quorum**: write to *any* W reachable nodes — not
+necessarily the W "home" replicas for that key. The write
+succeeds but consistency is weaker (a read might miss it until
+the home replicas catch up).
+
+**Hinted handoff**: when a node accepts a write meant for an
+unreachable target, it stores a hint and replays the write
+when the target recovers.
+
+Dynamo, Cassandra, Riak all support this. It's an
+**availability vs consistency** knob — sloppy quorum lets you
+keep writing during partition at the cost of stronger
+consistency guarantees.
+
+## Quorum math
+
+For N replicas with W writes + R reads required:
+
+- **Tolerates W-1 write failures**: if 2 of N=3 nodes are
+  down, you can't reach W=2, write fails.
+- **Tolerates N-R read failures**: if N=3 and R=2, you can
+  lose 1 node and still read.
+- **Cluster needs at least W nodes alive** to accept writes.
+
+For majority quorum (W = R = (N/2)+1), the cluster tolerates
+**(N-1)/2** failures. So:
+
+- N=3 tolerates 1 failure.
+- N=5 tolerates 2.
+- N=7 tolerates 3.
+
+This is why most quorum systems use odd N — even N gives the
+same tolerance as N-1 with more overhead.
+
+## Quorum reads ≠ linearizable
+
+A common misconception: R+W>N gives you linearizability.
+
+Counter-example: write W is in-progress, has acked at 1 of N=3
+nodes. Read R=2 contacts the two nodes that *don't* have W.
+Returns the old value. Write then completes acking 2 of 3
+nodes — but the read already returned.
+
+Subsequent reads might see W or might not (depending on which
+2 of 3 they contact). The system isn't linearizable.
+
+**Lightweight transactions** or **strong reads** (route through
+a leader/Paxos) are needed for true linearizability.
+Cassandra's LWT, Riak's strong consistency mode.
+
+## Where quorum systems shine
+
+- **Multi-DC writes.** Single-leader replication is brutal
+  cross-region. Quorum lets you accept writes in any DC.
+- **High write availability.** Lose a node, keep writing.
+- **Tunable per-query consistency.** Cassandra and DynamoDB
+  let the client request ONE/QUORUM/ALL per call.
+
+## Where they fall short
+
+- **Linearizability** without a separate consensus path.
+- **Multi-key transactions** — quorum is per-key.
+- **Uniqueness** — two clients can both insert the same
+  username at different replicas; replicas merge with LWW;
+  one silently loses.
+
+## In summary
+
+- Quorum systems: pick N replicas, W writes ack, R reads
+  contact. R + W > N gives overlap → reads see latest write.
+- Tune W vs R for write-heavy vs read-heavy workloads.
+- Sloppy quorum + hinted handoff trade consistency for
+  availability under partition.
+- **Doesn't give linearizability** without a separate consensus
+  path.
+- Used by Dynamo, Cassandra, Riak; underpins most leaderless
+  designs.

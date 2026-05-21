@@ -1,0 +1,319 @@
+export const level = 'senior';
+
+# Idempotency keys
+
+An **idempotency key** lets a client retry a mutating request safely.
+The server stores the key with the result of the first request; any
+repeat of the same key returns the stored result without re-executing
+the work.
+
+Required for: payments, queue consumers, webhook receivers, any
+write-side API a client may retry. Stripe popularized the
+`Idempotency-Key` header pattern; Geewax codifies it in *API Design
+Patterns*.
+
+## Why you need this
+
+The network is unreliable in a specific, painful way: the request
+arrives, the server processes it, then the **response is lost**. The
+client doesn't know whether the work happened. Two bad options if
+there's no idempotency:
+
+```
+- Don't retry → user sees an error; the work may have happened
+  anyway; they're confused.
+- Retry → the work happens twice. For a payment, that's $100 charged
+  twice. For an email, two emails. For an order, two orders.
+```
+
+Idempotency keys turn "retry" into "ask again," safely.
+
+## The contract
+
+The client picks a unique ID per logical operation (UUIDv4 is fine)
+and sends it as a header:
+
+```
+POST /payments
+Idempotency-Key: 3f29b8c2-7e83-4a01-9b3c-1a2d44557788
+{ "amount": 5000, "currency": "USD", "source": "tok_..." }
+```
+
+Behavior:
+
+1. First call with this key: server processes the request, stores
+   `(key, response)`, returns response.
+2. Repeat call with this key: server skips processing, returns the
+   stored response.
+3. Repeat with the **same key but different request body**: server
+   rejects with 422 (or similar). The key uniquely identifies an
+   *operation*; same key with different intent is a client bug.
+
+The key is the client's contract that "this is one logical
+operation, even if I send it multiple times."
+
+## Server-side mechanics
+
+The hard parts aren't the API surface; they're the storage and the
+race conditions.
+
+### Storage
+
+You need a (key → result) store that's:
+
+- Persistent across retries (Redis with persistence, or DB table).
+- Fast to look up (Redis or indexed table).
+- TTL'd (idempotency keys typically expire after 24h or 7 days).
+
+A minimal Redis approach:
+
+```js
+async function withIdempotency(key, body, doWork) {
+  // Try to claim the key.
+  const claimed = await redis.set(
+    `idem:${key}`,
+    JSON.stringify({ status: 'in_progress', body }),
+    'NX', 'EX', 86400,
+  );
+
+  if (!claimed) {
+    // Key exists. Return the stored result or wait if in progress.
+    const stored = JSON.parse(await redis.get(`idem:${key}`));
+    if (stored.status === 'completed') return stored.response;
+    if (stored.status === 'in_progress') {
+      // Another request is still processing. Poll or 409.
+      throw new ConflictError('idempotency key in progress');
+    }
+  }
+
+  // Do the actual work.
+  const response = await doWork();
+
+  // Store the result.
+  await redis.set(
+    `idem:${key}`,
+    JSON.stringify({ status: 'completed', response, body }),
+    'EX', 86400,
+  );
+  return response;
+}
+```
+
+That's the shape. The corner cases below are what make this hard.
+
+### Same key, different body
+
+The client must not reuse a key for a different operation. Verify
+on hit:
+
+```js
+if (storedBody !== currentBody) {
+  return res.status(422).json({ error: 'idempotency_key_mismatch' });
+}
+```
+
+Compare deterministically (canonicalize JSON; hash the canonical
+form). Bodies often serialize differently round-trip; raw byte
+comparison fails.
+
+### In-flight requests
+
+Two simultaneous requests with the same key. Without care, both
+think they're "first" and both execute. Solutions:
+
+```
+1. Atomic claim (SETNX). The losing request returns 409 Conflict
+   ("in progress, retry later") and the client retries.
+2. Wait-on-lock: the losing request waits for the first to finish,
+   then returns the result. Higher latency, simpler client.
+3. Distributed lock + state machine: in_progress → completed.
+```
+
+Stripe uses approach 1 — fail fast, client retries. Approach 2 is
+common in queue consumers.
+
+### Storing the response
+
+You store the **exact response** the first execution produced. That
+includes:
+
+- Status code.
+- Response body.
+- Important headers (location, content-type).
+
+Repeat callers get the bit-for-bit same response. This matters: a
+client retry sees the same `Location: /payments/pi_123` it would
+have seen, so its downstream logic doesn't diverge.
+
+### TTL
+
+Keys can't live forever. Typical values:
+
+- 24 hours: Stripe's default. Covers retry storms and a typical
+  client's retry window.
+- 7 days: more generous; uses more storage.
+
+After TTL, the same key with the same body should be **safe to
+re-execute** — meaning the operation should also be naturally
+idempotent at a deeper layer if possible. The key is the
+**replay protection**, not the only line of defense.
+
+## Where to apply
+
+A practical list:
+
+<Cheatsheet>
+| Surface | Why idempotency keys |
+|---|---|
+| Payments / refunds | Double-charge is a real-world disaster. Mandatory. |
+| Order creation | Duplicate orders confuse customers and fulfillment. |
+| User signup | Two accounts with same intent; downstream notifications. |
+| Email/SMS sending | Spam if duplicated. |
+| Webhook receivers | Senders retry on 5xx; you must dedupe. |
+| Queue consumers | At-least-once delivery → consumer dedupe required. |
+| Sagas (each step) | Retry safety per step in a multi-service workflow. |
+| Bulk write APIs | Per-item idempotency for partial-failure retries. |
+</Cheatsheet>
+
+The pattern is universal for non-idempotent mutations. If a request
+**creates state** and a retry could create duplicate state, you need
+keys.
+
+## Client guidance
+
+Clients should:
+
+- Generate one key per **logical operation** (one cart checkout =
+  one key, even if it produces multiple side effects).
+- Keep the key stable across retries of the same operation. Don't
+  generate a new UUID per HTTP attempt.
+- Time-box the key. If the operation is older than the server's TTL,
+  don't reuse — it's a new operation now.
+
+Bad client patterns:
+
+```js
+// Bad: new key per retry attempt.
+for (let i = 0; i < 3; i++) {
+  await fetch('/payments', {
+    headers: { 'Idempotency-Key': uuid() },  // new each loop
+    body,
+  });
+}
+
+// Good: one key for the whole operation.
+const idemKey = uuid();
+for (let i = 0; i < 3; i++) {
+  try {
+    return await fetch('/payments', {
+      headers: { 'Idempotency-Key': idemKey },
+      body,
+    });
+  } catch (e) { if (!isRetryable(e)) throw e; await sleep(backoff(i)); }
+}
+```
+
+The first pattern defeats the entire mechanism. It's the most
+common bug.
+
+## Idempotency without keys
+
+Some operations are naturally idempotent and don't need keys:
+
+- **PUT to a known resource**: `PUT /users/42 { name: "Ana" }`
+  produces the same state regardless of how many times you call it.
+- **DELETE**: `DELETE /users/42` is idempotent (the second call
+  returns 404 or 204, but state is the same).
+- **GET**, **HEAD**, **OPTIONS**: safe.
+
+Idempotency keys are specifically for **non-idempotent** writes —
+POSTs that create new things, PATCHes that increment counters, RPCs
+that have side effects.
+
+If you can design the operation as a PUT to a known ID (client picks
+the ID), you avoid the need for a key. Often a good simplification.
+
+## Failure modes
+
+### Key collisions
+
+Two clients accidentally pick the same key. With UUIDv4, vanishingly
+rare (2^122 space). With short codes (`order-42`), inevitable.
+**Require UUIDs or hashes**.
+
+### Storing keys forever
+
+A persistent store of keys without TTL grows without bound. Always
+TTL. Compute storage cost: keys × bytes × retention.
+
+### Hot key in storage
+
+A high-traffic endpoint can hammer the (key → result) store. The
+store itself becomes the bottleneck. Cache the most recent N keys in
+process memory; only hit Redis on miss.
+
+### Idempotency for partial-success operations
+
+The first call succeeds for items 1–7, fails for item 8. The client
+retries. What does the server return — the stored partial-success?
+Or re-attempt item 8?
+
+The right answer: store the per-item state. The key represents the
+**batch operation**; re-attempting picks up where it left off. This
+is hard to get right; many systems just fail-fast and require the
+client to retry per-item with per-item keys.
+
+### Idempotency across regions
+
+Active-active multi-region: the key store must be globally coherent
+or every region needs replication. Otherwise a retry hitting region
+B doesn't see the key that region A stored. Common solutions:
+
+- Stick the client to one region (session affinity).
+- Synchronously replicate the idempotency store (latency cost).
+- Use a globally-consistent store (Spanner, DynamoDB Global Tables).
+
+This is real production engineering; idempotency at scale is harder
+than the headline.
+
+## A reusable spec
+
+For any new write API, answer:
+
+```
+- Is this naturally idempotent (PUT/DELETE)? If yes, you may not
+  need keys.
+- If not, declare the Idempotency-Key header as required (or
+  strongly recommended).
+- Where does the (key → result) store live? TTL?
+- How do you detect same-key-different-body?
+- How do you handle concurrent same-key requests?
+- What does retention cost at peak QPS?
+- What happens at the TTL boundary?
+```
+
+If you can answer those, your idempotency story is real.
+
+<Callout variant="warning">
+"We don't need idempotency, our clients won't retry" is wrong twice:
+the network will retry for you (TCP retransmits, proxy retries,
+client libraries), and "won't retry" is a property you can't
+enforce. Build the keys in; the cost is small and the cost of not
+having them is unbounded.
+</Callout>
+
+## In summary
+
+- An idempotency key lets a client retry safely; the server dedupes
+  by storing the (key, response) tuple.
+- Required for non-idempotent writes: payments, orders, queue
+  consumers, webhook receivers, saga steps.
+- Hard parts are storage, race conditions, and same-key-different-
+  body detection. Use atomic claim (SETNX) and store the full
+  response.
+- Clients must reuse the same key across retries of one logical
+  operation. New key per attempt defeats the mechanism.
+- For naturally-idempotent operations (PUT to known ID, DELETE),
+  keys are unnecessary.
+- Plan TTL, storage growth, and cross-region coherence from the
+  start.

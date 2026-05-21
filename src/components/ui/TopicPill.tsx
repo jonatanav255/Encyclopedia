@@ -127,6 +127,18 @@ function TopicIcon({ topic, className }: { topic: string; className?: string }) 
           <path d="M12 2 4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6z" />
         </svg>
       );
+    case 'system-design':
+      // connected nodes (network/graph)
+      return (
+        <svg {...common}>
+          <circle cx="6" cy="6" r="2.5" />
+          <circle cx="18" cy="6" r="2.5" />
+          <circle cx="6" cy="18" r="2.5" />
+          <circle cx="18" cy="18" r="2.5" />
+          <circle cx="12" cy="12" r="2.5" />
+          <path d="M8 7l3 4M16 7l-3 4M8 17l3-4M16 17l-3-4" />
+        </svg>
+      );
     case 'typescript':
       // TS-style square
       return (

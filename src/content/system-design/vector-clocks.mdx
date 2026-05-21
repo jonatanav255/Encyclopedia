@@ -1,0 +1,141 @@
+export const level = 'senior';
+
+# Vector clocks
+
+A vector clock is **one Lamport counter per process**. Where a
+Lamport clock is a single integer, a vector clock is `[c1, c2,
+..., cN]` — one entry per node in the system.
+
+The richer structure lets you do something Lamport clocks
+can't: **detect true concurrency**. Two updates are concurrent
+if and only if their vector clocks are "incomparable" — each
+ahead in some dimensions and behind in others.
+
+## How they update
+
+Each process P maintains a vector `V[P]`. Rules:
+
+<Steps>
+<Step n={1} title="On local event:">
+Increment your own slot: `V[P][P] += 1`.
+</Step>
+<Step n={2} title="On message send:">
+Increment your slot, attach the entire vector to the message.
+</Step>
+<Step n={3} title="On message receive:">
+Take element-wise max with the received vector, then
+increment your own slot.
+</Step>
+</Steps>
+
+## Comparing two vectors
+
+Given vectors A and B:
+
+- **A happens before B** if every entry in A is ≤ the
+  corresponding entry in B, and at least one is strictly less.
+- **A equals B** if every entry matches.
+- **A and B are concurrent** otherwise — neither dominates.
+
+That third case is the killer feature. Lamport clocks can't
+see it.
+
+## Example
+
+Two clients editing a shopping cart on different replicas
+(R1, R2):
+
+```
+Initial: V[R1]=[0,0], V[R2]=[0,0]
+
+Client 1 adds "book" via R1:
+  R1 increments → V=[1,0]
+  Cart_v1 = {book}, vc=[1,0]
+
+Client 2 adds "pen" via R2 (before seeing R1's update):
+  R2 increments → V=[0,1]
+  Cart_v2 = {pen}, vc=[0,1]
+
+Sync: R1 sees R2's update, R2 sees R1's update.
+  R1: V = max([1,0],[0,1]) +1 in own = [2,1]
+  R2: V = max([0,1],[1,0]) +1 in own = [1,2]
+```
+
+Comparing [1,0] and [0,1]: neither dominates. **Concurrent**.
+The system surfaces the conflict; the application decides
+("merge as union: {book, pen}").
+
+Without vector clocks (just timestamps), you'd silently drop
+one cart's add.
+
+## Where they're used
+
+- **Dynamo and its descendants** (Riak, Voldemort) — surface
+  concurrent writes for application-level merge.
+- **Distributed version control** — Git's DAG of commits is
+  morally a vector clock per branch.
+- **Collaborative editing CRDTs** — vector clocks underlie
+  many CRDT correctness proofs.
+- **Causal consistency systems** (COPS, Eiger).
+
+## Cost
+
+The vector grows with the number of *writers*, not events.
+
+**Problem**: a long-lived system with churning replicas
+accumulates dead entries. A vector with 10,000 entries —
+because 10,000 transient clients touched the data — is
+expensive to ship per message.
+
+**Solutions**:
+
+- **Dotted version vectors** — per-key, only entries that
+  actually wrote to that key. Used in Riak.
+- **Garbage collection of inactive entries** — drop entries
+  whose value hasn't changed in N rounds.
+- **Move to HLC** — bounded size, accepts some loss of
+  concurrency detection.
+
+## Vector clocks vs HLC
+
+<Compare a="Vector clocks" b="Hybrid logical clocks">
+<>
+Exact concurrency detection. Size grows with writer count.
+Doesn't align with wall time — hard to read.
+</>
+<>
+Approximate concurrency (limited by clock granularity).
+Bounded size (one integer). Aligns with wall time — debugger
+shows recognizable timestamps. Used in modern systems
+(CockroachDB, MongoDB).
+</>
+</Compare>
+
+For most production systems, HLC has won. Vector clocks remain
+in use where the application *must* detect every concurrent
+update (Riak, conflict-resolving stores) and in CRDT
+correctness proofs.
+
+## When you actually need them
+
+- **Application-level conflict resolution.** Two writes
+  happened concurrently; you want to merge both, not pick
+  one. Vector clocks let you detect "both" reliably.
+- **CRDT bookkeeping.** The merge function relies on knowing
+  which updates each replica has seen.
+- **Distributed debugging.** "Did event A causally lead to
+  event B?" Vector clocks tell you definitively.
+
+If you only need timestamps for ordering and you're OK with
+"approximately right" concurrency detection, HLC is simpler.
+
+## In summary
+
+- Vector clocks: per-process counter array; detects exact
+  happens-before *and* concurrency.
+- Two vectors are concurrent iff neither dominates the other.
+- Used in Dynamo-style stores for surfacing concurrent writes
+  to the application.
+- Size grows with writer count — needs GC or compaction.
+- HLC is the modern default; vector clocks live on in CRDT
+  proofs and conflict-merging databases.

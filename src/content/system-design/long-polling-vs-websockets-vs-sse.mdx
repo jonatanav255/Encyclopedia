@@ -1,0 +1,207 @@
+export const level = 'mid';
+
+# Long-polling vs WebSockets vs SSE
+
+The same comparison as choosing-realtime-transport, but
+focused on the three modern options (skipping naive polling).
+This page is the implementer's view: protocol details, server
+considerations, common gotchas.
+
+## Protocol on the wire
+
+### Long polling
+
+A standard HTTP request that the server holds open until it
+has data, then returns. Client immediately reissues.
+
+```bash
+GET /events?since=42 HTTP/1.1
+   (server waits up to 30s for new data)
+HTTP/1.1 200 OK
+Content-Type: application/json
+{ "events": [...] }
+```
+
+Looks like normal HTTP. CDNs and proxies pass it through; LBs
+just see long-running requests.
+
+### SSE
+
+A standard HTTP response with `Content-Type:
+text/event-stream` that the server keeps writing to.
+
+```bash
+GET /stream HTTP/1.1
+Accept: text/event-stream
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+data: {"event":"order_placed","id":42}
+
+data: {"event":"order_paid","id":42}
+id: 99
+event: order_paid
+
+(connection stays open)
+```
+
+Still HTTP. Some old proxies buffer the response (defeating
+the stream); modern infra is fine. The `id:` line lets
+clients resume with `Last-Event-ID` header on reconnect.
+
+### WebSocket
+
+HTTP/1.1 upgrade handshake, then a binary frame protocol on
+the same TCP connection.
+
+```bash
+GET /ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: ...
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: ...
+
+(binary frames in both directions)
+```
+
+After the handshake, it's not HTTP. Proxies that don't
+understand WebSocket either pass it as opaque TCP or break it.
+
+## Server considerations
+
+### Connection count
+
+- **Long polling**: 1 short-lived connection per event. Easier
+  on the server (no idle connections), expensive on the
+  client (new TCP for each).
+- **SSE / WebSocket**: 1 long-lived connection per client.
+  Server must hold them all open.
+
+A single Node server with libuv handles ~10K open SSE/WS
+connections comfortably; Go/Rust/Erlang push to 100K+ per
+node.
+
+### Heartbeats
+
+For SSE and WebSocket, connections can silently drop (NAT
+timeout, mobile network switch). Send heartbeats to detect:
+
+- **SSE**: send a comment line every 30s (`: heartbeat\n\n`).
+- **WebSocket**: send a ping frame; expect pong.
+
+Without heartbeats, "dead" connections accumulate.
+
+### Backpressure
+
+If the server pushes faster than the client reads:
+
+- **SSE**: TCP backpressure pauses the server's write. If
+  ignored, OOM.
+- **WebSocket**: same. Libraries expose buffer size; cap or
+  drop messages.
+
+Always bound the outbound buffer per client.
+
+## Scaling out
+
+You have 1M concurrent connections. They won't fit on one
+server.
+
+### Sticky load balancing
+
+A client connects to backend X. Reconnects must go to X (or
+a backup that has the session state).
+
+- **Long polling**: each request can go anywhere if session
+  state is centralized (Redis, DB).
+- **SSE / WebSocket**: typically sticky by IP or cookie. Or
+  store session state externally so any backend can resume.
+
+### Fan-out
+
+A new event needs to reach 10K connected clients across 100
+backends. Two options:
+
+- **Broker bus**: every backend subscribes to a topic; new
+  events publish to the topic; backends fan out to their
+  clients.
+- **Direct mesh**: backends know about each other; the
+  receiver broadcasts to peers.
+
+The broker approach (Redis pub/sub, NATS, custom) is the
+standard.
+
+## Common gotchas
+
+### Proxy buffers SSE
+
+A reverse proxy buffers the response until "complete." SSE
+appears to never deliver. Fix: `X-Accel-Buffering: no` for
+nginx; configure your reverse proxy to disable buffering on
+event-stream content type.
+
+### WebSocket origin checks missing
+
+Browsers send `Origin` on WebSocket handshake. Servers MUST
+validate it; otherwise, any site can open a WebSocket to your
+API and exfiltrate data via the user's session cookie.
+
+### Mobile background
+
+iOS/Android suspend backgrounded apps. WebSocket dies; SSE
+dies. Apps must fall back to push notifications (APNs/FCM) for
+background updates and re-establish on foreground.
+
+### Browser connection limits
+
+Browsers limit ~6 concurrent HTTP/1.1 connections per origin
+(includes SSE). HTTP/2 multiplexes — many SSE streams over
+one connection.
+
+WebSocket has no such limit, but each origin's WS connections
+share TCP/TLS budget.
+
+### Reconnect storms
+
+Server restarts; 100K clients all reconnect within milliseconds.
+Backend collapses.
+
+Mitigations:
+
+- **Exponential backoff with jitter** on the client.
+- **Throttled connection acceptance** at the LB.
+- **Pre-warm** new backends before draining old.
+
+## Picking
+
+<Cheatsheet>
+| Use case | Best choice |
+|---|---|
+| Dashboard live updates | SSE |
+| LLM streaming responses | SSE |
+| Notifications / activity feed | SSE |
+| Chat | WebSocket |
+| Collaborative editor | WebSocket |
+| Live multiplayer game | WebSocket (or WebRTC) |
+| Job status with low latency | Long polling or SSE |
+| Mobile-friendly (background fallback) | WebSocket + push |
+</Cheatsheet>
+
+## In summary
+
+- Long polling: HTTP request held open; reissue on response.
+  Works through any HTTP proxy.
+- SSE: HTTP one-way streaming; auto-reconnect built into
+  EventSource; ideal for server-push.
+- WebSocket: bidirectional binary frames after HTTP upgrade;
+  best for bidirectional realtime.
+- Server-side: bound buffer per client, heartbeat, sticky
+  routing or external session store.
+- Watch for: proxy buffering (SSE), origin checks (WS),
+  background suspension (mobile), reconnect storms.

@@ -1,0 +1,317 @@
+export const level = 'staff';
+
+# Consensus algorithms overview
+
+Consensus is the foundational primitive of distributed
+systems: a set of nodes agree on a single value (or sequence
+of values) despite failures. Every replicated database,
+distributed lock service, leader election, and coordination
+system reduces to a consensus protocol underneath.
+
+The major families: **Paxos** and its variants, **Raft**,
+**Viewstamped Replication (VR)**, and **ZAB**. They differ in
+presentation more than substance — all solve the same problem
+with subtle variations.
+
+## The consensus problem
+
+Multiple nodes, each proposing a value. The protocol must
+deliver three properties:
+
+<Steps>
+<Step n={1} title="Agreement.">
+All non-faulty nodes decide on the same value.
+</Step>
+<Step n={2} title="Validity.">
+The decided value was proposed by some node (not invented by
+the protocol).
+</Step>
+<Step n={3} title="Termination.">
+Every non-faulty node eventually decides — subject to FLP's
+caveats (partial synchrony required).
+</Step>
+</Steps>
+
+Single-value consensus is the building block. Real systems
+need **state-machine replication**: an ordered, replicated log
+where each entry is the result of a consensus instance.
+Multi-Paxos, Raft, ZAB, and VR are all state-machine
+replication protocols built on single-value consensus.
+
+## Why we need it
+
+Consensus is the foundation for:
+
+- **Leader election** in databases.
+- **Replicated commit logs** (Kafka KRaft, Spanner, CockroachDB
+  per range).
+- **Distributed locks and leases** (ZooKeeper, etcd, Chubby).
+- **Atomic configuration changes** (Kubernetes etcd).
+- **Atomic broadcast** (multicast to a group with a total
+  order).
+- **Distributed transactions** in NewSQL databases.
+
+Without consensus, you have eventually-consistent systems with
+conflict resolution — which work but lose linearizability.
+
+## The shared structure
+
+All major consensus protocols share four ingredients:
+
+- **Terms / epochs / views / ballots**: monotonically
+  increasing numbers identifying the "current round." A
+  message from an old term is rejected.
+- **Quorum**: a majority of nodes (>N/2 of N total) must
+  agree. Guarantees any two quorums intersect, so there's
+  always a node that knows the latest decision.
+- **Leader**: most protocols elect a single leader per term to
+  serialize decisions. Without a leader, consensus per value
+  takes more round trips.
+- **Replicated log**: decisions are appended to a log; each
+  position is a separate consensus instance.
+
+Differences are in how leaders are elected, how the log is
+managed, and how the failure cases are handled.
+
+## Paxos (Leslie Lamport, 1989)
+
+The original. Solves single-value consensus in two phases.
+
+```
+Phase 1 (prepare):
+  Proposer picks a ballot number n, sends prepare(n) to acceptors.
+  Acceptors reply with promise(n, prev_value) if they haven't
+  promised a higher ballot.
+
+Phase 2 (accept):
+  Once a quorum has promised, proposer picks a value v
+  (any previously accepted value if one exists, else its own)
+  and sends accept(n, v).
+  Acceptors accept(n, v) if they haven't promised higher.
+  Once a quorum accepts, v is chosen.
+```
+
+Properties:
+
+- **Safe** under any number of failures (as long as a
+  majority survives).
+- **Lives** under partial synchrony.
+- **Single decision per protocol run.**
+
+The classical Paxos paper is famously hard to read. The
+algorithm is short; the proof of correctness is intricate.
+
+### Multi-Paxos
+
+For a replicated log, run Paxos for each slot. The
+optimization: a stable leader skips phase 1 for new slots —
+phase 1 is established once when becoming leader, then every
+new value uses just phase 2 (one round trip).
+
+Multi-Paxos is what's actually used in production (Spanner,
+Chubby, Megastore). The literature on Paxos is a maze of
+optimizations: Fast Paxos, Generalized Paxos, EPaxos, Flexible
+Paxos. Each addresses a specific scenario.
+
+## Raft (Ongaro & Ousterhout, 2014)
+
+Designed for **understandability**. Functionally equivalent to
+Multi-Paxos but presented as three subproblems:
+
+<Steps>
+<Step n={1} title="Leader election.">
+Followers have randomized election timeouts. On timeout, become
+candidate, request votes. Win on majority. Term is the
+monotonic counter.
+</Step>
+<Step n={2} title="Log replication.">
+Leader appends entries to its log, sends them to followers via
+AppendEntries RPCs. Entries are committed once a majority of
+followers persist them.
+</Step>
+<Step n={3} title="Safety.">
+Restrictions on leader election (must have all committed
+entries), log matching (consecutive entries in matching
+positions are identical), state machine safety (committed
+entries persist forever).
+</Step>
+</Steps>
+
+Why Raft displaced Paxos in new systems:
+
+- Clearer specification → easier to implement correctly.
+- Strong leader simplifies the log-management story.
+- Open-source implementations are mature (etcd-raft, Hashicorp
+  Raft, Tikv Raft).
+
+Used by: etcd, Consul, CockroachDB, TiKV, RethinkDB,
+Influxdb, MongoDB (since 3.2, election sub-protocol),
+YugabyteDB, NATS JetStream.
+
+See the Raft page for details.
+
+## Viewstamped Replication (VR)
+
+Liskov & Cowling, 1988 / revised 2012. Conceptually similar to
+Raft, predates it by decades. Used in some research systems.
+
+Key concepts:
+
+- **Views** (terms in Raft, ballots in Paxos).
+- **Primary** per view.
+- **View change** protocol when the primary fails.
+
+Largely subsumed by Raft in practice, but VR was a primary
+inspiration for Raft and an excellent read for understanding
+the protocol family.
+
+## ZAB (ZooKeeper Atomic Broadcast)
+
+ZooKeeper's protocol. Like Raft, has a stable leader.
+Specialized for "primary-backup" rather than general state
+machine replication.
+
+Phases:
+
+- **Discovery**: pick a leader (highest zxid wins).
+- **Synchronization**: leader sends followers any missing
+  proposals.
+- **Broadcast**: leader proposes and commits new entries.
+
+ZAB is conceptually similar to Multi-Paxos but optimized for
+ZooKeeper's specific access pattern (small writes, fast
+reads). It guarantees:
+
+- FIFO client order (a single client's operations stay in
+  order).
+- Total order (all servers see operations in the same order).
+
+## Comparing the protocols
+
+<Cheatsheet>
+| Feature | Paxos | Multi-Paxos | Raft | ZAB | VR |
+|---|---|---|---|---|---|
+| Single-value or log | Single | Log | Log | Log | Log |
+| Stable leader | No | Yes | Yes | Yes | Yes |
+| Election | Implicit | Explicit | Explicit (randomized) | Explicit (highest zxid) | Explicit |
+| Log management | Per-instance | Per-slot | Sequential | Sequential | Sequential |
+| Membership changes | Hard | Hard (joint consensus) | Single-server changes | Reconfiguration | View change |
+| Implemented by | Spanner, Megastore | Chubby, Spanner | etcd, Consul, CockroachDB | ZooKeeper | (research) |
+| Reputation | "Hard" | "Hard" | "Understandable" | "Specialized" | "Foundational" |
+</Cheatsheet>
+
+The protocols are functionally close. The choice for a new
+system is almost always Raft today — the implementations and
+literature are best.
+
+## Membership changes
+
+Adding or removing nodes mid-operation is the trickiest part
+of any consensus protocol. Naïve approaches risk split brain
+during reconfiguration.
+
+- **Paxos joint consensus**: temporarily run with both old and
+  new configurations; quorums must include majorities of both.
+  Complex.
+- **Raft single-server changes**: add or remove one server at
+  a time; majorities of old and new configs always overlap.
+- **ZAB**: reconfiguration as a special operation; handled
+  explicitly.
+
+Most implementations restrict membership changes to one node
+at a time to keep this manageable.
+
+## Optimizations and variants
+
+Worth knowing the names:
+
+- **Fast Paxos**: one round trip in the common case at the
+  cost of larger quorums.
+- **Generalized Paxos**: out-of-order commands when they
+  commute.
+- **EPaxos** (Egalitarian Paxos): no stable leader; better
+  WAN performance at the cost of complexity.
+- **Flexible Paxos**: different quorum sizes for prepare and
+  accept phases; trades durability for performance.
+- **Raft pre-vote**: candidates test viability before
+  incrementing terms; reduces flapping.
+
+These rarely affect application design. Implementation teams
+care; users get the same interface.
+
+## When the choice matters
+
+For most engineers consuming distributed databases, the
+underlying consensus protocol is invisible. It matters when:
+
+- **Picking a coordination service**: ZooKeeper (ZAB), etcd
+  (Raft), Consul (Raft), Chubby (Paxos). Functionality is
+  similar; ecosystem and operational maturity differ.
+- **Operating a new-SQL DB**: understanding Raft makes
+  CockroachDB / TiDB operations and tail-latency debugging
+  much easier.
+- **Designing a custom replication layer**: rare, but if you
+  do, take Raft, read the paper, and use a vetted library
+  (etcd-raft, dragonboat, hashicorp/raft).
+
+## Performance characteristics
+
+Common shape for all of them:
+
+- **Latency**: at least one round trip from leader to a quorum
+  of followers per committed entry. In a single DC, ~1 ms; in
+  a region, ~10 ms; cross-region, 50–200 ms.
+- **Throughput**: leader can batch many entries per round
+  trip. Modern Raft implementations sustain 10K-100K commits/s
+  per group.
+- **Per-shard throughput is the bottleneck**: if one shard's
+  consensus group is saturated, the answer is more shards
+  (more Raft groups), not faster Raft.
+
+Spanner and CockroachDB scale to massive throughput by running
+**thousands of independent Raft groups** in parallel — one per
+data range — not by making any single group faster.
+
+## Common pitfalls
+
+### Confusing consensus with replication
+
+Async replication (Postgres default) is not consensus. It's
+the leader pushing changes to followers without waiting. Real
+consensus requires the leader to wait for a quorum to ack
+before committing.
+
+### Believing Raft is "simpler" in production
+
+Raft is simpler to **understand**. Implementing it correctly is
+still extremely subtle — concurrency, log compaction, snapshot
+transfer, membership changes, edge cases under partition all
+need care. Use a battle-tested library.
+
+### Underestimating WAN cost
+
+Cross-region consensus is at least RTT × 1 per write. A
+multi-region quorum across three continents means every write
+pays the slowest pair. Spanner's TrueTime and CockroachDB's
+HLC help with read latency, not write latency.
+
+### Single-group bottleneck
+
+A monolithic Raft group caps throughput at one leader's
+write speed. Scale by partitioning into multiple groups (one
+per shard / range). Spanner does ~1M Paxos groups per cell.
+
+## In summary
+
+- Consensus = nodes agree on a value or log of values despite
+  failures. Foundation of all replicated, linearizable
+  systems.
+- The family: Paxos, Multi-Paxos, Raft, ZAB, Viewstamped
+  Replication. Functionally similar; Raft is the modern
+  default.
+- All require **majority quorum**, **monotonic terms**, and a
+  **stable leader** in the optimized case.
+- Real systems run **many independent consensus groups in
+  parallel** to scale beyond one leader's throughput.
+- Use existing implementations (etcd, ZooKeeper, Consul,
+  hashicorp/raft, etcd-raft). Don't roll your own.

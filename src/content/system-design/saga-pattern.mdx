@@ -1,0 +1,317 @@
+export const level = 'senior';
+
+# Saga pattern
+
+Two-phase commit across services is dead. Network partitions and
+service ownership made it impractical decades ago. The **saga**
+is what replaced it: a long-running business transaction
+modelled as a sequence of local transactions, each with a
+compensating action to undo it if a later step fails.
+
+The word "saga" comes from a 1987 Garcia-Molina paper about long-
+running database transactions. The idea is older than
+microservices and applies cleanly to them.
+
+## What problem it solves
+
+A "book a trip" command touches three services:
+
+```
+Hotel.reserveRoom()
+Flight.bookSeat()
+Car.reserveRental()
+```
+
+Each is its own DB. None of them share a transaction. If the
+flight is sold out after the room is reserved, you can't just
+roll back — the room is locked in a remote DB you don't own.
+
+Three bad answers:
+
+1. **Distributed 2PC.** Coordinator asks each service to prepare,
+   then commit. Each service holds locks across the
+   coordinator's round trip. Slow, fragile, blocks on coordinator
+   failure. Modern services don't expose it.
+2. **Pretend it didn't happen.** Leave the room reserved, hope.
+3. **Manual ops cleanup.** Page humans when steps disagree.
+
+The saga is the structured fourth answer: **for each step that
+succeeded, run a compensating action to undo it.**
+
+## The shape
+
+```
+forward:  reserveRoom() → bookFlight() → bookCar() → success
+                                     ↓ fail
+compensate:                    ← (already booked flight is in
+                                  doubt — needs the reverse op)
+                              ← cancelFlight()
+                              ← cancelRoom()
+                              → failure reported to client
+```
+
+Two variants:
+
+- **Choreography**: each service listens for events and decides
+  to act or compensate. No central authority.
+- **Orchestration**: a single component (the orchestrator) tracks
+  the saga state machine and tells each service what to do.
+
+## Choreography
+
+```
+[Booking] → BookingRequested → [Hotel] → RoomReserved
+                              → [Flight] → FlightBooked
+                              → [Car] → CarReserved
+                              → CarFailed
+                              → [Hotel] reacts: CompensateRoom
+                              → [Flight] reacts: CompensateFlight
+                              → [Booking] reacts: NotifyUser
+```
+
+Each service holds its piece. Events flow on a broker. No central
+coordinator.
+
+**Pros**:
+
+- No single point of failure.
+- Services are loosely coupled.
+- New steps can be added by adding new listeners.
+
+**Cons**:
+
+- The full flow lives in **no single place**. To understand what
+  happens, you read N services' code.
+- Compensation logic is scattered. "What gets undone when the
+  car fails?" has no answer except "follow the events."
+- Hard to monitor, debug, and visualize.
+- Cyclic event dependencies are easy to introduce.
+
+Choreography works for **2-3 step flows that don't change much**.
+Beyond that, the cognitive load explodes.
+
+## Orchestration
+
+```
+[Orchestrator]
+   ↓ call Hotel.reserveRoom()
+   ← success
+   ↓ call Flight.bookSeat()
+   ← failure
+   ↓ call Hotel.cancelRoom()
+   ← success
+   ↓ report failure to caller
+```
+
+A single component (the orchestrator) executes the saga step by
+step. Each step can be a synchronous RPC, an async event, or a
+durable activity in a workflow engine.
+
+**Pros**:
+
+- The whole flow is in one file. Reading the code tells you the
+  story.
+- Compensations are colocated with steps.
+- Easy to add observability, retries, timeouts, monitoring.
+- Modern workflow engines (Temporal, AWS Step Functions, Cadence,
+  Camunda) handle persistence, failure, and resumption for you.
+
+**Cons**:
+
+- Orchestrator is a new component to operate.
+- Services depend on the orchestrator's API/contracts.
+- Risk of fat orchestrator anti-pattern (orchestrator absorbs all
+  business logic).
+
+Orchestration is the right choice for **flows with more than ~3
+steps**, especially anything with branching or compensation.
+
+## Choreography vs orchestration
+
+<Compare a="Choreography" b="Orchestration">
+<>
+**Best for**: simple, stable, 2-3 step flows. "User signed up →
+fan out to mailer, analytics, billing."
+
+**Wins**: maximum decoupling, no single point of failure.
+
+**Loses**: visibility, debuggability, compensation discipline.
+Adding a 4th step often forces a refactor to orchestration.
+</>
+<>
+**Best for**: complex multi-step processes with conditional
+branches and compensation. "Book trip," "process order with
+fraud check, payment, fulfillment, notification."
+
+**Wins**: explicit, debuggable, version-controllable.
+
+**Loses**: orchestrator is a dependency. Easy to over-centralize
+business logic.
+</>
+</Compare>
+
+Bellemare's *Building Event-Driven Microservices* makes the case
+that **most production sagas should be orchestrated**, because
+the cost of opaque choreography is paid every time the flow
+needs to change.
+
+## Compensating actions
+
+Compensations are **not** rollbacks. They're **forward**
+actions that semantically undo a previous step.
+
+- `reserveRoom` is compensated by `cancelReservation`, not by
+  "delete the row."
+- `chargeCard` is compensated by `refundCard`, not by reversing
+  the charge in the DB.
+- `sendEmail` cannot be compensated. Email is sent.
+
+This matters because **the compensating action can also fail**.
+What if the cancel call to the hotel returns 500? The saga is
+stuck in an intermediate state.
+
+Answers:
+
+1. **Retry the compensation indefinitely** with backoff. Usually
+   the right call — the operation is intended to succeed
+   eventually.
+2. **Page humans** if it doesn't succeed within X minutes.
+3. **Log and accept**. For "send email" type actions where
+   compensation is impossible, the saga design must avoid putting
+   them before steps that can fail.
+
+Order matters. **Put compensable steps first; non-compensable
+steps last.** If sending the confirmation email is the last step
+and only happens on full success, you never need to "un-send"
+it.
+
+## State machines
+
+A saga is a finite state machine. Each step is a transition;
+each failure is a transition to a compensation chain.
+
+```
+INITIAL
+  → reserve_room → ROOM_RESERVED
+                 → ROOM_FAILED → FINAL_FAILED
+  → book_flight → FLIGHT_BOOKED
+                → FLIGHT_FAILED
+                  → compensate_room
+                    → ROOM_COMPENSATED → FINAL_FAILED
+                    → ROOM_COMPENSATION_FAILED → STUCK_NEEDS_HUMAN
+  ...
+  → final_step → FINAL_SUCCESS
+```
+
+Drawing this for any real saga reveals **how many failure
+branches there are**. A 4-step saga has ~10 failure states. Some
+need human intervention.
+
+Workflow engines (Temporal, Step Functions) make state
+persistence and resumption easy. Hand-rolled state machines in a
+DB table work too — a `saga_state` row with a current step and
+JSON state — but you'll re-invent retries, timeouts, and
+heartbeats.
+
+## Modern tooling
+
+### Temporal
+
+The 2026 default for sagas in any non-trivial scenario.
+
+```js
+// Sketch — Temporal worker
+async function bookTripWorkflow(input) {
+  const room = await activities.reserveRoom(input);
+  try {
+    const flight = await activities.bookFlight(input);
+    try {
+      const car = await activities.bookCar(input);
+      return { room, flight, car };
+    } catch (e) {
+      await activities.cancelFlight(flight);
+      await activities.cancelRoom(room);
+      throw e;
+    }
+  } catch (e) {
+    await activities.cancelRoom(room);
+    throw e;
+  }
+}
+```
+
+The workflow function looks synchronous. Temporal handles
+persistence, retries, timeouts, and resumption across restarts.
+Activities are the steps; the workflow is the saga.
+
+### AWS Step Functions
+
+JSON or YAML state machine. Each state is a Lambda or a service
+call. Built-in retry/catch/compensation primitives. Good if
+you're all-in on AWS.
+
+### Other
+
+- **Camunda**: BPMN-modeled workflows; popular in enterprise.
+- **Cadence**: Temporal's predecessor.
+- **DIY**: a saga state table + a worker. Works for small needs.
+
+## Idempotency is a hard requirement
+
+Every saga step must be idempotent. The orchestrator may
+re-invoke a step after a crash; the network may deliver a request
+twice; you may resume a workflow from the middle.
+
+`reserveRoom` called twice must produce the same outcome as
+calling it once. Use **idempotency keys** on every request to
+external services (see Idempotent consumer / inbox pattern).
+
+```js
+await hotelClient.reserveRoom({
+  userId, dates,
+  idempotencyKey: sagaId + ':reserve_room',
+});
+```
+
+Without this, sagas under failure produce duplicated bookings,
+double charges, etc. Workflow engines will retry; idempotency is
+the contract that makes retries safe.
+
+## Anti-patterns
+
+<Callout variant="warning">
+**Distributed 2PC under a new name.** "We'll lock all the rows
+across services, then commit at the end." That's 2PC. It will
+fail in every way 2PC fails. Just use a saga.
+</Callout>
+
+<Callout variant="warning">
+**No compensation strategy for non-final steps.** Each step that
+can fail must have a compensation for every prior committed
+step. Otherwise the system gets stuck in inconsistent state.
+</Callout>
+
+<Callout variant="warning">
+**Choreography without observability.** Spans, correlation IDs,
+saga IDs threaded through every event. Without them you can't
+debug a stuck flow.
+</Callout>
+
+<Callout variant="warning">
+**Fat orchestrator absorbing domain logic.** The orchestrator
+coordinates; it doesn't decide pricing, fraud, or business
+rules. Those stay in their owning services.
+</Callout>
+
+## In summary
+
+- **Sagas replace 2PC** for cross-service transactions.
+- **Choreography** = each service reacts to events. Decentralized,
+  hard to debug.
+- **Orchestration** = central coordinator drives the flow.
+  Visible, scalable, the default for non-trivial sagas.
+- **Compensations are forward actions**, not rollbacks. Each
+  failable step needs one.
+- **Workflow engines (Temporal, Step Functions)** are the modern
+  shape; hand-rolled state machines work for small needs.
+- **Every step must be idempotent.** Retries are inevitable.

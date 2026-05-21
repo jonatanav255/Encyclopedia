@@ -1,0 +1,349 @@
+export const level = 'senior';
+
+# Bulk and batch APIs
+
+A bulk API accepts many items in one request to amortize the round-
+trip cost. Done well, it transforms an API from "100 trips a second"
+into "100 items per trip, 1 trip per second." Done badly, it hides
+partial failures, encourages giant payloads, and produces
+unintelligible error responses.
+
+Geewax's *API Design Patterns* devotes a full chapter; AWS, Stripe,
+and Google API design guides all standardize the shape.
+
+## Why batches exist
+
+Two motivations, in priority order:
+
+<Steps>
+<Step n={1} title="Reduce round-trip overhead.">
+A round trip is ~1 ms intra-datacenter, ~50 ms cross-region. For
+1 000 items processed individually, that's 50 seconds of pure
+latency. Batched: one round trip, ~1 second total.
+</Step>
+<Step n={2} title="Enable downstream batching.">
+The handler can use a `INSERT ... VALUES (?, ?, ?)`, a bulk Kafka
+produce, a single S3 multipart upload — operations that are much
+faster per-item than N individual calls.
+</Step>
+</Steps>
+
+You don't add bulk because the API "should support" it. You add it
+when round-trip cost is measurably a problem. Otherwise the simpler
+per-item API is better.
+
+## Bulk vs batch — and "request batching"
+
+Three related concepts often conflated:
+
+<Cheatsheet>
+| Term | Meaning |
+|---|---|
+| Bulk operation | One API call processes N items of the same kind. `POST /users/batch` with N user creations. |
+| Batch / multi-op | One API call wraps N heterogeneous operations. "Create this user, then update that order, then delete this card." |
+| Request batching (server-side coalescing) | Server groups concurrent single-item requests into one downstream call (e.g., DataLoader). Transparent to clients. |
+</Cheatsheet>
+
+The first is most common. The second is rare and complex (Google's
+Compute Engine has it; most don't need it). The third is implementation,
+not API. This page is about (1).
+
+## Request shape
+
+The standard pattern:
+
+```js
+// POST /v1/users:batchCreate (Google AIP-231 style)
+//
+// Request:
+// {
+//   "requests": [
+//     { "user": { "name": "Ana",  "email": "ana@x.com"  } },
+//     { "user": { "name": "Bob",  "email": "bob@x.com"  } },
+//     { "user": { "name": "Cara", "email": "cara@x.com" } }
+//   ]
+// }
+//
+// Response:
+// {
+//   "users": [
+//     { "id": "u_1", "name": "Ana",  "email": "ana@x.com"  },
+//     { "id": "u_2", "name": "Bob",  "email": "bob@x.com"  },
+//     { "id": "u_3", "name": "Cara", "email": "cara@x.com" }
+//   ]
+// }
+```
+
+Or a flatter style:
+
+```js
+// POST /v1/users (with items array)
+// { "items": [...] }
+// → { "items": [...] }
+```
+
+Either is fine — be consistent across endpoints. Google's AIP and
+Stripe's pattern are the two most-copied styles.
+
+## Partial-failure semantics
+
+The hardest part of bulk APIs. Three options:
+
+<Compare a="All-or-nothing (atomic)" b="Best-effort (partial OK)">
+<>
+The whole batch succeeds or fails. If item 7 is bad, items 1-6 are
+also rolled back. Returns 200 on full success or 400/422 on any
+failure.
+
+Best when items represent a single logical unit (a saga's steps, a
+transaction). Requires DB transaction support.
+</>
+<>
+Each item is processed independently. The response reports per-item
+status. Returns 200 (or 207 Multi-Status) with item-level results,
+even if some failed.
+
+Best when items are independent (a list of user signups, a list of
+event ingestions). Resilient to one bad item poisoning a batch.
+</>
+</Compare>
+
+The "default" varies by use case. For mutations of independent
+resources: **best-effort with per-item status**. For multi-step
+business operations: **atomic**.
+
+### Best-effort response shape
+
+A common pattern (Google API style):
+
+```js
+// {
+//   "results": [
+//     { "status": "ok", "user": { "id": "u_1", ... } },
+//     { "status": "ok", "user": { "id": "u_2", ... } },
+//     { "status": "error", "error": { "code": "ALREADY_EXISTS",
+//         "message": "email taken", "field": "email" } }
+//   ],
+//   "summary": { "succeeded": 2, "failed": 1 }
+// }
+```
+
+Properties:
+
+- Item-level status, not just HTTP status.
+- Item-level error details (code, message, field).
+- Aggregate summary for quick consumption.
+- Per-item ordering matches request order.
+
+The HTTP status is 200 (the request was processed). Or 207 Multi-
+Status (WebDAV) if you want to be explicit. **Don't return 500** for
+any item failure — the caller can't distinguish "all items failed
+because the server is broken" from "one item had invalid data."
+
+## Idempotency in bulk
+
+Retrying a partial-failure batch is dangerous: items that succeeded
+get re-processed. Two patterns:
+
+### Per-item idempotency
+
+Each item has its own idempotency key:
+
+```js
+// {
+//   "requests": [
+//     { "idempotency_key": "k1", "user": {...} },
+//     { "idempotency_key": "k2", "user": {...} },
+//     { "idempotency_key": "k3", "user": {...} }
+//   ]
+// }
+```
+
+Retries are safe per-item. The server dedupes each. The overhead is
+per-item: more keys to store, more lookups per request. Worth it
+for write-heavy bulks.
+
+### Whole-batch idempotency
+
+One key for the whole batch:
+
+```
+Idempotency-Key: batch-7e83-...
+```
+
+On retry, the server returns the cached batch response. Simpler;
+works only if the batch is atomic or the caller is OK with replaying
+the same partial-success.
+
+See **Idempotency keys** for the underlying machinery.
+
+## Limits
+
+Every bulk endpoint needs explicit limits:
+
+```
+- Max items per batch (100 is a reasonable default; 1 000 is the
+  high end).
+- Max bytes per request (1 MB is conservative; some APIs do 4 MB,
+  10 MB).
+- Max processing time (request timeout, e.g., 30 seconds).
+- Max items in flight per client (concurrency limit, separate from
+  rate limit).
+```
+
+Document the limits. Return a clear error when exceeded:
+
+```js
+// HTTP 413 Payload Too Large (or 400 Bad Request)
+// {
+//   "error": "batch_too_large",
+//   "limit": 100,
+//   "received": 547,
+//   "advice": "split into chunks of <= 100 items"
+// }
+```
+
+Clients should chunk. Servers should refuse to silently accept too-
+big batches — at scale, "we'll handle whatever you send" leads to
+timeouts, OOMs, and DLQ pileups.
+
+## Streaming bulk for very large jobs
+
+For very large batches (millions of items), don't accept them as
+one HTTP request:
+
+- The request times out before completion.
+- The client can't see progress.
+- Retry of a 5-minute batch is wasteful.
+
+Better:
+
+```
+POST /v1/imports          → 202 Accepted, returns job ID.
+GET  /v1/imports/{id}     → status (queued, running, succeeded).
+GET  /v1/imports/{id}/errors → per-item errors (paginated).
+```
+
+The job runs async, internally. The bulk-request shape is replaced
+by an **async job pattern**. See "Background jobs" for the
+mechanism.
+
+A pragmatic rule:
+
+```
+- 1-100 items     → synchronous bulk endpoint.
+- 100-10 000      → async job (202 Accepted, poll).
+- > 10 000        → file upload + import job (CSV, NDJSON).
+```
+
+The boundaries depend on per-item cost; tune to actual workload.
+
+## NDJSON for streaming-out
+
+If the response is large (a million items), streaming line-by-line
+beats one huge JSON:
+
+```
+GET /v1/exports/large → 200 OK
+Content-Type: application/x-ndjson
+
+{"id":"e_1","payload":...}
+{"id":"e_2","payload":...}
+{"id":"e_3","payload":...}
+```
+
+The client parses one line at a time, no peak memory issue. Most
+HTTP stacks support streaming. Use for exports and large queries.
+
+## Operational concerns
+
+A few things bulk APIs introduce:
+
+### Per-item rate limit accounting
+
+A batch of 100 items counts as how many requests for rate-limiting
+purposes? If you say "1," 100-item batches can pummel a downstream
+that doesn't know it's a batch. If you say "100," small batches
+are unfairly throttled.
+
+The right answer: rate-limit by **work units**, not by API calls.
+Batch operations consume more units. Communicate this to clients.
+
+### Per-item observability
+
+Logs and metrics aggregate by request. For batches, you lose
+per-item visibility unless you log per-item: too much noise. The
+compromise:
+
+- Log summary counters per batch (succeeded, failed, took).
+- Sample-log a fraction of items.
+- Capture per-item failures in detail; per-item successes in summary.
+
+### Database transactions
+
+Atomic batches need a real database transaction. That bounds batch
+size: a 1-hour transaction is an availability hazard (long-running
+TX in Postgres holds locks, prevents vacuum, etc.). Limit batch
+size to what completes in seconds, not minutes.
+
+### Memory and CPU spikes
+
+A naïve handler loads the whole batch, processes synchronously, OOMs
+on the largest batch any client sends. Profile worst-case payloads;
+process in chunks; stream where possible.
+
+## Common pitfalls
+
+### Returning 500 on partial failure
+
+The server processed 99 of 100 items successfully. Returning 500
+implies nothing succeeded. The caller now doesn't know what state
+they're in. Always return 200 with per-item status for best-effort
+batches.
+
+### Silent truncation
+
+The server quietly drops items beyond limit N. The caller sees
+"success" with fewer items than they sent. Always reject too-big
+batches explicitly.
+
+### No per-item error detail
+
+Response says "3 failed" but doesn't say which 3 or why. The caller
+can't retry. Always include item-level errors with codes and field
+references.
+
+### Ordering surprises
+
+Some implementations process items in parallel and return them out
+of order. The caller assumed request order = response order.
+Document the contract and stick to it (typically: preserve order).
+
+### Treating bulk as the only mode
+
+Forcing every client to use batches when their use case is single-
+item adds complexity for no benefit. Support both `/items/{id}`
+and `/items:batch` shapes; let the client pick.
+
+<Callout variant="info">
+A bulk API's response is the contract. Spend more time designing
+the response (per-item status, error codes, summary) than the
+request — the request is easy; the response is what clients depend
+on to recover from failure.
+</Callout>
+
+## In summary
+
+- Bulk APIs reduce round-trip cost; add them when round-trips are
+  measurably a problem, not by default.
+- Choose atomic (all-or-nothing) for logical units; best-effort
+  with per-item status for independent items.
+- Always return per-item status, error codes, and a summary; never
+  return 500 for partial failure.
+- Use per-item idempotency keys for safe retry of best-effort
+  batches; whole-batch keys for atomic ones.
+- Enforce limits (max items, max bytes, max time) and reject
+  oversize batches explicitly.
+- For very large jobs, switch to async job APIs (202 Accepted +
+  poll) and file-based imports — sync bulk has a real ceiling.
+- Treat the response as the contract; design it carefully.

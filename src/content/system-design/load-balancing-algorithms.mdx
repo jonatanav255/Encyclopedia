@@ -1,0 +1,364 @@
+export const level = 'mid';
+
+# Load balancing algorithms
+
+The algorithm an LB uses to pick a backend matters more than
+people expect. Two LBs with identical hardware and identical
+backends will produce wildly different tail latencies depending
+on what algorithm they use — and the "obvious" choice
+(round-robin) is rarely the best one for production workloads.
+
+This page surveys the algorithms, when each one fits, and the
+classic mistakes.
+
+## Round robin
+
+Send request 1 to backend 1, request 2 to backend 2, request 3
+to backend 3, then back to 1.
+
+```
+   req 1 → backend A
+   req 2 → backend B
+   req 3 → backend C
+   req 4 → backend A
+   ...
+```
+
+Pros:
+
+- Trivially simple. No state required.
+- Fair distribution by request count.
+
+Cons:
+
+- **Assumes all requests are equal.** They aren't. A 5 ms
+  request and a 5-second request count the same.
+- **Assumes all backends are equal.** They aren't, after
+  enough hours of uptime — caches warm differently, JIT
+  optimizations diverge, GC pauses fall at different times.
+- **Doesn't react to load.** A backend mid-GC keeps getting
+  requests at the same rate as the others.
+
+The default in DNS-based and many older LBs. Acceptable for
+short, uniform requests on identical backends. Often the wrong
+default for modern workloads.
+
+## Weighted round robin
+
+Backends have weights. A backend with weight 2 gets twice as
+many requests as a backend with weight 1.
+
+```
+weights: A=3, B=2, C=1
+sequence: A, A, A, B, B, C, A, A, A, B, B, C, ...
+```
+
+Use when:
+
+- Heterogeneous hardware (some boxes are 2× bigger than
+  others).
+- Canary deploys (send 5% to the canary version).
+- Gradual traffic migration during deploys.
+
+Still suffers from "requests are not equal" and "doesn't react
+to load" — it's just round-robin with handicap stones.
+
+## Random
+
+Pick a backend uniformly at random for each request.
+
+```
+   for each request: pick one of N backends uniformly
+```
+
+Pros:
+
+- Stateless. No counter, no state to share across LB nodes.
+  This matters when you have a fleet of LBs.
+- Provably converges to even distribution at scale.
+
+Cons:
+
+- High variance for small N or small request counts.
+- Same fairness problems as round-robin.
+
+In practice, random is comparable to round-robin and is
+sometimes used in distributed LBs (each LB instance doesn't
+need to coordinate the counter with the others).
+
+## Least connections
+
+Send the next request to the backend with the **fewest active
+connections** right now.
+
+```
+   backend A: 12 connections
+   backend B: 8 connections   ← pick this one
+   backend C: 11 connections
+```
+
+The key intuition: if a backend has more open connections than
+its peers, it's either slower or doing more work. Either way,
+sending it more is a bad idea.
+
+Pros:
+
+- Adapts to slow backends. A backend mid-GC accumulates
+  connections; the LB stops sending new ones until it
+  recovers.
+- Naturally smooths out long-running requests.
+
+Cons:
+
+- Requires the LB to track connections per backend (cheap if
+  the LB owns the connections).
+- "Active connection" is a proxy for load, not a direct
+  measure. A backend with 100 short connections might be
+  doing less work than a backend with 10 long ones.
+
+The classic default for "modern" HTTP LBs. NGINX has it as a
+non-default option (`least_conn`). HAProxy uses it widely.
+AWS ALB uses **least outstanding requests**, a similar
+concept.
+
+## Least response time
+
+Track recent latency per backend (EWMA — exponentially
+weighted moving average). Send the next request to the
+backend with the lowest recent average latency.
+
+Pros:
+
+- Directly targets the metric you care about (latency).
+- Adapts fast to changes in backend performance.
+
+Cons:
+
+- More state to maintain.
+- Can amplify problems: a slow backend gets fewer requests,
+  so its sample size shrinks, so its EWMA stops updating,
+  so the LB sends it traffic again ("the LB forgot it was
+  slow"). Needs probe traffic to keep estimates current.
+- Variance from network jitter can mask real differences.
+
+Used by sophisticated LBs (Envoy with `LEAST_REQUEST` + outlier
+detection, Linkerd's EWMA-based proxying).
+
+## Power of two choices (P2C)
+
+Pick **two random backends**. Send to whichever has the lower
+load (fewer connections, lower latency).
+
+```
+   pick two random backends: A and B
+   compare loads: A has 5, B has 12
+   send to A
+```
+
+Provably:
+
+- Massive improvement over random/round-robin in tail latency.
+- Within a constant factor of "globally optimal least-loaded
+  choice" — but without the coordination cost.
+
+This is the surprising result. Comparing two random options
+is almost as good as comparing all N. And it's stateless across
+LB instances — no shared counter.
+
+Famous result from the 1990s ("The Power of Two Choices in
+Randomized Load Balancing", Mitzenmacher 2001). Implemented in
+Envoy (`LEAST_REQUEST` is P2C by default), HAProxy in random-
+with-two mode, and most modern service meshes.
+
+If you're building a load balancer today, **start with P2C**.
+It's the new default.
+
+## EWMA (Exponentially Weighted Moving Average)
+
+Not a stand-alone algorithm, but a smoothing technique applied
+on top of one of the above. Track per-backend latency or
+in-flight requests as an EWMA so transient spikes don't trigger
+overreaction.
+
+```
+new_avg = α × current_sample + (1 - α) × old_avg
+```
+
+Tunable α (typically 0.1 – 0.3). Higher α reacts faster but is
+noisier; lower α is smoother but slower to react.
+
+Linkerd's load balancer is fundamentally "P2C + EWMA-decayed
+latency tracking." Works extremely well in practice.
+
+## Consistent hashing
+
+Hash a request key (user ID, URL, session ID) and pick the
+backend whose position in the hash ring is next. Same key
+always lands on the same backend.
+
+```
+   hash("user-42") → backend C  (every time)
+   hash("user-17") → backend A
+```
+
+Used when:
+
+- You need cache locality — same user's data on the same
+  backend, hot in its memory.
+- Sticky sessions (without a sticky cookie).
+- Distributed cache key routing (Redis Cluster, Memcached
+  consistent hashing).
+
+The crucial property: when you add or remove a backend, only
+1/N of the keys move. With naive modulo hashing, nearly all
+keys move. See consistent-hashing-for-load-balancing for
+details.
+
+## Specialty: shortest queue / join shortest queue
+
+Send to the backend with the smallest pending-request queue.
+A variant of least connections that more directly models
+load.
+
+Used in fan-out workloads (search shards, where each request
+goes to all backends and you wait for the slowest). Less
+common in HTTP front-ends.
+
+## IP hash / source hash
+
+Hash the client IP, modulo number of backends. Same client
+always lands on the same backend.
+
+```
+   hash(192.0.2.10) % N = 3 → backend 3 (always)
+```
+
+Used for sticky sessions without a cookie. Has many problems:
+
+- NAT collapses many clients to one IP (corporate networks,
+  mobile carriers). One IP → one backend means all those
+  users hit the same box.
+- Doesn't adapt to load.
+- Re-balances badly when backends change (use consistent hash
+  instead).
+
+Avoid. Use cookie-based stickiness or consistent hashing on a
+better key.
+
+## Layered: tier-based
+
+Combine multiple algorithms. Common pattern:
+
+```
+1. Filter: only backends in the same AZ as the LB.
+2. Within that set: P2C by least-request.
+3. Fallback: cross-AZ P2C if local AZ has no healthy backends.
+```
+
+This is called "locality-aware" or "zone-aware" balancing.
+Reduces cross-AZ latency and bandwidth costs. AWS ALB, GCP
+load balancers, and service meshes (Envoy, Linkerd) all
+support it.
+
+## Choosing the right algorithm
+
+<Cheatsheet>
+| Workload | Best algorithm |
+|---|---|
+| Short, uniform HTTP requests, identical backends | Round-robin or random (anything works) |
+| Heterogeneous hardware or canary deploys | Weighted round-robin |
+| Variable request cost, modern HTTP service | Least connections or P2C |
+| Latency-sensitive at tail | P2C + EWMA on latency |
+| Per-user cache locality (Redis, CDN, sessions) | Consistent hashing on user ID |
+| Long-lived connections (WebSocket, gRPC) | Least connections (at connection establishment) |
+| Cross-AZ deployments | Locality-aware + P2C |
+| Service mesh sidecar (client-side LB) | Envoy/Linkerd defaults (P2C + EWMA) |
+</Cheatsheet>
+
+## Sticky vs unsticky algorithms
+
+Sticky algorithms (IP hash, consistent hashing, cookie-based)
+pin clients to backends. Unsticky algorithms (round-robin,
+random, least connections, P2C) treat every request
+independently.
+
+Stateless backends should use unsticky. Stateful backends
+(per-user in-memory state, long-lived connections) need
+sticky — or the state needs to move out (see sticky-sessions).
+
+## Common pitfalls
+
+### Round-robin in front of a Java service
+
+Java services have GC pauses. During a pause, the slow backend
+keeps receiving requests at the round-robin rate, building a
+queue. By the time GC finishes, the queue is so deep that
+latency is wrecked. P2C or least-connections naturally route
+around this.
+
+### Least connections with mostly-idle backends
+
+Below 10–20 concurrent connections per backend, the
+least-connections signal is too noisy to be useful. P2C
+degrades gracefully here; least-connections can produce weird
+choices.
+
+### Hashing on the wrong key
+
+If you consistent-hash on user ID for cache locality, but
+your API key includes session ID, you've broken cache reuse.
+Carefully match the hash key to the cacheable unit.
+
+### Forgetting to combine with outlier detection
+
+A backend that's broken (returning 500s in 10 ms) looks
+"fast" to a latency-based LB. Outlier detection (eject
+backends with high error rates) must complement latency
+balancing. Envoy and ALB do this; ad-hoc DIY LBs often miss
+it.
+
+### Distributed LB nodes with conflicting state
+
+If you run a fleet of LBs, "least connections" requires
+coordination — each LB only sees its own connections, not
+the global picture. P2C and random sidestep this; least-conn
+needs eventual coordination or per-LB-only state.
+
+### Hot keys defeating consistent hashing
+
+Consistent hashing on user ID works great until one user has
+1000× the traffic of others. Now one backend is saturated and
+no algorithm can save you. See hot-keys-and-key-sharding.
+
+## Algorithm choice in practice
+
+The most common patterns in real production:
+
+- **AWS ALB**: least outstanding requests (their term for
+  P2C-style). Sometimes round-robin if you check the box.
+- **NGINX**: `least_conn` or `random with two least_conn`.
+- **HAProxy**: `roundrobin` (default), `leastconn`, `random(2)`.
+- **Envoy**: P2C (`LEAST_REQUEST`) by default with EWMA
+  smoothing.
+- **Linkerd**: EWMA latency-based P2C.
+- **Cloudflare / Fastly**: proprietary, but conceptually
+  similar — P2C with locality awareness.
+
+If you're building from scratch, P2C + outlier detection + a
+locality preference is a near-universal good default.
+
+## In summary
+
+- Round-robin is the obvious choice and almost never the best
+  one.
+- Least connections and least response time react to backend
+  health and request cost.
+- **Power of two choices (P2C)** is the modern default —
+  almost as good as global optimization, stateless across LB
+  nodes.
+- Consistent hashing is for cache locality, not for general
+  balancing.
+- Combine an algorithm with outlier detection and locality
+  awareness. Algorithm alone is half the story.
+- Distributed LBs prefer stateless algorithms (P2C, random) so
+  they don't have to coordinate.

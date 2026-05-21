@@ -1,0 +1,360 @@
+export const level = 'mid';
+
+# Service discovery
+
+Service discovery answers a deceptively simple question: when
+service A needs to call service B, what address does it use?
+In a static deployment, B's address is hard-coded; problem
+solved. In a dynamic deployment — containers come and go,
+autoscaling adds and removes replicas, deploys roll instances —
+the address changes constantly. Service discovery is the
+machinery that keeps "where is B?" current.
+
+## What changes when discovery is dynamic
+
+Without discovery, the picture is:
+
+```
+A's config:  B_URL=https://b.prod.svc.cluster.local:8080
+A calls B at that fixed address.
+```
+
+This works exactly until B's address changes. In a Kubernetes
+cluster with rolling deploys, B's pods change IPs every few
+hours. Hard-coded addresses are wrong by lunch.
+
+Service discovery layers on top:
+
+```
+A's config:  B_NAME=billing-service
+A asks the discovery layer: "where is billing-service?"
+Discovery returns: [10.0.1.7, 10.0.1.8, 10.0.1.12]
+A picks one (or all) and calls.
+```
+
+The discovery layer maintains the current map from
+**service name** → **list of healthy backend addresses**.
+When backends come or go, the map updates. Clients (or LBs)
+see the change within seconds.
+
+## Components
+
+Every discovery system has three parts:
+
+1. **Registry**: the source of truth about which backends
+   exist for each service. Could be a key-value store
+   (etcd, Consul, ZooKeeper), a Kubernetes API server, or
+   even DNS.
+2. **Registration**: how a backend tells the registry "I'm
+   here." Could be self-registration (each backend calls the
+   registry on startup) or third-party (an orchestrator
+   registers it).
+3. **Resolution**: how a client (or LB) looks up the current
+   list. Could be client-side polling, server-side proxy,
+   DNS-SD, or a sidecar.
+
+## Server-side vs client-side discovery
+
+Two fundamentally different topologies.
+
+### Server-side discovery
+
+A load balancer (or service proxy) does the discovery on
+the client's behalf. The client just calls the LB; the LB
+knows which backend to route to.
+
+```
+client → [LB / proxy] → backend
+              │
+              │ asks registry for current backends
+              ▼
+          [registry]
+```
+
+Examples: Kubernetes Services (kube-proxy + DNS), AWS ALB
+target groups, NGINX upstream blocks with dynamic config.
+
+Pros:
+
+- Clients are simple — they call one address.
+- Discovery logic centralized; bugs are fixed once.
+- LB can do other work (TLS, rate limits, retries).
+
+Cons:
+
+- Extra hop (client → LB → backend).
+- LB is on the hot path; its failure affects everything.
+
+### Client-side discovery
+
+Each client knows the registry and picks a backend itself.
+No LB hop.
+
+```
+client (with discovery lib) ──► registry
+              │
+              └─► picks a backend ─► backend
+```
+
+Examples: Netflix Eureka (Java microservices, late 2010s),
+Consul + Consul Connect, gRPC name resolvers, service mesh
+sidecars (Envoy, Linkerd).
+
+Pros:
+
+- No LB hop — lower latency.
+- Client controls load-balancing strategy.
+- Client can do smart things (locality preference, outlier
+  detection).
+
+Cons:
+
+- Every client needs the discovery library — language-specific
+  effort.
+- Updates to discovery logic require redeploying every client.
+- Discovery bugs manifest in every client independently.
+
+The modern compromise: **sidecar proxy** (service mesh).
+Every pod runs a co-located Envoy that does the discovery
+locally. The application code calls localhost; the sidecar
+handles discovery + LB + TLS. Best of both: simple app code,
+local-only discovery hop.
+
+## DNS-based discovery
+
+The oldest mechanism still in use. A DNS record (typically
+SRV or A) maps the service name to current backends.
+
+```
+$ dig billing-service.prod.svc.cluster.local
+billing-service.prod.svc.cluster.local. 30 IN A 10.0.1.7
+billing-service.prod.svc.cluster.local. 30 IN A 10.0.1.8
+billing-service.prod.svc.cluster.local. 30 IN A 10.0.1.12
+```
+
+The client picks one of the returned A records (round-robin
+or random) and connects.
+
+Pros:
+
+- Universal — every language and runtime understands DNS.
+- No new infrastructure needed.
+
+Cons:
+
+- **DNS caching is opaque**. TTLs are advisory; many
+  resolvers ignore them. Stale entries persist.
+- **Health is bolted on** via separate periodic checks. The
+  DNS record can lag behind reality by tens of seconds.
+- **No load awareness**. The client picks randomly; no
+  least-connections or P2C.
+- **A-record list is limited** to ~25 entries before packet
+  fragmentation. Past that, you need rotation or
+  randomization.
+
+DNS-SD works well for static-ish services with few backends
+and lenient HA SLOs. For fast-changing microservices, it's
+been replaced by smarter mechanisms.
+
+### Kubernetes DNS specifically
+
+Kubernetes provides DNS records for services
+(`service-name.namespace.svc.cluster.local`). Behind the
+record, kube-proxy maintains a per-node iptables or eBPF
+table that load-balances to current pods. The DNS resolves
+to a **cluster IP** (a virtual IP); kube-proxy intercepts
+traffic to it and routes to pods.
+
+The DNS record itself rarely changes (just the virtual IP);
+kube-proxy handles the dynamic backend list. Best of DNS
+(universal client support) plus dynamic backends.
+
+## Registry-based discovery: etcd / Consul / ZooKeeper
+
+A dedicated key-value store holds the registry. Backends
+register themselves; clients (or proxies) read.
+
+```
+etcd / Consul:
+  /services/billing/instance-1 → 10.0.1.7:8080, healthy, last_heartbeat=...
+  /services/billing/instance-2 → 10.0.1.8:8080, healthy, last_heartbeat=...
+  /services/billing/instance-3 → 10.0.1.12:8080, unhealthy
+```
+
+Backends send heartbeats every N seconds. Missed heartbeats
+mark them unhealthy. Clients watch for changes (etcd watch,
+Consul blocking queries) and update their local view in
+real-time.
+
+Pros:
+
+- Fast updates (subscribers see changes within ms).
+- Health is integrated (heartbeats + active health checks).
+- Rich metadata (tags, versions, environment).
+- Works across data centers (Consul federation).
+
+Cons:
+
+- **Quorum-based**: etcd is Raft-replicated. Too many
+  registrations strain the cluster. Don't put high-cardinality
+  data (e.g., per-request state) in it.
+- **Operational complexity** — another distributed system to
+  run.
+
+Used by classic Netflix microservices (Eureka was their
+take), HashiCorp Consul, etcd-backed systems, Kubernetes
+itself (the API server is, fundamentally, a service registry
+on etcd).
+
+## Service mesh
+
+The modern compromise. Each pod runs a sidecar proxy
+(Envoy, usually) that handles all in/out networking.
+
+```
+   service A pod                   service B pod
+   ┌───────────────┐               ┌───────────────┐
+   │ app code      │               │ app code      │
+   │   ↕ localhost │               │ localhost ↕   │
+   │ envoy sidecar │ ◄──── mTLS ──►│ envoy sidecar │
+   └───────────────┘               └───────────────┘
+           ▲                                ▲
+           │                                │
+           └───── control plane (Istio / Linkerd) ─────┘
+                  pushes config: who can talk to whom,
+                  current backend lists, retry policies
+```
+
+The control plane handles discovery. The data plane (Envoy
+sidecars) does the actual proxying.
+
+Pros:
+
+- App code knows nothing — just calls localhost.
+- Rich features: mTLS, retries, circuit breaking, outlier
+  detection, observability.
+- Polyglot friendly (no per-language client library).
+
+Cons:
+
+- Heavy. A sidecar per pod = 2× the pods, 2× the memory.
+- Adds ~1–5 ms latency per hop.
+- Operationally complex (Istio especially).
+
+Service meshes are common in large microservice deployments
+where the value of mTLS + observability + retry consistency
+across services justifies the overhead. For small fleets,
+they're overkill.
+
+## Health-check integration
+
+Discovery is only useful if the registry reflects current
+health. Common patterns:
+
+- **Heartbeats**: backend sends a periodic "I'm alive" to
+  the registry. Missed → mark unhealthy.
+- **Active checks**: registry periodically probes backends.
+- **Self-deregistration**: backends call the registry on
+  shutdown ("I'm leaving").
+- **TTL-based**: registration expires unless renewed.
+
+Combining heartbeats and active checks gives robust
+detection (backend can't lie about being healthy via
+heartbeats alone).
+
+## Propagation delay during deploys
+
+The dirty secret of service discovery: **propagation isn't
+instant**. When a new backend comes up:
+
+1. Backend starts (5 s to 5 min).
+2. Backend passes startup health check (few seconds).
+3. Backend registers with discovery (immediate).
+4. Discovery propagates to clients (DNS TTL: 30 s; etcd
+   watch: ms; sidecar: seconds).
+5. Clients start sending traffic.
+
+Total: tens of seconds to minutes, depending on the
+mechanism. During this gap, the new backend is idle while
+existing ones still take all the load.
+
+When a backend goes down:
+
+1. Backend stops responding.
+2. Health check detects failure (interval × threshold:
+   ~30 s).
+3. Discovery marks unhealthy.
+4. Clients stop sending traffic.
+
+During the gap, clients are sending requests to a dead
+backend — those fail. Mitigations:
+
+- **Pre-stop hook**: backend calls deregister before
+  shutting down, then sleeps for the propagation delay,
+  then exits.
+- **Retries on the client side**: a transient failure to
+  one backend retries to another.
+
+## Common pitfalls
+
+### Long DNS TTL
+
+The biggest gotcha. A TTL of 5 minutes means a backend
+removal takes up to 5 minutes (often more) to reach all
+clients. For Kubernetes, TTLs are typically 30 seconds or
+less; for cross-region DNS, default to 60 seconds and use
+client-side caching with explicit invalidation.
+
+### Self-registration without deregistration
+
+Backend registers on startup. Crashes (kill -9 from OOM
+killer). Never deregisters. Registry holds a stale entry
+until heartbeat timeout. Always pair registration with TTL
+and active health checks.
+
+### Discovery for things that aren't services
+
+Putting per-request state, configuration, or hot data in a
+service registry abuses it. etcd's write throughput is
+limited (a few thousand ops/sec); ZooKeeper similar.
+Registry is for the slowly-changing membership map.
+Configuration → use a config service. Per-request state →
+use a cache or database.
+
+### Tight coupling between client and registry
+
+If every request to B causes a registry lookup, the registry
+is on the hot path. Cache the discovery result locally (with
+a short TTL and watch-based invalidation). Look up the
+registry, update local cache; serve from cache.
+
+### Discovery + LB conflicts
+
+A client-side LB has its own list of backends. A server-side
+LB also has one. Both update independently from discovery.
+They can disagree. Be explicit about which layer does
+discovery for which traffic.
+
+### Region- or AZ-blind discovery
+
+Default discovery returns all backends globally. The client
+randomly picks one — might be cross-region. Add locality
+metadata (zone, region) and prefer local backends with
+fallback to remote.
+
+## In summary
+
+- Service discovery maps service names to current backend
+  addresses, dynamically.
+- Server-side (LB-driven) and client-side (registry-driven)
+  are the two main topologies. Service meshes blend them via
+  sidecars.
+- DNS works for static-ish services; etcd/Consul/ZooKeeper
+  for dynamic environments; Kubernetes blends both.
+- Propagation delay is the dirty secret — registration and
+  deregistration aren't instant. Plan for the gap.
+- Don't put high-cardinality data in the registry. It's for
+  membership, not state.
+- The modern default in serious deployments is a service mesh
+  (Istio, Linkerd, Consul Connect) for the observability and
+  retry consistency benefits, despite the operational cost.

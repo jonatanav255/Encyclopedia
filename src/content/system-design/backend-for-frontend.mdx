@@ -1,0 +1,251 @@
+export const level = 'senior';
+
+# Backend for frontend (BFF)
+
+A BFF is an API service tailored to **one client channel** — web,
+iOS, Android, partner integration, smart TV — that aggregates and
+shapes data from internal services for that specific client. It
+exists so the underlying services don't have to know about every
+client's view, and so each client doesn't have to over-fetch from
+ten services.
+
+The pattern was named at SoundCloud; Phil Calçado's writeup is the
+canonical reference. Newman covers it in *Building Microservices*.
+
+## The problem it solves
+
+Without a BFF, two bad patterns dominate:
+
+<Compare a="One API for all clients" b="Each client calls many services">
+<>
+**One generic API** for web, mobile, and partners. The API has the
+union of fields every client needs, plus optional flags for what to
+include. Web ignores half the fields; mobile pays for fields it
+discards; new client requirements force backwards-incompatible
+changes that affect everyone.
+</>
+<>
+**Each client calls many services** directly. Mobile makes 8 calls
+to render one screen, on a flaky 4G connection. Cross-service joins
+happen in app code. Authentication has to be configured per call.
+Every backend change requires updates in every client.
+</>
+</Compare>
+
+Both are common. Both rot quickly.
+
+## The BFF shape
+
+```
+[web client]   [iOS client]   [Android client]
+     ↓              ↓                ↓
+[web BFF]      [iOS BFF]        [Android BFF]
+     │              │                │
+     └──────────────┼────────────────┘
+                    ↓
+   [orders] [users] [catalog] [recommendations]
+```
+
+One BFF per client channel. Each BFF:
+
+- **Aggregates**: turns "render this screen" into N parallel calls.
+- **Shapes**: returns only what this client uses, in the shape it
+  wants.
+- **Adapts**: handles per-client auth, versioning, error formats,
+  payload size budgets.
+- **Owns**: lives in the client team's repo, deploys with their
+  cadence.
+
+The services behind the BFFs stay generic, stable, and unaware of
+clients.
+
+## Why one BFF per client, not one for all
+
+The naive question is "why not just one BFF for all clients?" The
+honest answer:
+
+<Cheatsheet>
+| Concern | Why per-channel matters |
+|---|---|
+| Payload size | Mobile needs minimal payloads (battery, bandwidth). Web tolerates more. |
+| Auth model | Web uses session cookies; mobile uses long-lived OAuth tokens; partner uses API keys. |
+| Caching | Web can rely on CDN; mobile needs offline-friendly responses. |
+| Versioning | Mobile apps live in app stores for years; web ships weekly. Decoupling versions matters. |
+| Field shape | Same domain object renders differently per channel. |
+| Team ownership | Web team owns the web BFF; mobile team owns mobile BFFs. Conway's law in your favour. |
+</Cheatsheet>
+
+One BFF for everyone re-creates the original "generic API" problem,
+just one layer further in. The decoupling only works if each channel
+truly owns its BFF.
+
+## What goes in a BFF
+
+The BFF is **client-shaped glue**:
+
+- Aggregation: fan-out to services, combine results.
+- Filtering: only the fields this client needs.
+- Reshaping: nested vs flat, denormalized vs normalized, locale-
+  appropriate formats.
+- Error translation: map service errors to client-friendly responses.
+- Caching: per-screen caches when invalidation is feasible.
+- Per-screen endpoints: one call per screen on mobile, even if it's
+  many service calls behind it.
+
+What does NOT go in a BFF:
+
+- Domain logic. The BFF doesn't know how to compute order totals.
+- Persistent state. The BFF doesn't own data; it composes data.
+- Cross-client logic. If two clients need the same logic, it belongs
+  in a service.
+
+The line is "presentation aggregation" vs "business logic." Keep
+domain rules out.
+
+## BFF vs API gateway
+
+These are commonly confused. They are not the same thing:
+
+```
+API gateway: one edge entry; policy plane; auth/rate-limit/routing.
+BFF:         one per client channel; aggregates and shapes domain
+             data for that client.
+```
+
+They can stack:
+
+```
+[client] → [API gateway: auth, rate limit] → [BFF: shape & aggregate]
+                                                 ↓
+                                            [services]
+```
+
+The gateway is platform infrastructure. The BFF is client-team code.
+
+## A worked example
+
+A mobile "home screen" needs: profile, last 3 orders, recommended
+products, unread notifications, current cart count.
+
+**Without a BFF**: mobile makes 5 calls. Each over the wire. Each
+with its own auth, latency, retry. p99 is the slowest of 5 fan-out
+calls. Render delay measured in seconds on flaky networks.
+
+**With a BFF**: mobile makes 1 call to `/mobile/home`. The BFF
+fans out to the 5 services in parallel server-side (low-latency
+internal network), composes the response, returns ~3 KB of shaped
+JSON tailored to the home screen's exact fields.
+
+```js
+// mobile BFF: /mobile/home
+app.get('/mobile/home', async (req, res) => {
+  const [profile, orders, recs, notifs, cart] = await Promise.all([
+    users.getProfile(req.userId),
+    orders.listRecent(req.userId, { limit: 3 }),
+    recs.forUser(req.userId, { limit: 5 }),
+    notifications.unreadCount(req.userId),
+    cart.summary(req.userId),
+  ]);
+
+  res.json({
+    greeting: profile.firstName,
+    recentOrders: orders.map(o => ({ id: o.id, total: o.totalCents })),
+    recommended: recs.map(r => ({ id: r.id, title: r.title, image: r.thumbnail })),
+    notifications: { unread: notifs },
+    cart: { count: cart.itemCount },
+  });
+});
+```
+
+One round trip. Mobile-tailored fields. Service calls in parallel.
+Backend services unchanged.
+
+## Common pitfalls
+
+### BFF as a service-of-services
+
+A "BFF" that owns persistent state, has its own DB, has cron jobs
+and event handlers is not a BFF — it's a new service with bad
+naming. Keep BFFs **stateless aggregators**.
+
+### BFF as the new monolith
+
+Every team puts everything in the web BFF "because that's where the
+endpoints are." Now the web BFF is a god service that owns half the
+domain. Split BFFs along screen/feature lines, or extract domain
+logic into actual services.
+
+### Shared BFF across teams
+
+Two client teams share a BFF "to reuse code." Six months later,
+neither team can change it without coordination. Either split the
+BFF, or fold it into the underlying services as a generic API.
+
+### Untyped contracts between BFF and services
+
+The BFF calls services with raw HTTP and `any` types. Service schema
+changes silently break the BFF. Use generated client SDKs (OpenAPI,
+gRPC, GraphQL codegen) so contract drift is a compile error.
+
+### N+1 in BFF aggregation
+
+The BFF calls `getOrders`, then for each order calls `getCustomer`.
+Now you have N+1 service calls. Either expose a batched endpoint
+from the customer service, use a DataLoader-style coalescer in the
+BFF, or denormalize the data at the source. See **N+1 queries and
+DataLoader (architecture)**.
+
+### Over-fetching from services
+
+The BFF asks the orders service for everything and then filters in
+the BFF. The fix: services support **field selection** (GraphQL,
+sparse fieldsets in REST, gRPC field masks). The BFF asks only for
+what it needs.
+
+## When NOT to use a BFF
+
+Honest counterexamples:
+
+- **One client channel only.** No reason for a BFF; the service API
+  is the BFF.
+- **Very simple data shape.** If the client's response is one
+  service's response, you're paying overhead for nothing.
+- **Tiny teams.** A BFF per channel × 4 channels = 4 services to
+  operate. If your team is 3 engineers, you cannot afford it.
+- **GraphQL already in place.** A well-run GraphQL gateway can play
+  the BFF role for multiple clients; the line blurs.
+
+## GraphQL and BFFs
+
+GraphQL is sometimes positioned as "BFF you don't have to write" —
+the client picks fields, the gateway resolves them from services.
+This works in real teams (GitHub, Shopify) but has costs:
+
+- Each service must expose a typed resolver or DB query.
+- Query cost limits, persisted queries, depth limits are required;
+  open GraphQL is a DDoS surface.
+- Schema federation (Apollo, Wundergraph) has its own complexity.
+
+GraphQL can substitute for many BFFs **at sufficient scale**. For
+smaller teams, a handful of REST BFFs is simpler. See **REST vs
+gRPC vs GraphQL**.
+
+<Callout variant="info">
+A BFF is glue, not a service. If yours has business logic, a
+database, or cron jobs, it is no longer a BFF — and you should
+either reduce its scope or rename what you've built.
+</Callout>
+
+## In summary
+
+- A BFF aggregates and shapes data for one client channel; one
+  per channel (web, iOS, Android, partner).
+- It exists so services stay generic and clients don't over-fetch
+  or fan out from the device.
+- It is **glue**: aggregation, shaping, error translation, caching.
+  No domain logic, no persistent state, no cross-client logic.
+- BFF and API gateway are different; they can coexist (gateway for
+  policy, BFF for shape).
+- Common failure modes: BFF turns into a god service, shared across
+  teams, or carries business logic — refactor or rename.
+- For very small teams or single-channel products, skip the BFF.

@@ -1,0 +1,346 @@
+export const level = 'senior';
+
+# Change data capture (CDC)
+
+Change data capture turns a database's commit log into a
+stream of change events that other systems can consume. It is
+the backbone of modern event-driven architectures, real-time
+analytics, search index updates, cache invalidation, and
+microservice data fan-out — and one of the highest-leverage
+patterns you can adopt.
+
+The core insight: the database already records every change
+durably and in order. Just read that log and publish it.
+
+## Why CDC, not polling
+
+The naïve approach: query for changes periodically.
+
+```js
+`SELECT * FROM orders WHERE updated_at > $last_seen`
+```
+
+Problems with polling:
+
+- **Misses deletes.** A deleted row leaves no `updated_at`.
+- **Heavy on the primary.** Each poll is a query.
+- **Latency = poll interval.** Sub-second freshness requires
+  hammering the DB.
+- **Clock skew & races.** Two writes with the same
+  `updated_at` may be missed if the poll cursor advances
+  between them.
+- **Schema discipline.** Every table must have a reliable
+  `updated_at` and the application must maintain it.
+
+CDC reads the database's **write-ahead log** (Postgres WAL,
+MySQL binlog, MongoDB oplog) and emits every row mutation —
+inserts, updates, deletes — in commit order, with no
+application support required.
+
+## The shape of a CDC event
+
+Each event represents one row change:
+
+```json
+{
+  "op": "u",
+  "before": { "id": 42, "email": "a@x", "name": "A", "version": 7 },
+  "after":  { "id": 42, "email": "b@x", "name": "A", "version": 8 },
+  "source": {
+    "db": "app",
+    "table": "users",
+    "lsn": "0/16AB47B0",
+    "ts": 1715000000000
+  }
+}
+```
+
+Fields:
+
+- `op`: `c` (create), `u` (update), `d` (delete), `r` (snapshot read).
+- `before` / `after`: row state.
+- `source`: log position (LSN / GTID / oplog ts), source table.
+
+Consumers process events in order, idempotently, and
+acknowledge their progress via offset/LSN.
+
+## What CDC is used for
+
+Five canonical use cases:
+
+<Steps>
+<Step n={1} title="Search index updates.">
+Every row change flows to Elasticsearch / OpenSearch / Algolia.
+The index stays seconds-fresh without batch jobs.
+</Step>
+<Step n={2} title="Cache invalidation.">
+On a row change, publish "users/42 changed" — services with
+that key cached purge it. No more "30 second TTL cache that's
+also wrong."
+</Step>
+<Step n={3} title="Analytical warehouse loading.">
+Real-time replication from OLTP to ClickHouse / Snowflake /
+BigQuery. Dashboards are minutes-fresh, not hours.
+</Step>
+<Step n={4} title="Microservice data fan-out.">
+The order service writes to its DB; CDC publishes
+`order.placed` events; inventory, shipping, and notifications
+services react. No coupling at the API layer.
+</Step>
+<Step n={5} title="Database replication & migration.">
+Logical replication between heterogeneous databases. Move
+from Postgres 14 to 16, or to a different engine, without
+downtime.
+</Step>
+</Steps>
+
+## How CDC works under the hood
+
+Three families of source mechanisms:
+
+### Log-based CDC
+
+Read the database's transaction log directly.
+
+- **Postgres**: logical replication slots decode WAL into row
+  events; `pgoutput` or `wal2json` plugins.
+- **MySQL**: binlog in `ROW` format includes per-row
+  before/after images.
+- **MongoDB**: oplog is a capped collection of all changes.
+- **Oracle**: LogMiner / XStream.
+- **SQL Server**: CDC tables / Change Tracking.
+
+This is the **correct** way. Captures everything (including
+deletes), no load on the primary's query path, ordered by
+commit, low latency.
+
+### Trigger-based CDC
+
+Database triggers write a copy of each change to an audit
+table. A worker reads the audit table.
+
+- Works for any database, including those without good log
+  access.
+- Doubles the write cost (every write fires a trigger).
+- Triggers can be bypassed (TRUNCATE, certain bulk loads).
+- Schema discipline (triggers per table) is tedious.
+
+Used when log-based isn't available; otherwise avoid.
+
+### Query-based CDC
+
+Periodic `SELECT WHERE updated_at > last_seen`. The polling
+anti-pattern above. Only viable as a stopgap.
+
+## Debezium: the canonical implementation
+
+Debezium is the de facto open-source CDC platform. It runs as
+a Kafka Connect connector — one process per source database —
+that reads the database's log and writes to Kafka topics.
+
+Architecture:
+
+```
+[Postgres / MySQL / Mongo]
+         ↓ logical replication slot / binlog / oplog
+[Debezium connector (Kafka Connect)]
+         ↓
+[Kafka topics: db.schema.table]
+         ↓
+[Consumers: search, cache, warehouse, services]
+```
+
+Properties:
+
+- **One topic per source table.** Partition key = primary key.
+- **At-least-once** delivery by default; exactly-once with
+  Kafka transactions.
+- **Snapshotting**: on startup, reads the entire table once,
+  then streams ongoing changes.
+- **Schema registry**: schema evolves; consumers see versioned
+  events.
+- **Replayable**: rewind a consumer's offset to reprocess.
+
+Operational reality: Debezium + Kafka + schema registry is a
+real platform to operate. The payoff is enormous, but plan for
+the operational weight.
+
+## Postgres specifics
+
+```bash
+# postgresql.conf
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+```
+
+```js
+// On the database
+`CREATE PUBLICATION app_pub FOR ALL TABLES;
+ SELECT pg_create_logical_replication_slot('debezium_slot', 'pgoutput');`
+```
+
+Things that bite:
+
+- **Slot retention**: an unused replication slot accumulates
+  WAL forever. Disk fills; primary dies. Always monitor
+  `pg_replication_slots.active = true` and drop dead slots.
+- **TOAST values not always present**: unchanged large fields
+  may be missing from `before` images.
+- **DDL doesn't replicate**: ALTER TABLE on the source
+  doesn't flow through; consumers must handle schema changes
+  out of band (or use connector features that emit schema
+  events).
+- **Logical replication is heavier than physical**: more CPU
+  on the source, especially for high-write tables.
+
+## MySQL specifics
+
+```bash
+# my.cnf
+log-bin = mysql-bin
+binlog_format = ROW
+binlog_row_image = FULL
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+The binlog must be in `ROW` format (not `STATEMENT`); `FULL`
+row image is needed for `before` data.
+
+GTIDs allow consumers to track position uniquely across
+failover.
+
+## Alternatives without Kafka
+
+CDC doesn't require Kafka. Lighter-weight options:
+
+- **Postgres LISTEN/NOTIFY**: triggers emit notifications;
+  workers `LISTEN`. Doesn't replay, but simple.
+- **Debezium server / standalone**: streams to AWS Kinesis,
+  Google Pub/Sub, Pulsar, or HTTP webhooks.
+- **AWS DMS**: managed CDC from RDS / MySQL / etc.
+- **Database-native streams**: DynamoDB Streams, MongoDB
+  Change Streams.
+- **Native CDC tables**: SQL Server / Oracle expose CDC tables
+  the application can query.
+
+For a small team, "CDC into Snowflake" via Fivetran or AWS DMS
+beats running Debezium yourself. As volumes and consumer
+counts grow, owning the pipeline pays off.
+
+## Outbox pattern: simpler alternative
+
+For "write to DB + emit a domain event" without Kafka, the
+outbox pattern stays atomic without a CDC platform.
+
+```js
+await db.transaction(async (tx) => {
+  await tx.orders.insert({ ...order });
+  await tx.outbox.insert({
+    aggregate: 'order',
+    aggregate_id: order.id,
+    type: 'order.placed',
+    payload: order,
+  });
+});
+
+// worker:
+const events = await db.query('SELECT * FROM outbox WHERE processed = false LIMIT 100');
+for (const e of events) {
+  await broker.publish(e.type, e.payload);
+  await db.query('UPDATE outbox SET processed = true WHERE id = $1', [e.id]);
+}
+```
+
+Trade: an extra table and a worker, but no Debezium /
+Kafka / schema registry. Excellent for small-to-mid
+deployments.
+
+The outbox can also be **read by Debezium** as a CDC source,
+giving you "domain events" rather than raw row changes.
+
+## Consumer concerns
+
+### Idempotency
+
+Events may be redelivered. Consumers must be idempotent:
+
+- Track `(topic, partition, offset)` (Kafka) or LSN /
+  event-id and skip duplicates.
+- Use `UPSERT` semantics when writing to downstream stores.
+- Use the event's `version` field to ignore stale events.
+
+### Ordering
+
+Partition key = primary key guarantees per-key ordering.
+Cross-key ordering is not preserved. Consumers that care about
+cross-key ordering (rare) need a single partition (which
+sacrifices throughput).
+
+### Schema evolution
+
+The source DB schema changes; consumers must cope. Strategies:
+
+- **Backward-compatible only**: add nullable columns, never
+  remove. Apply schema changes in stages (deploy consumer
+  first, then producer).
+- **Schema registry**: each event carries a schema id;
+  consumers fetch the schema lazily.
+- **Versioned topics**: `users.v1`, `users.v2` for major
+  schema breaks.
+
+### Lag monitoring
+
+Consumer lag = events produced but not yet processed. Critical
+SLI:
+
+- For cache invalidation: < 1s.
+- For search indexes: < 30s typical.
+- For analytics: < 5 min.
+
+When lag exceeds threshold, alert. A slow consumer can cause
+Kafka topic retention to roll past its offset; that's data
+loss.
+
+## Failure modes
+
+### Slot bloat (Postgres)
+
+Active replication slot keeps WAL around. If the consumer
+disappears, WAL accumulates until disk is full. **Monitor
+slot lag**; drop slots that have been inactive for > N hours
+after operator confirmation.
+
+### Replay storms
+
+Restarting Debezium from scratch on a TB-sized DB triggers a
+multi-hour snapshot followed by catch-up. Plan for it.
+
+### Wrong partition key for ordering
+
+If you partition by user_id and care about per-order ordering,
+ordering breaks when a user has multiple orders processed
+concurrently. Match partition key to the consumer's ordering
+needs.
+
+### Consumer drift
+
+The consumer applies events out of order or with bugs; its
+downstream view diverges from the source. Build periodic
+reconciliation jobs that compare counts or checksums.
+
+## In summary
+
+- CDC tails the database's commit log and turns row mutations
+  into a stream of change events.
+- Replaces polling: low latency, captures deletes, no source
+  query load.
+- Use cases: search indexes, cache invalidation, real-time
+  analytics, microservice events, replication.
+- Log-based (Debezium reading Postgres WAL / MySQL binlog /
+  Mongo oplog) is the production-grade approach.
+- Outbox is the lighter alternative when you don't want to run
+  Debezium.
+- Operational concerns: slot bloat, consumer lag, ordering
+  guarantees, schema evolution. Plan for all four.

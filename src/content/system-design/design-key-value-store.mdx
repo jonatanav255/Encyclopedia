@@ -1,0 +1,179 @@
+export const level = 'staff';
+
+# Design a key-value store
+
+A Dynamo-class distributed KV store. The interview classic.
+Mostly about applying every distributed-systems primitive at
+once: consistent hashing, quorum reads/writes, vector clocks,
+gossip, anti-entropy.
+
+## 1. Clarify the scope
+
+- Strong consistency or tunable?
+- Multi-region or single?
+- Read/write ratio?
+- Value size: a few KB or multi-MB?
+- Linearizable single-key ops needed (LWT-style)?
+- Persistent storage or in-memory?
+
+Default assumption for this design: tunable consistency,
+multi-region, mostly KB values, persistent, no transactions.
+
+## 2. Estimate scale
+
+```
+DAU: 100M, ops/user/day: 100 = 10B ops/day
+QPS avg: 100K; peak 300K
+Storage: 10B ops × 1KB avg × 30 days retention = 300 TB
+Nodes: 300 TB / 4 TB per node × 3x replication = ~225 nodes
+```
+
+## 3. API
+
+```bash
+PUT /kv/<key>
+  Body: <value bytes>
+  Returns: 200 OK with version vector
+
+GET /kv/<key>
+  Returns: 200 OK with value + version vector
+
+DELETE /kv/<key>
+  Returns: 200 OK
+```
+
+Optional headers: `Consistency: ONE|QUORUM|ALL`, `Vector: <vc>`
+for causal reads.
+
+## 4. High-level design
+
+```
+client → coordinator (any node) → N replicas via consistent hash
+                                      ↓
+                                  ack to coordinator
+                                      ↓
+                                  ack to client
+```
+
+Every node is identical. Any node can be the coordinator for
+any request. Replication is N=3 by default; coordinator
+forwards to the N nodes owning that key's hash range.
+
+## 5. Data model
+
+A flat key → value mapping. Internally:
+
+- **Storage**: LSM tree per node (RocksDB / leveldb / custom).
+- **Replication metadata**: vector clock per key.
+- **Cluster metadata**: gossip-replicated ring of node ownership.
+
+Consistent hashing places keys on a ring; each node owns
+several non-contiguous "virtual nodes" (vnodes) to balance
+load.
+
+## 6. Deep dives
+
+### Consistent hashing with vnodes
+
+Each physical node hosts 100–256 vnodes scattered around the
+ring. When a node is added or removed, only its vnodes move —
+~1/N of the data — instead of half.
+
+### Quorum reads/writes
+
+`PUT` waits for W of N replicas to ack. `GET` reads from R.
+With R+W>N you can guarantee a read sees the latest write.
+Tunable per request:
+
+- ONE / ONE: fastest, weakest
+- QUORUM / QUORUM: balanced, R+W>N
+- ALL / ALL: strongest, least available
+
+See quorum-systems.
+
+### Conflict resolution with vector clocks
+
+Concurrent writes produce sibling versions. On read, the
+coordinator returns all siblings; the client decides how to
+merge.
+
+```js
+const { value, vectorClock } = await get('cart:user42');
+// value might be { siblings: [{cart: ['A']}, {cart: ['B']}] }
+const merged = mergeCart(value.siblings);
+await put('cart:user42', merged, { vectorClock });
+```
+
+For most workloads, LWW is fine; for shopping carts and
+counters, application-level merge or CRDTs.
+
+### Anti-entropy
+
+Replicas drift due to drops, partitions, slow nodes. Periodic
+**Merkle tree** comparison between replicas detects divergence:
+
+<Steps>
+<Step n={1} title="Each replica builds a Merkle tree of its data per partition range.">
+Hashes of hashes of hashes; root is one hash.
+</Step>
+<Step n={2} title="Two replicas exchange root hashes.">
+Equal → done. Different → recurse.
+</Step>
+<Step n={3} title="Recurse down branches until disagreement.">
+Identifies divergent keys without scanning the whole dataset.
+</Step>
+<Step n={4} title="Reconcile by comparing vector clocks.">
+Take the newer (or both as siblings for app merge).
+</Step>
+</Steps>
+
+### Hinted handoff
+
+If replica R is down when a write arrives, the coordinator
+writes to another node with a **hint** marking "this should
+have gone to R." When R recovers, the hint-holder replays.
+
+### Gossip-based membership
+
+(See gossip-protocols.) Each node gossips its view of the
+ring. Joins, departures, and failures propagate in O(log N)
+rounds. No central registry.
+
+### Read repair
+
+On read, if some replicas return stale values, asynchronously
+update them. The system self-heals between full anti-entropy
+passes.
+
+## 7. Bottlenecks and scale-ups
+
+- **Hot keys** → see hot-keys-and-key-sharding.
+- **Cross-region writes** → quorum across regions costs
+  latency; default to single-region writes with async cross-region
+  replication.
+- **Large values** → store the value in object storage; KV holds
+  only the pointer + metadata.
+- **High write QPS** → split into multiple clusters by key prefix.
+
+## 8. Tradeoffs called out
+
+- **Leaderless (Dynamo) vs leader-based (Raft KV)**: chose
+  leaderless for write availability across regions.
+- **Eventual consistency by default**: tunable per request.
+- **Application-merge conflicts**: chose surfacing siblings
+  over silent LWW, because for cart-shaped data LWW silently
+  loses items.
+- **No multi-key transactions**: trade-off for scalability.
+  Need transactions → use a different store.
+
+## In summary
+
+- Dynamo-style design: consistent hashing for partitioning,
+  replication factor N, tunable R/W quorums.
+- Vector clocks for conflict detection; application or LWW
+  resolution.
+- Gossip for membership and failure detection.
+- Hinted handoff for transient failures, anti-entropy for
+  permanent drift, read repair for online healing.
+- Trades multi-key transactions and strong-by-default
+  consistency for write availability and horizontal scale.

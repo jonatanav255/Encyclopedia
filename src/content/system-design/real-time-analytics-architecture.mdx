@@ -1,0 +1,208 @@
+export const level = 'staff';
+
+# Real-time analytics architecture
+
+Combine **streaming ingest** with **sub-second OLAP queries**.
+The user types a query in a dashboard; the system returns
+aggregates of the last few minutes of data in tens of
+milliseconds.
+
+The class of systems: Apache Druid, Apache Pinot,
+ClickHouse, Apache Doris, StarRocks, Materialize, RisingWave.
+
+## What "real-time" means here
+
+Traditional warehouses (Snowflake, BigQuery) are great at
+"yesterday's data" but slow for "now." Refresh cycles measure
+in minutes to hours.
+
+Real-time OLAP serves dashboards with:
+
+- **Ingestion latency**: events queryable within seconds.
+- **Query latency**: sub-second p99.
+- **High concurrency**: hundreds of dashboard users.
+- **Aggregations across billions of rows**.
+
+Used for: user-facing analytics (Linkedin's dashboards, Uber's
+realtime ops), trading dashboards, ad-tech reporting, IoT
+fleet monitoring.
+
+## The architecture
+
+```
+event sources
+   ▼
+Kafka (durable buffer)
+   ▼
+ingest workers (transform, enrich)
+   ▼
+columnar OLAP store
+   ├── recent data: in-memory / NVMe (hot)
+   └── older data: object storage (cold)
+       ▼
+   query engine (parallel scan, vectorized)
+       ▼
+   dashboard / API
+```
+
+Key engineering wins:
+
+- **Columnar storage** for fast aggregation.
+- **Pre-aggregated rollups** at multiple granularities.
+- **Tiered storage** for cost.
+- **Bitmap and sparse indexes** for filter-heavy queries.
+
+## Druid's design
+
+The canonical example:
+
+- **Real-time ingestion nodes** accept stream data.
+- **Historical nodes** serve immutable segments from older
+  data.
+- **Coordinator** distributes segments to nodes.
+- **Broker** routes queries, scatters them across nodes,
+  merges results.
+
+A query "average response time, grouped by service, last 5
+minutes" scatters across nodes responsible for the relevant
+time range, each computes a partial result, the broker
+combines.
+
+Sub-second on terabytes of data.
+
+## Pinot's design
+
+Similar shape: realtime + offline ingestion, segments distributed
+across nodes. Distinguishes:
+
+- **Realtime servers**: ingest from Kafka, serve fresh data.
+- **Offline servers**: serve segments built from batch jobs.
+
+A query can span both: "the last 7 days" hits both realtime
+(last hour) and offline (older).
+
+## ClickHouse's design
+
+A single-binary OLAP database. Columnar storage; aggressive
+vectorization; runs on single nodes and clusters.
+
+Compared to Druid/Pinot: more SQL-friendly, simpler
+operation, slightly higher query latency for the same data
+size. Often the right choice for teams new to real-time
+analytics.
+
+## Schema design
+
+Real-time OLAP schemas are different from OLTP:
+
+- **Wide, denormalized tables**. No expensive joins at query
+  time.
+- **Pre-aggregated columns** for common metrics.
+- **Bitmap indexes** on low-cardinality columns.
+- **Sort key** on the most-filtered column (usually
+  timestamp + an identifier).
+
+Trade off **storage and ingest cost** for **query speed**.
+
+## Pre-aggregation
+
+For "events per minute per service" queries on a billion-event
+table, scanning every row is slow.
+
+Pre-aggregate: maintain rollup tables at 1-minute, 1-hour,
+1-day granularity. The query picks the right table based on
+its time range.
+
+Druid does this automatically (rollups during ingestion).
+ClickHouse supports it via materialized views or summing
+merge trees. dbt + clickhouse can model it explicitly.
+
+## Cardinality limits
+
+OLAP systems handle modest cardinality fine. **Very high
+cardinality** (millions of unique values per dimension) is
+hard:
+
+- Bitmap indexes for low-cardinality (e.g., country, service
+  name) work well.
+- Hash indexes for high-cardinality (user_id, request_id) take
+  more memory and slow filters.
+
+For user-id-grain queries, sample or use approximate
+aggregations (HyperLogLog for distinct counts, TDigest for
+percentiles).
+
+## Approximate aggregations
+
+Many real-time OLAP systems support sketches:
+
+- **HyperLogLog** for distinct count (e.g., DAU).
+- **t-digest** / **q-digest** for percentiles.
+- **count-min sketch** for top-K.
+
+Accept 0.5-2% error in exchange for orders-of-magnitude
+better performance.
+
+## Ingestion considerations
+
+### Exactly-once or at-least-once?
+
+For some metrics (counts, sums), at-least-once with
+de-duplication on a request_id works. For others, exactly-once
+streaming (Kafka transactions + Flink checkpoints) is needed.
+
+(See exactly-once-stream-processing.)
+
+### Late events
+
+Events arriving minutes/hours late. Patterns:
+
+- **Time-windowed late tolerance**: rollups accept late events
+  for some grace period.
+- **Reprocess**: a batch job re-aggregates affected windows.
+
+### Schema evolution
+
+New columns added: most OLAP systems handle gracefully (old
+rows get NULL or default).
+Column type changes: harder; usually requires a new column +
+backfill + cutover.
+
+## Query patterns to optimize for
+
+OLAP queries follow patterns. Tune storage for them:
+
+- **Filter by time range + group by something** — sort by
+  time, partition by day.
+- **Filter by service + aggregate** — bitmap index on service.
+- **Top-K of high-cardinality** — pre-rollup at coarser
+  grain.
+- **Window functions over a single key's history** — sort by
+  (key, time).
+
+A schema designed for the wrong query patterns can be 100×
+slower than one designed for them.
+
+## Costs
+
+Real-time OLAP is not cheap:
+
+- **Compute**: always-on; many cores for parallel scan.
+- **Storage**: pre-aggregations multiply.
+- **Operations**: cluster management, schema evolution,
+  upgrades.
+
+Use only when warehouses + 5-minute refresh aren't fast
+enough. For "yesterday's KPIs," a warehouse is much cheaper.
+
+## In summary
+
+- Real-time analytics: streaming ingest + sub-second OLAP
+  queries.
+- Druid, Pinot, ClickHouse, Doris, StarRocks dominate.
+- Architecture: Kafka → ingest → columnar store (hot + cold
+  tiers) → query engine.
+- Pre-aggregation at multiple grains key to performance.
+- Use approximate sketches (HLL, t-digest) for high cardinality.
+- Don't reach for it unless 5-minute refresh isn't fast
+  enough; warehouses are dramatically cheaper.

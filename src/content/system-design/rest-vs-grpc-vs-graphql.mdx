@@ -1,0 +1,261 @@
+export const level = 'senior';
+
+# REST vs gRPC vs GraphQL
+
+Three families dominate inter-service APIs in 2026. Each makes a
+different trade among **performance, schema rigor, client
+flexibility, ecosystem, and observability**. The honest answer is
+that they're not interchangeable — picking is mostly about which
+trade you're willing to make.
+
+Geewax's *API Design Patterns* covers the design surface; Continuous
+API Management covers the lifecycle.
+
+## The thumbnail
+
+<Cheatsheet>
+| | REST (HTTP+JSON) | gRPC (HTTP/2+protobuf) | GraphQL (HTTP+typed schema) |
+|---|---|---|---|
+| Wire | JSON (text) | Protobuf (binary) | JSON over HTTP POST |
+| Transport | HTTP/1.1 or 2 | HTTP/2 (HTTP/3 emerging) | HTTP/1.1 or 2 |
+| Schema | Optional (OpenAPI) | Required (.proto) | Required (SDL) |
+| Codegen | Optional | First-class | First-class |
+| Browser-friendly | Yes | No (needs gRPC-Web) | Yes |
+| Streaming | SSE / WebSockets | Bidirectional first-class | Subscriptions (over WS) |
+| Caching | HTTP caches just work | None native | Per-query, harder |
+| Client-driven shape | No | No | Yes (the killer feature) |
+| Versioning | URL / header | Field numbers in proto | Schema evolution rules |
+| Best for | Public APIs, simple CRUD | Internal services, low-latency | Many clients with different shapes |
+</Cheatsheet>
+
+## REST
+
+**HTTP + JSON, conventionally CRUD over resources.** The default and
+usually the right one.
+
+Pros:
+
+- **Ubiquity.** Every language, every tool, every CDN, every cache,
+  every browser, every load balancer speaks it. Logs, dashboards,
+  rate limiters work out of the box.
+- **HTTP caching.** GETs cache at every layer (browser, CDN, gateway,
+  app). Free performance, no code.
+- **Simple debugging.** `curl`, browser devtools, any proxy. You
+  can read the wire.
+- **Cheap to evolve.** Add fields without breaking clients (with
+  discipline). Deprecate via headers (`Sunset`, `Deprecation`).
+
+Cons:
+
+- **Larger payloads** vs binary formats. 2–10× for typical objects.
+- **No native schema.** OpenAPI bolts one on. Codegen is fine but
+  not the universal experience gRPC has.
+- **Designed for resources, not RPC.** "Send these 17 commands as
+  one batch" is awkward; "subscribe to changes" requires SSE or
+  WebSockets.
+- **Round-trips for hierarchical data.** "Get user, then their
+  orders, then each order's items" → 3 round trips unless you
+  build a custom endpoint.
+
+Best for: public APIs, partner integrations, browser-facing services,
+any service where you want to lean on HTTP infrastructure.
+
+## gRPC
+
+**HTTP/2 + Protocol Buffers, RPC semantics.** Designed at Google for
+internal service calls.
+
+Pros:
+
+- **Performance.** Binary payloads, header compression, HTTP/2
+  multiplexing. 5–10× smaller payloads, ~2× better p99 latency than
+  JSON REST for chatty calls.
+- **Strict schema.** `.proto` files are the contract. Codegen for
+  every major language. Breaking changes are visible at compile time.
+- **Native streaming.** Server-streaming, client-streaming,
+  bidirectional. Useful for real-time data, large file transfer,
+  long-running responses.
+- **Built-in retries, deadlines, cancellation.** Library-level
+  primitives that REST clients reinvent.
+- **First-class field masks and partial updates.** No `PATCH` ad-hoc
+  semantics; you say which fields you mean.
+
+Cons:
+
+- **Not browser-friendly.** Browsers can't speak gRPC directly.
+  gRPC-Web works but requires a proxy and loses bidirectional
+  streaming.
+- **Poor cache story.** No HTTP caching; you build your own.
+- **Worse debuggability.** Binary on the wire. Need grpcurl or
+  protoc-decoded logs.
+- **Tooling expectations.** Schema registry, codegen pipeline, CI
+  enforcement. Without these, the schema's value erodes.
+- **Load balancer awareness.** L4 LBs work; L7 with proper HTTP/2
+  multiplexing requires Envoy or equivalent.
+
+Best for: internal service-to-service calls in a polyglot fleet,
+low-latency requirements, streaming workloads, when the schema is
+the source of truth.
+
+## GraphQL
+
+**Single endpoint (`POST /graphql`), typed schema, client picks
+fields.** Born at Facebook to serve heterogeneous clients from one
+backend.
+
+Pros:
+
+- **Client-driven shape.** Mobile asks for `{ name, avatar }`; web
+  asks for `{ name, avatar, bio, recent_orders { id, total } }`. No
+  over-fetch, no under-fetch.
+- **Strongly typed schema.** Codegen for clients; introspection;
+  documentation comes free.
+- **Aggregation across services.** Federated GraphQL (Apollo,
+  Wundergraph) stitches multiple services into one endpoint —
+  effectively replacing BFFs.
+- **Subscription support** (over WebSockets) for real-time.
+
+Cons:
+
+- **Caching is hard.** All requests are `POST /graphql`; HTTP caches
+  don't help. Per-query caching needs special handling (persisted
+  queries, normalized client caches).
+- **N+1 by default.** Naive resolvers fetch each nested field
+  separately. DataLoader is mandatory, not optional. See **N+1
+  queries and DataLoader (architecture)**.
+- **Query-cost surface.** A client can request a deeply nested,
+  expensive query. Open GraphQL is a DDoS vector; depth limits,
+  cost analysis, persisted queries are required for safety.
+- **Versioning by deprecation only.** You don't bump versions; you
+  deprecate fields. Works if the team is disciplined; rots if not.
+- **Operational complexity at scale.** Federation is non-trivial.
+  Schema governance across teams becomes a job.
+
+Best for: products serving many client platforms with different data
+needs (web + iOS + Android + partner), data-aggregation layers,
+public APIs where flexible shapes matter more than performance.
+
+## A decision frame
+
+Pick by the question that matters most:
+
+<Steps>
+<Step n={1} title="Who calls this API?">
+Browsers and external partners: REST or GraphQL. Internal services:
+gRPC is on the table.
+</Step>
+<Step n={2} title="How chatty is the call pattern?">
+One round trip per business operation: REST is fine. Many small
+calls in a tight path: gRPC's perf advantage shows. Many fields
+across resources from one call: GraphQL.
+</Step>
+<Step n={3} title="How important is the schema?">
+A team that ships fast without strict contracts: REST with OpenAPI
+is enough. A polyglot org with strict typing: gRPC. A many-client
+product where the schema is the product: GraphQL.
+</Step>
+<Step n={4} title="How important is HTTP infrastructure?">
+You want CDN caching, simple rate limiting, browser tools, easy
+debugging: REST. You don't care: gRPC.
+</Step>
+<Step n={5} title="Streaming or real-time?">
+Bidirectional streaming as a first-class need: gRPC. Server-push
+of events to clients: GraphQL subscriptions or SSE. Otherwise REST.
+</Step>
+</Steps>
+
+The dominant outcome at most companies:
+
+- **Public/external APIs**: REST (or GraphQL for many-client
+  products).
+- **Internal service-to-service**: gRPC.
+- **Client aggregation layer**: BFF in REST, or federated GraphQL.
+
+Don't pick one for the whole stack just to be consistent. Different
+layers have different needs.
+
+## Versioning across the three
+
+A specific area where they differ:
+
+```
+REST:    URL versioning (/v1, /v2) or content-negotiation headers.
+         Deprecate via Sunset/Deprecation headers; long parallel
+         deployment.
+
+gRPC:    Field numbers in proto are forever. Add new fields with
+         new numbers; never reuse old ones. Whole-service version
+         via package name (v1beta1, v1).
+
+GraphQL: No versions. Add fields; deprecate fields with @deprecated.
+         The schema is forever-evolving. Requires discipline.
+```
+
+See **API versioning at scale** and **Schema evolution**.
+
+## Caching across the three
+
+REST is the only one with frictionless caching:
+
+```
+REST GET /users/42 → HTTP cache hit, no app code touched.
+
+gRPC GetUser(42) → no cache. Build your own (Redis, in-memory).
+
+GraphQL POST /graphql {query} → HTTP doesn't see semantics.
+Persisted queries (sending a hash, server has the query) enables
+per-query caching but requires plumbing.
+```
+
+If caching is a primary requirement and you can't build infra for it,
+REST is the easy answer.
+
+## Common pitfalls
+
+### Choosing gRPC for a browser API
+
+Browsers don't speak gRPC. gRPC-Web is a real path but adds a proxy
+and removes bidirectional streaming. If your primary client is a
+browser, REST or GraphQL is better.
+
+### Choosing GraphQL "to be modern"
+
+GraphQL's value is **shape flexibility across many clients**. If you
+have one client, GraphQL is overhead. If you have many clients with
+nearly identical needs, GraphQL is overhead. The pattern's payoff
+needs heterogeneity.
+
+### Choosing REST then bolting on RPC semantics
+
+A REST API with `POST /users/42/actions/refund-balance` is REST
+with RPC tunneled through HTTP verbs. Either commit (gRPC) or stay
+resource-oriented (treat it as a `refunds` resource you POST to).
+
+### Mixing all three in one product
+
+A backend with REST for external, gRPC for internal, and a GraphQL
+gateway is fine — common, even. A backend with all three for
+overlapping purposes is chaos. Define which layer uses which; don't
+let teams pick ad-hoc.
+
+<Callout variant="info">
+The strongest signal for a wrong choice is friction with HTTP
+infrastructure. If your team is rebuilding caching, rate limiting,
+or routing layers because the chosen protocol doesn't play with
+HTTP, reconsider — that work is essentially infinite.
+</Callout>
+
+## In summary
+
+- REST: default for public/external APIs; cheap, ubiquitous,
+  cache-friendly.
+- gRPC: best for internal service-to-service in polyglot fleets;
+  binary perf, strict schema, native streaming.
+- GraphQL: shines when many clients need different shapes from the
+  same backend; replaces BFFs at sufficient scale.
+- Pick per layer, not for the whole stack. External + internal +
+  aggregation can each use different protocols.
+- Cache, schema, streaming, browser support, and team discipline
+  matter more than performance benchmarks.
+- The worst pattern is mixing all three for overlapping purposes
+  without governance.

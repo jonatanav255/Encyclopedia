@@ -1,0 +1,318 @@
+export const level = 'staff';
+
+# Paxos
+
+Paxos is the consensus algorithm against which all others are
+compared. Leslie Lamport published it in 1989 (as "The
+Part-Time Parliament," a parody paper); the 2001 simplification
+"Paxos Made Simple" became the canonical reference. It is the
+foundation of Google's Chubby, Megastore, Spanner, and many
+other large-scale systems — and notoriously hard to implement
+correctly.
+
+Today Raft is the more common choice for new systems, but
+Paxos remains worth understanding: a great deal of the
+distributed-systems literature, and several massively
+deployed production systems, are built on it.
+
+## What Paxos solves
+
+The same problem as Raft: a set of processes propose values,
+and the protocol picks one such that:
+
+- **Only a proposed value can be chosen.**
+- **At most one value is chosen.**
+- **A process learns the chosen value only after it has been
+  chosen.**
+
+This is **single-value consensus**. Multi-Paxos extends it to
+agreeing on a sequence of values (replicated log).
+
+## The three roles
+
+Paxos describes the protocol in terms of three logical roles
+that nodes can play (often the same physical node plays
+several):
+
+- **Proposers**: propose values.
+- **Acceptors**: vote on proposals.
+- **Learners**: learn the chosen value.
+
+A node may be all three. In Multi-Paxos, one designated
+proposer-leader does most of the work.
+
+## The protocol
+
+Paxos runs in two phases.
+
+### Phase 1: Prepare / Promise
+
+```
+Proposer:
+  pick a ballot number n (must be greater than any used before)
+  send PREPARE(n) to a majority of acceptors
+
+Acceptor receives PREPARE(n):
+  if n > highest prepare seen:
+    promise not to accept any proposal with ballot < n
+    return PROMISE(n, accepted_n, accepted_value)
+      where accepted_n / accepted_value are the highest-numbered
+      proposal previously accepted (if any)
+  else: ignore (or NAK)
+```
+
+### Phase 2: Accept / Accepted
+
+```
+Proposer, on receiving PROMISE from a majority:
+  pick value v:
+    if any acceptor returned accepted_value, use the one
+      with the highest accepted_n
+    else: use proposer's own desired value
+  send ACCEPT(n, v) to a majority
+
+Acceptor receives ACCEPT(n, v):
+  if n >= highest prepare seen:
+    accept the proposal; record (n, v)
+    return ACCEPTED(n, v)
+
+Once a majority has accepted (n, v), v is chosen.
+```
+
+The choice of `v` in phase 2 is the subtle bit: a proposer
+must adopt any previously-accepted value to preserve safety.
+
+## Why it works
+
+The intuition behind safety:
+
+<Steps>
+<Step n={1} title="Any two majorities intersect.">
+A value chosen by majority M1 with ballot n1 is known to any
+later majority M2 — at least one acceptor is in both.
+</Step>
+<Step n={2} title="A proposer with a higher ballot learns prior decisions.">
+Phase 1 brings back any previously-accepted value via PROMISE
+messages. The proposer must propose that value (or one with
+the highest ballot if multiple).
+</Step>
+<Step n={3} title="Therefore only one value can ever be chosen.">
+Once a value v is chosen with ballot n, any subsequent ballot
+n' > n will see v in PROMISE responses and propose v itself.
+Conflicting values are impossible.
+</Step>
+</Steps>
+
+Liveness depends on partial synchrony — proposers must
+eventually be able to complete a round without being preempted
+by a higher ballot. Two competing proposers can "duel" by
+preempting each other's ballots indefinitely; in practice, a
+leader-elected protocol (Multi-Paxos) avoids this.
+
+## Multi-Paxos
+
+Single-value Paxos requires two round trips per decision —
+too slow for a replicated log. Multi-Paxos amortizes:
+
+- **Phase 1 is run once per leader term.** The leader prepares
+  for a range of slots.
+- **Phase 2 runs per slot.** Each new value is committed in
+  one round trip.
+
+The leader's role becomes:
+
+1. Win an election (a one-time phase 1 for an unbounded range
+   of slots).
+2. For each new client request, send ACCEPT to acceptors with
+   the next slot number.
+3. Once a majority accepts, the value is chosen.
+
+This is functionally identical to Raft's log replication. The
+difference is mostly presentational.
+
+## The hard parts
+
+What makes Paxos famously hard to implement:
+
+### 1. Leader election is unspecified
+
+The classic paper says "elect a leader by any means." Real
+implementations need a concrete election protocol; many
+hand-rolled solutions had subtle bugs. Raft, in contrast,
+defines election as part of the protocol.
+
+### 2. Membership changes
+
+Adding or removing acceptors mid-flight risks losing the
+majority-intersection invariant. The standard solution is
+**joint consensus** — temporarily run with both old and new
+configurations, requiring a majority of each. Complex to get
+right.
+
+### 3. Snapshot and log compaction
+
+The protocol describes commitment but not how to garbage
+collect the log. Production systems must define snapshot
+formats, transfer protocols, and the rules for installing them
+on lagging acceptors.
+
+### 4. Reconciling many slots concurrently
+
+A leader may have many in-flight accept rounds across many
+slots. Tracking ballot numbers, partial accepts, and
+out-of-order arrivals is intricate.
+
+### 5. Proving correctness
+
+Subtle bugs in proposer/acceptor logic are easy to introduce.
+TLA+ specifications exist; production systems rely on them
+plus extensive Jepsen-style testing.
+
+## Variants and optimizations
+
+### Fast Paxos
+
+Skip phase 1 in the common case: clients send values directly
+to acceptors. Achieves one round trip instead of two — but
+requires a larger quorum (3/4 instead of 1/2 + 1) to maintain
+safety, and complicates conflict handling.
+
+### Generalized Paxos
+
+Allows commands that commute (e.g., independent updates to
+different keys) to be committed without ordering. Higher
+throughput at the cost of complexity.
+
+### EPaxos (Egalitarian Paxos)
+
+No leader; any replica can commit. Lower WAN latency because
+clients hit the nearest replica. The conflict graph for
+non-commutative operations adds complexity.
+
+### Flexible Paxos
+
+The realization that prepare and accept quorums don't have to
+be the same size — they only need to intersect. Lets you trade
+durability for performance in specific ways.
+
+### Disk-Paxos / Cheap Paxos
+
+Variants that reduce hardware requirements or use shared
+storage as a coordination medium.
+
+## Paxos in production
+
+The systems that explicitly use Paxos:
+
+<Cheatsheet>
+| System | Notes |
+|---|---|
+| Google Chubby | Lock service for Google's internal infra; Multi-Paxos |
+| Google Megastore | Replicated database on Bigtable; Paxos per entity group |
+| Google Spanner | Paxos per tablet, across regions; the canonical "globally distributed" Paxos use |
+| Google F1 | SQL layer atop Spanner |
+| Apache Cassandra Lightweight Transactions | Paxos for compare-and-set semantics |
+| ScyllaDB LWT | Same |
+| Amazon DynamoDB transactions | Internally Paxos-like |
+| AWS Cell-based architectures | Internal Paxos in several services |
+</Cheatsheet>
+
+Most "new" systems built since ~2014 use Raft instead.
+Pre-2014 systems and systems explicitly modeled on Google
+papers use Paxos.
+
+## Spanner: Paxos at scale
+
+Spanner runs Paxos groups per "tablet" — a range of data —
+with replicas placed across regions. Each tablet has its own
+Paxos leader; the global system runs millions of groups.
+
+Key Spanner-specific contributions:
+
+- **TrueTime** integration for external consistency: reads
+  carry a timestamp; writes wait through clock uncertainty
+  before committing to ensure ordering.
+- **Two-phase commit between Paxos groups** for cross-tablet
+  transactions: each group is reliable; the 2PC coordinator
+  uses Paxos for fault tolerance.
+
+The combination is "global linearizable transactions" — which
+is what Spanner sells.
+
+## Paxos vs Raft, head to head
+
+<Cheatsheet>
+| Aspect | Paxos | Raft |
+|---|---|---|
+| Year | 1989 (1998 published) | 2014 |
+| Specification | Several papers, often confusing | One paper |
+| Roles | Proposer / acceptor / learner | Leader / follower / candidate |
+| Leader | Optional in single-value; required in Multi-Paxos | Always required |
+| Log management | Less prescriptive | Sequential, with backtracking |
+| Membership | Joint consensus (complex) | Single-server changes (simple) |
+| Common quorum | Majority | Majority |
+| Implementations | Spanner, Chubby, Cassandra LWT | etcd, Consul, CockroachDB, TiKV, ... |
+| Reputation | "Famously hard" | "Understandable" |
+</Cheatsheet>
+
+For a new project: Raft. For understanding the literature
+(Spanner, Chubby, classical papers): Paxos.
+
+## Why notoriously hard
+
+Concrete reasons Paxos earned its reputation:
+
+- **Original paper presentation**. The parable framing was
+  considered impenetrable. Lamport published "Paxos Made
+  Simple" 12 years later acknowledging this.
+- **No reference algorithm for Multi-Paxos.** Engineers had to
+  derive their own; minor mistakes broke safety.
+- **Optimizations conflate with the base protocol.** Production
+  systems include leader leases, batching, pipelining,
+  read-only optimizations, snapshot transfer, all built atop
+  bare Paxos. Each is correct in isolation; composing them
+  while preserving safety is hard.
+- **Failure modes are subtle.** Network partitions, slow
+  nodes, dueling proposers — each requires careful handling.
+- **Verification effort is enormous.** TLA+ models of Paxos
+  exist; real implementations rarely match them line-for-line.
+
+The Google Chubby team published "Paxos Made Live"
+documenting how their implementation diverged from the paper
+for unobvious reasons. It's the best paper on the gap between
+theory and practice in consensus.
+
+## When to choose Paxos today
+
+Honestly: rarely.
+
+- You're working inside a system that already uses Paxos
+  (Spanner, Chubby, Cassandra LWT).
+- You want very specific Paxos-variant optimizations (Fast
+  Paxos, EPaxos for WAN).
+- You're doing research or building a new variant.
+
+For everyone else, Raft is the practical choice. The
+implementations are mature, the literature is clear, and the
+operational story is well-trodden.
+
+<Callout variant="info">
+Reading "Paxos Made Simple" + the original Raft paper
+back-to-back is a great way to internalize what consensus
+actually is. They solve the same problem with different
+priorities — Paxos for theoretical clarity, Raft for engineer
+clarity.
+</Callout>
+
+## In summary
+
+- Paxos: a 1989 consensus protocol; two phases (prepare /
+  accept), majority quorum, monotonic ballots.
+- Solves single-value consensus; Multi-Paxos extends to logs
+  by amortizing phase 1.
+- Used by Chubby, Megastore, Spanner, Cassandra LWT — large
+  systems and the foundations of the field.
+- Famously hard to implement: leader election unspecified,
+  membership changes complex, log compaction implicit.
+- For new systems, use Raft. For understanding the
+  foundations, read Paxos.

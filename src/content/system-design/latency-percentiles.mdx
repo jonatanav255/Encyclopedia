@@ -1,0 +1,190 @@
+export const level = 'mid';
+
+# Latency percentiles (p50/p95/p99/p999)
+
+Latency isn't a number. It's a **distribution**. The right
+way to summarize is with percentiles, not means.
+
+A percentile p_N is "the value below which N% of observations
+fall." So p99 latency = 99% of requests were faster than this.
+
+## The lie of the mean
+
+Mean of [10, 10, 10, 10, 10, 10, 10, 10, 10, 1000] = 109ms.
+
+Looks fine — until you realize 10% of users wait 1 second.
+Mean hid the tail.
+
+Percentiles tell the real story:
+
+- p50 = 10ms
+- p90 = 10ms
+- p99 = 1000ms
+- mean = 109ms
+
+The mean is closer to p99 than to p50. Misleading.
+
+## What each percentile means
+
+<Cheatsheet>
+| Percentile | Reflects |
+|---|---|
+| p50 (median) | Typical request |
+| p90 | Most users |
+| p95 | Common slow case |
+| p99 | 1 in 100 — visible in busy services |
+| p999 (p99.9) | 1 in 1000 — matters at high QPS |
+| p9999 | Almost nobody, but at scale and fan-out, still common |
+| max | Worst-case observed |
+</Cheatsheet>
+
+A service handling 1M requests/day has 10K p99 events per
+day. That's a real number of users having a slow experience.
+
+## Fan-out amplifies tails
+
+Each user-visible action might call 10 backends. The slowest
+of N determines latency:
+
+- N=1, per-call p99 = 100ms → user p99 ≈ 100ms.
+- N=10 → user p99 ≈ 700ms (the slowest of 10 calls).
+- N=100 → user p99 ≈ 2s.
+
+(See tail-latency for the math.)
+
+This is why **p999 matters at scale**. Per-call p999 of 1s
+becomes user p99 of 1s when N=100.
+
+## Don't average percentiles
+
+A common bug: "Service A p99 is 200ms. Service B p99 is
+300ms. So combined p99 is 250ms."
+
+**Wrong.** Percentiles are not linear. The combined p99 is
+worse than either, often by a lot.
+
+The right way: combine the underlying distributions
+(histograms), then recompute the percentile.
+
+## Histograms vs summaries
+
+Two metric shapes capture latency:
+
+### Summaries (pre-aggregated)
+
+The system computes p50, p95, p99 *inside the instance*. The
+metric value is the percentile.
+
+Problem: you can't add percentiles across instances. "What's
+the p99 across all 50 servers?" is not the average of their
+p99s.
+
+Used by older Prometheus client libraries; deprecated now.
+
+### Histograms
+
+The system maintains bucket counts: 10 requests under 10ms,
+50 under 50ms, 100 under 100ms, and so on.
+
+These add across instances. Percentiles can be re-computed at
+query time:
+
+```
+histogram_quantile(0.99, sum by (le) (rate(latency_bucket[5m])))
+```
+
+Use histograms. Always.
+
+## Streaming percentile estimation
+
+Computing percentiles requires sorting. Sorting all requests
+isn't feasible at high QPS. Solutions:
+
+- **t-digest**: sketch data structure that approximates
+  percentiles with bounded memory. Used by Datadog, Druid.
+- **HDR Histogram**: log-bucketed counts. Bounded memory,
+  bounded error.
+- **Pre-binned histograms** (Prometheus): you define the
+  buckets in advance; lossy but cheap.
+
+For application-side metrics, use HDR or t-digest. For server
+metrics, Prometheus-style buckets are usually enough.
+
+## Choosing percentile targets for SLOs
+
+For most user-facing services:
+
+- **p50 < 100ms** — feels instant.
+- **p99 < 500ms** — feels responsive.
+- **p999 < 2s** — feels survivable.
+
+For latency-critical (trading, gaming):
+
+- **p99 < 10ms** — required for HFT.
+- **p9999 < 100ms** — gaming twitch responsiveness.
+
+For background batch:
+
+- Nobody cares about latency; throughput SLOs instead.
+
+## Reading distributions in production
+
+A "spike" in p99 might be:
+
+- A small subset of slow requests (one hot key).
+- A subtle widening of the whole distribution (GC across the
+  fleet).
+- A reporting artifact (you switched to a new metrics
+  collection).
+
+Look at multiple percentiles together:
+
+- p50 stable, p99 spike → tail problem, not general overload.
+- p50 and p99 both moving → distribution shifted, broad
+  issue.
+- p999 spike, p99 stable → isolated incident, few requests
+  affected.
+
+The shape of the shift tells you what kind of problem you
+have.
+
+## Common gotchas
+
+### Latency includes queueing
+
+A request that takes 5ms of "work" but waits 200ms in the
+queue is 205ms of latency. p99 latency under load is queue +
+work, not just work.
+
+Always measure end-to-end.
+
+### Don't measure inside the service only
+
+The user sees client→LB→service→DB→service→LB→client. If you
+only measure the service portion, you miss network, queuing
+at the LB, and DNS.
+
+Use distributed tracing (see distributed-tracing) for end-to-end
+view.
+
+### Outliers vs population
+
+A single 30-second request might bump p99.99 but not p99. Is
+that "an outlier" you can ignore? Depends on what caused it.
+A connection timeout that always takes 30s isn't an outlier;
+it's a bug. Always investigate the very-slow tail.
+
+## In summary
+
+- Latency is a distribution; summarize with percentiles, not
+  means.
+- p50 = typical; p95/p99 = slow case; p999 = scale-out
+  pathology.
+- Fan-out amplifies tails — user-facing p99 worse than
+  per-call p99.
+- Don't average percentiles. Combine histograms, recompute.
+- Use histograms (re-aggregatable) over summaries
+  (pre-baked).
+- For SLOs, pick percentile targets based on what users feel.
+- Read distributional shifts — p50 vs p99 movement tells
+  different stories.

@@ -1,0 +1,354 @@
+export const level = 'mid';
+
+# Cache eviction policies
+
+A cache has finite memory. When it fills up, something has to
+go to make room for new entries. The eviction policy is the
+rule that picks which entry leaves. Picking the right policy
+can change cache hit rate by 5–20 percentage points on the
+same workload — and those points translate directly to source
+load and user latency.
+
+LRU is the default in most systems. It's almost never the
+worst choice, sometimes the best, and frequently beaten by
+more sophisticated policies on real workloads.
+
+## What "eviction" actually means
+
+When the cache reaches its max size (memory or entry count),
+inserting a new entry triggers eviction of one (or more) old
+entries. The policy decides which.
+
+```
+   cache (max 1000 entries, currently 1000)
+        │
+        ▼
+   new entry arrives
+        │
+        ▼
+   policy picks a victim → evicted
+        │
+        ▼
+   new entry inserted
+```
+
+Eviction is distinct from **expiration** (TTL-based removal).
+Expiration removes entries that have aged out; eviction
+removes valid-but-cold entries to make room.
+
+## LRU — Least Recently Used
+
+Evict the entry that was accessed longest ago. The simplest
+useful policy.
+
+```
+   accessed in order: A, B, C, D, E, F (cache holds 4)
+   queue: F, E, D, C  (A and B evicted in order)
+   if G arrives next, evict C; queue: G, F, E, D
+```
+
+Implementation: a doubly-linked list (oldest at head, newest
+at tail) + a hash map for O(1) lookup. Insert / promote /
+evict are all O(1).
+
+Pros:
+
+- Trivial to implement.
+- Reasonable on most workloads.
+- Predictable behavior.
+
+Cons:
+
+- **Scan-vulnerable.** A one-time scan through millions of
+  entries (analytics query, backup) evicts everything hot.
+  The cache cold-starts after every scan.
+- **Frequency-blind.** Accessing entry A 100 times in the
+  past hour vs once recently — LRU treats them the same.
+- **Doesn't model "popular but old."** A homepage hit by
+  millions of users gets evicted just like a one-time URL.
+
+The standard default. Used by Redis (`allkeys-lru`),
+Memcached, Node's `lru-cache`, Caffeine's previous default,
+and most in-process caches.
+
+## LFU — Least Frequently Used
+
+Evict the entry with the lowest access count.
+
+```
+   counts: A:50, B:5, C:100, D:1
+   new arrival → evict D (lowest count)
+```
+
+Pros:
+
+- Adapts to long-term popularity. The most-accessed entries
+  stay regardless of when they were last touched.
+- Robust against scans (one-time accesses don't dislodge
+  popular entries).
+
+Cons:
+
+- **Frequency doesn't decay.** Once-popular-now-cold entries
+  hang on forever. The cache fills with stale popularity.
+- **Slow to adapt to new hotness.** A newly-popular entry
+  starts with count 1; needs many accesses to compete with
+  established entries.
+- More complex implementation (max-heap or bucketed
+  approach).
+
+Used selectively — for workloads where popularity is genuinely
+long-lived (e.g., file metadata caches, codecs).
+
+## LFU with aging / "Window LFU"
+
+LFU with a decay function. Counts age out over time so old
+popularity doesn't dominate.
+
+```
+   periodic: count = count * 0.5
+```
+
+Better than pure LFU. Still complex.
+
+## FIFO
+
+Evict the entry that was inserted longest ago, regardless of
+how recently it was accessed.
+
+Pros: simplest possible. Used in some streaming workloads.
+Cons: ignores recency completely. Almost always worse than
+LRU.
+
+Use it when implementation simplicity is paramount and the
+workload is uniform (everything roughly equally hot).
+
+## Random
+
+Pick an entry uniformly at random.
+
+Pros: stateless. No metadata to maintain.
+Cons: makes no use of access information.
+
+Surprisingly competitive on small caches and for some
+workloads (Cliff Click has data showing this). Used in some
+GPU caches and as a degraded-mode fallback. Redis offers
+`allkeys-random` as an option.
+
+## ARC — Adaptive Replacement Cache
+
+ARC (2003, IBM Almaden) is a self-tuning policy that
+combines recency and frequency. It maintains four lists:
+
+- T1: recent entries seen once.
+- T2: recent entries seen multiple times.
+- B1: recently evicted from T1 (ghost list, metadata only).
+- B2: recently evicted from T2 (ghost list).
+
+On a hit in B1 or B2 (the ghost lists), ARC infers the
+workload favors recency or frequency, and adjusts the
+T1:T2 size ratio accordingly. It tracks "would this have
+been a hit if my cache were sized differently?" and shifts
+its bias.
+
+Pros:
+
+- Beats LRU on virtually every benchmarked workload.
+- Self-tuning (no parameters).
+- Scan-resistant.
+
+Cons:
+
+- More complex to implement (four lists, careful pointer
+  management).
+- Patent issues historically slowed adoption (now expired).
+
+Used in ZFS's ARC, IBM's storage products. Was the basis for
+Caffeine's design until they moved to W-TinyLFU.
+
+## 2Q — Two Queues
+
+A simpler variant of ARC. Two queues:
+
+- **A1in** (FIFO): new entries land here.
+- **Am** (LRU): entries promoted from A1in on second access.
+
+A scan goes through A1in and never reaches Am, so it doesn't
+pollute the LRU portion. Hot entries quickly move to Am.
+
+Pros:
+
+- Scan-resistant.
+- Simpler than ARC.
+- Used in PostgreSQL's buffer manager (where it's actually
+  called "clock sweep" with some 2Q-like properties).
+
+Cons:
+
+- Tuning the A1in vs Am sizes is workload-dependent.
+
+## TinyLFU / Window TinyLFU
+
+The modern best-of-class. Combines a small **window LRU** with
+a **TinyLFU admission filter**.
+
+Mechanism:
+
+- New entries enter a small window LRU (~1% of cache).
+- When they age out of the window, an admission filter
+  decides whether to promote to the main cache.
+- The filter uses a Bloom-filter-like count-min sketch to
+  estimate the entry's frequency, decayed over a time window.
+- Admit only if the entry is "more frequent" than the LRU
+  victim it would replace.
+
+Pros:
+
+- Best hit rate of any well-known policy on most workloads.
+- Scan-resistant.
+- Small constant memory overhead per entry (~6 bytes for the
+  sketch).
+
+Cons:
+
+- Complex. Hard to implement correctly.
+
+Used in Caffeine (Java's most popular cache library — now the
+default in Spring, Cassandra, others), and in some CDN edge
+caches.
+
+## SLRU — Segmented LRU
+
+Two LRU segments: protected and probationary. New entries land
+in probationary. On a second hit, they get promoted to
+protected. Protected has higher priority on eviction.
+
+A simpler intermediate between LRU and 2Q.
+
+## Comparing policies
+
+<Cheatsheet>
+| Policy | Hit rate vs LRU | Complexity | Best for |
+|---|---|---|---|
+| FIFO | Worse | Trivial | Streaming, uniform workloads |
+| LRU | Baseline | Simple | General purpose, default |
+| LFU | Mixed | Medium | Workloads with long-term popularity |
+| Random | Comparable on small caches | Trivial | Memory-constrained, simplicity |
+| LFU with aging | Better than LRU often | Medium | Adapting LFU |
+| ARC | Better than LRU | Complex | Workloads varying recency vs frequency |
+| 2Q | Better than LRU on scans | Medium | Mixed read patterns |
+| SLRU | Slight improvement | Medium | Two-tier access patterns |
+| W-TinyLFU | Best overall | Complex | Most production caches |
+</Cheatsheet>
+
+## What to use in practice
+
+- **In-process cache in app code**: use the library's default
+  (often LRU or W-TinyLFU). For Node, `lru-cache` (LRU) is the
+  default; for Java, **Caffeine** (W-TinyLFU) has displaced
+  Guava as the standard.
+- **Redis**: configure `maxmemory-policy` to `allkeys-lru` or
+  `allkeys-lfu`. `volatile-*` variants only evict keys with
+  TTLs.
+- **Memcached**: LRU by default.
+- **Database buffer pools**: usually a custom policy (Postgres
+  uses clock sweep, MySQL uses LRU with midpoint insertion).
+  Don't fight this — it's tuned to the workload.
+
+The biggest wins:
+
+- **Pick LFU/aged-LFU for popularity-dominated workloads**
+  (CDN edge, recommendation cache). +5-10 pp hit rate over
+  LRU.
+- **Pick W-TinyLFU if your library supports it** (Caffeine,
+  pluggable Caffeine ports). Consistently beats LRU and ARC.
+- **Stay with LRU otherwise** — the gains from "exotic"
+  policies are real but small for many workloads.
+
+## Eviction policy interaction with TTL
+
+Eviction kicks in when memory fills. TTL kicks in when an
+entry ages out. Both can remove entries — they're orthogonal.
+
+Without TTL, eviction can keep a stale entry forever (it's
+"recent enough" or "popular enough" to stay). Always pair
+eviction policy with TTL as a safety net.
+
+Redis's `volatile-lru` policy evicts only keys with TTLs;
+keys without TTL stick forever. Pick the right policy for
+your usage.
+
+## Eviction in disaggregated caches
+
+When the cache is sharded across many nodes (Redis Cluster,
+Memcached), each node runs its own eviction policy. A key
+on node 3 is evicted by node 3's local view.
+
+Consequences:
+
+- The cluster's total hit rate is the **per-node hit rate
+  weighted by load**. A hot node with thrashing eviction
+  hurts overall metrics.
+- **Hot keys** (see hot-keys-and-key-sharding) defeat
+  per-node eviction policies — one node thrashes while
+  others sit on cold entries.
+
+For sharded caches: balance load (consistent hashing with
+vnodes) so eviction pressure is even.
+
+## Common pitfalls
+
+### Picking LFU and forgetting decay
+
+Pure LFU lets popular-once-popular-never entries stay
+forever. Always pair LFU with aging or use W-TinyLFU.
+
+### Cache too small for working set
+
+No policy can save you from a cache that's too small. If
+the working set is 100 GB and the cache is 1 GB, every
+eviction policy will have a low hit rate. Size the cache to
+the working set; tune the policy as a secondary concern.
+
+### Eviction policy without observability
+
+You set `maxmemory-policy` and never look at it again.
+Workload changes; suddenly the eviction rate is 10× higher.
+Monitor `evicted_keys` per second; alert on changes.
+
+### Treating "all evictions are equal"
+
+Evicting a one-time URL is fine. Evicting the homepage
+during peak is a cost-amplifier (cache miss + DB hit +
+recompute + recache, repeated across many concurrent
+readers). Scan-resistant policies (2Q, W-TinyLFU) prevent
+this.
+
+### Mixing eviction policies across layers
+
+Browser uses HTTP cache (LRU-ish). CDN uses LRU. Reverse
+proxy uses LFU. Each layer evicts at different rates. The
+behavior is hard to predict. Pick one approach per workload
+and apply it across layers, or accept that each layer's
+characteristics differ.
+
+### Forgetting cache memory accounting
+
+Setting `maxmemory` doesn't always include all overhead
+(replication buffers, client connections, AOF buffers). The
+cache OOMs even though you "set the limit." Always size with
+~20% headroom.
+
+## In summary
+
+- LRU is the default. It's good enough for most.
+- LFU adapts to long-term popularity but needs decay to stay
+  useful.
+- ARC, 2Q, SLRU, and W-TinyLFU all beat LRU on most
+  benchmarked workloads. W-TinyLFU is the modern champion.
+- Pick a policy that matches workload shape (scan-resistant
+  for analytics-mixed workloads; LFU-ish for popularity-
+  dominated CDNs).
+- Always combine eviction with TTL as a safety net.
+- The biggest hit-rate win is usually **size**, not **policy**.
+  No policy saves an undersized cache.

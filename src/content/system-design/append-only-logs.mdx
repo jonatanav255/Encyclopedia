@@ -1,0 +1,163 @@
+export const level = 'senior';
+
+# Append-only logs
+
+A sequence of records, written only at the end. No update,
+no delete (in the simple form). Each new entry has a higher
+sequence number than every previous entry.
+
+It sounds primitive. It's the single most important data
+structure in modern distributed systems: databases (WAL),
+brokers (Kafka), filesystems (ext4 journal), event stores,
+metric stores, blockchain.
+
+## Why sequential writes are special
+
+A disk that does **sequential writes** is dramatically faster
+than one doing random writes:
+
+- **SSD**: random ~100K IOPS, sequential ~3 GB/s. ~30K× more
+  throughput.
+- **HDD**: random ~100 IOPS, sequential ~100 MB/s. Even more
+  dramatic.
+
+So a system that converts "many random updates" into "one
+sequential append" wins massively.
+
+## Examples
+
+### Database WAL
+
+Every Postgres transaction writes to the write-ahead log
+sequentially. Pages on disk are updated later, but the log
+provides durability immediately. (See write-ahead-log.)
+
+### LSM trees
+
+Updates go to an in-memory buffer; periodically flushed to
+disk as new immutable sorted files. The disk only ever sees
+sequential writes. Compaction merges them later. (See
+btree-vs-lsm-storage-engines.)
+
+### Kafka
+
+A partition is literally an append-only log file on disk.
+Producers append; consumers read from a position they
+maintain. Old data is truncated after retention.
+
+### Event sourcing
+
+The system's state is "the result of replaying all events."
+Events are append-only. (See event-sourcing.)
+
+### Filesystem journals
+
+ext4, ZFS, NTFS — all use journals (essentially WALs) to
+provide crash safety.
+
+## Properties
+
+- **Single writer is trivial.** Mutable data structures need
+  locks; appending is just `seek(end); write`.
+- **Many readers concurrently.** Readers can scan up to their
+  last-seen position; new writes don't disturb them.
+- **Order is preserved.** Sequence number = position. Two
+  events' relative order is unambiguous.
+- **Durability via fsync.** Append + fsync = crash-safe write.
+- **Truncation by drop**: delete old segments from the front;
+  no per-record deletion needed.
+
+## What you give up
+
+- **In-place update.** Want to "fix" a record? Append a new
+  version; old one still in the log.
+- **Random delete.** Same — append a tombstone, compact later.
+- **Random access by key.** A log is sequential by nature;
+  point lookups require an index alongside.
+
+## Segments
+
+A practical implementation splits the log into **segments**
+(files of fixed size, e.g., 1 GB each). Benefits:
+
+- **Truncation is cheap**: delete an old segment, not a
+  prefix of one giant file.
+- **Index per segment**: faster lookups via per-segment
+  indices.
+- **Parallel processing**: different consumers can scan
+  different segments.
+
+Kafka uses 1 GB segments by default. Postgres WAL uses 16 MB.
+
+## Indexing alongside
+
+A log gives you "find record by sequence number." To get
+"find record by key X," you need an external index.
+
+- **In-memory index** (hash map by key → log position).
+  Reset on restart.
+- **Persistent index** alongside the log (LSM trees use
+  this).
+- **Compaction**: periodically rewrite the log with only the
+  latest version of each key. Kafka has log compaction;
+  Bitcask too.
+
+## Replication
+
+Append-only logs are easy to replicate. Followers stream
+appends from the leader. They write the same bytes at the
+same offsets — the log is the replication protocol.
+
+This is why most modern databases use log shipping for
+replication: Postgres streaming replication, MySQL binlog
+replication, MongoDB oplog, Cassandra commit log.
+
+## Compaction
+
+A log grows forever without intervention. Two strategies:
+
+- **Time-based**: drop everything older than N days.
+- **Key-based**: drop earlier versions of any key superseded
+  by a later version (Kafka's log compaction).
+- **Size-based**: keep the most recent N GB.
+
+Kafka topics can be configured for either time or key-based
+compaction; some workloads use both.
+
+## When append-only doesn't fit
+
+- **High random update rate where reads must always be
+  current.** A log + index works, but a B-tree is often
+  simpler.
+- **Storage cost is critical and updates are common.** Logs
+  accumulate; compaction has overhead.
+- **You don't care about durability or ordering.** A log's
+  guarantees aren't free.
+
+For most distributed systems work, though, "append-only log
+plus index" is the right starting point. It's how Kafka,
+RocksDB, Cassandra, etcd, and many others are built.
+
+## The log as integration backbone
+
+Kleppmann's "log-centric architecture" idea: every data flow
+between systems goes through a log. Source-of-truth lives in
+the log; databases, caches, search indexes are all derived.
+
+(See log-as-database.)
+
+The log is the **immutable, ordered, replayable** spine
+that makes the rest of the system tractable.
+
+## In summary
+
+- Append-only log: sequential writes at the end of a file or
+  segment chain.
+- Massively faster than random writes on real hardware.
+- Foundation of WAL, LSM, Kafka, event sourcing, filesystem
+  journals, blockchain.
+- Single-writer simple; multi-reader natural.
+- Need an external index for non-positional lookups.
+- Compact to bound size: time-based, key-based, size-based.
+- "Log as integration backbone" is the modern data-platform
+  pattern.

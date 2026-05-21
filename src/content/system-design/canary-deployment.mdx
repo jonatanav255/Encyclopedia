@@ -1,0 +1,232 @@
+export const level = 'mid';
+
+# Canary deployment
+
+Roll the new version out to a **small fraction of traffic
+first** — 1%, then 5%, then 25%, then 100% — and compare its
+behavior to the old version at each step. If the canary
+regresses, roll back before the rest of the fleet is affected.
+
+The name comes from coal miners' canaries: a small, sensitive
+sample that warns of danger to the larger group. The
+architectural payoff: the **blast radius of a bad deploy is
+capped at the canary fraction** until you have evidence it's
+safe.
+
+## The mechanics
+
+A canary rollout in steps:
+
+<Steps>
+<Step n={1} title="Deploy the new version alongside the old.">
+A small number of pods running v2. Old version still handles
+the majority of traffic.
+</Step>
+<Step n={2} title="Route a small fraction to the canary.">
+1% is a common starting point. Either by weighted load
+balancing, service mesh routing, or feature flag.
+</Step>
+<Step n={3} title="Compare metrics — old vs new.">
+Error rate, latency p50/p99, business metrics. The point is
+not "is the new version OK in absolute terms" but "is it
+better, same, or worse than the old."
+</Step>
+<Step n={4} title="If healthy, advance.">
+1% → 5% → 25% → 50% → 100%. Each step is gated on the
+comparison.
+</Step>
+<Step n={5} title="If unhealthy, roll back.">
+Drop canary traffic to 0%. Old version handles all requests
+again. Diagnose at leisure.
+</Step>
+</Steps>
+
+The healthy variant is uneventful. The unhealthy variant
+short-circuits at 1% and never reaches the other 99%.
+
+## Why it's the default for user-facing services
+
+The "if your deploy is bad, only 1% of users see it" property
+is hard to overstate. It changes the cost of shipping:
+
+- Engineers ship more often because individual deploys are
+  smaller and lower-risk.
+- Regressions caught at canary cost a rollback; regressions
+  caught after full rollout cost an incident.
+- The team's relationship to deploy fear improves measurably.
+
+Canary deployments are the default at most large web companies
+for this reason.
+
+## Traffic split mechanisms
+
+<Cheatsheet>
+| Mechanism | How | Granularity |
+|---|---|---|
+| Pod count ratio | 1 canary pod + 99 stable; LB round-robins | ~1% if connections are balanced |
+| Weighted routing | LB rule: 1% to canary, 99% to stable | Exact percentage |
+| Service mesh | Mesh route: weight `v2=1, v1=99` | Exact, with sticky-session support |
+| Feature flag | App-level: % of requests go through new path | Per-request, fine-grained |
+| Header-based | Internal users / dogfood by header | Targeted, not random |
+
+</Cheatsheet>
+
+Pod-count ratio is the simplest and works in plain Kubernetes
+with no extra tooling. Mesh and weighted routing are more
+precise. Feature flags give you in-app control without needing
+infra changes.
+
+## Comparing the canary
+
+A canary is only as good as the comparison. You're asking: "is
+v2 worse than v1 on the same traffic?"
+
+The discipline:
+
+- **Same metrics, both versions, side by side.** Don't compare
+  v2's error rate to "the historical baseline." Compare to v1
+  **right now**.
+- **Same traffic mix.** Canary should get a representative
+  sample, not 1% of low-traffic endpoints.
+- **Wait long enough.** A canary at 1% for 30 seconds has too
+  few samples to detect regressions. Wait for statistical
+  power; minutes, sometimes longer for low-traffic services.
+- **Watch the right metrics.** Error rate, latency p50 + p99
+  (split by success/fail), business metrics (conversions,
+  signup completions). CPU/memory of the canary process if
+  resource regressions matter.
+
+Automation: tools like **Argo Rollouts**, **Flagger**, **Spinnaker
+Kayenta**, **Linkerd's traffic-shifting** automate this — compute
+metrics, decide healthy/unhealthy, advance or roll back.
+
+## What "regression" means
+
+The canary's metrics need explicit thresholds. Examples:
+
+- Error rate of v2 must not exceed v1 by more than 0.5% absolute,
+  measured over the last 5 minutes.
+- p99 latency of v2 must be within 20% of v1's p99.
+- Business metric (conversions/min) must be within 2 standard
+  deviations of v1's recent rate.
+
+Without explicit thresholds, you'll either roll back on every
+noise spike or fail to catch real regressions. The
+**comparison is statistical**; treat it that way.
+
+## Phases and dwell time
+
+A typical canary plan:
+
+```
+0%  → 1%   (wait 5 min)
+1%  → 5%   (wait 5 min)
+5%  → 25%  (wait 10 min)
+25% → 50%  (wait 10 min)
+50% → 100% (full rollout)
+```
+
+The numbers depend on traffic volume. A high-traffic service
+collects enough samples in 1 minute at 1% to make a decision; a
+low-traffic service needs longer or a higher initial percentage.
+
+The "dwell time" at each step is **statistical confidence**, not
+arbitrary. Less = faster deploys, more risk; more = safer, slower.
+
+## State and migrations
+
+Canary deployments inherit the same state problems as
+blue-green:
+
+- Schema must be backward-compatible — both v1 and v2 are running
+  simultaneously and both write to the same DB.
+- Write-side regressions can affect data in ways that don't
+  rollback when traffic does.
+- Caches see writes from both versions; key versioning matters.
+
+The expand-then-contract migration discipline applies here just
+as in blue-green. See blue-green deployment.
+
+## Variants
+
+Canary deployment has several flavors:
+
+<Cheatsheet>
+| Variant | What |
+|---|---|
+| Random canary | 1% of all users see v2 |
+| Internal canary | Employees / dogfood users see v2 first |
+| Geographic canary | One region rolls first; spread on success |
+| Cell-based canary | One "cell" rolls first; see cell-based architecture |
+| Sticky canary | Same user stays on the same version for the session |
+
+</Cheatsheet>
+
+Internal canary is the cheapest: zero customer risk for the
+first phase. Sticky canaries matter when a user's experience
+across requests should be consistent (multi-step forms,
+real-time apps).
+
+## Automatic rollback
+
+The most valuable canary feature: **automatic rollback** when
+metrics regress. Without it, a canary still requires a human to
+watch the dashboard during a deploy. With it, the deploy runs
+overnight and rolls itself back if something goes wrong.
+
+The trade-off: false positives. An automatic rollback on noise
+is annoying; an automatic rollback on a real bug is invaluable.
+Tune thresholds; budget for both.
+
+## Anti-patterns
+
+- **Canary too small or too short.** 0.1% for 30 seconds
+  collects almost no data and gives false confidence.
+- **Comparing to historical baselines.** The traffic shape
+  yesterday was different. Compare to v1 right now.
+- **Skipping the canary for "small" changes.** "It's just a
+  config change" is the lead sentence of many incident
+  postmortems.
+- **Manual gating only.** A canary you advance by hand at 2am
+  is a canary that becomes "screw it, just push" by 3am.
+  Automate.
+- **Single metric.** A canary that only checks error rate
+  misses latency regressions. Check several signals.
+
+<Callout variant="warning">
+A canary doesn't catch **all** regressions. Slow-burning bugs
+(memory leaks, data corruption) may not show up in a 10-minute
+canary window. Pair canary with longer-term monitoring after
+full rollout.
+</Callout>
+
+## Canary vs feature flags
+
+Both gate exposure. The difference:
+
+- **Canary** = whole new code path / binary, gated by traffic
+  routing.
+- **Feature flag** = single code path, gated by configuration
+  evaluated per request.
+
+You can use both together: canary the new binary, feature-flag
+the new feature inside it. Decouple deploy from release.
+
+See feature flags at architecture level.
+
+## In summary
+
+- Roll new versions to a small fraction first, advance on
+  evidence.
+- Compare v2 metrics to v1 **right now**, not to historical
+  baselines.
+- Schema and state must be backward-compatible during the
+  rollout.
+- Automate the advance and rollback — humans gating canaries by
+  hand at 3am defeats the purpose.
+- Pair with feature flags for finer-grained, per-feature
+  exposure control.
+- Canaries don't catch slow-burning bugs; keep monitoring after
+  full rollout.
+- The default deploy strategy for user-facing services in
+  2026.

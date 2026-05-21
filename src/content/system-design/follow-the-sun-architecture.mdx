@@ -1,0 +1,220 @@
+export const level = 'staff';
+
+# Follow-the-sun architecture
+
+Route writes to whichever region currently owns the data,
+with **the home region itself shifting throughout the day**
+as user activity moves around the globe.
+
+Used in global gaming, financial services, and some
+collaborative systems where active users in a region get
+local-region strong consistency, then "the data follows
+them" when activity shifts.
+
+## Why this exists
+
+Globally distributed users have an awkward consistency
+problem:
+
+- Pure single-region: users far from the home region pay
+  cross-region latency. Bad UX for them.
+- Pure multi-leader: writes everywhere, but conflicts and
+  eventual consistency.
+- Geo-partitioned: each user's data lives in their home
+  region; cross-user operations are slow.
+
+Follow-the-sun gives **strong consistency in the active
+region** without requiring cross-region writes for any single
+session. The "home" of the data shifts to wherever the
+active session is.
+
+## How it works
+
+```
+Hour 0-8:   activity is in Asia → data home is ap-southeast-1
+Hour 8-16:  activity is in Europe → data home is eu-west-1
+Hour 16-24: activity is in Americas → data home is us-east-1
+```
+
+The system detects when activity is shifting (last N
+hours of writes by region) and **promotes a different
+region** to home for that key/object.
+
+Implementation steps:
+
+<Steps>
+<Step n={1} title="Detect shift.">
+Activity metric per region (writes per minute, last hour).
+When one region's activity drops below threshold and
+another's rises, decide to migrate.
+</Step>
+<Step n={2} title="Drain the old home.">
+Stop accepting writes at the old home; flush in-flight to
+durable storage.
+</Step>
+<Step n={3} title="Synchronize.">
+Make sure the new home has up-to-date data. Either
+replicate the delta, or block until replication catches up.
+</Step>
+<Step n={4} title="Promote the new home.">
+Update routing so writes for this object go to the new
+home. Old home becomes a read replica.
+</Step>
+</Steps>
+
+The migration takes seconds; happens during natural activity
+lulls.
+
+## Where it's used
+
+### Gaming
+
+A global MMO with millions of players. The "alliance" or
+"city" object is active in EU during EU evening; activity
+moves to NA during NA evening. The data home migrates ahead
+of player activity.
+
+### Financial markets
+
+Trading sessions follow Tokyo → London → New York. Order books
+and market data home to wherever the session is active.
+
+### Collaborative editing
+
+Most document collaboration happens within one timezone for
+a given day. The doc's "home" can migrate to wherever the
+current editors are.
+
+### Multi-region SaaS with tenant locality
+
+Some SaaS providers move tenant data to whichever region the
+tenant's users are most active, weekly or monthly.
+
+## Trade-offs
+
+### Pros
+
+- **Strong consistency in the active region**.
+- **Low write latency for active users**.
+- **Global system can be split-brain-free** because writes
+  always go to one definitive home.
+
+### Cons
+
+- **Migration is complex**. Drain, sync, promote — at scale,
+  this is real engineering work.
+- **Cross-home operations pay**. A user in the US writing to
+  an object currently homed in Asia pays the round-trip.
+- **Migration windows have brief consistency degradation**.
+  Reads might serve from old home while writes go to new.
+- **Operational discipline**. Migration must be observable,
+  reversible, alertable.
+
+## Distinct from geo-partitioning
+
+In geo-partitioning, each piece of data has a **fixed home**.
+US user's data lives in US, forever. The fix for
+"my data is far away when I travel."
+
+In follow-the-sun, the home **moves** based on activity. The
+data goes where it's needed.
+
+Follow-the-sun is harder; useful only when activity shifts
+predictably or is detected in real time.
+
+## Detection signals
+
+What triggers migration?
+
+- **Write rate per region** over the last N minutes.
+- **Active session count** per region.
+- **Time-of-day heuristics** (if predictable).
+- **Explicit user signal**: "I'm logging in from Tokyo."
+
+A migration system needs hysteresis (don't bounce back and
+forth) and minimum dwell time (no migrating every 5 minutes).
+
+## Migration mechanics
+
+### Live migration with replication
+
+The new home pre-syncs from the old home as a replica. When
+in sync, switch the routing in one atomic step.
+
+```
+old home: us-east primary, eu-west replica
+                                  ↓ sync close
+new home: us-east replica, eu-west primary
+```
+
+### Migration with brief unavailability
+
+Easier: refuse writes for a few seconds during migration.
+Acceptable for some applications.
+
+### Per-object vs cluster-wide
+
+- **Per-object migration**: a single document's home moves;
+  others stay. Fine-grained but complex.
+- **Cluster-wide migration**: the whole region's data shifts.
+  Coarser but simpler.
+
+Most production follow-the-sun systems migrate per-object or
+per-shard.
+
+## Failure modes
+
+### Migration mid-write
+
+A write arrives at the old home as migration begins. The
+home is being moved; where should the write go?
+
+Mitigation: define a transition state where writes block
+briefly, or accept that a tiny window of writes are routed
+to the wrong place and resync afterward.
+
+### Bouncing migrations
+
+Activity is bursty: 5 minutes EU, 5 minutes US, repeat. The
+system migrates every 5 minutes. Cost dominates.
+
+Mitigation: hysteresis (require N hours of higher activity
+before migration) and minimum dwell time.
+
+### Routing inconsistency
+
+The router doesn't know about the new home yet; sends writes
+to the old home. Old home rejects them. User sees errors.
+
+Mitigation: routing changes propagate atomically; old home
+forwards writes to new home during the transition.
+
+## When to use it
+
+Honestly: rarely. Geo-partitioning + cross-region async
+replication usually solves the global product problem.
+
+Follow-the-sun pays off when:
+
+- Active sessions actually shift across regions predictably.
+- Strong consistency within an active session is mandatory.
+- Cross-region latency for "stragglers" is acceptable.
+- You have a large enough engineering team to operate it.
+
+Most teams don't have all four. Geo-partitioned + tolerant of
+eventual consistency for cross-region is easier.
+
+## In summary
+
+- Follow-the-sun: data home migrates to wherever activity
+  currently is.
+- Strong consistency in the active region; low latency for
+  active users.
+- Used by global gaming, financial markets, some collab
+  systems.
+- Migration is the hard part: detect, drain, sync, promote
+  atomically.
+- Complex; usually overkill. Most teams should geo-partition
+  instead.
+- Pays off only when activity shifts predictably across
+  regions and consistency requirements are strict per-session.

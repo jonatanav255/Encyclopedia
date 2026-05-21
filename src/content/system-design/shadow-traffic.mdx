@@ -1,0 +1,249 @@
+export const level = 'senior';
+
+# Shadow traffic (dark launches)
+
+Run real production traffic against a **new system in parallel
+with the old one**, but discard the new system's responses.
+Users see only the old system's answers. The new system gets to
+prove it can handle production load, latency, and edge cases
+**before any user ever depends on it**.
+
+This is the standard tool for high-risk migrations: a rewrite,
+a new microservice replacing an old subsystem, a new
+implementation of a critical algorithm. By the time you cut
+over, you've already run the new system under fire for weeks.
+
+## What it looks like
+
+```
+                    +-------- old system (serves user) ----- response → user
+request →  splitter |
+                    +-------- new system (shadow)  -----  response discarded
+                                                                |
+                                                                +→ logged + compared
+```
+
+The splitter is whatever sits in front of the system being
+replaced — an API gateway, a service mesh, an L7 load balancer,
+or application code emitting an extra async call. It sends the
+**same** request to both systems but returns only the old
+system's response.
+
+## What you learn
+
+<Cheatsheet>
+| Question | What shadow traffic tells you |
+|---|---|
+| Does it scale? | New system handles real production volume |
+| Does it match? | New responses match old responses (or differ in expected ways) |
+| What's the latency? | New system's p50/p99 under realistic load |
+| What's the cost? | Per-request CPU, memory, and downstream call volume |
+| What edge cases exist? | Real prod traffic exposes inputs your tests didn't cover |
+| What breaks? | New system errors out of the comparison logs |
+
+</Cheatsheet>
+
+The point is that none of this can be learned from synthetic
+load tests or staging. Real production traffic has shapes
+test data doesn't.
+
+## The diffing
+
+The interesting part is the comparison. For each request, you
+have two responses: `old` and `new`. The question is **are
+they equivalent**.
+
+Naive comparison: `old == new`. This fails on:
+
+- **Timestamps**. Both servers say "I responded at X." X is
+  different. Strip.
+- **IDs**. New system assigns a fresh ID; old has a different
+  fresh ID. Strip or compare structurally.
+- **Order**. Both return a list; order isn't significant.
+  Canonicalize.
+- **Floating-point**. Numerical answers differ in the last few
+  digits. Tolerance.
+- **Non-determinism**. Random sampling, hash-randomized iteration.
+  Either seed the same or accept variation.
+
+The comparison logic is **the spec for what "equivalent" means**.
+Writing it is a forcing function: you discover the implicit
+contract the old system has.
+
+GitHub's `Scientist` library popularized this pattern; it
+formalizes "run old, run new, compare, log discrepancies,
+return old's answer."
+
+```ts
+const science = scientist({
+  experiment: 'new-pricing',
+  control: () => oldPricing(req),
+  candidate: () => newPricing(req),
+  compare: (a, b) => deepEqual(strip(a), strip(b)),
+});
+const result = await science.run();
+// result is always control's answer
+// candidate's behavior is logged
+```
+
+## What shadow doesn't catch
+
+Real limits:
+
+- **Write-side effects.** If the new system writes to a DB,
+  shadow traffic doubles your writes. Either the new system
+  writes to a **separate DB**, or its writes are routed to a
+  no-op store, or you skip writes entirely. None is perfect.
+- **External calls.** Calling third-party APIs twice doubles
+  costs and sometimes triggers rate limits. Mock them, or
+  cache the call's response and replay it to the new system.
+- **Time-of-day patterns.** A 24-hour shadow gives you 24
+  hours of patterns; a week is more representative.
+- **State drift.** If the new system maintains state, that
+  state lags real state because writes go to the old system.
+  Some discrepancies will be artifacts of this.
+
+Shadowing **reads** is easy. Shadowing **writes** is hard. Most
+practical shadow deployments restrict to reads or use a
+separate test database.
+
+## Routing approaches
+
+<Cheatsheet>
+| Where the split happens | Cost | Properties |
+|---|---|---|
+| Load balancer / mesh | Cheap, no code changes | Limited diff/compare logic |
+| API gateway with mirroring (Envoy `mirror`) | Cheap | Async fire-and-forget; no compare in gateway |
+| In-app shadow (Scientist-style) | Code change | Full compare logic; runs in your process |
+| Replay service | Most expensive | Read prod traffic logs and replay later; offline analysis |
+
+</Cheatsheet>
+
+Envoy's `request_mirror_policies` is the production
+heavyweight: configure the proxy to mirror N% of traffic to a
+shadow destination, fire-and-forget. The comparison happens
+separately, against logged responses.
+
+In-app shadowing (Scientist-style) gives you tight comparison
+but requires every consumer of the old system to integrate the
+library. Worth it when you really want to compare semantics.
+
+## Sample, then ramp
+
+You don't shadow 100% of traffic from day one. The new
+system's bugs would page you. Instead:
+
+<Steps>
+<Step n={1} title="Start with 1%.">
+Catch obvious bugs without volume risk.
+</Step>
+<Step n={2} title="Watch errors and latencies of the shadow.">
+The shadow system errors should not be paging — they're
+inevitable in the first phase. But they're recorded.
+</Step>
+<Step n={3} title="Diff comparison.">
+Discrepancies between old and new are your work list. Each one
+is either a bug in the new system, an incorrect strip rule, or
+a real prod edge case you need to handle.
+</Step>
+<Step n={4} title="Ramp.">
+1% → 10% → 100% as discrepancies trend to zero.
+</Step>
+<Step n={5} title="When zero discrepancies for N days, cut over.">
+The new system now answers users. The shadow becomes the
+primary; the old system can be torn down or kept on standby.
+</Step>
+</Steps>
+
+The runway: weeks to months. Treat it as a real project.
+
+## Examples that demonstrate the win
+
+- **GitHub's rewrite of the merge logic** (2016) used Scientist
+  to ship a new mergeability checker. Months of shadow runs
+  caught dozens of edge cases before the new system controlled
+  any merges.
+- **Stripe's rewrite of the payment APIs** ran reads against
+  both old and new systems for years, fixing diffs incrementally.
+- **Twitter's transition from Ruby to JVM-based services** used
+  shadow traffic to validate per-service equivalence.
+
+Each used the same pattern. The work is in the comparison
+logic and the patience to ramp.
+
+## When to use it
+
+Shadow traffic shines when:
+
+- The system is **read-heavy** (writes are harder).
+- The semantics are **well-defined** (you can write a diff).
+- The risk of regression is **high** (a rewrite of a critical
+  path).
+- You have **time** (weeks to months).
+
+Shadow traffic is overkill when:
+
+- The change is small.
+- You have good canary deploy + automatic rollback.
+- The semantics are unclear (you're not just replacing; you're
+  changing behavior).
+
+## Cost
+
+Shadow doubles backend cost for the duration of the experiment.
+For a service costing $10K/month, that's $10K/month in extra
+infrastructure (plus the diff-logging pipeline) for the entire
+shadow window.
+
+Worth it when the old system is critical and the rewrite is
+risky. Wasteful when the old system was barely working and the
+new one is obviously better.
+
+## Compared to canary
+
+<Compare a="Canary" b="Shadow">
+<>
+A canary serves **some users**: 1% see the new version, 99% see
+the old. Bugs affect real users (a small fraction).
+
+- Faster signal (real outcomes).
+- Bounded user impact.
+- Doesn't validate at full prod load until late.
+</>
+<>
+A shadow serves **no users**: 100% see old; new runs in
+parallel. Bugs affect nobody.
+
+- Validates at full prod load immediately.
+- Zero user impact.
+- Slower — diffs and discrepancies take time to work through.
+- More infrastructure cost during the shadow phase.
+</>
+</Compare>
+
+In practice they compose: shadow first (no user risk), then
+canary the cutover (small user risk).
+
+<Callout variant="info">
+Shadow traffic is one of the few engineering practices that
+truly takes "test in production" seriously without harming
+users. It's also under-used because the diff-comparison work
+isn't glamorous and the gains aren't visible until cutover. The
+teams that use it consistently for high-risk migrations rarely
+suffer the kinds of incidents that follow rewrites done
+without it.
+</Callout>
+
+## In summary
+
+- Run the new system in parallel with the old; discard new
+  responses; compare them with old.
+- The comparison logic is the spec — writing it is the work.
+- Validates real production load before any user depends on
+  the new system.
+- Writes and external calls are the hard part — usually
+  shadow reads first.
+- Envoy mirroring + log-based diffing is the cheap pattern;
+  Scientist-style in-app comparison is more precise.
+- Run for weeks; ramp 1% → 100% as diffs trend to zero.
+- Composes with canary at cutover.

@@ -1,0 +1,295 @@
+export const level = 'senior';
+
+# Design Netflix / video streaming
+
+A video-on-demand service: a catalog of titles, each available
+to stream globally with low startup time, adaptive quality, and
+multi-device continuity. The interesting parts: CDN strategy
+and origin offload, video encoding pipeline, adaptive bitrate
+streaming, and the playback session.
+
+## 1. Clarify the scope
+
+- Browse catalog, search, recommendations.
+- Start a stream on TV/phone/web; adaptive quality; resume on
+  another device.
+- DRM-protected content.
+- Live streaming: out of scope (different system).
+- Ratings, watch history, recommendations: yes.
+- Payments and accounts: out of scope here.
+
+## 2. Estimate scale
+
+```
+Subscribers              = 250M
+Concurrent peak streams  = 100M
+Average bitrate          = 5 Mbps (HD), peak up to 25 Mbps (4K HDR)
+Peak egress              = 100M × 5 Mbps = 500 Tbps
+
+Catalog                  = 50 000 titles
+Encodings per title      = ~50 (resolutions × codecs × HDR variants)
+Average title size       = 200 GB (all encodings + audio + captions)
+Total catalog storage    = 10 PB origin, replicated to edges
+
+Playback events/sec      = 1M (heartbeats, seeks, errors)
+```
+
+500 Tbps egress is the headline number. Not solvable from
+datacenter origins; this is fundamentally a CDN architecture
+problem with a dedicated content-delivery network at the edge.
+
+## 3. API
+
+```bash
+GET  /v1/catalog/browse?row=trending&page=1
+GET  /v1/titles/:id
+GET  /v1/search?q=
+
+POST /v1/playback/start   { titleId, deviceId, profileId }
+  Resp: { sessionId, manifestUrl, drmLicenseUrl, startPosition }
+
+POST /v1/playback/heartbeat { sessionId, position, qualityLevel, droppedFrames }
+POST /v1/playback/stop      { sessionId, finalPosition }
+
+GET  /<edge>/<titleId>/<rendition>.m3u8     -- HLS manifest
+GET  /<edge>/<titleId>/<segment>.ts         -- video segment
+```
+
+Browse + metadata endpoints are low volume. The playback API
+authorizes the session and returns a manifest URL pointing at
+the CDN. Heartbeats let us update watch progress and detect
+stream health.
+
+## 4. High-level design
+
+```
+Control plane (origin):
+  [ client ] → [ edge gateway ] → [ API services ]
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        ↓                              ↓                              ↓
+[ Catalog service ]            [ Playback service ]         [ Recommendation svc ]
+        │                              │
+        ↓                              ↓
+[ Catalog DB ]                  [ Watch history DB ]
+                                       │
+                                       └── async ──→ [ Events Kafka ]
+                                                          ↓
+                                                  [ Analytics / ML training ]
+
+
+Content plane (edge):
+  client ─request manifest→ [ Edge CDN PoP ] ─miss→ [ Regional cache ] ─miss→ [ Origin storage ]
+                                  │
+                                  ↓
+                          [ Video segments ]
+                          (precomputed during encoding,
+                           replicated to PoPs proactively)
+
+
+Encoding pipeline (offline):
+  raw master → [ encoder farm ] → [ packager (HLS/DASH/CMAF) ] → [ DRM keys ]
+                                        ↓
+                              [ object storage / origin ]
+                                        ↓
+                            [ CDN pre-positioning by popularity ]
+```
+
+The data plane (video bytes) is separate from the control plane
+(API, metadata, recommendations). This is the most important
+shape of the architecture.
+
+## 5. Data model
+
+```
+titles {
+  id              string PK
+  metadata        json (cast, year, genres, ...)
+  available_in    string[] (region codes)
+}
+
+encodings {
+  title_id        string
+  rendition       string (1080p_h264_5mbps, 4k_av1_25mbps, ...)
+  manifest_path   string
+  size_bytes      bigint
+  PRIMARY KEY (title_id, rendition)
+}
+
+watch_history {
+  user_id         bigint
+  title_id        string
+  position_sec    int
+  updated_at      timestamp
+  PRIMARY KEY (user_id, title_id)
+}
+
+playback_sessions  (Redis, short-lived)
+  key: "session:<id>" → { userId, titleId, deviceId, startedAt, lastHeartbeat }
+```
+
+Catalog is read-heavy and small (50K rows); easily in
+Postgres + cache. Watch history is per-user partitioned;
+heartbeats are batched not direct DB writes.
+
+## 6. Deep dives
+
+### 6.1 CDN strategy
+
+500 Tbps egress is not optional CDN — it's "we run our own
+content delivery network." Three tiers:
+
+<Steps>
+<Step n={1} title="Origin storage">
+Object store (S3-class) holding all encodings. Read by regional
+caches; never directly by clients.
+</Step>
+<Step n={2} title="Regional cache">
+Datacenter-scale caches per continent. Cache miss is rare;
+houses the long tail of catalog. Multi-PB.
+</Step>
+<Step n={3} title="Edge PoPs (Open Connect at Netflix)">
+Caches placed inside ISP networks. Hot content (top 5-10K
+titles) lives here; near zero RTT to subscribers. This is what
+makes 500 Tbps feasible — most bytes never traverse internet
+backbone.
+</Step>
+</Steps>
+
+Pre-positioning: every night, ML predicts which titles will be
+hot in each region tomorrow; segments are pushed to edge PoPs
+during off-peak hours. Hit rate at edge PoPs is typically 95%+
+on a steady evening.
+
+### 6.2 Encoding pipeline (offline)
+
+Each title is encoded into many renditions: H.264, H.265, AV1,
+VP9 × multiple resolutions × HDR/SDR. The pipeline:
+
+```
+master video file
+    ↓
+[ shot detection ]   -- split at scene boundaries for parallel work
+    ↓
+[ encoder farm (workers per shot) ]   -- thousands of cores
+    ↓
+[ stitch + package ]   -- assemble into HLS/DASH manifests
+    ↓
+[ quality validation ] -- automated checks: PSNR, VMAF
+    ↓
+[ object storage + DRM key generation ]
+    ↓
+[ CDN pre-positioning ]
+```
+
+Per-shot encoding lets the pipeline parallelize a 2-hour movie
+across thousands of cores and finish in minutes. Modern
+encoders (Netflix's Dynamic Optimizer, AV1) tune bitrate
+per-shot for fixed perceptual quality — saving 30%+ bytes vs
+fixed-bitrate.
+
+### 6.3 Adaptive bitrate (ABR)
+
+Client downloads a **manifest** (HLS `.m3u8` or DASH `.mpd`)
+listing renditions and their segment URLs. Client picks a
+rendition based on current bandwidth estimate, switches every
+few seconds as conditions change.
+
+```
+manifest:
+  rendition 1: 360p,  500 kbps, segments [...]
+  rendition 2: 720p,  1.5 Mbps, segments [...]
+  rendition 3: 1080p, 5 Mbps,   segments [...]
+  rendition 4: 4K,    15 Mbps,  segments [...]
+
+client logic:
+  estimate bandwidth from recent segment downloads
+  pick highest rendition such that download time < segment duration × 0.7
+  prefetch next 1-2 segments
+  on bandwidth drop, switch down at next segment boundary
+```
+
+The server side doesn't need to know what rendition the client
+is on — each segment is a separate object served by CDN.
+Trade-off: more renditions = better fit per-condition, but more
+storage (linear in count).
+
+### 6.4 Playback session and DRM
+
+Authorization is server-side; bytes are CDN-side.
+
+<Steps>
+<Step n={1} title="Client calls /playback/start">
+Server checks subscription, geo-restrictions, device limits.
+Returns manifest URL (signed/short-lived) and DRM license URL.
+</Step>
+<Step n={2} title="Client fetches manifest from CDN">
+Manifest is small (~10 KB), cached at edge. Lists segment URLs.
+</Step>
+<Step n={3} title="Client requests DRM license">
+Sends device's playback-secure key; server returns
+content-decryption key wrapped with device key. Widevine /
+FairPlay / PlayReady — three flavors of the same idea.
+</Step>
+<Step n={4} title="Client downloads segments">
+Decrypts and plays. Heartbeats to control plane every 10-30s.
+</Step>
+</Steps>
+
+DRM ensures CDN can serve segments to anyone, but only paying
+subscribers can decrypt them.
+
+### 6.5 Continuity across devices
+
+User pauses on TV, resumes on phone. The state:
+
+- `watch_history(user_id, title_id) → position_sec, updated_at`
+- Updated by heartbeats (every 10-30s) batched into a stream
+  processor → DB write.
+
+On `/playback/start`, server reads `watch_history` and returns
+`startPosition`. Sub-second precision isn't required; user
+tolerates "10 seconds back from where I was." Heartbeats can
+sample (write every Nth) without losing UX.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 5 Pbps egress | CDN PoP capacity | More PoPs; better pre-positioning; lower top-end bitrate |
+| Encoder cost | Re-encoding entire library on codec change | Incremental encoding; defer cold catalog |
+| New-release flash crowd | Edge PoP miss surge | Aggressive pre-fetch hours before release; "premiere" warming |
+| Heartbeat write QPS | DB writes saturated | Stream aggregator: heartbeats → batched DB write per minute |
+| DRM license server | Crypto throughput | Stateless replicas; cache device-key context; co-locate with edge |
+| Geo-restricted content checks | Per-request external call | Cache subscription state in edge; refresh on auth events |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Run own edge CDN** over commercial CDN: huge upfront
+  investment, far cheaper per-bit at this scale, and
+  control over peering.
+- **Per-shot encoding** over per-title: 30% bandwidth savings
+  for big encoding-pipeline complexity.
+- **Pre-positioning** over pull-through CDN: cold-content
+  latency tax avoided; storage cost higher at edge.
+- **HLS/DASH adaptive** over fixed quality: smoother on bad
+  networks; small client complexity.
+- **DRM** over watermark/none: required by content licenses;
+  binds session to device.
+
+## In summary
+
+- The architecture is a CDN at heart. The control plane is
+  small; the data plane is enormous.
+- Three CDN tiers (edge PoP → regional cache → origin) with
+  pre-positioning of predicted hot content.
+- Encoding pipeline is offline, per-shot, massively parallel;
+  produces dozens of renditions per title.
+- Adaptive bitrate happens on the client; server-side just
+  exposes a manifest of renditions.
+- Cross-device continuity from a simple watch-history row;
+  heartbeats batched, never direct writes.
+- 500 Tbps is impossible without owning the edge — that's the
+  forcing function of the design.

@@ -1,0 +1,222 @@
+export const level = 'senior';
+
+# Batching and request coalescing
+
+Combine many small operations into fewer larger ones. The
+underlying system pays fixed overhead per call (TCP setup,
+serialization, query planning). Batching amortizes that
+overhead across many items.
+
+The classic trade-off: latency vs throughput. Batching adds
+latency (wait for the batch to fill), increases throughput.
+
+## Why batching helps
+
+A typical RPC has overhead independent of payload size:
+
+- TCP handshake (if not reusing connection): ~5ms
+- TLS handshake: another ~5ms
+- Serialization + parsing: ~1ms
+- Application logic to handle the request: ~5ms
+- Database connection acquisition: ~2ms
+- DB query planning: ~5ms
+
+For a single call, that's ~20ms of overhead. If the actual
+work is 1ms, you're 95% overhead.
+
+Batch 100 calls into one: same overhead, 100× the work. Now
+you're 95% useful work.
+
+## Common batching patterns
+
+### Time-window batching
+
+Accumulate requests for N ms; flush when window expires or
+batch size hits a limit.
+
+```js
+class Batcher {
+  pending = [];
+  timer = null;
+  
+  enqueue(item) {
+    this.pending.push(item);
+    if (this.pending.length >= 100) return this.flush();
+    if (!this.timer) {
+      this.timer = setTimeout(() => this.flush(), 10);
+    }
+  }
+  
+  flush() {
+    const items = this.pending.splice(0);
+    clearTimeout(this.timer);
+    this.timer = null;
+    return this.backend.batchSubmit(items);
+  }
+}
+```
+
+Trade-off: longer window = more batching efficiency, more
+latency.
+
+### Size-only batching
+
+Flush when N items accumulate. No timer.
+
+Risk: a partial batch may sit forever if traffic dies. Use
+when you'd rather drop the partial batch than process it
+slowly.
+
+### Per-key batching (DataLoader pattern)
+
+For N+1 query problems: many parallel requests for `user(id)`
+become one `users(ids)` call. The classic pattern in GraphQL:
+
+```js
+const loader = new DataLoader(async (ids) => {
+  const users = await db.users.where('id', 'in', ids);
+  return ids.map(id => users.find(u => u.id === id));
+});
+
+await Promise.all([
+  loader.load(1),
+  loader.load(2),
+  loader.load(3),
+]);
+// → ONE db query for ids [1, 2, 3]
+```
+
+Within a single event loop tick (or short async window),
+DataLoader collects all `.load()` calls into one batch.
+
+(See n-plus-one-and-data-loader-arch.)
+
+## Request coalescing (single-flight)
+
+A specialized batching: multiple concurrent **identical**
+requests are served by a single downstream call.
+
+```js
+const inflight = new Map();
+
+async function get(key) {
+  if (inflight.has(key)) return inflight.get(key);
+  const promise = expensiveCall(key)
+    .finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+  return promise;
+}
+```
+
+Different from batching: 100 different requests for the
+*same* thing become 1 call. The other 99 callers wait on the
+first.
+
+The standard fix for cache stampede. (See request-collapsing.)
+
+## Where batching pays off
+
+- **Database writes**: 1000 inserts → 1 `INSERT ... VALUES`
+  statement.
+- **Database reads**: 100 lookups → 1 `WHERE id IN (...)`.
+- **Network RPCs**: batch endpoint that accepts arrays.
+- **Logging / metrics**: batch events before sending to
+  collector.
+- **Search index updates**: bulk index API instead of one
+  doc at a time.
+- **File operations**: batch S3 uploads, tar+gz before
+  shipping.
+- **Kafka writes**: bigger batches → higher throughput, more
+  efficient compression.
+
+## Where it doesn't
+
+- **Latency-sensitive single requests**: a user waiting for a
+  page can't wait 10ms for a batch.
+- **Operations with rejection**: if any item in the batch
+  fails the validation, what happens? Atomic batches roll all
+  back; non-atomic surface partial failures.
+- **Cold path with low throughput**: timer fires, batch is
+  size 1, no win.
+
+## Backpressure on batches
+
+A consumer can't keep up. The batcher's queue grows. Memory
+exhausts.
+
+Bound the queue:
+
+- **Drop oldest**: keep the most recent N items, drop the
+  rest. OK for telemetry.
+- **Block the producer**: producer waits when queue is full.
+  Good for ordering-critical work.
+- **Reject the producer**: return 429 / error. Forces the
+  upstream to back off.
+
+## Per-call vs batch APIs
+
+When you control the API, providing both is best:
+
+```bash
+POST /events
+  Body: { ...one event... }
+
+POST /events/batch
+  Body: { events: [...] }
+```
+
+Default callers to the per-call endpoint for simplicity.
+High-volume callers use the batch endpoint.
+
+Internally, the per-call endpoint should batch under the
+hood too — many micro-callers' requests aggregated server-side
+before hitting the DB.
+
+## Common mistakes
+
+### Batch latency overshoots SLOs
+
+Batch window is 100ms. User-facing latency budget is 80ms.
+You'll always miss SLO.
+
+Fix: shorter window, dynamic window, or batch only on
+low-priority paths.
+
+### Atomic batches that should be non-atomic
+
+A batch of 1000 inserts; one row violates a constraint;
+entire batch rolls back. Now the legitimate 999 inserts are
+gone.
+
+Fix: non-atomic batch APIs that return per-item status.
+
+### Forgotten partial batch
+
+App shuts down with 50 items in an unfilled batch buffer. On
+restart, those 50 are lost.
+
+Fix: flush on shutdown (graceful drain), or use durable
+batching (Kafka, SQS) where the buffer survives crash.
+
+### Hot-key in the batch
+
+A "batch by user" approach where one user does 99% of the
+volume → effectively no batching for them.
+
+Fix: also shard by something high-cardinality (item id,
+timestamp).
+
+## In summary
+
+- Batching: combine many small ops into one large op,
+  amortize overhead.
+- Patterns: time-window, size-only, per-key (DataLoader),
+  single-flight (coalescing).
+- Pays off for DB writes, RPCs, logs, search indexing, Kafka
+  writes.
+- Hurts latency — don't batch on user-facing critical paths
+  unless throughput is the bigger problem.
+- Watch for: partial batches lost on shutdown, atomic
+  semantics, hot keys defeating the batch.
+- Provide both per-call and batch APIs; default callers to
+  per-call; batch under the hood.

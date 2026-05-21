@@ -1,0 +1,186 @@
+export const level = 'mid';
+
+# CDN architecture
+
+A Content Delivery Network puts copies of your content
+**physically close to users**, on hardware operated by the CDN
+provider, so requests are served from a nearby city instead of
+your origin halfway around the world.
+
+The performance win is two-fold: lower latency (no round trip
+to origin) and lower origin load (most requests don't reach
+you).
+
+## The shape
+
+```
+user ──► nearest POP (edge cache)
+              │
+              ├── hit  → return cached object
+              │
+              └── miss → fetch from origin (or mid-tier shield)
+                            │
+                            └── store in POP for next time
+```
+
+**POP** = Point of Presence. A small datacenter run by the CDN
+provider, typically in a major city's interconnect point. Big
+providers run hundreds globally.
+
+## Cache hierarchy
+
+Modern CDNs aren't flat. They have multiple tiers:
+
+<Steps>
+<Step n={1} title="Edge POP — closest to the user.">
+Small storage, hottest content. Cache hit latency: 5–30 ms.
+</Step>
+<Step n={2} title="Mid-tier / regional shield.">
+Aggregates several edge POPs in a region. Catches cache
+misses from the edge before they hit the origin. Larger
+storage, broader content.
+</Step>
+<Step n={3} title="Origin shield (optional).">
+Dedicated front for the origin. Final tier before hitting
+your servers. Some providers (Fastly, CloudFront) call this
+"origin shielding."
+</Step>
+<Step n={4} title="Origin — your servers.">
+The source of truth. Should serve only cache misses, and
+even then rarely.
+</Step>
+</Steps>
+
+The hit-rate math: if each tier is 90% hit, the origin sees
+0.1 × 0.1 × 0.1 = 0.1% of total traffic. A 1000:1 reduction.
+
+## Cache keys
+
+A cache key is what the CDN looks up to find an object. The
+default is **scheme + host + path + query string**. You can
+customize:
+
+- Strip cookies (otherwise per-user cookies produce per-user
+  cache entries, defeating the cache).
+- Strip query parameters that don't affect the response
+  (analytics tags like `utm_source`).
+- Include the `Accept-Language` header (per-language cache
+  variants).
+- Include the `Vary` header for content negotiation.
+
+A bad cache-key design — including too much — drops hit rate.
+Including too little serves wrong content.
+
+## Cache lifetime control
+
+The origin's response headers tell the CDN how long to cache:
+
+```bash
+Cache-Control: public, max-age=3600, s-maxage=86400
+```
+
+- `max-age=3600` — browser caches for 1 hour.
+- `s-maxage=86400` — *shared* caches (CDN) cache for 1 day.
+- `public` — cacheable by intermediaries.
+- `private` — only the user's browser may cache.
+- `no-store` — never cache.
+
+The CDN's own cache settings can override the origin (e.g.,
+"cache everything for at least 24h regardless of headers")
+when configured.
+
+## Invalidation
+
+Two strategies:
+
+### TTL-based
+
+Set a max-age. The cache expires the object eventually. Simple,
+but stale data lingers until expiry. Fine for slowly-changing
+content.
+
+### Active purge
+
+Send a purge request to the CDN: "drop these URLs everywhere."
+Latency to global purge varies — Fastly, Cloudflare promise
+seconds; older CDNs took minutes.
+
+For frequently-changing content, **versioned URLs** are better
+than purging:
+
+```
+/static/app.js?v=abc123  →  cache forever
+/static/app.js?v=def456  →  new version, different cache entry
+```
+
+A new deploy publishes new versioned URLs; old ones expire
+naturally. No purge needed.
+
+## Origin shielding
+
+When many edge POPs miss the same object simultaneously
+(viral content, deploy invalidation), they all stampede the
+origin. A **shield** layer in front of origin reduces this:
+
+- Coalesces concurrent requests for the same object.
+- Acts as another cache tier.
+- Lets origin scale for hot content with minimal infra changes.
+
+CloudFront, Fastly, Akamai all support shielding. Costs
+slightly more in latency (extra hop) but prevents thundering
+herd.
+
+## CDN features beyond static caching
+
+Modern CDNs do more than serve static files:
+
+- **Image optimization** — resize, recompress, switch formats
+  (WebP, AVIF) based on the requesting client.
+- **Video segmentation and adaptive bitrate** — chunk and
+  cache HLS/DASH manifests and segments.
+- **Edge compute** — run code at the POP (Cloudflare Workers,
+  Lambda@Edge, Fastly Compute@Edge). See edge-compute-architecture.
+- **TLS termination** — handle HTTPS at the edge, talk plaintext
+  or mTLS to origin.
+- **WAF / DDoS protection** — filter bad traffic before it
+  reaches origin.
+- **HTTP/3 support** — POPs negotiate HTTP/3 with the client
+  while talking HTTP/1.1 or 2 to origin.
+
+## Cache-friendly response design
+
+To make content cacheable:
+
+- **Stable URLs.** `/api/users/42` is cacheable; `/api/users?session=xyz`
+  isn't (per-user).
+- **No personalization in URLs.** Personalize on the client
+  (JS reads cookies, fetches a small per-user JSON, merges with
+  cached HTML).
+- **Long TTLs with versioned URLs** for static assets.
+- **`Vary` for legitimately-varying content** (language,
+  device type).
+- **Set `Cache-Control` always.** Default behavior on unset
+  headers is provider-specific and surprising.
+
+## When a CDN doesn't help
+
+- **Heavy write workloads.** CDNs cache reads; writes bypass.
+- **Per-user data.** Without an architecture for personalization
+  at the edge, every request is uncacheable.
+- **Real-time content.** Anything that must reflect a state
+  change within seconds; CDN invalidation lag matters.
+
+## In summary
+
+- CDN: serve content from a POP near the user; tiered caches
+  shield origin.
+- Hit-rate math: 90% per tier × 3 tiers = 99.9% origin
+  reduction.
+- Cache keys default to URL; customize via headers and query
+  rules.
+- Invalidation via TTL or active purge; versioned URLs dodge
+  the problem.
+- Modern CDNs do edge compute, image optimization, WAF —
+  not just static caching.
+- Design responses to be cacheable: stable URLs, no per-user
+  content baked into URL paths.

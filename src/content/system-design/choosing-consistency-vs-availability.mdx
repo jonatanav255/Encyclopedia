@@ -1,0 +1,161 @@
+export const level = 'senior';
+
+# How to choose: strong vs eventual consistency
+
+Per operation, not per system. Different operations in the
+same product need different consistency.
+
+The CAP framing is too coarse for real design. PACELC is
+better. The right question: **which operations can't tolerate
+stale or lost writes**, and which can?
+
+## Operations that need strong consistency
+
+- **Money**: account balance, ledger entries, transfers, refunds.
+- **Inventory**: don't sell the last item twice.
+- **Identity**: who am I logged in as right now?
+- **Uniqueness constraints**: don't let two users register
+  the same username.
+- **Configuration / metadata**: routing tables, secrets,
+  schema version.
+- **Distributed locks / leases**: only one process holds the
+  lock.
+- **Leader election**: exactly one leader.
+
+For these, accept the cost: latency, leader-only writes,
+quorum round-trips, occasional unavailability under partition.
+
+## Operations that can be eventually consistent
+
+- **Like / view counts**: off by 0.1% is invisible.
+- **Search indexes**: 30 seconds behind the truth is fine.
+- **Recommendations / feeds**: yesterday's model output is OK.
+- **Analytics / dashboards**: minutes-old data is the norm.
+- **Cross-region read replicas**: stale by replication lag.
+- **Caches**: stale within TTL is the entire point.
+- **Activity feeds**: missing a few seconds of new posts is
+  invisible.
+
+For these, take the win: fast writes, multi-region replicas,
+high availability.
+
+## The same data, different consistency per operation
+
+The user's email address: strong on update (don't lose the
+new value), eventual on read (showing the old one for a few
+seconds is fine).
+
+The bank account balance: strong on the actual ledger;
+**display** can be eventual (cached for sub-second freshness).
+
+The trick is to identify per-operation requirements rather
+than per-data.
+
+## Cost differences
+
+<Cheatsheet>
+| Mode | Write latency | Read latency | Availability under partition |
+|---|---|---|---|
+| Strong (linearizable) | High (quorum / cross-region) | Same or higher | Lower (CP) |
+| Causal | Medium | Low (local) | High |
+| Eventual | Low | Low (local) | Highest |
+</Cheatsheet>
+
+Cross-region, the gap is ~50 ms on writes — that's the
+difference between "fast user experience" and "feels slow."
+
+## Per-operation routing
+
+A common architecture:
+
+```
+strong writes → primary region → durable, linearizable store
+                   ▼
+       cross-region replication
+                   ▼
+eventual reads ← read replicas / caches in each region
+```
+
+A user's "transfer money" goes to the primary; their "show
+my recent transactions" comes from a local replica. Different
+latency, different consistency, same user.
+
+## The honest interview answer
+
+When asked "what consistency does your design use?", the wrong
+answer is "strong" or "eventual." The right answer is:
+
+> "Writes to the ledger and inventory go through a linearizable
+> path; reads of historical balances come from replicas with
+> ~1-minute staleness; user preferences and search indexes
+> are eventually consistent."
+
+Per-operation analysis shows you understand the trade-offs.
+
+## Patterns to make eventual feel strong
+
+- **Read-your-writes for the writer.** After a user posts,
+  their next read sees their post even if global replication
+  hasn't caught up. (See read-your-writes-consistency.)
+- **Optimistic UI.** Render the change client-side immediately;
+  reconcile if the server later rejects.
+- **Causal tokens.** Server returns "version 42 after this
+  write"; client passes it on next read; server blocks until
+  the replica catches up.
+
+These cover the most-painful eventually-consistent UX bugs
+without making the underlying system strong.
+
+## Common mistakes
+
+### "We need ACID everywhere"
+
+You don't. The shopping cart doesn't need linearizable
+consistency. The login session is per-user — stronger than
+needed for "everyone agrees" but doesn't need cross-region
+linearizability.
+
+### "Eventual is good enough" → silent money loss
+
+A "+1 to balance" write replicated async; the leader crashes
+before replicating; user is debited but creditor isn't paid.
+Eventually consistent banking is a phrase that should not
+exist.
+
+### "Linearizable by default" → cross-region writes 200 ms each
+
+You overpaid by 10×. Most of those writes didn't need
+linearizability; the ones that did could route to a single
+strong path.
+
+## Decision questions
+
+<Steps>
+<Step n={1} title="Can the user re-do this operation if it's lost?">
+Yes (post a comment again) → eventual. No (transferred money)
+→ strong.
+</Step>
+<Step n={2} title="Will inconsistency lead to financial / safety / legal harm?">
+Yes → strong. No → eventual.
+</Step>
+<Step n={3} title="Is the system already eventually consistent for the data being written?">
+Yes (cache, search index) → fine to stay eventual.
+</Step>
+<Step n={4} title="Is the latency acceptable for strong consistency?">
+Single region, 1–5 ms → strong is cheap. Cross-region, 100+
+ms → strong is expensive; consider per-region partitioning.
+</Step>
+</Steps>
+
+## In summary
+
+- Strong vs eventual: a per-operation question, not
+  per-system.
+- Strong for money, inventory, identity, uniqueness, config,
+  locks.
+- Eventual for counts, search, feeds, recommendations, caches,
+  cross-region reads.
+- Hide eventual-consistency UX bugs with read-your-writes,
+  optimistic UI, causal tokens.
+- Wrong answers: "we use ACID everywhere," "eventual
+  consistency is fine for money," "linearizable by default."

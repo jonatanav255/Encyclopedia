@@ -1,0 +1,254 @@
+export const level = 'mid';
+
+# Design a distributed rate limiter
+
+A rate limiter caps how many requests a caller can make in a
+time window. Distributed because the API is served by many
+instances and the limit applies across all of them. The system
+must reject excess traffic with low latency, low memory, and
+without becoming a single point of failure.
+
+## 1. Clarify the scope
+
+- Granularity: per-user, per-API-key, per-IP, per-endpoint, or
+  combinations.
+- Limits: a few fixed tiers, or per-customer custom limits?
+- Window: per-second, per-minute, per-hour, all of them?
+- Response: 429 with `Retry-After`? Or silent drop?
+- Distributed across a fleet of N API servers, possibly multi-region.
+- Failure mode: fail open (allow on infra failure) or fail closed?
+
+Out of scope: WAF rules, layer-3 DDoS scrubbing, billing
+metering (separate system, different latency budget).
+
+## 2. Estimate scale
+
+```
+API traffic         = 1M QPS peak (varies)
+Distinct keys       = 100M API keys + 1B IPs
+Window granularities = 1s, 1m, 1h
+Latency budget      = < 5 ms p99 added per request
+
+Storage:
+  per key: counter(s) + last-reset = ~50B
+  100M keys × 50B = ~5 GB hot
+  works as Redis cluster in memory
+```
+
+Two firm constraints: a counter lookup per request (1M QPS into
+the rate-limiter store), and a strict added-latency budget.
+
+## 3. API
+
+```bash
+# Internal API used by gateway / sidecar before forwarding the call
+POST /ratelimit/check
+  Body: { key: string, rule: string }
+  Resp: { allow: bool, remaining: int, resetAt: timestamp,
+          retryAfterSec?: int }
+
+# Admin
+PUT /ratelimit/rules/:ruleId
+  Body: { window: "1s"|"1m"|"1h", limit: int, scope: "user"|"ip"|... }
+```
+
+## 4. High-level design
+
+```
+[ client ] → [ API gateway ] ──(check)──→ [ Rate-limiter service ]
+                  │                              │
+                  │                              └─→ [ Redis cluster ]  (counters)
+                  ↓
+          [ App service ]   ←── allowed only when check returns allow=true
+
+
+Sidecar variant (Envoy / linkerd):
+  [ gateway ] ──→ [ sidecar ratelimit filter ] ──→ [ ratelimit svc ] ──→ [ Redis ]
+```
+
+Two deployment shapes:
+
+- **Centralized service** behind the gateway — clean separation,
+  one network hop.
+- **In-gateway filter** — Envoy's `ratelimit` filter or
+  equivalent — avoids a hop, harder to evolve.
+
+For a 5 ms budget, in-process counters with periodic Redis sync
+work if you accept ~window-size slack across the fleet.
+
+## 5. Data model
+
+For each `(key, ruleId)`:
+
+```
+ratelimit:<ruleId>:<key>
+  → { count, windowStart }   in Redis
+```
+
+TTL = window length. Keys auto-expire when the window closes; no
+cleanup job needed.
+
+For multiple windows (1s, 1m, 1h on the same key), keep separate
+counters — combining them defeats independent rule changes.
+
+## 6. Deep dives
+
+### 6.1 The four classic algorithms
+
+<Cheatsheet>
+| Algorithm | Idea | Pro | Con |
+|---|---|---|---|
+| **Fixed window** | Counter resets at window boundary | Trivial; 1 op/req | Boundary bursting: 2x at window edges |
+| **Sliding window log** | Record each request's timestamp | Exact; smooth | Memory = O(requests); slow at high QPS |
+| **Sliding window counter** | Weighted blend of current + previous window | Smooth; ~exact; constant memory | Slight approximation |
+| **Token bucket** | Tokens refill at rate R, max B; consume 1/req | Allows controlled bursts | Need careful parameter tuning |
+| **Leaky bucket** | Queue, drained at rate R | Smooth output rate | Adds queuing latency; less common at edge |
+</Cheatsheet>
+
+**Production default**: sliding-window counter for accuracy, or
+token bucket if you want explicit burst tolerance.
+
+Sliding-window counter math:
+
+```
+estimated = previousWindowCount × overlapFraction
+          + currentWindowCount
+allow = estimated < limit
+```
+
+Approximation is within ~0.003% of true sliding count and uses
+two integers per key.
+
+### 6.2 Distributed counters: the read-modify-write race
+
+A naïve `GET; INCR; SET` from N gateway instances against Redis
+races: two requests see count=99, both increment to 100, both
+allow → over-limit. Fixes:
+
+- **Atomic `INCR` then check** — Redis `INCR` is atomic; one
+  RTT.
+- **Lua script** on Redis — atomic `check-and-set` in a single
+  command for token-bucket math.
+
+```js
+// pseudo Redis-Lua for sliding-window counter
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local windowMs = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+
+local cur = tonumber(redis.call('HGET', key, 'count') or '0')
+local windowStart = tonumber(redis.call('HGET', key, 'start') or '0')
+
+if now - windowStart > windowMs then
+  cur = 0
+  windowStart = now
+end
+
+if cur + 1 > limit then return 0 end
+
+redis.call('HMSET', key, 'count', cur+1, 'start', windowStart)
+redis.call('PEXPIRE', key, windowMs * 2)
+return 1
+```
+
+One RTT per request, atomic, no race.
+
+### 6.3 Latency budget
+
+A 1-2 ms Redis RTT per request adds up. Three mitigations:
+
+<Steps>
+<Step n={1} title="Co-locate Redis with gateways">
+Same AZ; sub-ms RTT. Don't cross AZ for rate limiting unless
+absolutely necessary.
+</Step>
+<Step n={2} title="Local approximate counter, periodic sync">
+Each gateway keeps an in-memory bucket; flushes deltas to Redis
+every N ms. Cost: at most N-ms slack of over-limit traffic per
+gateway, multiplied by gateways. Good enough for soft limits;
+not for billing.
+</Step>
+<Step n={3} title="Pre-fetch tokens">
+Each gateway requests `K` tokens from Redis at once and serves
+locally. Bursts allowed up to K; cross-fleet drift bounded by
+K × instances. Standard approach in Envoy/Stripe-style systems.
+</Step>
+</Steps>
+
+### 6.4 Failure mode: fail open or fail closed?
+
+When Redis is unreachable, the limiter can either let
+everything through (fail open) or block everything (fail
+closed).
+
+<Compare a="Fail open" b="Fail closed">
+<>
+Default for most public APIs. Better to serve over-limit than
+to take an outage during a Redis incident. Trust that downstream
+protections (DB connection pools, app-level limits) catch the
+worst.
+</>
+<>
+Required for hard limits where over-serving is catastrophic
+(billing fraud, regulator rules, abuse-of-service). Pair with
+a local LRU fallback to keep recent counters even if Redis is
+gone.
+</>
+</Compare>
+
+For most products: **fail open with monitoring**. A 5xx-burst
+in the limiter shouldn't take the API down.
+
+### 6.5 Per-customer tiers and multi-key rules
+
+Real systems run multiple rules per request:
+
+- 1 000 req/s per API key
+- 100 req/s per endpoint per key
+- 50 000 req/s per IP
+
+Each is a separate counter increment; the request is allowed
+only if all pass. Per-request: 3 INCRs in a pipeline. Slightly
+more latency, much more useful.
+
+Custom limits per customer live in a small config service
+(read-through cache, updated rarely). Don't fetch them from the
+DB per request.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 10M QPS into limiter | Single Redis cluster | Shard by key; consistent hashing |
+| Hot key (one tenant) | Single shard saturated | Pre-allocate token blocks to gateways |
+| Cross-region | Latency budget violated | Per-region counters; loose global cap |
+| Counter precision | Approximation drifts | Periodic reconciliation, accept slack |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Sliding-window counter** over fixed-window: ~50% more memory
+  for ~10x accuracy at window boundaries.
+- **Pre-fetch tokens** over per-request Redis call: trade some
+  drift slack for a 10x latency improvement.
+- **Fail open** over fail closed: trade rare over-serving for
+  far higher availability.
+- **Per-region counters** over global counter: trade a small
+  amount of imprecision for staying inside the latency budget at
+  scale.
+
+## In summary
+
+- Rate limiting at scale is about counter algorithm + atomic
+  updates + acceptable latency.
+- Sliding-window counter is the default; token bucket if you
+  need bursts.
+- Use atomic Redis ops (INCR, Lua script). Don't read-modify-write.
+- Co-locate Redis with gateways. Use pre-fetched token blocks
+  when 1 ms is too much.
+- Fail open by default; fail closed only when overage is
+  expensive.
+- Real systems run multiple rules per request — design for it
+  from the start.

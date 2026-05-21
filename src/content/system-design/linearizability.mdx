@@ -1,0 +1,167 @@
+export const level = 'senior';
+
+# Linearizability
+
+The strongest single-operation consistency model. The system
+behaves as if there were exactly one copy of every object, and
+every operation happens **atomically** at some instant between
+its invocation and its return.
+
+If write W returns success at time T, every operation starting
+after T sees W or a later state. No replica reorders. No client
+sees a "stale" value once any other client has seen a newer one.
+
+## What it gives the application
+
+<Steps>
+<Step n={1} title="Recency.">
+Once any client observes a value, no client sees an older
+value.
+</Step>
+<Step n={2} title="Single-key atomic operations.">
+Compare-and-swap, increment, and conditional updates work
+the way the application expects: as if running on one node.
+</Step>
+<Step n={3} title="Composable safety.">
+You can use a linearizable register as a building block for
+locks, leases, and other coordination primitives without
+worrying about replica skew.
+</Step>
+</Steps>
+
+## What it costs
+
+You can't be linearizable, available, and partition-tolerant
+all at once — that's exactly what CAP says. So under network
+partition a linearizable system must:
+
+- **Refuse some operations** (CP systems: etcd, Zookeeper,
+  Spanner default).
+- Or **route every operation through a single leader** with
+  consensus, which means cross-AZ or cross-region round-trips
+  for every write.
+
+For geo-distributed systems this is brutal. A linearizable
+write across US/EU/Asia takes 150–200 ms round-trip
+**minimum** — physics floor, not software.
+
+## How systems implement it
+
+Three common approaches:
+
+### Single leader
+
+All writes go to one node. Reads from the leader (or from
+replicas with a "wait for at least this log index" check).
+Postgres, MySQL, MongoDB primary-only reads.
+
+Failure mode: the leader can die, and during the failover
+window the system isn't writable.
+
+### Consensus log
+
+Writes go through Raft/Paxos. Quorum agrees on the order.
+etcd, Consul, CockroachDB, Spanner. Linearizability is a
+property of the log: every node executes operations in the
+same order.
+
+Failure mode: needs a quorum (3/5 or 4/7) to be available.
+Lose more than that, you lose writes.
+
+### Synchronous replication
+
+Writes block until N replicas acknowledge. Tunable for
+durability vs latency. Cassandra with `QUORUM` reads + writes
+gives linearizable single-key ops.
+
+## Linearizable vs serializable
+
+<Compare a="Linearizable" b="Serializable">
+<>
+A property of **single objects**. Says "every op on this
+register appears atomic at some instant." Doesn't talk about
+multi-object transactions.
+</>
+<>
+A property of **transactions**. Says "any concurrent
+execution is equivalent to some serial execution." Doesn't
+require real-time ordering — a serializable system can
+execute T1 before T2 even if T2 started first.
+</>
+</Compare>
+
+**Strict serializable** = serializable + linearizable. The
+gold standard for distributed databases. Spanner and
+CockroachDB target this.
+
+A serializable-but-not-linearizable system can show you "the
+past" — a read that started after a commit might still miss
+that commit's effects. Usually surprising; sometimes
+acceptable.
+
+## How to verify linearizability
+
+You can't prove it from inside the system. Tools like
+**Jepsen** record concurrent client operations with
+timestamps and search for a serial order consistent with
+real-time ordering. If they can't find one, the system isn't
+linearizable.
+
+Jepsen has caught linearizability bugs in essentially every
+distributed database; if a vendor claims "fully linearizable"
+without a Jepsen report, treat the claim as marketing.
+
+## When you actually need it
+
+Reach for linearizability when one of these is true:
+
+- **Distributed locks / leases.** Two clients must not both
+  hold the lock.
+- **Leader election.** Exactly one node must believe it's the
+  leader at any instant.
+- **Unique constraints.** Two requests can't both succeed at
+  registering the same username.
+- **Inventory / money.** Concurrent purchases of "the last
+  one" must not both succeed.
+- **Configuration / metadata.** The schema, the routing table,
+  the secret rotation — needs to be consistent across the
+  fleet.
+
+If your operation isn't on that list, weaker consistency
+probably suffices and costs an order of magnitude less.
+
+## Common mistakes
+
+### Assuming reads from replicas are linearizable
+
+"We use Postgres with read replicas, so it's linearizable" is
+false. The leader is. The replicas lag. A read off a replica
+might miss a just-committed write. To stay linearizable, route
+reads to the leader, or use a "wait for log position" trick.
+
+### Thinking ACID = linearizable
+
+A single-node ACID database is linearizable trivially (one
+copy). A multi-node ACID database may or may not be — depends
+on the replication mode.
+
+### Using quorum reads + quorum writes and assuming linearizability
+
+Cassandra `QUORUM` + `QUORUM` gives you linearizability for
+single keys **only if the keys exist on every replica before
+the read**. Edge cases (sloppy quorums, hinted handoff,
+replica repair) break this in subtle ways. Use the
+`LightweightTransactions` (LWT) path for true linearizable
+single-key ops.
+
+## In summary
+
+- Linearizability: the system behaves as one copy, every op
+  appears to happen at a single instant.
+- Costs latency, availability under partition, or both.
+- Implemented via leader-only writes, consensus log, or
+  synchronous quorum.
+- Different from serializable (single objects vs transactions);
+  strict serializable combines both.
+- Use it for locks, leaders, uniqueness, inventory, money — and
+  almost nothing else.

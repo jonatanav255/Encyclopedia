@@ -1,0 +1,279 @@
+export const level = 'mid';
+
+# Availability math
+
+"Three nines" sounds vague until you do the math. **99.9%
+uptime** is **8.76 hours of downtime per year**. **99.99%** is
+**52 minutes**. The difference is the difference between "two
+afternoons of incidents" and "no observable downtime." These two
+SLAs require very different architectures, and you can't pick
+one without knowing the numbers.
+
+This page is the arithmetic of availability — the budget table,
+how availability composes across components, and why naïve
+microservice architectures *erode* availability rather than
+improve it.
+
+## The nines table
+
+<Cheatsheet>
+| Availability | Downtime / year | Downtime / month | Downtime / week |
+|---|---|---|---|
+| 99% (two nines) | 3.65 days | 7.3 hours | 1.68 hours |
+| 99.5% | 1.83 days | 3.65 hours | 50.4 min |
+| 99.9% (three nines) | 8.76 hours | 43.8 min | 10.1 min |
+| 99.95% | 4.38 hours | 21.9 min | 5.04 min |
+| 99.99% (four nines) | 52.6 min | 4.38 min | 60.5 s |
+| 99.999% (five nines) | 5.26 min | 26.3 s | 6.05 s |
+| 99.9999% (six nines) | 31.5 s | 2.63 s | 0.6 s |
+</Cheatsheet>
+
+Each extra nine costs **10x more downtime budget shrinkage**.
+The engineering cost is super-linear: going from three to four
+nines is typically harder than from two to three.
+
+## What "uptime" actually means
+
+The number is meaningless without saying **what was measured and
+how**. Three pitfalls:
+
+<Steps>
+<Step n={1} title="Probed from where?">
+Internal pings will always show better availability than external
+synthetics. Customer-perceived availability is what's measured
+from outside the network you run.
+</Step>
+<Step n={2} title="What counts as down?">
+Hard 500s, sure. But also: 200 with the wrong data; correct
+data but past the latency SLO; correct data but on the wrong
+version after a botched deploy. Different teams draw the line
+differently.
+</Step>
+<Step n={3} title="Aggregated how?">
+"99.99% across the year" can hide a single multi-hour outage if
+the rest of the year is perfect. Most SLAs report *per-month* or
+use *request-success rate* (good requests / total) to avoid this.
+</Step>
+</Steps>
+
+The honest SLO is a triple: **(metric, target, window)**. Example:
+"99.95% of API requests succeed within 200 ms, measured by edge
+probes, in any rolling 30-day window."
+
+## Composing availability — series vs parallel
+
+If your request must succeed at A *and* B *and* C — they're in
+**series** — availability multiplies.
+
+```
+A_series = A * B * C
+```
+
+Example: a request that needs the API server (99.9%), DB
+(99.9%), and cache (99.9%) all up.
+
+```
+0.999 × 0.999 × 0.999 = 0.997  (≈ 99.7%)
+```
+
+Three "three nines" components in series give you **less than
+three nines** combined. Series erodes availability.
+
+If your request can succeed at A *or* B *or* C — they're in
+**parallel** (redundant replicas) — unavailability multiplies.
+
+```
+A_parallel = 1 - (1 - A) × (1 - B) × (1 - C)
+```
+
+Example: three replicas, each 99.9%.
+
+```
+1 - 0.001^3 = 0.999999999 (~9 nines, in theory)
+```
+
+In practice replicas share failure modes (same network, same
+region, same deploy), so the gain is smaller than the math says.
+But the direction is right: **parallelism increases availability,
+serial chains decrease it**.
+
+## Why microservices *reduce* availability without effort
+
+A request that touches 10 services, each at 99.9% individually,
+chains them in series:
+
+```
+0.999^10 = 0.99004 ≈ 99% (two nines)
+```
+
+Ten three-nines services collectively give **two nines**. To
+maintain three nines end-to-end with 10 components in series,
+each must be ~99.99%.
+
+```
+x^10 = 0.999  →  x ≈ 0.9999
+```
+
+Each service must be **10x more available** than the target SLO.
+This is the "microservices availability tax." Solutions:
+
+- **Fewer hops on the critical path** — the deepest available
+  call chain has the deepest budget.
+- **Graceful degradation** — non-critical services treated as
+  optional; their unavailability returns partial results, not
+  failure.
+- **Caching** — last known good result returned when the
+  downstream is unavailable.
+
+## SLI, SLO, SLA — the SRE vocabulary
+
+<Compare a="SLO (Objective)" b="SLA (Agreement)">
+<>
+The **internal target**. "99.95% of requests succeed in 200 ms,
+30-day window." Your team owns and tunes this. Engineering
+decisions are driven by SLOs.
+</>
+<>
+The **external promise**. The number you write in customer
+contracts, with associated refunds/credits if you miss it.
+Always **looser** than the SLO — your SLA is the SLO with
+safety margin baked in. If SLO is 99.95%, SLA is typically
+99.9% or 99%.
+</>
+</Compare>
+
+The thing measured is the **SLI** (Service Level Indicator) —
+e.g. "fraction of HTTP responses in any 5-minute window with
+status < 500 and latency < 200 ms."
+
+SLO = target on the SLI. SLA = contractual promise on the SLO.
+
+## Error budgets
+
+If your SLO is 99.95%, your **error budget** is 0.05% — the
+amount of failure you're allowed to have without missing the
+SLO. In a 30-day month:
+
+```
+30 days × 24 hr × 60 min = 43 200 minutes
+Error budget @ 99.95% = 0.0005 × 43 200 ≈ 21.6 min/month
+```
+
+Error budgets are the **risk currency** of an SRE org:
+
+- Spending it on planned things (e.g. chaos experiments, risky
+  deploys) is fine.
+- Spending it on unplanned outages without learning is the
+  problem.
+- Burning the entire budget early in the window → freeze
+  risky changes until the window resets.
+
+This is how Google SRE separates "we shipped fast" from "we
+should slow down." Without an error budget, the only question
+is "did we have an outage today?" and that conversation has no
+trade-off lever.
+
+## MTBF, MTTR, and their relationship to availability
+
+Availability decomposes into two numbers:
+
+```
+Availability = MTBF / (MTBF + MTTR)
+
+MTBF = mean time between failures
+MTTR = mean time to recovery
+```
+
+A system with **infrequent but long** outages and one with
+**frequent but short** outages can have identical availability.
+Two levers:
+
+- **Increase MTBF** — make failures less frequent (redundancy,
+  better testing, careful releases).
+- **Decrease MTTR** — make failures shorter (faster detection,
+  automated rollback, runbooks, hot standbys).
+
+Most modern reliability work targets **MTTR**, not MTBF. You
+can't eliminate failures at scale; you can absolutely **shorten
+them**. Automated rollback turns a 30-minute outage into a 90-second
+blip.
+
+## A worked example
+
+Service composed of:
+
+- Edge (CDN): 99.99%
+- API gateway: 99.99%
+- Auth service: 99.99%
+- App tier (3 replicas, each 99.9%): parallel.
+- Postgres (HA pair, primary+replica failover): 99.95% effective.
+- Redis (3-node cluster): 99.95%.
+
+Compute end-to-end on the read path:
+
+```
+App tier parallel  = 1 - 0.001^3 ≈ 0.999999  (call it 99.9999%)
+Series:
+  Edge × Gateway × Auth × App × Postgres × Redis
+= 0.9999 × 0.9999 × 0.9999 × 0.999999 × 0.9995 × 0.9995
+≈ 0.9982 (≈ 99.82%)
+```
+
+End-to-end availability ≈ **99.82%**, below three nines, driven
+by Postgres and Redis. To hit three nines you'd:
+
+- Run Postgres in active-active or with sub-30-second automated
+  failover (target 99.99%).
+- Run Redis with replicas and accept eventual consistency on
+  near-miss reads.
+- Cache aggressively so that Redis being briefly unavailable
+  serves stale-but-acceptable data.
+
+## Designs that buy availability
+
+- **Replication** (parallel components).
+- **Stateless services** (instances are interchangeable).
+- **Automated failover** (no human in the recovery loop).
+- **Graceful degradation** (failed dependencies don't fail the
+  whole request).
+- **Backpressure & shedding** (overload doesn't compound into
+  outage).
+- **Bulkheads / pools** (one slow thing doesn't drain everything).
+- **Health checks + load balancer eviction** (route around
+  broken nodes in seconds).
+
+Most of these come from *Release It!* (Nygard) and the Google SRE
+books. They're not optional at four nines.
+
+## Designs that destroy availability
+
+- **Singletons in the request path** — the leader, the gateway,
+  the one cache node. Single point of failure.
+- **Deep synchronous call chains** — availability multiplies.
+- **Shared resources** — one tenant exhausting capacity for all.
+- **Manual recovery** — your MTTR is now "however long until
+  on-call wakes up."
+- **No circuit breakers** — one slow dep cascades.
+
+<Callout variant="warning">
+Beware "we have a hot standby" without **regularly tested
+failover**. Failover paths that aren't exercised in production
+*will not work* when needed. Netflix's Chaos Monkey exists
+because the team that doesn't kill servers in normal times finds
+out the failover is broken in a crisis.
+</Callout>
+
+## In summary
+
+- Three nines = ~9 hours/year, four nines = ~52 min/year, five
+  nines = ~5 min/year.
+- Components in series multiply availabilities — a long chain
+  of three-nines services is a two-nines system.
+- Components in parallel multiply unavailabilities — replicas
+  add nines, in theory.
+- Microservices erode availability unless every service is one
+  nine better than the target.
+- Availability = MTBF / (MTBF + MTTR). Most reliability work
+  shortens MTTR, not extends MTBF.
+- Error budgets convert availability into a trade-off currency
+  the org can actually reason about.

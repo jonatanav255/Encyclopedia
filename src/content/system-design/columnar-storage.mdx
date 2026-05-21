@@ -1,0 +1,323 @@
+export const level = 'senior';
+
+# Columnar storage
+
+Column-oriented storage is the single largest reason modern
+analytical databases scan terabytes in seconds. Instead of
+storing rows packed together, the engine stores **each column
+in its own file**, compressed, and processes batches of values
+through vectorized code.
+
+Once you understand the shape, every characteristic of OLAP
+engines — query speed, compression ratios, immutability bias,
+weak update story — follows directly.
+
+## The fundamental shape
+
+Row store, conceptually:
+
+```
+page on disk:
+  | row 1 | id=1 | name='a' | city='NYC' | age=30 | ... |
+  | row 2 | id=2 | name='b' | city='SFO' | age=25 | ... |
+  | row 3 | id=3 | name='c' | city='LAX' | age=40 | ... |
+```
+
+A query needs the row → one disk read fetches all columns.
+A query needs one column → still reads every row in full.
+
+Column store:
+
+```
+file id:    [1, 2, 3, 4, 5, ...]
+file name:  ['a', 'b', 'c', 'd', 'e', ...]
+file city:  ['NYC', 'SFO', 'LAX', 'NYC', 'SFO', ...]
+file age:   [30, 25, 40, 35, 28, ...]
+```
+
+A query needs one column → read just that file.
+A query needs the row → fetch from each file and reassemble.
+
+Reads are inverted. Analytical workloads almost always touch a
+handful of columns across millions of rows — they win by an
+order of magnitude before any encoding tricks.
+
+## Why this is so much faster
+
+Three compounding effects.
+
+<Steps>
+<Step n={1} title="Read less data.">
+A query that touches 4 of 50 columns reads ~8% of the raw
+bytes. On a 1 TB table that's 80 GB instead of 1 TB — a 12×
+win before compression.
+</Step>
+<Step n={2} title="Compress much better.">
+Adjacent values in a column have the same type and often
+similar values. Run-length, delta, dictionary, and bitpacking
+encodings achieve 10–100×. Compression isn't a side benefit —
+it's load-bearing.
+</Step>
+<Step n={3} title="Vectorize execution.">
+Process column slices of (e.g.) 1024 values per CPU operation
+using SIMD instructions. Aggregates and filters run 10–50×
+faster than row-at-a-time interpretation.
+</Step>
+</Steps>
+
+Multiplicatively: 10× less data × 10× compression × 10×
+vectorization = ~1000× over a naïve row scan. Real-world wins
+are 100–500× for analytical queries.
+
+## Encodings
+
+A column store doesn't just store an array. Each chunk picks an
+encoding to fit the data.
+
+### Dictionary encoding
+
+Replace each value with a small integer index into a
+dictionary of distinct values.
+
+```
+city = ['NYC', 'SFO', 'LAX', 'NYC', 'SFO', 'NYC']
+dict   = {'NYC': 0, 'SFO': 1, 'LAX': 2}
+indices = [0, 1, 2, 0, 1, 0]
+```
+
+Three distinct values across a billion rows compress
+massively. Strings become 1–2 byte integers; filters compile
+into integer comparisons.
+
+### Run-length encoding (RLE)
+
+For sorted or piecewise-constant columns.
+
+```
+status = ['A', 'A', 'A', 'A', 'B', 'B', 'C', 'C', 'C']
+encoded = [(A, 4), (B, 2), (C, 3)]
+```
+
+Used for low-cardinality columns that cluster.
+
+### Bitpacking
+
+If a column's range fits in 7 bits, store 7 bits per value
+instead of 32. Combined with dictionary encoding (where dict
+indices are small), enormously effective.
+
+### Delta encoding
+
+For monotonically increasing columns (ids, timestamps).
+
+```
+timestamps = [1000, 1003, 1005, 1009, 1010]
+deltas     = [1000, 3, 2, 4, 1]
+```
+
+Combined with bitpacking on the small deltas — common encoding
+for time columns.
+
+### Frame-of-reference / Gorilla / Zstd block compression
+
+Most modern engines combine specialized integer encodings with
+generic block compression (zstd, snappy, lz4) on top.
+
+## Storing rows in column stores
+
+Despite the name, column stores still group rows into chunks —
+they're not literally infinite columns. The hierarchy is
+typically:
+
+- **Table** = list of **row groups** / **partitions** / **data
+  files**.
+- Each row group holds a fixed range of rows (e.g., 1M rows).
+- Within a row group, **each column has its own chunk**
+  (compressed, encoded).
+- Metadata per chunk: min/max, null count, dictionary, etc.
+
+This shape is critical for query optimization — engines skip
+entire row groups whose `min/max` makes them irrelevant to the
+query's predicates (zone maps).
+
+## Predicate pushdown and zone maps
+
+Each chunk stores min/max of its values. A query
+`WHERE ts >= '2026-01-01'` consults the chunk's min/max for
+`ts` and **skips entirely** chunks where `max < '2026-01-01'`.
+
+On a 10-year time-partitioned table, a query on last week
+might touch 1% of chunks. Combined with columnar reads, that's
+~0.04% of raw bytes.
+
+Bloom filters per chunk extend this to equality predicates
+(`WHERE user_id = 42` skips chunks whose bloom doesn't include
+42).
+
+## Vectorized execution
+
+Traditional row engines (Postgres, MySQL) process queries one
+row at a time:
+
+```
+for each row in scan:
+  evaluate predicates(row)
+  if matches: emit
+```
+
+Vectorized engines process columns in batches:
+
+```
+for each batch of 1024 values:
+  apply predicate to entire batch with SIMD
+  produce a 1024-bit selection vector
+  pass batch + selection to next operator
+```
+
+CPUs are designed for this — SIMD instructions (AVX-512)
+process 16 32-bit integers per cycle. Cache lines line up with
+column chunks. Branch mispredictions disappear.
+
+ClickHouse, DuckDB, Photon (Databricks), and Velox (Meta) are
+all vectorized. The performance gap over row-at-a-time engines
+is staggering for analytical queries.
+
+## Updates and deletes
+
+The flip side. Modifying a single row in a column store means
+rewriting (parts of) every column file in the affected row
+group. Expensive.
+
+Strategies:
+
+- **Append-only**: new data goes into new row groups; old
+  groups never change. The natural model for time-series and
+  events.
+- **Delete markers**: a sidecar bitmap or column tracks
+  deleted rows; compaction periodically rewrites groups to
+  drop deletes.
+- **MVCC over columnar**: store updates as new versions with
+  visibility timestamps; old versions cleaned up by
+  compaction. CockroachDB, BigQuery (internally).
+- **Hybrid row+column**: recent writes go to a row store;
+  background process moves them to columnar after some
+  delay. SingleStore, TiDB+TiFlash.
+
+The practical model for analytical workloads: **append-mostly
+with periodic compaction**. Updates exist but are not the hot
+path.
+
+## Engines and formats
+
+### Engines
+
+- **ClickHouse**: open-source columnar OLAP. MergeTree family
+  of engines.
+- **BigQuery**: Google's managed columnar warehouse on
+  Colossus storage.
+- **Snowflake**: managed columnar warehouse with separated
+  compute and storage.
+- **Redshift**: AWS warehouse, columnar with optional
+  RA3-style storage separation.
+- **DuckDB**: in-process columnar engine — embedded
+  analytics, no server.
+- **Druid, Pinot**: real-time columnar analytics on streaming
+  data.
+- **Vertica, Greenplum**: classical MPP columnar.
+
+### File formats (for open table stores / data lake)
+
+- **Apache Parquet**: dominant columnar file format for data
+  lakes; row groups, page-level compression, statistics.
+- **Apache ORC**: similar shape, more aggressive
+  predicate-pushdown.
+- **Apache Arrow**: in-memory columnar format for inter-system
+  data exchange.
+
+A modern lakehouse (Iceberg, Delta Lake, Hudi) is a metadata
+layer atop Parquet files in object storage; compute engines
+(Spark, Trino, DuckDB, ClickHouse) read them in place.
+
+## When columnar is not the answer
+
+Column storage is a poor fit when:
+
+- **The dominant access is single-row read/write**. A user
+  profile lookup costs N column reads instead of one row
+  read.
+- **Workload is point-update heavy**. Each update rewrites
+  many files.
+- **Schema is highly heterogeneous** with hundreds of optional
+  columns per row.
+- **Strong transactional guarantees** are required. Most
+  column stores have weaker ACID than OLTP engines.
+
+Use a row store for OLTP, columnar for OLAP. Don't pretend one
+is the other.
+
+## Sizing intuitions
+
+For a typical analytical workload:
+
+<Cheatsheet>
+| Property | Order of magnitude |
+|---|---|
+| Compression ratio vs raw | 10–30× typical, 100× with very repetitive data |
+| Scan rate (single node) | 1–10 GB/s logical / 100 MB - 1 GB/s physical |
+| Aggregation throughput | 100M–1B rows/sec/node |
+| Concurrent queries | 10–100, not 10K |
+| Latency for billion-row scans | seconds, not ms |
+</Cheatsheet>
+
+These rule out columnar as a primary store for high-QPS
+applications and rule it in for analytical workloads larger
+than ~10 GB.
+
+## Common pitfalls
+
+### Treating it as a fast OLTP
+
+Hitting BigQuery 10K times/sec with point reads bankrupts your
+account and grinds latency. Cache analytical results; don't
+issue analytical queries from request paths.
+
+### Wrong sort/partition keys
+
+Columnar engines rely on sort/partition keys to enable zone-map
+pruning. A query that doesn't filter on the sort key reads
+everything. Designing sort keys for the dominant queries is
+the columnar version of designing indexes.
+
+### High-cardinality columns without dictionary
+
+If a column has many distinct values, dictionary encoding
+doesn't help and compression degrades. UUIDs and emails are
+classic offenders — consider hashing or breaking them apart.
+
+### Lots of small files
+
+Parquet on S3 with 10K small files per partition is slow
+because each open is an HTTP round trip. Compaction jobs that
+merge small files into reasonable sizes (~100 MB) is part of
+operating a lakehouse.
+
+### Treating column stores as "schemaless"
+
+Adding a column to a billion-row table is fast (new file with
+defaults), but dropping or changing types is operationally
+heavy. Schema evolution still needs planning.
+
+## In summary
+
+- Column-oriented storage reads only the columns a query
+  needs and compresses each one aggressively — orders of
+  magnitude faster than row stores for analytical scans.
+- Encodings (dictionary, RLE, bitpacking, delta) + block
+  compression deliver 10–100× compression.
+- Zone maps and bloom filters per chunk skip irrelevant data
+  before reading it.
+- Vectorized execution processes column batches per CPU
+  instruction; an additional 10–50× over row-at-a-time.
+- The trade-off is poor row-level update and single-row
+  read performance. Use columnar for OLAP, row stores for
+  OLTP, and a pipeline between them.

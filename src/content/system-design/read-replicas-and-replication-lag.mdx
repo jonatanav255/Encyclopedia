@@ -1,0 +1,383 @@
+export const level = 'mid';
+
+# Read replicas and replication lag
+
+A read replica is a follower copy of the primary database. The
+primary handles all writes; the replica receives a stream of
+changes and serves reads. Add more replicas, get more read
+throughput. It's the most common way to scale read-heavy
+workloads, and the source of the most common consistency bug:
+users reading stale data right after they wrote it.
+
+## What a read replica buys you
+
+Three things, in order of importance:
+
+1. **Read scaling**. N replicas ≈ N× read capacity for queries
+   that don't go through the primary.
+2. **HA / failover**. If the primary dies, promote a replica.
+   Most managed databases do this in 30–60 s.
+3. **Isolation of expensive queries**. Run analytical
+   aggregations, exports, backups on a dedicated replica
+   without affecting transactional traffic.
+
+What it doesn't buy you:
+
+- **Write scaling**. Writes still funnel through one primary.
+  For that you need sharding (Z-axis), not replication.
+- **Strong consistency on the replica**. There's always lag.
+
+## How replication actually works
+
+The primary applies a write to its data files and to its
+**write-ahead log** (WAL in Postgres, binlog in MySQL, oplog
+in MongoDB). The replica receives the log stream and replays
+it.
+
+```
+   client writes
+        │
+        ▼
+   [primary]
+        │ writes to data + WAL
+        │
+   ┌────┴────┐  WAL stream (async)
+   ▼         ▼
+[replica] [replica]
+   │         │
+ applies   applies
+   ▼         ▼
+ data     data
+```
+
+Two modes (Postgres terminology, but most databases follow this
+pattern):
+
+- **Physical replication**: ship raw WAL bytes. Replica
+  reconstructs the same on-disk structure. Fast, identical,
+  same-version-only.
+- **Logical replication**: decode WAL into row-level events
+  (INSERT/UPDATE/DELETE) and apply via SQL. Slower but
+  supports cross-version, selective tables, schema changes.
+
+For HA read replicas, physical is the default. For migrations
+and CDC, logical. See replication-and-cdc for full details.
+
+## Synchronous vs asynchronous
+
+The key knob:
+
+- **Async**: primary acknowledges the write immediately, ships
+  WAL to replicas in the background. Replicas can lag by
+  seconds or minutes. Default for everything.
+- **Sync**: primary waits for at least one replica to confirm
+  before acknowledging. Replicas are at most one transaction
+  behind. Adds primary latency (one network round-trip per
+  write). Worse: if the sync replica goes slow or dies,
+  primary writes hang.
+
+For most workloads, async is correct. Sync is a heavy-handed
+tool for "must not lose any write" scenarios (financial
+systems, audit logs), and even then "semi-sync" (`remote_write`
+in Postgres — replica has received but not yet applied) is
+usually a better compromise.
+
+## Replication lag — what it is and what causes it
+
+Lag is the time difference between when the primary committed
+a write and when the replica has applied it.
+
+```sql
+-- on Postgres replica
+SELECT now() - pg_last_xact_replay_timestamp() AS lag;
+```
+
+Lag has multiple sources:
+
+- **Write rate on the primary**. WAL volume per second. A burst
+  on the primary outpaces the replica's apply rate.
+- **Replica's apply throughput**. A single thread on most
+  databases (Postgres, MySQL classic) replays WAL — even if the
+  primary used parallel writes.
+- **Network bandwidth**. Cross-region replication is bandwidth-
+  bound.
+- **Long-running queries on the replica**. They hold locks
+  that conflict with WAL replay (Postgres) or block the
+  replication thread (MySQL).
+- **Index maintenance on apply**. Replays don't always parallel
+  the primary's I/O patterns.
+
+Typical lag: < 50 ms in steady state on a healthy intra-region
+replica. < 500 ms with bursts. Multi-second lag is a sign of
+saturation. Multi-minute lag means something is wrong.
+
+## Reading from replicas — the consistency tax
+
+The promise is "read your replica, free read capacity." The
+catch is **staleness**. A user writes, then reads; if the read
+hits a replica that hasn't caught up, the user sees their
+write missing.
+
+Three classes of anomaly:
+
+### Read-your-writes
+
+User posts a comment. The page reloads. Replica lags by 200
+ms. Comment is missing. User gets confused, retries, and
+ends up with two comments.
+
+### Monotonic reads
+
+Two consecutive reads from the same user hit different
+replicas at different lag levels. Read 1 sees the new value;
+read 2 sees the old one. Time appears to go backwards.
+
+### Causal consistency violations
+
+User A writes a message that triggers user B's read of related
+data. The replicas serving the two reads have different lag.
+B sees a state that isn't causally consistent with A's write.
+
+## Patterns to hide lag
+
+You have to pick a strategy per route. Different reads tolerate
+different staleness.
+
+### Route reads to primary for N seconds after a write (per user)
+
+The simplest pattern, and the right answer for 90% of cases.
+After a user writes, mark them "fresh" in a small cache for
+~5 seconds. While fresh, their reads go to the primary.
+
+```ts
+// after write
+await redis.set(`fresh:${userId}`, '1', 'EX', 5);
+
+// before read
+const fresh = await redis.get(`fresh:${userId}`);
+const conn = fresh ? primary : replicaPool.next();
+```
+
+User pays a small primary load for a few seconds — the cost is
+trivial. Lag is hidden completely. Doesn't help cross-user
+reads.
+
+### Wait-for-LSN / wait-for-position
+
+The write returns the WAL position it produced. The subsequent
+read passes that position to the replica, which waits to catch
+up before answering.
+
+```ts
+const result = await primary.query('INSERT ... RETURNING pg_current_wal_lsn() AS lsn');
+const lsn = result.rows[0].lsn;
+// later:
+await replica.query('SELECT pg_wal_replay_wait($1, $2)', [lsn, '5s']);
+const data = await replica.query('SELECT ...');
+```
+
+Stronger guarantee than the timeout pattern. Costs added
+latency on every read. Postgres 17 added `pg_wal_replay_wait`
+natively; older versions need application logic.
+
+### Causal tokens
+
+Track per-user (or per-session) the highest position seen.
+Carry it in the cookie or session. Reads route to a replica
+that's at least at that position.
+
+Equivalent to wait-for-LSN at the protocol level. Common in
+distributed databases (Spanner, CockroachDB) as a built-in.
+
+### Just live with it for non-critical reads
+
+The like counter on a tweet doesn't have to be exactly right.
+The recommendations list can be 30 seconds stale. The user's
+account balance must be exact.
+
+For each read, ask: **what's the cost of being stale?** If
+"none" or "trivial," use the replica without a fence. If
+"the user will complain," route to the primary or use a fence.
+
+## How many replicas?
+
+A rule of thumb:
+
+- **2 replicas in the same region**: minimum for production.
+  One for failover, one for read load. Many shops run 1 hot
+  standby (no reads) + 1 read replica.
+- **3+ replicas**: at high read load. Each replica adds ~10K
+  QPS of capacity (workload-dependent).
+- **Replicas in other regions**: only if users in those
+  regions need locality. Each cross-region replica adds
+  bandwidth cost and lag.
+
+More replicas = more primary outbound bandwidth (one WAL stream
+per replica) and more failure surface.
+
+## Connection routing
+
+Two routing patterns:
+
+### Application-side
+
+App opens two connection pools — one to the primary, one to a
+read replica (or pool of them). Each query picks the right
+pool.
+
+```ts
+function getConn({ readOnly }) {
+  if (readOnly) return readPool.next();
+  return primaryPool;
+}
+```
+
+Pros: simple, no extra infra. Cons: the app must know which
+queries are read-only — easy to mistake.
+
+### Proxy-side
+
+A connection proxy (PgPool, Pgcat, ProxySQL, AWS RDS Proxy)
+routes based on the query type. Read queries go to replicas;
+write queries to primary.
+
+Pros: app uses one connection string. Cons: proxies can mis-
+classify, especially transactions that read then write. Most
+serious proxies fall back to "route the whole transaction to
+primary" to be safe.
+
+For most apps, application-side routing is simpler and gives
+finer control.
+
+## Replication topologies
+
+### Single-leader (primary + N followers)
+
+What we've been describing. 95% case.
+
+### Cascading replication
+
+Primary → 1 replica → multiple sub-replicas. Reduces load on
+the primary (fewer outbound WAL streams).
+
+```
+[primary] → [replica-1] → [replica-1a]
+                       → [replica-1b]
+         → [replica-2] → [replica-2a]
+```
+
+Adds extra lag (each hop adds latency) and complicates
+failover. Use only if outbound bandwidth on the primary is
+genuinely a constraint.
+
+### Multi-region replicas
+
+Replica in EU + US + APAC. Each region reads locally; writes
+still go to the primary's region.
+
+```
+   [primary - us-east]
+        │
+   ┌────┼────┐
+   ▼    ▼    ▼
+ [eu]  [us-w] [apac]
+```
+
+EU users get fast reads but slow writes (transcontinental
+hop to the primary). For write-heavy regional workloads, you'd
+need multi-leader or per-region primaries — see multi-region.
+
+## Failover
+
+When the primary dies:
+
+<Steps>
+<Step n={1} title="Detection.">
+Heartbeat / health check sees the primary unreachable. Wait
+long enough to avoid spurious failovers (10–30 s).
+</Step>
+<Step n={2} title="Selection.">
+Pick the replica with the most up-to-date WAL position. With
+async replication, some recent writes may not yet be on any
+replica — they're lost on failover. This is the cost of async.
+</Step>
+<Step n={3} title="Promotion.">
+The selected replica becomes the new primary. It starts
+accepting writes.
+</Step>
+<Step n={4} title="Redirect.">
+Application config (DNS, proxy, service mesh) points writes
+to the new primary. Connection pools reconnect.
+</Step>
+<Step n={5} title="Re-attach the old primary.">
+When the old primary comes back, it joins as a follower of
+the new primary. May require rewinding its WAL.
+</Step>
+</Steps>
+
+Managed databases (RDS, Aurora, Cloud SQL) do all of this
+automatically in 30–60 s. Self-managed setups use Patroni,
+repmgr, or Stolon coordinated through etcd/Consul/ZooKeeper.
+
+The split-brain risk: if the old primary is reachable by some
+clients during failover, you might get two writers. Use a
+fencing mechanism (etcd lease, proxy-side cutoff) to prevent
+this.
+
+## Common pitfalls
+
+### Reading freshly-written data from a replica
+
+Already discussed. The most common bug. Use the
+"primary for N seconds after write" pattern by default.
+
+### Routing writes to a replica
+
+Most replicas are read-only and reject writes outright. But
+write-through ORMs sometimes route writes via the wrong pool
+and silently fail (or hit a follower-with-fallback proxy and
+land on the wrong shard). Test it.
+
+### Ignoring lag in capacity planning
+
+You added 5 replicas to handle peak reads. Peak is also when
+the primary writes the most — so lag is highest then. You're
+spreading load across replicas that are stale by 5 seconds.
+Monitor lag during peak, not at 3 AM.
+
+### Long transactions on the replica
+
+A reporting query runs for 30 minutes on a replica. Lag grows
+during those 30 minutes because WAL replay is blocked. Use a
+dedicated reporting replica or `hot_standby_feedback`.
+
+### Forgetting to re-sequence indexes on failover
+
+A new primary that was just promoted needs to update its
+sequence positions. ORMs sometimes write IDs by client-side
+sequence values; if the new primary hasn't been told, two rows
+can collide. Postgres handles this; some setups don't.
+
+### Treating sync replication as a silver bullet
+
+"We'll use sync replication so we never lose data." Now your
+primary write latency includes a network round-trip and is
+hostage to the slowest replica. A 10 ms write becomes 60 ms.
+Worse, if the replica goes slow, primary stalls. Sync is rare
+in production for a reason.
+
+## In summary
+
+- Replicas multiply read capacity, give you HA, and isolate
+  heavy queries.
+- They lag. Always. Usually milliseconds, sometimes minutes.
+- The default pattern: route reads to the primary for a few
+  seconds after a user's write; route everything else to a
+  replica.
+- Use sync replication only if you genuinely cannot lose
+  writes — and accept the latency.
+- Monitor lag as a first-class SLI. Spikes are a leading
+  indicator of saturation, not a bug to silence.
+- More replicas isn't always better — each one is bandwidth,
+  another failure surface, and another consistency-question
+  source.

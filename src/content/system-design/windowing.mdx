@@ -1,0 +1,309 @@
+export const level = 'senior';
+
+# Windowing
+
+Streams are unbounded. You can't compute "total events" — that
+sum never ends. You compute "events per window," and the choice
+of window shape determines what question you've actually answered.
+
+Four windowing primitives cover almost every real use case:
+**tumbling, sliding (hopping), session, global**. Each turns an
+infinite stream into a series of finite buckets.
+
+The taxonomy is from the Beam / Dataflow model (Akidau et al.),
+and most engines (Flink, Kafka Streams, Spark Structured
+Streaming, ksqlDB) implement the same four.
+
+## Tumbling windows
+
+Fixed-size, non-overlapping. Each event belongs to exactly one
+window.
+
+```
+events:  e1  e2     e3    e4   e5      e6  e7
+windows: [---- w1 ----][---- w2 ----][---- w3 ----]
+         10:00       10:05         10:10        10:15
+```
+
+The 5-minute tumbling window groups events by event-time bucket.
+Useful for:
+
+- "Requests per minute."
+- "Hourly aggregates."
+- "Per-day active user count."
+
+Tumbling windows align to a fixed boundary (the clock). They're
+the building block of most time-series dashboards.
+
+```js
+// Kafka Streams
+stream.groupByKey()
+  .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
+  .count();
+```
+
+The drawback: an event near a boundary is "lost" to its neighbor.
+"Requests in the last 5 minutes" is approximately 0 to 5 minutes
+old depending on where in the window you query.
+
+## Sliding (hopping) windows
+
+Fixed-size, **overlapping**. An event belongs to multiple windows
+that overlap.
+
+```
+events:  e1  e2     e3    e4   e5
+window 1: [-- 10:00-10:05 --]
+window 2:           [-- 10:01-10:06 --]
+window 3:                     [-- 10:02-10:07 --]
+```
+
+Specified by **size** and **slide** (advance amount). A 5-minute
+window sliding every 1 minute means every event appears in up to
+5 windows.
+
+Useful for "smooth" moving averages and trending computations:
+
+- "Rolling 5-minute error rate, updated every minute."
+- "Top-K terms over the last hour, refreshed every 5 minutes."
+
+Storage cost: O(size/slide) — each event sits in multiple
+windows. A 1-hour window sliding every second is rarely worth
+the cost.
+
+```js
+stream.groupByKey()
+  .windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(
+    Duration.ofMinutes(5),
+    Duration.ofMinutes(1),
+  ));
+```
+
+Some engines distinguish:
+
+- **Sliding (Flink)**: window of size N, advancing by step S. The
+  Beam term.
+- **Hopping (Kafka Streams)**: equivalent.
+- **Pure sliding (Flink's "sliding event-time window" with
+  hop = 1 event)**: window slides per event.
+
+All flavors of the same concept.
+
+## Session windows
+
+Variable-size, defined by a **gap** of inactivity. Events less
+than the gap apart belong to the same session; longer silence
+starts a new one.
+
+```
+events:  e1 e2  e3        gap > T         e4 e5
+session: [---  s1  ---]                  [-- s2 --]
+```
+
+The session window doesn't have a fixed size — it grows as
+events keep arriving and closes after a quiet period.
+
+Useful for:
+
+- **Web sessionization**: group a user's clicks into "visits."
+- **Phone calls**: group call events into call sessions.
+- **Search refinement**: group consecutive queries.
+
+```js
+stream.groupByKey()
+  .windowedBy(SessionWindows.ofInactivityGapAndGrace(
+    Duration.ofMinutes(30),    // gap
+    Duration.ofMinutes(5),     // late grace
+  ));
+```
+
+Session windows are stateful per key (per user). The processor
+holds open sessions in state, extending them on each event,
+closing them when the gap elapses. State storage cost is
+proportional to concurrent open sessions.
+
+## Global windows
+
+A single, infinite window covering all events. Only useful when
+combined with a **trigger** — something other than time decides
+when to emit.
+
+```
+events:  e1  e2  e3  e4  e5  e6  e7  ...
+window:  [────────────────────────────...
+```
+
+Triggers might fire:
+
+- After N events ("every 100 events").
+- On a punctuation event ("close-of-day marker").
+- On a control signal from another stream.
+
+Rare in practice. Most "global" use cases are better modeled as
+**state stores updated continuously** rather than windows.
+
+## Choosing a window
+
+<Steps>
+<Step n={1} title="Is the natural question 'per fixed time bucket'?">
+Yes → tumbling.
+</Step>
+<Step n={2} title="Do you need a smooth, continuously-updated metric over a moving window?">
+Yes → sliding (hopping). Pick size for the rolling-average
+period, slide for the refresh cadence.
+</Step>
+<Step n={3} title="Are you grouping a user's bursts of activity?">
+Yes → session. Pick gap to match what "ended the session"
+intuitively means.
+</Step>
+<Step n={4} title="None of the above; you have a custom trigger?">
+Global windows with custom triggers. Rare.
+</Step>
+</Steps>
+
+## The window key
+
+All four window types are usually **per-key**: events grouped by
+user, by device, by sku. The aggregate is computed
+window-by-window-per-key.
+
+```
+key=A, window=[10:00, 10:05): {count: 12, sum: 240}
+key=A, window=[10:05, 10:10): {count: 8,  sum: 160}
+key=B, window=[10:00, 10:05): {count: 33, sum: 990}
+```
+
+Storage = (active keys) × (active windows per key) × (state
+size per window). With session windows on a high-cardinality key
+(per-user across millions of users), state can be enormous.
+Tuning retention and grace period matters.
+
+## Allowed lateness and grace
+
+A window has a **size** and an **allowed lateness** (or "grace
+period"). Lateness defines the event-time threshold past which
+late arrivals are ignored.
+
+```
+window: [10:00, 10:05)
+grace:  5 minutes
+events arriving with event_time in [10:00, 10:05):
+  - by 10:10:00 → accepted, window updated
+  - after 10:10:00 → dropped (or routed to side output)
+```
+
+Grace works with **watermarks**: the watermark advancing past
+window_end + grace permanently closes the window. See
+**Watermarks** for the mechanism.
+
+Trade-off:
+
+- **More grace** → more correct, more state, later final result.
+- **Less grace** → faster final result, more dropped data.
+
+Pick from the worst-case producer delay you accept.
+
+## Triggers and refinements
+
+A window doesn't have to emit only once at close. Triggers
+control when results emit:
+
+- **Default**: emit at watermark (window close).
+- **Early**: emit every N seconds or N events for "interim
+  results."
+- **Late**: emit again when late data arrives within grace.
+
+Accumulation modes:
+
+- **Discarding**: each emission contains only the events since
+  the last emission.
+- **Accumulating**: each emission is the running aggregate of all
+  events in the window so far.
+
+Most production dashboards want accumulating + late refinements
+("the value at 10:05 was 102, oh we got a late one, now 105").
+You need a sink that handles updates (upsert), not appends.
+
+## Common patterns
+
+### Sessionization
+
+```js
+// User events → sessions of last 30 minutes inactivity
+events
+  .groupByUserId()
+  .windowedBy(sessionWindow(Duration.ofMinutes(30)))
+  .aggregate(buildSession, mergeSessions);
+```
+
+### Top-K trending
+
+```js
+// Top 10 search terms over rolling 5-minute window, updated every minute
+events
+  .groupByTerm()
+  .windowedBy(sliding(5min, 1min))
+  .count()
+  .selectKey()
+  .topK(10);
+```
+
+### Rate-limiting
+
+```js
+// Reject if > 100 requests in last 60 seconds
+events
+  .groupByApiKey()
+  .windowedBy(tumbling(60s))
+  .count()
+  .filter(count => count > 100);
+```
+
+## Pitfalls
+
+<Callout variant="warning">
+**Tumbling windows with mismatched boundaries.** Sliding-aligned
+clients querying a tumbling backend will see weird off-by-one
+mismatches. Document the boundary convention (left-closed,
+right-open is the default).
+</Callout>
+
+<Callout variant="warning">
+**Sliding windows with too-tight slide.** A 1-hour window
+sliding every second × 1M events/sec → 3600 × 1M state entries
+per key. Quietly OOMs. Pick slide proportional to the cadence
+you actually need.
+</Callout>
+
+<Callout variant="warning">
+**Session windows without grace.** Late events that should
+have extended a session start a new one instead. Sessions split
+incorrectly. Always grace > expected lateness.
+</Callout>
+
+<Callout variant="warning">
+**Global windows for "running totals."** A growing state store
+that never compacts. Better modeled as a regular keyed state
+update, not a window.
+</Callout>
+
+<Callout variant="warning">
+**Windowing on processing time when you wanted event time.**
+Common in starter pipelines. The number "5 events in the last
+minute" is meaningless if events were delayed by 10 minutes in
+delivery.
+</Callout>
+
+## In summary
+
+- **Tumbling**: fixed-size, non-overlapping. The default for
+  per-bucket aggregates.
+- **Sliding (hopping)**: fixed-size, overlapping. Rolling
+  averages and continuously-updated top-K.
+- **Session**: variable-size, gap-defined. Sessionization,
+  bursts of activity.
+- **Global**: one window, custom triggers. Rare.
+- **Grace + watermark** close event-time windows correctly even
+  with late arrivals.
+- **State storage scales with (keys × open windows)** — tune
+  window size and lateness for your memory budget.

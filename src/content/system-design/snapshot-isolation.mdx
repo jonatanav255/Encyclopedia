@@ -1,0 +1,156 @@
+export const level = 'senior';
+
+# Snapshot isolation
+
+A read in a transaction sees a consistent view of the database
+as of a single point in time — the snapshot. Writes in the
+transaction are buffered and committed atomically when the
+transaction commits.
+
+Snapshot isolation prevents most concurrency anomalies (dirty
+reads, non-repeatable reads, phantom reads on point queries)
+without taking read locks. It's the default isolation in
+PostgreSQL ("Repeatable Read"), MySQL InnoDB, Oracle, and most
+modern cloud databases.
+
+## How it works
+
+MVCC (Multi-Version Concurrency Control) keeps multiple
+versions of each row tagged with their committing transaction's
+timestamp.
+
+<Steps>
+<Step n={1} title="Transaction starts.">
+The DB records a snapshot timestamp `T_start` and the set of
+transactions still in-flight at that moment.
+</Step>
+<Step n={2} title="Reads use the snapshot.">
+For each row, the DB returns the latest version that was
+committed before `T_start` and not from an in-flight
+transaction.
+</Step>
+<Step n={3} title="Writes go into a private buffer.">
+New versions are written with `T_start` as their tentative
+timestamp; not visible to other transactions yet.
+</Step>
+<Step n={4} title="Commit gets a new timestamp.">
+At commit time, the DB assigns `T_commit` and makes the new
+versions visible to transactions starting after `T_commit`.
+</Step>
+</Steps>
+
+Old versions linger until no transaction can see them, then
+vacuum / autovacuum / compaction cleans them up.
+
+## What it prevents
+
+<Cheatsheet>
+| Anomaly | Prevented? |
+|---|---|
+| Dirty read | Yes |
+| Non-repeatable read | Yes |
+| Phantom read on point query | Yes |
+| Phantom read on range query | Yes (in most implementations) |
+| Lost update | No (in some implementations) |
+| Write skew | **No** |
+</Cheatsheet>
+
+That last row is the famous gotcha.
+
+## Write skew: the anomaly snapshot isolation allows
+
+Two transactions both read the same rows, both decide based on
+the read, both write disjoint rows that violate a multi-row
+invariant.
+
+Classic example: doctor on-call rotation.
+
+```js
+// Invariant: at least one doctor on call at all times.
+// Two doctors run this concurrently at midnight:
+
+BEGIN;
+  count = SELECT count(*) FROM doctors WHERE on_call = true;
+  // both transactions see count = 2 (themselves + colleague)
+  if (count >= 2) {
+    UPDATE doctors SET on_call = false WHERE id = me;
+  }
+COMMIT;
+```
+
+Both transactions see 2 doctors on call. Both decide it's safe
+to clock off. Both commit. Now zero doctors are on call —
+invariant violated.
+
+Snapshot isolation didn't notice because each transaction
+wrote a *different* row.
+
+## Fix: serializable snapshot isolation (SSI) or explicit locks
+
+- **SSI**: the DB tracks read-write conflicts at runtime and
+  aborts transactions whose serial order would have violated
+  serializability. Postgres added this as `SERIALIZABLE`
+  isolation. CockroachDB uses it as default.
+- **Explicit locks (`SELECT ... FOR UPDATE`)**: take a row
+  lock on rows you read and intend to base writes on. Common
+  in MySQL, where SERIALIZABLE is more expensive.
+
+## Snapshot isolation vs read committed
+
+<Compare a="Read committed" b="Snapshot isolation">
+<>
+Each *statement* gets a fresh snapshot. Two reads in the same
+transaction can return different data. Most permissive
+isolation that's still safe (dirty reads excluded).
+</>
+<>
+The *transaction* gets one snapshot. Two reads in the same
+transaction always return the same data, even if rows
+changed in between.
+</>
+</Compare>
+
+Read committed is faster, snapshot is easier to reason about.
+For long-running reports, snapshot avoids "data shifted while I
+was scanning" pain.
+
+## Performance considerations
+
+**MVCC bloat**: every write creates a new version. Tables grow
+faster than the logical row count. Vacuum (Postgres) /
+purge (Oracle) / compaction (LSM-based) must keep up.
+
+**Long transactions are evil**: a transaction that started 30
+minutes ago holds back vacuum for *every* row modified since.
+Tables bloat, performance degrades, until the long
+transaction finishes or is killed. Always cap query timeouts.
+
+**Read scaling on replicas**: replicas can serve snapshot reads
+without coordinating with the leader, because they have all
+the versions they need. Postgres "hot standby" exploits this.
+
+## When the anomaly actually bites
+
+Write skew is rare in CRUD code. It shows up most in:
+
+- **Bookings / reservations** where the count of resources is
+  the invariant.
+- **Bank-style invariants**: "balance ≥ 0" enforced via
+  read-then-write.
+- **Uniqueness checks** without a unique constraint.
+- **Multi-row state machines** like the doctor rotation.
+
+If your invariant spans multiple rows, snapshot isolation is
+not enough. Use SERIALIZABLE or row locks.
+
+## In summary
+
+- Snapshot isolation: each transaction reads a consistent
+  point-in-time view via MVCC.
+- Default in Postgres ("Repeatable Read"), MySQL InnoDB,
+  Oracle, most modern databases.
+- Prevents dirty/non-repeatable/phantom reads.
+- Doesn't prevent **write skew** — when invariants span rows.
+- For multi-row invariants, use SERIALIZABLE (SSI) or `SELECT
+  FOR UPDATE`.
+- Long transactions cause MVCC bloat; always cap timeouts.

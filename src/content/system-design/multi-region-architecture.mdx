@@ -1,0 +1,196 @@
+export const level = 'staff';
+
+# Multi-region architecture
+
+Running the same product out of multiple geographically
+distinct regions. The motivation: availability (region
+failure), latency (serve users near them), or compliance
+(data residency).
+
+The cost: complexity. Multi-region is not free; it's an
+order of magnitude more operational work than single-region.
+
+## Why multi-region
+
+- **Disaster recovery**: a whole region can go down. AWS has
+  had multi-hour region outages. If your service must keep
+  working, multi-region is the answer.
+- **Latency**: a user in Singapore querying a US-East
+  database experiences 150-250ms round-trip. Local region
+  cuts to ~10ms.
+- **Compliance**: GDPR, data residency laws. EU user data
+  must stay in EU.
+- **Capacity headroom**: spread load across regions; failover
+  capacity is real capacity.
+
+## The hard problem
+
+Replication across regions is **slow** (50-200ms one-way).
+Strong consistency across regions costs at least one cross-region
+round-trip per write — usually unaffordable.
+
+So multi-region forces choices about consistency:
+
+- **Active-active with eventual consistency**.
+- **Active-active with partitioned writes** (each region
+  owns a subset).
+- **Active-passive**: one region accepts writes; others
+  failover.
+
+(See multi-region-replication.)
+
+## Common architectures
+
+### Active-passive
+
+One region serves all traffic; another stands by. Failover
+under regional outage.
+
+```
+primary: us-east-1 (writes + reads)
+   ▼ async replication
+secondary: us-west-2 (read-only standby)
+   (on failover, becomes primary)
+```
+
+Pros: simplest consistency; minimal duplication.
+Cons: secondary capacity idle in steady state; failover is
+risky (manual or automated, both error-prone); RPO from async
+replication means recent writes may be lost.
+
+### Active-active, partitioned
+
+Each region owns its users / data. Cross-region access pays
+latency but is rare.
+
+```
+us-east-1: serves US users; owns user IDs starting with even
+eu-west-1: serves EU users; owns user IDs starting with odd
+```
+
+Used by Spanner regional placement, CockroachDB partitioned
+tables, many SaaS systems.
+
+Pros: strong consistency per partition; low latency for the
+home region.
+Cons: cross-region access (e.g., a US user emailing an EU
+user) is slow; rebalancing partitions is operationally
+heavy.
+
+### Active-active, eventual
+
+Every region accepts every write; replication is async;
+conflicts resolved per merge strategy.
+
+```
+us-east, eu-west, ap-southeast — all accept writes locally
+async replication everywhere
+conflicts: LWW / CRDT / app-level
+```
+
+Used by Cassandra multi-DC, MongoDB sharded with multiple
+mongos, DynamoDB Global Tables.
+
+Pros: low latency everywhere; survives any single-region
+outage.
+Cons: eventual consistency; conflict resolution is the
+application's problem; debugging is hard.
+
+## Data placement strategies
+
+### Replicate everywhere
+
+Every region has a full copy. Reads always local. Writes
+asynchronously replicated.
+
+Storage cost: N×. Used when data set is small (config) or
+mostly-read (catalog).
+
+### Geo-partition
+
+Each piece of data lives in its home region. Cross-region
+access pays latency.
+
+Storage cost: 1×. Used for user data, region-specific
+content.
+
+### Hybrid
+
+Hot / frequently-read data replicated; cold / per-user data
+partitioned.
+
+Most production systems do hybrid.
+
+## Failover
+
+How do you actually move traffic when a region goes down?
+
+### DNS-based
+
+Update DNS to point clients at the surviving region.
+Propagation takes minutes (TTL). User-visible downtime
+during the switch.
+
+### Anycast / GeoDNS
+
+Routing layer (anycast IP, GeoDNS) automatically routes to
+the nearest healthy region. Faster failover; more
+infrastructure.
+
+### Application-level
+
+Clients have multiple endpoints baked in; try them in order.
+Cuts DNS dependence. Used by mobile apps, native clients.
+
+## Failover testing
+
+Untested failover doesn't work. Run drills regularly:
+
+- **Game days**: practice region failover quarterly.
+- **Chaos engineering**: occasional automated region cuts.
+- **Read-only weekends**: simulate "primary is down" by
+  forcing read-only mode somewhere.
+
+Without practice, your runbook has stale steps and your
+team has stale skills.
+
+## Cost
+
+Multi-region is **expensive**:
+
+- 2-3× compute (each region needs near-full capacity for
+  failover).
+- 2-3× storage (replication factor).
+- Cross-region data transfer fees (often the surprise bill —
+  AWS charges per GB).
+- Engineering complexity (every feature must handle multi-region
+  semantics).
+
+Don't go multi-region without a specific business case.
+
+## When to stay single-region
+
+- Your SLA is 99.9% (8 hours/year downtime); a region outage
+  is within budget.
+- Your customer base is regional.
+- You have no team capacity for the operational complexity.
+- Your data wouldn't survive eventual consistency.
+
+A well-run single-region service with multi-AZ replication is
+99.99% reliable and dramatically simpler.
+
+## In summary
+
+- Multi-region: copies of the service in multiple
+  geographies, for availability / latency / compliance.
+- Three patterns: active-passive (simplest), active-active
+  partitioned (consistent), active-active eventual (most
+  available).
+- Cross-region writes are expensive; design which writes
+  cross regions explicitly.
+- Failover infrastructure: DNS, anycast, app-level.
+- Test failover regularly — untested = broken.
+- Costs 2-3× single region in compute, storage, transfer,
+  and complexity.
+- Skip it unless you have a specific reason; multi-AZ is
+  often enough.

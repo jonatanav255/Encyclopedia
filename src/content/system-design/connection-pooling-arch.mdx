@@ -1,0 +1,195 @@
+export const level = 'mid';
+
+# Connection pooling (architecture)
+
+Establishing a new database, HTTP, or gRPC connection is
+expensive — typically 5-50ms for TCP+TLS handshakes, more
+for DB authentication. Doing it per-request kills throughput.
+
+A connection pool keeps a set of warm connections that
+multiple requests reuse. Each request "borrows" a connection
+from the pool, uses it, returns it.
+
+## The shape
+
+```
+N application threads
+        ▼
+  connection pool (M connections, M < N typically)
+        ▼
+   downstream (DB, gRPC server, HTTP endpoint)
+```
+
+When a thread needs to call the downstream, it acquires a
+connection. If none free, it waits (up to a timeout). When
+done, it returns the connection.
+
+## Pool sizes
+
+The classic formula (Little's Law):
+
+```
+pool_size = expected_concurrent_uses × p99_latency_per_use
+```
+
+For a DB doing 100 QPS with p99 latency 10ms:
+
+```
+in-flight queries at any moment ≈ 100 × 0.01 = 1
+pool size: 5-10 (with headroom)
+```
+
+For an HTTP client to a slow downstream (500ms p99) at 100
+QPS:
+
+```
+in-flight requests ≈ 100 × 0.5 = 50
+pool size: 60-80
+```
+
+Too small: requests wait for connections; throughput cap.
+Too large: idle connections waste downstream resources;
+each connection has memory + TCP socket overhead.
+
+## Common pool gotchas
+
+### Pool exhaustion under slow downstream
+
+Downstream gets slow (p99 jumps from 10ms to 500ms). In-flight
+count balloons. Pool exhausted. New requests block waiting for
+connections. Upstream sees timeouts and starts retrying →
+more requests → more in-flight → death spiral.
+
+Fix: connection wait timeout (e.g., 100ms). When pool is
+exhausted, fail fast instead of queueing forever.
+
+### Connection leaks
+
+Code path acquires a connection but doesn't return it (forgot
+the `finally`, exception not handled). Pool slowly drains.
+After hours, pool empty, all requests fail.
+
+Fix: structured connection lifecycle (try-with-resources,
+async-disposable patterns); monitor pool's available connections
+metric.
+
+### Stale connections
+
+Connection in pool for hours; downstream firewall kills it
+silently (TCP keepalive expires). Next use throws "connection
+reset" mid-query.
+
+Fix: connection validation on borrow (`SELECT 1` ping with
+caching); max-lifetime on pooled connections (recycle every
+30 min).
+
+### Pool sized per-instance, not per-cluster
+
+Each app instance has a 50-connection pool. You have 100 app
+instances. The DB now has 5000 connections, way more than it
+can handle.
+
+Fix: account for cluster-wide totals when sizing. Use a
+shared proxy (PgBouncer for Postgres, ProxySQL for MySQL)
+that aggregates application-side small pools into a tighter
+DB-side connection count.
+
+## PgBouncer and proxy pools
+
+For databases that have low connection limits (Postgres
+defaults to 100, often less in practice), the standard
+pattern is a **proxy pool**:
+
+```
+1000 app processes (each 5 connections)
+        ▼
+   PgBouncer (1 proxy, 100 DB connections)
+        ▼
+       Postgres
+```
+
+PgBouncer's transaction-pool mode: maps thousands of
+client-side connections onto a tiny pool of DB-side
+connections. Multiplexes by transaction.
+
+Trade-off: lose features that require connection state
+(prepared statements via name, server-side sessions, etc.).
+Most apps don't use these.
+
+## HTTP connection pooling
+
+Same idea, different vocabulary:
+
+- **Keep-alive**: reuse the TCP connection across HTTP
+  requests.
+- **Connection pool size**: max parallel connections per
+  origin.
+- **Idle connection lifetime**: how long to keep an unused
+  connection before closing.
+
+Defaults vary widely. Node.js `http.Agent` defaults to no
+limit (which can exhaust file descriptors). Always set:
+
+```js
+const agent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 100,
+  maxFreeSockets: 10,
+});
+```
+
+## gRPC connection sharing
+
+gRPC uses HTTP/2 multiplexing — one connection carries many
+parallel RPCs. So "pool" is per-host, not per-RPC. Usually
+1-2 connections to each upstream host is enough.
+
+Tune via the gRPC channel's flow control window if you
+saturate a single connection.
+
+## Pool metrics to monitor
+
+- **Pool utilization** (in-use / total).
+- **Pool exhaustion events** (couldn't acquire).
+- **Average wait time** for a connection.
+- **Connection age distribution** (are they cycling?).
+- **Connection error rate** (validations failing?).
+
+A healthy pool: utilization 30-70%, no exhaustion, low
+wait times.
+
+A pool at 100% utilization is the canary for incoming
+outage.
+
+## Distributed transactions and connection state
+
+Pool reuse breaks if connections carry session state. Things
+to watch:
+
+- **Postgres temporary tables**: visible only on the
+  connection that created them; if reused, other clients see
+  weird state.
+- **Session-level locks**: held until the connection is
+  returned; can deadlock if held across multiple borrows.
+- **Set role / SET statements**: change session settings;
+  affect later borrowers.
+- **Transactions left open**: returned to pool mid-transaction
+  → other clients inherit the transaction.
+
+Best practice: reset state on connection return (`DISCARD ALL`
+in Postgres; some pools do this automatically).
+
+## In summary
+
+- Connection pool: warm pool of connections to amortize
+  setup cost.
+- Size by Little's Law: concurrency × p99 latency.
+- Always set a wait timeout; fail fast when exhausted.
+- Validate connections on borrow; cap max lifetime.
+- Cluster-wide totals matter; use PgBouncer / ProxySQL when
+  DB connection limits force smaller per-app pools.
+- gRPC multiplexes; usually 1-2 connections per host
+  sufficient.
+- Reset connection state on return to avoid cross-tenant
+  leakage.

@@ -1,0 +1,222 @@
+export const level = 'senior';
+
+# Denormalization for read paths
+
+Precompute joins into a **single read-optimized record** so
+the serving path does no joins. The classic trade-off:
+heavier writes (must update multiple denormalized copies) for
+massively faster reads.
+
+The pattern is foundational for feeds, profiles, product
+pages, and anything served at high read rates.
+
+## Why denormalize
+
+A normalized schema:
+
+```
+users (id, name)
+posts (id, user_id, body, created_at)
+likes (post_id, user_id)
+comments (post_id, user_id, body)
+```
+
+Rendering a single post requires 4 joins. At 10K reads/sec,
+that's 40K join operations per second on hot tables. Painful.
+
+Denormalized:
+
+```
+post_view (
+  id, user_id, user_name, body, created_at,
+  like_count, recent_likers[3],
+  comment_count, recent_comments[3]
+)
+```
+
+One row contains everything the read path needs. No joins.
+Read latency: 1 ms instead of 50 ms.
+
+## When to denormalize
+
+- **High read-to-write ratio.** 1000:1 or higher. Read cost
+  matters more than write cost.
+- **Tight latency budget.** Sub-10ms reads aren't achievable
+  with multi-join queries at scale.
+- **Predictable read shape.** You know what fields the read
+  path needs.
+- **Cache-friendly view.** The denormalized row maps cleanly
+  to what you serve.
+
+When not:
+
+- **Write-heavy workloads.** Updates to multiple copies amplify
+  cost.
+- **Unpredictable queries.** A denormalized view optimized
+  for one query is useless for another.
+- **Strict consistency.** Denormalized copies drift.
+
+## The cost: keeping copies in sync
+
+Updates must propagate to every denormalized copy. Two
+strategies:
+
+### Sync writes
+
+The write path updates every copy in the same transaction.
+Strong consistency; write latency = sum of all updates.
+
+```js
+await db.transaction(async tx => {
+  await tx.posts.update({ id: 42 }, { likes: ['user1', 'user2'] });
+  await tx.post_view.update({ id: 42 }, { like_count: 2, recent_likers: [...] });
+  await tx.user_feed.updateMany({ recent_posts: { has: 42 } }, ...);
+});
+```
+
+Works for tightly-bounded fan-out (single post + single view
+row).
+
+### Async writes (event-driven)
+
+The write publishes an event; subscribers update their views.
+Eventually consistent.
+
+```js
+await db.posts.update({ id: 42 }, { likes: ['user1', 'user2'] });
+await events.publish('post_like_changed', { postId: 42 });
+
+// In a separate worker:
+events.subscribe('post_like_changed', async ({ postId }) => {
+  const fresh = await computePostView(postId);
+  await db.post_view.update({ id: postId }, fresh);
+});
+```
+
+Decouples write latency from denormalization cost. The
+denormalized view is briefly stale.
+
+Used at scale by Twitter (timeline fanout), Facebook (newsfeed),
+Pinterest.
+
+### Write-then-batch
+
+For very high write rates, batch up updates and flush
+periodically. The read sees yesterday's like count for
+some seconds; OK for like counters.
+
+## CDC-driven denormalization
+
+A modern pattern: the source of truth (normalized DB)
+streams changes via CDC. Downstream consumers maintain
+their own denormalized views.
+
+```
+Postgres (normalized) → Debezium CDC → Kafka → ksqlDB / Flink →
+   ├── post_view in Cassandra
+   ├── user_feed_view in Redis
+   └── search index in Elasticsearch
+```
+
+Each view is purpose-built for its read pattern; the source
+DB stays clean.
+
+## Common denormalized shapes
+
+### Embedded counts
+
+```
+post (id, body, like_count, comment_count, share_count)
+```
+
+vs computing counts via aggregation queries.
+
+### Embedded summaries
+
+```
+post (id, body, ..., top_3_commenters: [{name, avatar}, ...])
+```
+
+vs joining for the latest comments.
+
+### Embedded entity copies
+
+```
+order_view (id, customer_name, customer_email, customer_tier, line_items: [...])
+```
+
+vs joining orders + customers + line_items.
+
+### Per-user materialized views
+
+```
+user_feed (user_id, post_ids: [...latest 100 post ids for this user...])
+```
+
+vs computing the feed at read time from "users they follow."
+
+## Update amplification
+
+A denormalized field copied 1000 times means each update fans
+out 1000×. For a popular post's update:
+
+- Like count is stored on `post_view` (1 update).
+- Recent commenter is stored on `post_view` and on each
+  follower's `user_feed_summary` (many updates).
+- A "celebrity" with 1M followers means 1M update writes per
+  small post change.
+
+Mitigation: fanout-on-read for celebrities, fanout-on-write
+for the rest. (See fanout-on-write-vs-read.)
+
+## Staleness boundaries
+
+Different fields tolerate different staleness:
+
+- **Like count**: stale by seconds → invisible to users.
+- **User's display name**: stale by hours → odd but tolerable.
+- **Permission grants** (private post): must be fresh →
+  don't denormalize lazily.
+
+Match denormalization strategy to staleness tolerance per
+field.
+
+## Common antipatterns
+
+### Denormalize without a fanout strategy
+
+Write to N copies synchronously without considering N at
+scale. Works for 100 copies; breaks at 1M.
+
+### Denormalize then re-query
+
+Denormalize for fast reads, but service code still joins
+back to the source to "verify." You've doubled the work.
+
+### Forgotten copies
+
+Denormalized copies of a field are scattered in 5 places.
+Add a new feature that updates the field; only updates 3 of
+the 5 copies. Drift.
+
+Fix: document every denormalized copy explicitly; CDC + tests
+that verify consistency.
+
+### Premature denormalization
+
+Normalize first. Measure. Denormalize the specific hot path
+that needs it.
+
+## In summary
+
+- Denormalize: precompute joins into a single read-optimized
+  record.
+- Trade heavier writes (must update copies) for faster reads.
+- Best for high read:write ratio, tight latency budget,
+  predictable query shape.
+- Sync writes for tightly-bounded copies; async / CDC-driven
+  for large fan-out.
+- Watch for update amplification (celebrity problem),
+  inconsistent staleness, forgotten copies.
+- Normalize first; denormalize the hot read paths
+  specifically.

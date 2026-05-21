@@ -1,0 +1,244 @@
+export const level = 'mid';
+
+# Deployment strategies compared
+
+A decision matrix across rolling, blue-green, canary, A/B,
+and shadow deployments. Each trades off speed, safety, infra
+cost, and rollback ease differently.
+
+## The five strategies
+
+<Cheatsheet>
+| Strategy | Risk | Rollback speed | Extra infra | Best for |
+|---|---|---|---|---|
+| Recreate | Highest | Slow (redeploy old) | None | Dev / non-prod |
+| Rolling | Medium | Medium | None | Standard prod |
+| Blue-green | Low | Instant | 2x | Critical apps |
+| Canary | Lowest | Instant for canary | ~1.1x | High-risk releases |
+| Shadow | None | N/A (no real traffic) | 2x compute | Validating new versions |
+| A/B | Variable | Per-cohort | Some extra | Product experiments |
+</Cheatsheet>
+
+## Recreate
+
+Stop all old instances; start all new instances. Downtime
+during the swap.
+
+```
+[old v1] [old v1] [old v1]  → STOP
+                            → START
+[new v2] [new v2] [new v2]
+```
+
+Pros: no infra overhead, no half-state.
+Cons: downtime.
+
+Use for: dev / staging where downtime is acceptable.
+
+## Rolling
+
+Replace instances one (or batch) at a time, gradually
+shifting from old to new.
+
+```
+[old] [old] [old] [old]
+[new] [old] [old] [old]  ← replace 1
+[new] [new] [old] [old]  ← replace 2
+[new] [new] [new] [old]
+[new] [new] [new] [new]
+```
+
+Pros: no extra infra; standard K8s deployment.
+Cons: both versions live simultaneously (compatibility
+required); rollback means rolling again.
+
+Use for: standard prod deploys of internal services.
+
+## Blue-green
+
+Two complete environments. Switch traffic between them.
+
+```
+Blue: v1, receiving traffic
+Green: v2, prepared and warm
+Switch: traffic → Green
+Blue stays around for quick rollback
+```
+
+Pros: instant rollback (flip back); single version live at a
+time (no compat issues).
+Cons: 2x infra during the transition; DB state must be
+compatible across both versions.
+
+Use for: critical apps where rollback speed matters more than
+infra cost.
+
+## Canary
+
+Roll out to a small subset (1-5%) of traffic first. Monitor.
+Expand if healthy.
+
+```
+[v1] [v1] [v1] [v1] [v1] (95%)
+[v2] (5% - canary)
+
+Monitor metrics for 1-24h
+If OK: expand to 25%, 50%, 100%
+If NOT OK: roll back the canary
+```
+
+Pros: catches bad releases before full impact; gradual
+risk exposure.
+Cons: requires per-cohort metric comparison; longer total
+rollout time.
+
+Use for: changes with unknown risk; major version upgrades.
+
+## A/B
+
+Like canary, but the split is per-user (sticky), and you're
+comparing **product outcomes**, not just stability.
+
+```
+50% of users: version A (control)
+50% of users: version B (experiment)
+
+Compare: conversion rate, engagement, etc.
+```
+
+Same infra needs as canary; different goal (product
+experimentation vs deploy safety).
+
+Use for: product changes where you want statistical
+evidence.
+
+## Shadow
+
+Duplicate real traffic to the new version, but **discard its
+responses**. The new version doesn't affect users.
+
+```
+client request → LB
+                  ├── service v1 (response goes to user)
+                  └── service v2 (response discarded)
+```
+
+Pros: load-tests the new version against real traffic; no
+user impact.
+Cons: 2x compute (running both); side-effect-bearing
+operations must be designed to be safe in shadow mode (no
+duplicate emails, no double-charges).
+
+Use for: massive rewrites, performance validation, training
+new ML models.
+
+## Multi-stage rollouts
+
+Most teams combine these:
+
+<Steps>
+<Step n={1} title="Shadow deploy to validate.">
+Run v2 in shadow for a week. Compare latency, errors,
+output diffs.
+</Step>
+<Step n={2} title="Canary release.">
+1% of traffic to v2 for a day.
+</Step>
+<Step n={3} title="Progressive rollout.">
+5%, 25%, 50% over a week.
+</Step>
+<Step n={4} title="Full release.">
+100%.
+</Step>
+<Step n={5} title="Decommission v1.">
+After enough soak time, remove the old version.
+</Step>
+</Steps>
+
+The whole process takes 1-4 weeks. Slow, but bad releases get
+caught early.
+
+## Database considerations
+
+Multi-version rollouts force **schema compatibility**:
+
+- **Add columns**: new schema works with old code (old code
+  ignores new column).
+- **Remove columns**: deploy code that doesn't use the
+  column first; remove later.
+- **Rename**: don't. Add new, deprecate old.
+
+The **expand-contract pattern**:
+
+```
+Phase 1: expand schema (add new col, keep old)
+Phase 2: deploy app reading and writing both
+Phase 3: backfill new col from old
+Phase 4: deploy app reading new, writing both
+Phase 5: deploy app reading and writing new only
+Phase 6: contract schema (remove old col)
+```
+
+Each phase is independently rollbackable.
+
+## Feature flags as deployment substitute
+
+For risky features, deploy the code in an "off" state. Turn
+on via feature flag at runtime — no deploy needed.
+
+```js
+if (flag('new-search-algo').isOn(userId)) {
+  return newSearch(query);
+}
+return oldSearch(query);
+```
+
+Pros: instant rollback (turn flag off); per-user rollout;
+A/B testing built in.
+Cons: code paths multiply; tests must cover both branches.
+
+Often combined with canary: deploy, then flip flag for
+canary users.
+
+## Automation
+
+For all but the smallest teams, automated rollout systems:
+
+- **Argo Rollouts** / **Flagger**: K8s-native canary +
+  blue-green with metric-driven promotion.
+- **Spinnaker** / **Harness**: full pipeline + deploy
+  orchestration.
+- **Custom**: scripted rollouts with health gates.
+
+Automation lets you do many small rollouts safely; manual
+rollouts are slow and error-prone.
+
+## Rollback
+
+Every deploy strategy needs a rollback plan:
+
+- **Recreate**: redeploy old version. Slow (minutes).
+- **Rolling**: roll the other direction. Same speed as
+  deploy.
+- **Blue-green**: flip traffic. Instant.
+- **Canary**: stop the canary; remove its instances.
+- **Shadow**: just stop it. No user impact.
+- **Feature flag**: turn off. Instant.
+
+Test rollback in non-prod. A deploy that succeeded but can't
+be rolled back is a trap.
+
+## In summary
+
+- Recreate: simplest, has downtime.
+- Rolling: standard prod default; medium safety.
+- Blue-green: instant rollback at 2x infra; great for
+  critical apps.
+- Canary: gradual exposure; great for unknown risk.
+- Shadow: validate against real traffic with no user impact;
+  watch side effects.
+- A/B: product experiments, not deploy safety.
+- Combine strategies; use feature flags for instant
+  on/off.
+- Schema must be compatible across versions during rollout
+  (expand-contract).

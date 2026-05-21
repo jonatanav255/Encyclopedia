@@ -1,0 +1,156 @@
+export const level = 'senior';
+
+# How to choose: synchronous vs asynchronous
+
+The two-question test:
+
+1. **Does the caller need the result before doing anything
+   else?** If yes → sync. If no → async.
+2. **Can the work fail without immediate user impact?** If
+   yes → async. If no → sync.
+
+Most systems get this wrong by defaulting to sync everywhere
+(it's what HTTP gives you) or async everywhere (it's
+"scalable"). Pick per operation.
+
+## Sync wins when
+
+- **The user is waiting for the answer.** "What's my balance?"
+  must be sync.
+- **The next step depends on the result.** "Create user, then
+  add them to the team" — the team-add needs the user ID.
+- **Failures must be visible to the user immediately.** Form
+  submission errors should show inline, not via email later.
+- **Low latency matters.** Async hops add 10–100ms each.
+
+## Async wins when
+
+- **The work is slow.** Resizing a video, sending email,
+  generating a PDF. The user doesn't want to wait 30 seconds.
+- **Fan-out to many consumers.** "Order placed" event triggers
+  billing, inventory, email, analytics. Sync to all four is
+  brittle.
+- **Failure can be retried.** Email delivery, webhook
+  notification — the system can retry without user
+  involvement.
+- **Spiky load.** A burst of 10K orders/sec; sync calls overload
+  downstream. Async + queue lets the downstream catch up.
+- **Decoupling deployments.** Producer and consumer can deploy
+  independently if they share an event format.
+
+## The default
+
+For a typical CRUD endpoint:
+
+```
+POST /users
+  → sync DB insert
+  → sync return ID + email
+  → async: send welcome email
+  → async: index in search
+  → async: notify analytics
+```
+
+The user gets a fast response with the created ID. The heavy
+post-processing happens out-of-band.
+
+## Common mistakes
+
+### "Async = scalable" → message broker for everything
+
+You replaced HTTP RPC with broker RPC: producer sends event,
+sits in a loop checking a reply queue. You've added ms of
+latency and one more failure mode. Just use HTTP.
+
+### "Sync for everything" → user waits 8 seconds for signup
+
+Sync welcome email + sync search indexing + sync analytics
+push. Each adds 1–2 seconds. The user's POST takes 8s. Move
+all of them to async background jobs.
+
+### "Async means I don't have to handle failures"
+
+Async work fails too. If the welcome email fails 5 retries,
+something has to notice. Async ≠ fire and forget.
+
+## The hybrid pattern
+
+Many real endpoints are sync for the critical path + async
+for the rest:
+
+```js
+async function createOrder(input) {
+  // Sync, must succeed:
+  const order = await db.transaction(async tx => {
+    const o = await tx.orders.insert(input);
+    await tx.inventory.reserve(o.items);
+    return o;
+  });
+  
+  // Async, can retry/recover:
+  await queue.enqueue('email-confirmation', { orderId: order.id });
+  await queue.enqueue('search-index', { orderId: order.id });
+  await queue.enqueue('analytics-event', { type: 'order.placed', orderId: order.id });
+  
+  return order; // returned quickly to user
+}
+```
+
+The sync part returns when the order is durable. The async
+parts can retry without the user noticing.
+
+## Async semantics to watch for
+
+### At-least-once delivery
+
+Brokers deliver messages at least once. Your handler must be
+idempotent (see inbox-pattern-idempotent-consumer).
+
+### Eventual consistency
+
+A user creates an order, the search index hasn't indexed it
+yet. If they search 2 seconds later, they might not see it.
+Either accept the lag or fetch fresh data via API instead of
+search.
+
+### Out-of-order events
+
+Event A "order placed" and event B "order paid" might arrive
+in either order at a downstream. Handler must tolerate.
+
+### Dead-letter queues
+
+Some messages can't be processed (malformed, depending on
+deleted entities). They go to a DLQ; ops manually inspects
+and reprocesses.
+
+## When request/response is reasonable but feels slow
+
+A common pattern: the user submits a long-running operation,
+gets back a `job_id`, then polls for status. Combines sync
+acceptance with async work without forcing the user to wait.
+
+```
+POST /reports
+  Body: { ... }
+  Response: { job_id: "abc", status_url: "/reports/abc" }
+
+GET /reports/abc
+  Response: { status: "running" | "done", result: ... }
+```
+
+Pairs well with WebHooks (server notifies client of
+completion) or WebSockets (push status updates).
+
+## In summary
+
+- Sync when the caller blocks on the result, the work is
+  fast, or failure must be immediate.
+- Async when the work is slow, fan-out is wide, or failure is
+  retryable.
+- Most endpoints are hybrid: sync critical path, async
+  everything else.
+- Async ≠ fire and forget — handle failures, idempotency,
+  ordering, and DLQ.
+- Pattern: return a `job_id` for long operations; client
+  polls or subscribes for completion.

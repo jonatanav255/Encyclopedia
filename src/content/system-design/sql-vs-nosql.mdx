@@ -1,0 +1,291 @@
+export const level = 'mid';
+
+# SQL vs NoSQL
+
+The framing is misleading. "SQL" is a query language; "NoSQL"
+is a collection of unrelated data models that happen to not be
+relational. The real question is **which data model fits the
+workload**, and then which engine implements it well.
+
+Pick the model first, the product second.
+
+## The actual taxonomy
+
+There are five widely-used data models, not two.
+
+<Cheatsheet>
+| Model | Examples | Shape | Sweet spot |
+|---|---|---|---|
+| Relational | Postgres, MySQL, SQL Server, CockroachDB | Tables + rows + foreign keys | Transactional apps with related entities |
+| Document | MongoDB, Couchbase, DocumentDB | Self-contained JSON-ish trees | Aggregates retrieved/written as a unit |
+| Key-value | Redis, DynamoDB, RocksDB, Riak | Opaque value behind a key | Caches, sessions, simple lookups |
+| Wide-column | Cassandra, ScyllaDB, HBase, Bigtable | Rows + sparse columns + partition keys | Huge writes, time-series, log-like |
+| Graph | Neo4j, JanusGraph, Neptune, Memgraph | Nodes + typed edges | Relationship-traversal queries |
+</Cheatsheet>
+
+"Relational vs NoSQL" lumps four of these together. They have
+nothing in common except "not a foreign key."
+
+## What relational actually gives you
+
+Three things, all related and easy to lose without noticing:
+
+<Steps>
+<Step n={1} title="A declarative query language.">
+You describe **what** you want, the planner figures out **how**.
+Indexes, join orders, predicate pushdown — all transparent.
+This is enormously powerful for ad-hoc queries and reporting.
+</Step>
+<Step n={2} title="Joins.">
+Data lives in normalized form across tables. The engine joins
+them at query time. The cost is moved from write-time to
+read-time, and indexes make most joins cheap.
+</Step>
+<Step n={3} title="ACID transactions across rows.">
+Update two tables atomically with isolation guarantees.
+Without this, your application enforces invariants —
+inevitably with bugs.
+</Step>
+</Steps>
+
+Modern relational engines also bolt on JSON columns (Postgres
+JSONB), arrays, full-text search, geospatial, and partitioning.
+The "relational means rigid" criticism is a decade out of date.
+
+## What document gives you
+
+A document is a self-describing tree — typically JSON or BSON —
+read and written as one unit.
+
+```js
+{
+  _id: ObjectId("..."),
+  email: "a@b.com",
+  addresses: [
+    { type: "billing",  line1: "...", city: "..." },
+    { type: "shipping", line1: "...", city: "..." }
+  ],
+  prefs: { theme: "dark", locale: "en-US" }
+}
+```
+
+Benefits:
+
+- **No join for the aggregate**: one read returns the whole user.
+- **Schema flexibility**: add a field on one document without
+  migrating all of them.
+- **Maps to object models**: easier ORM-free programming.
+
+Costs:
+
+- **No cross-document joins** (or weak ones). Querying across
+  collections is awkward.
+- **Implicit schema is still a schema** — just enforced at the
+  read site instead of the write site. Inconsistency surfaces
+  as runtime bugs.
+- **Updates that touch multiple documents** lose atomicity unless
+  the engine supports multi-document transactions (MongoDB 4.0+,
+  but with cost).
+
+Use documents when the access pattern is "fetch one aggregate,
+mutate it, save it" and the aggregate boundary is stable.
+
+## What key-value gives you
+
+The minimal API: `get(k)`, `put(k, v)`, `del(k)`. Sometimes
+`scan(prefix)`.
+
+Predictable O(1) latency, trivial sharding by key hash, huge
+write throughput. The price is that the engine sees the value
+as an opaque blob — no indexing, no querying inside it.
+
+Redis adds rich value types (lists, sets, sorted sets, streams,
+hashes) and is closer to a data-structure server than a pure
+KV store. DynamoDB is KV with secondary indexes bolted on.
+
+Use KV for caches, sessions, feature flags, rate-limit counters,
+leaderboards, and any "one key in, one value out" workload.
+
+## What wide-column gives you
+
+Cassandra-style: rows live inside **partitions** keyed by a
+partition key. Within a partition, rows are sorted by a
+clustering key. Columns are sparse — different rows in a
+partition can have different columns.
+
+```
+partition key: user_id
+clustering key: ts DESC
+
+(user_id=42, ts=t1, action=login, ip=...)
+(user_id=42, ts=t2, action=view,  resource=...)
+(user_id=42, ts=t3, action=logout)
+```
+
+Built for **massive write throughput**, **linear horizontal
+scaling**, **time-series and log-like workloads**, and
+**multi-datacenter active-active**. Reads are fast *if* they
+hit a single partition; cross-partition queries are an
+anti-pattern.
+
+The model forces you to design the schema for the query — see
+partition key selection.
+
+## What graph gives you
+
+When the **edges** matter more than the nodes — fraud rings,
+social graphs, recommendation paths, dependency graphs,
+permissions hierarchies — relational joins blow up
+exponentially with traversal depth. Graph engines compile
+traversal-first.
+
+```
+MATCH (u:User {id:42})-[:FRIEND*1..3]->(f)
+RETURN f
+```
+
+A 3-hop friend-of-friend query is index-free in a graph DB and
+catastrophic in SQL once you cross a few million rows.
+
+Graph is rarely the primary store. It's an auxiliary store
+populated from the primary via CDC or batch jobs.
+
+## Transactions
+
+The marketing tells you NoSQL is "BASE" and SQL is "ACID." The
+reality in 2026:
+
+<Cheatsheet>
+| Engine | Single-key | Multi-row same shard | Cross-shard |
+|---|---|---|---|
+| Postgres / MySQL | ACID | ACID | N/A (single node) |
+| CockroachDB / Spanner | ACID | ACID | ACID (slower) |
+| MongoDB (4.0+) | ACID | ACID (replica set) | ACID with cost |
+| DynamoDB | ACID | TransactWriteItems (limited) | TransactWriteItems |
+| Cassandra | "lightweight" via Paxos (slow) | No | No |
+| Redis | Atomic per command, MULTI/EXEC | Atomic on one node | No (Cluster) |
+</Cheatsheet>
+
+If you need multi-row transactions, default to a relational
+engine. NoSQL engines that bolted them on later have
+operational caveats and surprising performance cliffs.
+
+## Joins
+
+Joins aren't slow — **unindexed joins on cold data over the
+network** are slow. A two-table inner join on indexed FKs in
+Postgres is microseconds. The reason document and KV stores
+"don't have joins" is that they're a different data model, not
+because joins are inherently bad.
+
+When you denormalize to avoid joins, you've moved the work to
+write time and accepted update anomalies. That's a fine
+trade-off when reads dwarf writes; it's a disaster when the
+aggregate boundary is wrong.
+
+## Scaling
+
+The lazy claim is "SQL doesn't scale, NoSQL does." This is
+half-true and decades old.
+
+- **Vertical scaling**: any DB scales by buying a bigger box.
+  A modern Postgres on 128 cores and 2 TB RAM handles
+  remarkable load.
+- **Read scaling**: every relational DB does replicas. Reads
+  scale by adding replicas. Writes still bottleneck on the
+  primary.
+- **Horizontal write scaling**: this is where models diverge.
+  Cassandra, DynamoDB, Bigtable, and CockroachDB scale writes
+  by partitioning. Vanilla Postgres/MySQL require manual
+  sharding or middleware (Citus, Vitess).
+
+If your write QPS comfortably fits on one node — and it does
+for the overwhelming majority of products — relational is
+fine. If you genuinely need 100K+ sustained writes/sec,
+horizontally scalable engines earn their complexity.
+
+## A decision framework
+
+Stop asking "SQL or NoSQL." Ask these in order:
+
+<Steps>
+<Step n={1} title="What's the dominant access pattern?">
+Lookup by key? Aggregate by query? Traversal? Analytics? This
+filters models more than anything else.
+</Step>
+<Step n={2} title="What are the invariants?">
+Anything that needs "A and B both update or neither does"
+(money, inventory, bookings) pushes you toward ACID
+transactions and therefore relational by default.
+</Step>
+<Step n={3} title="What's the write QPS at year-3 scale?">
+Below ~5K sustained writes/sec, one Postgres handles it. Above,
+sharded relational or wide-column starts paying off.
+</Step>
+<Step n={4} title="Is the schema stable or exploratory?">
+Highly variable per-record shape (CMS, product catalog with
+heterogeneous attributes) leans document. Stable shape leans
+relational.
+</Step>
+<Step n={5} title="Operational budget?">
+Postgres is the most operationally mature option. Cassandra,
+Spanner, and the others demand a different skill set. Don't
+pick a DB you can't operate.
+</Step>
+</Steps>
+
+## When NoSQL is the right call
+
+- **Massive write throughput** that genuinely exceeds one node
+  (event logging, IoT telemetry, ad tracking).
+- **Multi-region active-active writes** with conflict tolerance
+  (Cassandra, DynamoDB global tables).
+- **Pure cache / session / queue workloads** (Redis).
+- **Document-as-aggregate** with stable boundaries and
+  per-document mutations (CMS, user profiles, product specs).
+- **Graph traversal at depth** in the primary access pattern.
+
+## When SQL is the right call
+
+- **Default**. Until proven otherwise.
+- **Multi-row transactions** with non-trivial invariants.
+- **Ad-hoc queries** by analysts or internal tools.
+- **Reporting** alongside the OLTP workload (until volume
+  forces a warehouse).
+- **Anything with foreign keys you'd actually enforce.**
+
+## Polyglot persistence
+
+Real systems use several stores. A typical 2026 stack:
+
+- **Postgres** for the system of record (users, orders, billing).
+- **Redis** for sessions, caches, rate limits, queues.
+- **Elasticsearch / OpenSearch** for full-text search.
+- **ClickHouse / BigQuery / Snowflake** for OLAP.
+- **S3** for blobs.
+
+Each one carries operational weight. Three stores is a sensible
+default; seven is technical debt waiting to be acknowledged.
+The goal is to use one engine for as long as possible and only
+add specialized stores when the primary stops fitting.
+
+<Callout variant="warning">
+"Postgres can do that" is true for ~80% of "we need NoSQL"
+cases. JSONB, full-text search, partitioning, and listen/notify
+cover more than people remember. Push Postgres until it
+visibly bends before reaching for a second store.
+</Callout>
+
+## In summary
+
+- Pick the **data model**, not the marketing label. Five models,
+  not two.
+- Relational gives you joins, declarative queries, and ACID —
+  three things expensive to rebuild.
+- Document, KV, wide-column, and graph each solve a specific
+  shape of access pattern. They're not interchangeable.
+- Most products are well-served by Postgres until at least
+  several million users and several thousand writes/sec.
+- Default to relational. Add a specialized store only when the
+  workload visibly outgrows it. Operational simplicity is a
+  feature.

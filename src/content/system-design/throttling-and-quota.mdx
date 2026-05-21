@@ -1,0 +1,308 @@
+export const level = 'senior';
+
+# Throttling and quotas
+
+Rate limiting protects **the system**. Quotas constrain **the
+customer**. Throttling is the act of slowing or rejecting traffic
+when either is exceeded. The mechanisms overlap; the contracts and
+user experience differ sharply.
+
+Confusing these is one of the most common API-design mistakes
+(Geewax devotes a chapter to it in *API Design Patterns*).
+
+## The distinction
+
+<Compare a="Protective rate limit" b="Contractual quota">
+<>
+**Defends the system.** Internal capacity protection. Limits are
+chosen by the operator. Crossing one is a hint to back off; it's
+expected occasionally. Returns 429.
+
+Examples: "no more than 100 req/sec/IP," "no more than 1 query/sec
+per user against `/reports`."
+</>
+<>
+**Defines what the customer paid for.** Part of the product
+contract. Limits are tied to a plan or agreement. Crossing one is
+the customer's problem — they need to upgrade. Returns 402 or
+403 (or 429 with billing context).
+
+Examples: "Free tier: 1 000 API calls/month," "Pro tier: 100 000
+events/day."
+</>
+</Compare>
+
+Same mechanism (counter + reject), very different meaning:
+
+- Rate limit hit → "please retry in 30 seconds."
+- Quota hit → "you're out for this billing period; upgrade or wait."
+
+The user experience must reflect the difference. Saying "too many
+requests" to a paying customer who hit their monthly quota is a
+support ticket waiting to happen.
+
+## Why both exist
+
+Without rate limits, one buggy customer can take down the system.
+Without quotas, the business can't price tiered plans. Both layers
+of protection are needed:
+
+```
+[client]
+   ↓
+[rate limit: 1000 req/sec/key]     ← protects the system; rejects bursts
+   ↓
+[quota check: 100 000 req/month]   ← enforces business contract
+   ↓
+[service]
+```
+
+A request can be:
+
+- Accepted (under both).
+- Rate-limited (over 1000/sec; can retry in seconds).
+- Over quota (over 100k/month; can retry next month, or upgrade).
+
+Both go to "rejected," but the meaning to the customer is different.
+
+## Quota mechanics
+
+Quotas are slower and stateful:
+
+<Cheatsheet>
+| Property | Rate limit | Quota |
+|---|---|---|
+| Time window | Seconds to minutes | Days to months |
+| Reset | Automatic, frequent | Aligned to billing cycle |
+| Counter location | Hot path (Redis) | Slower path (DB / billing system) |
+| Visibility | Mostly internal | Surfaced in customer dashboard |
+| Per-key cost | Small (~1 KB hot) | Variable; aggregated nightly OK |
+| Failure cost | Rare, retry-able | Customer-facing; impacts revenue |
+| Status code | 429 | 402 Payment Required, or 429 with billing context |
+</Cheatsheet>
+
+Quotas can usually tolerate **eventual consistency** — being a few
+seconds behind in counting requests is fine, as long as the billing
+period total is correct. Rate limits cannot — they must be enforced
+in milliseconds.
+
+A common architecture:
+
+```
+- Hot path: fast in-memory increment per request.
+- Periodic flush: roll up local counts to a central billing service.
+- Customer dashboard: queries billing service.
+- Hard cap: when central count exceeds quota, push a flag back to
+  the hot path: "deny this key."
+```
+
+This avoids hitting the billing system on every request.
+
+## Quota policies: hard vs soft
+
+<Compare a="Hard quota" b="Soft quota">
+<>
+At the limit, requests are **rejected**. Customer must upgrade or
+wait. Predictable cost ceiling, painful user experience.
+</>
+<>
+At the limit, requests **succeed but bill at overage rate**.
+Higher revenue, can surprise customers with bills. Common in cloud
+APIs.
+</>
+</Compare>
+
+Hybrid: soft quota up to a multiplier, hard quota above that. AWS-
+style: "100 GB included; pay per GB up to 10 TB; refuse beyond."
+
+The UX expectation matters:
+
+- Consumer SaaS: hard quota is friendlier ("you're out; here's how
+  to upgrade") than a surprise bill.
+- Enterprise: soft quota with overage is normal; customers expect
+  burst tolerance.
+
+Communicate the policy clearly. Surprise bills generate support
+tickets and churn.
+
+## Throttling: the mechanism, not the contract
+
+"Throttling" is what happens when limits are crossed. Two flavors:
+
+### Reject
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+{ "error": "rate_limit_exceeded", "retry_after": 60 }
+```
+
+Or, for quota:
+
+```
+HTTP/1.1 429 Too Many Requests
+X-Quota-Resource: api_calls
+X-Quota-Limit: 100000
+X-Quota-Remaining: 0
+X-Quota-Reset: 2026-06-01T00:00:00Z
+{ "error": "quota_exceeded", "upgrade_url": "https://example.com/billing" }
+```
+
+The headers tell the client (and the customer support team) exactly
+what was hit and when it resets.
+
+### Delay / queue
+
+The request waits until capacity is available, then is served. Used
+for:
+
+- Internal traffic with known senders (queue consumers).
+- Batch operations where latency is tolerated.
+
+Doesn't fit user-facing APIs — clients with their own timeouts will
+abandon, and held connections cost server resources. Default to
+reject.
+
+## Tier shapes
+
+Common pricing-tier shapes, from Continuous API Management:
+
+```
+Tier         Rate limit       Quota          Concurrency
+─────────────────────────────────────────────────────────
+Free         10 req/sec       1 000/month    1
+Developer    100 req/sec      100 000/month  5
+Pro          1 000 req/sec    1 000 000/mo   25
+Enterprise   negotiated       negotiated     negotiated
+```
+
+Each tier has all three axes: rate (per second), quota (per period),
+concurrency (in flight). Different tiers expose different axes;
+real customers care about different ones (rate for chatty clients,
+quota for monthly users, concurrency for batch jobs).
+
+Pricing on a single axis is brittle: "10 000 calls/month" doesn't
+prevent 10 000 calls in one second from breaking the system.
+
+## Per-endpoint differentiation
+
+Not all endpoints are equal. A search endpoint is 100× more expensive
+than a "get user." A naïve flat limit (100 req/sec for everything)
+either over-protects cheap endpoints or under-protects expensive
+ones.
+
+Two common approaches:
+
+### Cost-weighted limits
+
+Each endpoint has a "cost" (in units); the limit is per-units, not
+per-request:
+
+```
+GET /users           = 1 unit
+GET /search?q=...    = 10 units
+POST /reports/run    = 100 units
+```
+
+Quota: "1 000 units/sec." Search effectively limited to 100/sec;
+report generation to 10/sec. Fair to the system.
+
+### Per-endpoint limits
+
+Separate counters per endpoint:
+
+```
+/search:   10/sec/key
+/users:    1000/sec/key
+/reports:  1/sec/key
+```
+
+Easier to communicate, easier to tune individually, more counters
+to operate. Common in mature APIs.
+
+GraphQL has its own version of this: **query cost analysis**, where
+the cost of a query is computed from its shape (depth × breadth ×
+known per-field costs).
+
+## Failure modes
+
+### Hard quota without warning
+
+Customer hits 100% of their monthly quota silently. Production
+breaks. Customer is furious.
+
+The fix: warn at 80%, 90%, 95%, 100%. Email, dashboard, response
+headers. Quotas should never surprise a paying customer.
+
+### Quota counters drift
+
+The hot path increments locally; the billing system aggregates
+nightly. By month end, the totals don't match. Customer disputes.
+
+The fix: reconcile daily; treat the billing system as source of
+truth for invoices, the hot path as source of truth for enforcement;
+log discrepancies and resolve them.
+
+### Quota reset confusion
+
+"100 000/month" — does that reset on the 1st of the month, or
+30 days from signup? Billing-period-aligned is normal but must be
+documented. Customers will plan their batch jobs around resets.
+
+### Throttling expensive operations cheaply
+
+A 1 req/sec rate limit lets a customer issue 1 expensive report per
+second, costing the system 100 cheap-request-equivalents. The
+limit was the wrong unit. Use cost-weighted or per-endpoint limits.
+
+### Throttling internal traffic by accident
+
+Your own service-to-service calls hit the public rate limiter and
+get 429'd. Internal traffic should have its own path (different
+key, different rate-limit policy, or a separate endpoint).
+
+### Confusing 429 and 402
+
+Returning 429 "rate limited" when the customer is actually out of
+their plan's quota. They retry. They still get 429. They don't
+understand they need to upgrade. The fix: when quota is the cause,
+say so in the response body and surface upgrade links.
+
+## Communication
+
+Quotas are a product feature, not just an infra concern:
+
+- Customer dashboard shows current usage and remaining quota.
+- Response headers report quota state on every successful call
+  (cheap for the customer to track).
+- Billing emails warn at 50%/75%/90%/100%.
+- Documentation explains rate limit vs quota vs concurrency
+  distinctly.
+
+The infra implementation is the easy part. The customer-experience
+work — communicating limits, warnings, upgrade paths — is where most
+teams underinvest.
+
+<Callout variant="info">
+Rate limit answers "is the system in danger?" Quota answers "did
+the customer pay for this much?" They should give different errors,
+different docs, and different recovery instructions. Conflating them
+is the most common cause of confused customers and lost revenue.
+</Callout>
+
+## In summary
+
+- Rate limit defends the system; quota defines the customer
+  contract. Same mechanism, different meaning.
+- Rate limits live in the hot path (Redis); quotas can be eventually
+  consistent (billing system).
+- Hard quotas predict cost; soft quotas with overage maximize
+  revenue; choose by audience.
+- Tier on multiple axes: rate, quota, concurrency. A single axis is
+  brittle.
+- Use cost-weighted or per-endpoint limits when endpoints differ
+  greatly in expense (search vs. get).
+- Communicate quota state proactively (warnings, dashboard, response
+  headers). Surprise bills churn customers.
+- Use distinct error codes and messaging for rate vs. quota — don't
+  conflate.

@@ -1,0 +1,156 @@
+export const level = 'senior';
+
+# Gossip protocols
+
+A pattern for **propagating information in a peer-to-peer
+cluster without a central coordinator**. Each node periodically
+picks a random peer and exchanges state. Information spreads
+exponentially — like a rumor — and reaches every node in
+O(log N) rounds.
+
+Used for cluster membership (who's alive?), failure detection,
+metadata propagation, and antientropy.
+
+## The basic algorithm
+
+<Steps>
+<Step n={1} title="Every T seconds, pick a random peer.">
+T is typically 100ms–1s. Random selection (uniform or
+weighted) keeps the cluster fair.
+</Step>
+<Step n={2} title="Exchange state.">
+Three flavors: push (I send mine), pull (I ask for yours),
+push-pull (both). Push-pull converges fastest.
+</Step>
+<Step n={3} title="Merge.">
+On each side, merge the received state with the local state.
+Typically last-write-wins or vector-clock based.
+</Step>
+</Steps>
+
+After log(N) rounds, an update injected at any node reaches
+every other node (with high probability). For a 1000-node
+cluster, that's ~10 rounds — about 1–10 seconds depending on T.
+
+## What gossip is good at
+
+- **Membership.** "Who's in the cluster right now?" Every node
+  knows after a few rounds.
+- **Failure detection.** A node that stops responding to gossip
+  is marked suspect, then dead. Phi-accrual failure detection
+  builds on gossip-derived heartbeats.
+- **Metadata.** Schema versions, partition maps, configuration.
+  Eventually consistent across the cluster without a central
+  control plane.
+- **Anti-entropy.** Compare Merkle trees of data, sync where
+  they disagree. Cassandra repair, Riak handoff.
+
+## What gossip is bad at
+
+- **Strong consistency.** Gossip is eventually consistent; the
+  cluster only converges in the limit.
+- **Tight latency.** A change takes O(log N) rounds — fine for
+  membership, terrible for "deploy this config now."
+- **Large state.** Each exchange ships some/all of the local
+  state. Big payloads with frequent gossip kill bandwidth.
+
+## Examples in production
+
+<Cheatsheet>
+| System | What it gossips |
+|---|---|
+| Cassandra | Membership, schema, partition ownership, load stats |
+| Consul | Service registry, health, KV updates (combined with Raft for the source-of-truth KV) |
+| Redis Cluster | Cluster topology, slot assignments, node states |
+| Riak | Ring membership, gossip for cluster claim |
+| HashiCorp Serf / memberlist | Generic gossip library used by Consul, Nomad |
+| Hyperledger Fabric | Block propagation among peers |
+| Dynamo (Amazon) | Membership and failure detection |
+</Cheatsheet>
+
+## SWIM: gossip + failure detection
+
+SWIM (Scalable Weakly-consistent Infection-style Process Group
+Membership) is a refinement that adds:
+
+- **Random probing**: instead of all-to-all, each node probes
+  one random peer per round. If the peer doesn't ack, probe via
+  K other peers indirectly before declaring it suspect.
+- **Suspect → dead state machine** with timeouts.
+- **Infection-style propagation**: rumors of join/leave
+  piggyback on probe messages.
+
+SWIM scales to 10K+ node clusters with bounded gossip
+bandwidth. Used by HashiCorp's memberlist, Uber's Ringpop.
+
+## Push vs pull vs push-pull
+
+<Compare a="Push" b="Pull">
+<>
+Node A sends its state to random B. A converges if many
+nodes push to it. Total messages: O(N log N). Risk: hot
+spots if nodes pick non-uniformly.
+</>
+<>
+Node A asks random B for state. B converges if many ask.
+Total messages: O(N log N). Pull adapts better when most
+nodes are "behind."
+</>
+</Compare>
+
+**Push-pull** combines both per round and converges in O(log
+log N) rounds — fastest among the three. Most production
+gossip uses push-pull.
+
+## Common pitfalls
+
+### Gossip rate too high
+
+Every node gossiping every 100ms in a 10K-node cluster
+generates 100K messages/sec just for membership. Tune T and
+node selection (prefer same-rack peers for most rounds).
+
+### Gossip state too large
+
+Shipping the entire cluster's view every round bloats
+bandwidth. Most systems gossip **deltas** (state diffs since
+the last exchange with this peer).
+
+### Catastrophic gossip storms
+
+A failed node gets re-marked alive by gossip from a partition;
+the partition merges; both halves disagree about who's dead;
+each generation of gossip flips it. Real failure mode in
+early Cassandra clusters. Fix: gossip with version vectors,
+not just state.
+
+### Eventual is too eventual
+
+If you need a fact globally consistent within seconds, gossip
+won't reliably do it. Use Raft/Paxos for the small set of
+critical metadata, and gossip for everything else. Consul
+does exactly this.
+
+## Gossip + consensus: the production pattern
+
+The classic split:
+
+- **Gossip** carries large, frequently-updating state
+  (membership, health, load).
+- **Consensus** (Raft/Paxos) carries the small set of
+  source-of-truth state that needs linearizability (cluster
+  config, schema, leader election).
+
+Mixing the two is how Consul, etcd, Kubernetes, and most
+modern coordination systems are built.
+
+## In summary
+
+- Gossip protocols: peer-to-peer state exchange with random
+  partners; reaches all nodes in O(log N) rounds.
+- Best for membership, failure detection, metadata, anti-entropy.
+- Push-pull converges fastest.
+- SWIM adds probe-based failure detection at scale.
+- Eventually consistent; not a replacement for consensus.
+- Production systems combine gossip (large, fast-changing) +
+  consensus (small, source-of-truth).

@@ -1,0 +1,229 @@
+export const level = 'senior';
+
+# Failure modes and anti-patterns
+
+A field guide to the named failures every operator recognizes
+from the postmortem chat channel. Each has a shape, a cause,
+and a fix. The patterns repeat across every system long enough
+to develop a personality.
+
+## Cascading failure
+
+One component fails; its load shifts to peers; they overload;
+they fail; their load shifts to *their* peers; the cluster
+collapses.
+
+```
+A → B → C
+            (C dies)
+            ▼
+       B retries C, fills B's threads
+            ▼
+       A retries B, fills A's threads
+            ▼
+       Everything is in retry loops
+```
+
+**Fix**: circuit breakers, retry budgets, load shedding,
+bulkheads.
+
+## Retry storm
+
+A downstream is briefly slow. Every client retries
+simultaneously. The downstream is now under 2-5× the original
+load. It stays slow. Clients retry more.
+
+**Fix**: exponential backoff with jitter, retry budgets,
+client-side circuit breakers.
+
+## Thundering herd
+
+A cached resource expires; thousands of in-flight requests
+all hit the origin. Origin melts.
+
+**Fix**: request coalescing, probabilistic early expiration,
+lock + serve-stale. (See cache-stampede.)
+
+## Slow dependency
+
+A downstream is responding, but slowly. Calling threads
+block. Calls pile up. The caller becomes "slow" too.
+
+**Fix**: tight timeouts (treat slow as failure), circuit
+breakers that trip on latency, bulkheads.
+
+## Unbounded queue
+
+A queue with no maximum size grows until memory exhausts.
+The receiver can't keep up; producers don't know.
+
+**Fix**: bounded queues, explicit backpressure (reject when
+full), monitor queue depth, alert on growth.
+
+## Memory leak
+
+Memory usage climbs steadily; eventually OOM. Common causes:
+event emitters never removed, caches without eviction, leaked
+DB connections.
+
+**Fix**: heap profiling, instance recycling (preventative
+restart), test for leak patterns in CI.
+
+## File descriptor exhaustion
+
+Each open file/socket consumes an FD. Default limit ~1024 in
+many environments; ~65k tuned. When exhausted, the process
+can't accept new connections, can't open files, can't even
+log errors properly.
+
+**Fix**: monitor FD usage, raise limits, fix code paths that
+don't close descriptors.
+
+## DB connection exhaustion
+
+Each web request opens a DB connection; releases it on
+completion. If requests pile up (overload, slow query), all
+connections in-use. New requests block waiting for a
+connection. The whole service freezes.
+
+**Fix**: connection pool with timeout (wait at most N ms for
+a connection, then reject), monitor pool utilization, fix
+slow queries.
+
+## SLA inversion
+
+Your SLA is 99.99%. You depend on a service with 99% SLA.
+Math says you can't beat 99%. But product committed to
+99.99%.
+
+**Fix**: redundancy across providers, caching with long TTL
+for the dependency's data, fail-graceful patterns.
+
+## Integration-point failure
+
+The connection to a third-party API is the single point of
+failure. Any glitch — TLS renewal, DNS issue, their
+infrastructure — and your service is down with it.
+
+**Fix**: timeouts, circuit breakers, fallbacks, async
+processing for non-critical paths.
+
+## Self-DDoS
+
+The system DDOSes itself. Common causes:
+
+- A new feature batched 1000 requests per user-action;
+  spike crushed origin.
+- An admin script ran in production with no rate limit; 1M
+  events per second.
+- A bug caused infinite recursion of API calls.
+
+**Fix**: rate limits at the edge (even for internal
+traffic), feature flags for new heavy paths, monitor for
+abnormal traffic patterns from your own services.
+
+## Heisenbug
+
+A bug that disappears when you look at it. Often:
+
+- A logging statement that adds latency masks a race
+  condition.
+- A debugger pause changes timing enough to hide a TOCTOU
+  bug.
+- Restarting the service "fixes" memory state that triggered
+  the bug.
+
+**Fix**: detailed structured logging *before* the bug is
+investigated; rich metrics that capture state without
+changing it; never trust "couldn't reproduce."
+
+## Time-of-check, time-of-use (TOCTOU)
+
+```js
+if (await db.exists(id)) {       // check
+  await db.delete(id);             // use — but record might be gone
+}
+```
+
+In between the check and the use, another process modified
+the state. The "use" operation either fails or, worse,
+silently does the wrong thing.
+
+**Fix**: atomic operations, optimistic concurrency with
+version checks, transactions.
+
+## Clock-related bugs
+
+- Tokens expire because two machines disagree about time.
+- Timestamps in logs are reordered.
+- Distributed locks expire too early (or too late).
+
+**Fix**: monotonic clocks for elapsed time; fencing tokens
+for locks; tolerate ~1s skew for token expiry. (See
+clock-skew-and-true-time.)
+
+## Configuration drift
+
+The deployment template says X. The cluster has Y because
+someone hand-edited. A new deploy resets to X; everything
+breaks.
+
+**Fix**: GitOps — config is in git, deployed by automation;
+forbid manual changes; periodic drift detection.
+
+## Capacity surprise
+
+Last year's load test was 10K QPS. Code paths changed; per-request
+work doubled. New capacity ceiling is 5K. No one knew until
+an outage at 7K.
+
+**Fix**: continuous load testing in CI; track per-request
+resource consumption; alert on capacity headroom.
+
+## Logging-induced outage
+
+Detailed error logging on a high-frequency error path fills
+disks; service crashes from full disks. Or: every request
+logs to stdout, log shipper can't keep up, log buffer fills,
+process OOM.
+
+**Fix**: rate-limit error logs; sample noisy paths;
+asynchronous shipping with bounded buffers.
+
+## Antipatterns to recognize
+
+| Antipattern | What it looks like |
+|---|---|
+| God service | One service does everything; touching anything breaks it |
+| Shared database | Multiple services write same tables; tight coupling |
+| Distributed monolith | Microservices that must deploy together |
+| The "temporary" workaround | "TODO: fix later" still there 3 years later |
+| Lifecycle leak | Test code accidentally runs in prod |
+| Magic number | `if (count > 47)` — nobody remembers why |
+
+Each has a cost that compounds. Knowing the names helps you
+spot them in your own code.
+
+## How to use this catalog
+
+When something breaks, identify which named pattern matches.
+The pattern points to the fix.
+
+When designing new systems, run through the list as a
+checklist of "things to defend against." Most production
+failures repeat shapes that are decades old.
+
+## In summary
+
+- Production failures take recognizable shapes:
+  cascading, retry storm, thundering herd, slow dependency,
+  unbounded queue, memory leak, FD/connection exhaustion,
+  SLA inversion, integration-point failure, self-DDoS,
+  TOCTOU, clock skew, config drift, capacity surprise,
+  logging-induced.
+- Antipatterns: god service, shared DB, distributed monolith,
+  "temporary" workarounds, lifecycle leaks, magic numbers.
+- Knowing the names is half the diagnosis.
+- Defenses overlap (timeouts, breakers, bulkheads,
+  backpressure, shed load) — apply them systematically, not
+  reactively.

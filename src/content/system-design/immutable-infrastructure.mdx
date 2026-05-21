@@ -1,0 +1,269 @@
+export const level = 'senior';
+
+# Immutable infrastructure
+
+Once a server is running, **never modify it**. To deploy a new
+version, build a new image, launch new servers from that image,
+and terminate the old ones. Configuration changes are also new
+images. Patching is a new image. Anything you'd traditionally
+"do on the server" becomes "build a new image."
+
+The shift is from servers as **pets** (named, kept alive,
+configured by hand) to servers as **cattle** (numerous,
+interchangeable, replaced when sick). The label dates to ~2012;
+the practice is now ubiquitous in container and cloud
+deployments.
+
+## Why immutability
+
+Three concrete properties:
+
+<Cheatsheet>
+| Property | What you get |
+|---|---|
+| Reproducibility | The image is the source of truth; what's running matches the build |
+| Auditability | Every running instance corresponds to a known artifact + commit |
+| Roll-forward / rollback | Deploy = new image. Rollback = previous image. Both identical mechanism |
+| Drift elimination | No "snowflake" servers — instances are identical or replaced |
+| Faster failure recovery | Replace, don't repair |
+
+</Cheatsheet>
+
+The deepest win: **failure mode shifts**. A misbehaving server
+isn't diagnosed and patched; it's terminated and replaced. The
+new server's behavior is the image's behavior — known, tested,
+boring.
+
+## The mutable baseline you're escaping
+
+What you used to do, on a long-lived VM:
+
+```
+ssh prod-app-01
+sudo apt update && apt install ...
+sudo systemctl restart myapp
+edit /etc/myapp/config.ini
+```
+
+What goes wrong:
+
+- **Drift.** Server-01 was patched manually on Tuesday;
+  server-02 wasn't. They diverge silently.
+- **Reproducibility collapses.** Months later, no one can
+  recreate the exact state of a host.
+- **State is invisible.** What's actually installed? What was
+  changed? Nobody knows.
+- **Rollback is hand-craft.** "Roll back to last week" is hours
+  of careful editing on every host.
+
+Immutable infrastructure eliminates these because **the
+distinction "what was changed?" disappears** — nothing was
+changed. Things were created and destroyed.
+
+## The image as artifact
+
+The unit of deployment is an **image**, not a deployment
+script. Common image types:
+
+<Cheatsheet>
+| Format | Used with | Build tool |
+|---|---|---|
+| Container image (OCI) | Kubernetes, ECS, Cloud Run | Docker, BuildKit, buildah |
+| VM image (AMI, ISO) | EC2, GCE | Packer |
+| Function bundle (zip / image) | AWS Lambda, GCP Functions | CI pipelines |
+| Unikernel | rare specialist cases | rumprun, MirageOS |
+
+</Cheatsheet>
+
+The image is **bit-identical** across environments. Same image
+in staging as in prod. Differences come from **runtime
+configuration** (env vars, mounted secrets), not from rebuilding.
+
+## The build is the truth
+
+If the deployment process is "build an image, run it," the
+build process is **the entire spec**. The Dockerfile or Packer
+template is the documentation; whatever's in it is what runs.
+
+A simple example:
+
+```bash
+# Multi-stage build, pinned base
+FROM node:22.10-slim AS build
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+
+FROM node:22.10-slim
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+Everything that ends up in production is described here. There's
+no `apt install` happening on the running container at startup;
+no config files edited; no manual changes. What ran in CI is
+what runs in prod.
+
+## Configuration: the runtime layer
+
+Image immutability doesn't mean **everything** is in the image.
+Configuration — secrets, env vars, feature flags, endpoints —
+lives at the runtime layer:
+
+```
+image  + runtime config  =  running instance
+```
+
+Runtime config comes from:
+
+- Environment variables set by the orchestrator.
+- Mounted volumes (secrets, configmaps).
+- Service discovery / sidecar injectors.
+- Flag systems polled at startup or runtime.
+
+The image is the same in dev and prod; the runtime config
+differs. This is the practical version of "build once, deploy
+many."
+
+## Replacing, not repairing
+
+The operational discipline: when something's wrong, **replace**.
+
+<Steps>
+<Step n={1} title="A server misbehaves.">
+High memory, weird state, a stuck process. Old instinct: ssh
+in, diagnose, restart.
+</Step>
+<Step n={2} title="New instinct: terminate it.">
+The orchestrator launches a new instance from the image. The
+old one's state is lost; the cluster doesn't care because
+state is in the database or shared store.
+</Step>
+<Step n={3} title="Investigate the image, not the instance.">
+If the misbehavior repeats across instances, the bug is in
+the image — not in the instance. Reproduce in a build, fix,
+new image, deploy.
+</Step>
+</Steps>
+
+This works because services are designed **stateless**. State
+lives in the DB, the cache, the object store. The compute is
+replaceable. See stateless services.
+
+## Caveats and exceptions
+
+Immutability isn't free.
+
+### Stateful services
+
+A database server isn't replaceable mid-flight; its **data** is
+its identity. Patterns that preserve immutability for stateful
+services:
+
+- The **disk** (data) is decoupled from the **VM**. Replace the
+  VM, keep the disk.
+- For replicated stateful services, replace one replica at a
+  time. The data flows from peers.
+- For Kubernetes: StatefulSets with persistent volumes. The
+  pod is replaceable; the volume is not.
+
+### Long warmup
+
+A service that needs five minutes of cache warming after start
+makes "replace freely" expensive. Common mitigations:
+
+- Pre-warmed pools (replace N at a time, never the last).
+- Cache warming as part of the health check (don't mark
+  ready until warm).
+- Persistent caches that survive restart.
+
+### Build times
+
+If your image takes 30 minutes to build, fast iteration is
+hard. Layer caching (Docker BuildKit, distroless minimal
+images, lock-step dependencies) keeps incremental builds in
+the seconds-to-minutes range.
+
+## Patching: through the build
+
+Security patches that on a mutable system would be
+`apt upgrade` become "rebuild the image with newer base
+layer" plus rolling deploys.
+
+The pattern:
+
+- Pin the base image to a specific digest (`@sha256:...`),
+  not a moving tag.
+- A separate pipeline rebuilds images periodically (weekly,
+  monthly) with the latest patched bases.
+- Each rebuild triggers a deploy.
+- Critical CVEs trigger an out-of-band rebuild and deploy.
+
+This is **slower** than `apt upgrade` on a single host. It's
+**safer** because every patched system is identical and was
+tested in CI.
+
+## Configuration drift detection
+
+Even with immutable infrastructure, things can drift if
+operators have the ability to make manual changes. Defense:
+
+- **Disable SSH** to production hosts. Use break-glass tools
+  with audit logging for the rare case.
+- **Read-only root filesystems** in containers (`readOnlyRootFilesystem:
+  true` in Kubernetes).
+- **Periodic re-deployment** — even unchanged services are
+  recycled weekly. Any in-place change vanishes.
+- **Configuration declared in code** — Terraform, Pulumi,
+  Crossplane. Drift detection runs on a schedule.
+
+## Compared to mutable
+
+<Compare a="Mutable" b="Immutable">
+<>
+- Long-lived servers, patched in place.
+- Configuration changes by editing files.
+- "Just SSH in and fix it" culture.
+- Reproducibility depends on documentation discipline.
+- Rollback is hand-crafted reversal.
+- Per-host drift accumulates.
+</>
+<>
+- Short-lived servers; replace on change.
+- Configuration baked into images or injected at runtime.
+- "Replace, don't repair" culture.
+- Reproducibility comes from build artifact.
+- Rollback is deploy the previous image.
+- No drift — instances are identical or replaced.
+</>
+</Compare>
+
+The mutable approach was state-of-the-art in 2005. By 2015 it
+was a code smell. By 2025 it's a job offer red flag.
+
+<Callout variant="note">
+*The Twelve-Factor App* (2011) sketched many of these ideas
+(strict separation of config from code, processes are
+stateless and disposable). Containers + Kubernetes turned the
+sketch into a default. Immutable infrastructure is now the
+**baseline** for new systems.
+</Callout>
+
+## In summary
+
+- The unit of deployment is an image; servers are launched from
+  it and terminated when changed.
+- Reproducibility, audit, and rollback all collapse to "what
+  image is running?"
+- Misbehaving instances are replaced, not repaired.
+- State lives in the DB; compute is stateless and disposable.
+- Configuration is runtime-injected, not baked.
+- Patching = rebuild + redeploy; slower than ssh-and-upgrade,
+  vastly safer.
+- The baseline for new systems; converting legacy is a quarter
+  of work that pays for itself in incident-response time.

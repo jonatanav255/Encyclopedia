@@ -1,0 +1,255 @@
+export const level = 'senior';
+
+# Kappa vs Lambda architecture
+
+Two named architectures for "process events and produce
+analytical results." Both still appear in interviews; only one
+is the modern default.
+
+- **Lambda** (Nathan Marz, 2011): run a **batch** pipeline for
+  correctness and a **stream** pipeline for low-latency
+  freshness. Serve queries from the union.
+- **Kappa** (Jay Kreps, 2014): run a **single stream pipeline**;
+  if you need to reprocess, replay the log through a new
+  version of the pipeline.
+
+Kappa won for greenfield systems. Lambda still exists in
+heritage stacks and remains relevant for some workloads.
+
+## Lambda architecture
+
+Marz's premise: streaming systems are good at fresh, weak on
+correctness; batch systems are good at correctness, weak on
+fresh. Run both.
+
+```
+                     ┌─→ [batch layer] → batch views
+[immutable          ─┤                         ↓
+ event log]          │                    [serving layer] → queries
+                     └─→ [speed layer] → real-time views
+                                              ↑
+                                         (combined)
+```
+
+Three layers:
+
+1. **Batch layer**: stores the master dataset (immutable log).
+   Re-runs the full pipeline periodically (hourly, daily) to
+   produce **batch views**. Slow but correct.
+2. **Speed layer**: a stream processor handles records since the
+   last batch run, producing **real-time views**. Fresh but
+   approximate (may not handle late data, may have bugs).
+3. **Serving layer**: queries merge batch view (older,
+   authoritative) with real-time view (recent, approximate).
+
+Each layer answers a different aspect: batch for "how many users
+were active yesterday" (authoritative), stream for "how many in
+the last 5 minutes" (fresh).
+
+### Why it appealed
+
+- Batch pipelines were the proven technology of the early 2010s
+  (MapReduce, Spark batch).
+- Stream processors of that era (Storm, early Spark Streaming)
+  weren't trusted for correctness — they had limited state
+  management, weak exactly-once, manual recovery.
+- Lambda gave you "best of both" without trusting streaming
+  alone.
+
+### Why it became painful
+
+- **Two implementations of every metric.** Batch SQL on Spark
+  plus a streaming version of the same logic. Drift between them
+  is constant operational noise.
+- **Reconciliation is hard.** Merging "yesterday in batch view"
+  with "since-then in real-time view" requires careful boundary
+  handling. Off-by-one errors abound.
+- **Twice the bugs, twice the deployments, twice the
+  monitoring.**
+
+By 2015, the duplication tax was the dominant criticism. Kreps's
+"Questioning the Lambda Architecture" (2014) proposed Kappa as
+the alternative.
+
+## Kappa architecture
+
+```
+[event log] ──→ [single stream pipeline] ──→ serving store
+                                                 ↑
+                                              queries
+
+reprocess: spin up a second copy of the pipeline,
+read the log from the start, populate a parallel view,
+swap when caught up.
+```
+
+One pipeline. To reprocess (new logic, schema fix, bug fix),
+spin up a parallel copy of the pipeline that reads from the
+beginning of the log, populates a parallel materialized view,
+and atomically switches reads to it when caught up.
+
+### Preconditions
+
+For Kappa to work, the stream pipeline must be:
+
+- **Correct enough for the final answer.** No "approximate, then
+  reconciled."
+- **Replayable**: the log retains data long enough to reprocess
+  history (often months or years, with log compaction for
+  current state).
+- **Operable**: state, exactly-once, watermarks, late data, all
+  handled.
+
+These weren't true in 2011. They became broadly true around
+2017-2019 with mature Flink, Kafka Streams EOS, Kafka log
+compaction, and Beam.
+
+### Why it won
+
+- One codebase per pipeline.
+- One operational pattern.
+- Replay-based reprocessing replaces "rerun the batch job."
+- Real-time results are first-class, not approximate.
+
+For new pipelines, Kappa is the default in 2026.
+
+## When Lambda still makes sense
+
+- **Heavy historical recomputation**: training a model on all
+  10 years of data weekly. The streaming pipeline can't
+  efficiently rebuild years of state. A batch pipeline running
+  Spark over the data lake is the right tool.
+- **Cost-sensitive periodic workloads**: nightly aggregates that
+  don't need to be fresh. Cheaper as batch.
+- **Streaming engine immaturity**: legacy stacks where the
+  team doesn't have Flink expertise but has Spark batch
+  expertise.
+- **Long historical windows with stream-incompatible logic**:
+  e.g., model training, large joins across the full dataset.
+
+For these, the modern shape is **stream for real-time, batch for
+historical retraining/reconciliation** — which is in spirit a
+Lambda, even if not branded as one.
+
+## Comparison
+
+<Cheatsheet>
+| Property | Lambda | Kappa |
+|---|---|---|
+| Pipelines | 2 (batch + stream) | 1 (stream) |
+| Code duplication | High | None |
+| Reprocessing model | Re-run batch | Replay stream |
+| Correctness | Batch is authoritative | Stream is authoritative |
+| Operational complexity | High (two stacks) | Lower (one stack, harder per pipeline) |
+| Best for | Heavy historical + real-time | Real-time first |
+| Year peaked | ~2014 | 2017+ default |
+</Cheatsheet>
+
+## Replay in practice (Kappa)
+
+```
+v1 pipeline → reads from log, writes to materialized_view_v1
+v2 pipeline (new logic) → reads from log offset 0, writes to materialized_view_v2
+
+When v2 catches up (offset ≈ live tail), traffic switches reads
+to materialized_view_v2. v1 is decommissioned.
+```
+
+The key requirement: the log retains enough history. For
+compacted topics, "enough" is "all current-state-relevant
+events." For non-compacted, "enough" is the longest replay
+window you ever need.
+
+Kafka's tiered storage (see Tiered storage) makes long retention
+affordable by spilling cold log segments to object storage.
+Modern Kafka can retain years of events at reasonable cost.
+
+## Reprocessing in practice (Lambda)
+
+```
+Daily batch job: read all events from data lake, compute view_v_today
+Stream job: continuously compute deltas since view_v_today's cutoff
+Serving: merge view_v_today + stream-deltas
+```
+
+To "reprocess" with new logic in Lambda: update the batch job,
+let tomorrow's run produce a corrected view. The stream
+pipeline meanwhile catches the deltas with the same new logic
+(both jobs deploy together to avoid drift).
+
+## The continuum
+
+Real systems often look like **Kappa-with-batch-reconciliation**:
+
+```
+[log] → [stream pipeline] → [serving]
+[log] → [nightly batch reconciliation] → [authoritative store]
+                                              ↑
+                          stream periodically aligns to authority
+```
+
+Stream serves real-time. Batch nightly produces a "ground truth"
+to compare against. When they drift, an alert fires, and the
+stream is restarted from the batch checkpoint.
+
+This is the practical posture for ledgers, billing, and any
+domain where stream-only correctness is hard to fully trust.
+
+## Pitfalls
+
+<Callout variant="warning">
+**Lambda for the sake of "best of both."** If you don't have
+the historical-recomputation need, you're paying duplication
+tax for nothing.
+</Callout>
+
+<Callout variant="warning">
+**Kappa with insufficient log retention.** A bug requires
+replaying a year of data; the log only kept 7 days. Reprocessing
+isn't possible. Plan retention for the worst-case replay.
+</Callout>
+
+<Callout variant="warning">
+**Kappa with non-deterministic stream logic.** Replay produces
+different results than the original run. Determinism is a
+prerequisite for replay-based reprocessing.
+</Callout>
+
+<Callout variant="warning">
+**Kappa with stream-incompatible operations.** Some queries
+(massive joins, training on full history) genuinely need batch
+or batch-like processing. Reaching for Kappa-only-everywhere
+is dogma.
+</Callout>
+
+## Decision
+
+<Steps>
+<Step n={1} title="Is this a new pipeline?">
+Yes → start with Kappa. Streaming engines and ecosystems are
+mature.
+</Step>
+<Step n={2} title="Does the workload include heavy historical recomputation (ML training, decade-scale joins)?">
+Yes → add a batch layer for that work. Now you have Lambda-
+shaped reality with one stream pipeline as the operational
+core.
+</Step>
+<Step n={3} title="Existing system with batch + stream duplication?">
+Migrate one at a time. Start with metrics where the duplication
+is most expensive.
+</Step>
+</Steps>
+
+## In summary
+
+- **Lambda**: batch + stream, merged at serving. Solved early
+  streaming's correctness gap; created duplication tax.
+- **Kappa**: single stream pipeline; replay for reprocessing.
+  Modern default.
+- **Both shapes still appear**; Lambda lingers in heavy
+  historical workloads and legacy stacks.
+- **Kappa requires retention + replayability + deterministic
+  logic** to work.
+- **Most real systems are Kappa-with-batch-reconciliation** —
+  one stream pipeline as the real-time path, nightly batch as
+  the auditor.

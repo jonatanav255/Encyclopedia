@@ -1,0 +1,258 @@
+export const level = 'senior';
+
+# At-most-once vs at-least-once vs exactly-once
+
+Three phrases that get thrown around as if they mean the same
+thing across every system. They don't. Each is a contract about
+what happens when a message is in flight and something fails.
+
+The TL;DR up front:
+
+- **At-most-once**: maybe zero, never two. Lose freely.
+- **At-least-once**: maybe one, maybe many, never zero. Default
+  in production.
+- **Exactly-once**: marketing word. What actually exists is
+  at-least-once + deduplication, ideally end-to-end transactional.
+
+## What "delivery" actually means
+
+Every broker handles two transitions: a producer hands a message
+to the broker, the broker hands it to a consumer. Each handoff
+can fail in three places: before, during, or after the network
+hop. A guarantee describes what happens at each failure point.
+
+```
+producer --(1)--> broker --(2)--> consumer
+                            ack <--+
+```
+
+- **(1) failure** between producer and broker: did the broker
+  receive it? Retry without dedup → duplicate. Don't retry →
+  loss.
+- **(2) failure** between broker and consumer: did the consumer
+  process it? Auto-ack before processing → loss. Ack after
+  processing, retry on crash → duplicate.
+
+A "guarantee" is just a choice about which side of those failure
+modes you accept.
+
+## At-most-once
+
+The fastest, cheapest, least durable mode. The broker delivers
+**at most once** — possibly zero times.
+
+How: producer fires and forgets (no retry, no ack). Or consumer
+acks before processing. Or both. Crashes cause messages to
+vanish.
+
+<Cheatsheet>
+| System | At-most-once posture |
+|---|---|
+| Redis Pub/Sub | Default. No retention, subscriber down = loss. |
+| UDP-based event systems (statsd) | Inherent in the transport. |
+| Kafka with `acks=0` | Producer doesn't wait for broker ack. |
+| Auto-ack consumers | Ack on receive, before processing. |
+</Cheatsheet>
+
+When this is acceptable:
+
+- **Metrics, telemetry, ephemeral signals.** Missing one heartbeat
+  doesn't matter because another arrives in 5 seconds.
+- **Cache invalidation**, when stale-but-fresh-soon is okay.
+- **Live ephemeral UI updates** (typing indicators).
+
+When it isn't:
+
+- Anything that affects money, inventory, identity, or audit.
+
+## At-least-once
+
+The default in every durable broker. The broker delivers **at
+least once** — usually once, occasionally many times, never zero.
+
+How: producer retries until the broker acks. Consumer acks **after**
+processing. Crashes cause re-delivery rather than loss.
+
+```
+producer → send → no ack → retry → send (broker may already have it)
+broker → deliver → consumer crashes before ack → re-deliver
+```
+
+The pricetag of durability: **duplicates**. The consumer must be
+idempotent.
+
+<Cheatsheet>
+| System | How at-least-once is achieved |
+|---|---|
+| Kafka (default) | `acks=all`, consumer commits offset after processing |
+| RabbitMQ | Manual ack mode (`noAck: false`) |
+| SQS | Visibility timeout + delete on success |
+| Redis Streams | XACK only after processing |
+| SNS → SQS | Per-subscription delivery with retries |
+</Cheatsheet>
+
+The mandatory pairing: **idempotent consumers** (see Idempotent
+consumer / inbox pattern). Without dedup, at-least-once is a
+correctness bug waiting to happen — the welcome email goes out
+five times, the card gets charged twice, the inventory drops by
+two instead of one.
+
+## "Exactly-once"
+
+The marketing term for the holy grail: each message processed
+once and only once. The honest engineering version: there is no
+such thing **end-to-end** without effort. Brokers can offer
+exactly-once **on the wire** in narrow conditions. Making that
+useful in your application is a separate problem.
+
+### Why it's hard
+
+A pure exactly-once protocol between three parties (producer,
+broker, consumer) violates the FLP impossibility result and the
+Two Generals problem in the general case. You can get arbitrarily
+close, but the final "did you really process it?" requires
+**atomicity between message handling and state change**.
+
+In practice exactly-once means **one of the following**:
+
+1. **Broker-side dedup**: the producer attaches a sequence
+   number; the broker drops repeats. Solves producer→broker
+   duplicates.
+2. **Consumer-side dedup (idempotency)**: the consumer records
+   "I've processed message X" atomically with its state change.
+   Solves broker→consumer duplicates.
+3. **Transactional sinks**: the consumer commits its output and
+   its consumer offset in one transaction (Kafka EOS, Flink
+   two-phase commit).
+
+End-to-end exactly-once = all three combined.
+
+### Kafka's transactional exactly-once
+
+The most-cited example. Three pieces:
+
+```js
+const producer = kafka.producer({
+  idempotent: true,           // producer-side dedup
+  transactionalId: 'svc-1',   // enable transactions
+});
+
+await producer.transaction(async (tx) => {
+  await tx.send({ topic: 'orders', messages: [...] });
+  await tx.sendOffsets({ consumerGroupId: 'g1', topics: [...] });
+});
+```
+
+- **Idempotent producer** prevents broker-side duplicates from
+  retries (each producer has an epoch + sequence number; the
+  broker rejects repeats).
+- **Transactions** allow producing to multiple topics + committing
+  consumer offsets atomically. Either all visible or none.
+- **Consumers with `isolation.level=read_committed`** skip
+  aborted-transaction records.
+
+This gives **exactly-once within Kafka**. The moment the consumer
+writes to anything outside Kafka (database, S3, third-party API),
+you're back to at-least-once unless that write is also
+transactional or idempotent.
+
+### "Effectively-once" in application code
+
+For most services, the achievable shape is:
+
+```js
+async function handle(msg) {
+  // 1. Dedup on a unique key
+  const inserted = await db.processed.insert({ id: msg.id })
+    .onConflictDoNothing();
+  if (!inserted) return;  // already processed
+
+  // 2. Do the work
+  await applyChange(msg);
+}
+```
+
+The dedup key + the side effect must commit atomically. If they
+don't (different DBs, external API), then **exactly-once is a
+lie** — re-processing on retry will repeat the side effect.
+
+See **Idempotent consumer / inbox pattern** for the canonical
+shape.
+
+## Comparison
+
+<Cheatsheet>
+| Property | At-most-once | At-least-once | Exactly-once (with effort) |
+|---|---|---|---|
+| Loss | Possible | Never | Never |
+| Duplicates | Never | Possible | Never (if implemented right) |
+| Throughput | Highest | High | Lower (tx overhead) |
+| Implementation | Trivial | Standard | Hard, end-to-end |
+| Consumer must be idempotent | No | Yes | Yes (still, defensively) |
+| Typical use | Telemetry | Most production | Financial transactions, billing |
+</Cheatsheet>
+
+## A common confusion: "We use Kafka so we're exactly-once"
+
+No. Default Kafka is at-least-once. Exactly-once requires
+**explicitly** enabling idempotent producers, transactional
+writes, and read-committed consumers — and even then it only
+covers Kafka-to-Kafka pipelines.
+
+The moment your consumer writes to Postgres, exactly-once depends
+on **your code**, not Kafka's. See **Exactly-once stream
+processing** for the full picture.
+
+## A common shortcut that works
+
+For 90% of services, the practical answer is:
+
+<Steps>
+<Step n={1} title="Pick at-least-once.">
+Durable broker, manual acks, retries. SQS, Kafka, RabbitMQ all
+do this by default.
+</Step>
+<Step n={2} title="Make consumers idempotent.">
+Every message has an ID. Every handler inserts that ID into a
+processed-messages table (or set) atomically with its work. See
+the inbox pattern.
+</Step>
+<Step n={3} title="Configure dead-letter queues.">
+After N failed deliveries, quarantine. Don't loop forever.
+</Step>
+<Step n={4} title="Reserve transactional exactly-once for actual money.">
+Payments, ledger entries, regulated events. Pay the complexity
+where the cost of duplicates is unbounded.
+</Step>
+</Steps>
+
+## Pitfalls
+
+<Callout variant="warning">
+**Auto-ack with at-least-once expectations.** Many client
+libraries default to auto-ack for convenience. That silently
+downgrades you to at-most-once. Always check the default.
+</Callout>
+
+<Callout variant="warning">
+**Idempotency keys that aren't.** "Use the timestamp" → two
+events at the same ms produce the same key. Use the producer's
+event ID, the broker's offset, or a UUID assigned before send.
+</Callout>
+
+<Callout variant="warning">
+**Idempotency table without a TTL or partitioning.** Grows
+forever. After a year you have a 500 GB index that slows every
+write.
+</Callout>
+
+## In summary
+
+- **At-most-once**: speed over durability. Telemetry only.
+- **At-least-once**: durable, requires idempotent consumers. The
+  production default.
+- **Exactly-once**: at-least-once + dedup + atomic commits. A
+  property of the system, not the broker. Worth the effort only
+  when duplicate-cost is unbounded.
+- The broker tells you what's on the wire; your code is what
+  makes it correct.

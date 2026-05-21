@@ -1,0 +1,249 @@
+export const level = 'mid';
+
+# Pub/sub vs queue
+
+The first question to ask about any messaging system: **is each
+message delivered to one consumer or to many?** That single
+distinction determines the broker, the failure mode, the scaling
+model, and the operational headaches.
+
+Get it wrong and you'll spend a quarter fighting the wrong tool.
+
+## The core distinction
+
+<Compare a="Queue (point-to-point)" b="Pub/sub (fanout)">
+<>
+**One message → one consumer.** Many consumers can pull from
+the queue, but each message is delivered to exactly one of them.
+Used to **distribute work**.
+
+```
+producer → [queue] → worker A   (msg 1)
+                  → worker B   (msg 2)
+                  → worker C   (msg 3)
+```
+
+Scaling reads = adding more workers. Each new worker reduces the
+per-worker load.
+</>
+<>
+**One message → every subscriber.** Each subscriber gets its
+own copy. Used to **broadcast facts** so independent systems
+can react.
+
+```
+producer → [topic] → subscriber A (msg 1)
+                  → subscriber B (msg 1)
+                  → subscriber C (msg 1)
+```
+
+Adding a subscriber doesn't reduce anyone else's load — it adds
+a new pipeline of work.
+</>
+</Compare>
+
+A queue is about **load**. A pub/sub is about **interest**. They
+solve different problems and confusing them is a top-5 messaging
+mistake.
+
+## "Is this a queue or a log?"
+
+The second question to ask, and the one most teams skip. A
+**queue** holds messages until they're consumed and then deletes
+them. A **log** holds messages for a retention window regardless
+of who has consumed them. Different shape, different price.
+
+<Cheatsheet>
+| Property | Queue (RabbitMQ, SQS) | Log (Kafka, Pulsar, Kinesis) |
+|---|---|---|
+| Lifecycle | Delete on ack | Retain for N days |
+| Replay | Generally no | Yes, just rewind offset |
+| Backpressure | Queue grows, ops alert | Producer rate unchanged; consumers fall behind |
+| Many consumer groups | Each needs its own queue (or fanout exchange) | Native — each group has independent offset |
+| Storage cost | Empties out | Grows with retention |
+| Typical use | Background jobs | Event streaming, audit, CDC |
+</Cheatsheet>
+
+A Kafka topic with a single consumer group **looks** like a
+queue but isn't — replay is free, retention is governed by time,
+and multiple groups can independently consume the same stream. A
+RabbitMQ queue with multiple bindings **looks** like pub/sub but
+each queue still has competing consumers.
+
+## Choosing between them
+
+### Pick a queue when
+
+- The work is per-message: send an email, resize an image,
+  charge a card, render a thumbnail.
+- You want **load leveling** — bursts of work absorbed, drained
+  by a worker pool.
+- The message has no value once processed.
+- You'll never need to replay or audit.
+
+The mental shape: **producer says "do this thing once."**
+
+### Pick pub/sub when
+
+- The producer publishes a **fact**: "user signed up", "order
+  placed", "inventory updated."
+- Multiple independent services react. Today: analytics +
+  email. Tomorrow: fraud + recommendation. The producer
+  shouldn't know.
+- You may need a **new consumer next quarter** that has to
+  read history.
+
+The mental shape: **producer says "this happened."**
+
+### Pick a log (Kafka-style) when
+
+- Pub/sub semantics, plus you want retention, replay, or
+  partitioning for ordered per-key processing.
+- Downstream consumers vary wildly in speed (a slow analytics
+  consumer shouldn't block the fast cache invalidator).
+- You're building event sourcing, CDC, or stream processing.
+
+See **Choosing a message broker** and **Log-centric
+architecture** for deeper trade-offs.
+
+## A common misuse: queue-as-event-bus
+
+Team has SQS. New service needs to react to `OrderPlaced`. They
+add a second consumer to the same queue, expecting fanout. Each
+message now goes to **one of the two** — half to the order
+service, half to the new consumer. Both break.
+
+Fixes, in order of effort:
+
+1. SNS fanout to two SQS queues (one per consumer).
+2. Move to Kafka with two consumer groups.
+3. Outbox + Debezium publishing to a real event log.
+
+The right answer depends on how many consumers you'll have. One
+extra? SNS. Many over time? Kafka.
+
+## Delivery semantics differ too
+
+Queues optimize for **work completion**: at-least-once with
+visibility timeouts and explicit ack/nack. Pub/sub historically
+optimized for **fanout latency**: at-most-once was acceptable
+because the next event would correct the state.
+
+Modern systems blur this — Kafka gives durable at-least-once
+fanout, JetStream gives durable subjects, SNS+SQS gives durable
+fanout via subscriptions. But the **defaults** still differ:
+
+<Cheatsheet>
+| System | Default | Notes |
+|---|---|---|
+| RabbitMQ classic queue | At-least-once | Manual ack |
+| AWS SQS | At-least-once | Visibility timeout, no ordering (standard) |
+| Redis Pub/Sub | At-most-once | No durability |
+| Redis Streams | At-least-once | Consumer groups, ack required |
+| Kafka | At-least-once | Exactly-once with idempotent producer + tx |
+| NATS Core | At-most-once | JetStream adds durability |
+| SNS | At-least-once to each subscriber | Per-subscription delivery |
+</Cheatsheet>
+
+See **At-most-once vs at-least-once vs exactly-once** for what
+each of these actually means on the wire.
+
+## A useful diagnostic
+
+When someone asks "what broker should we use?", reverse it:
+
+<Steps>
+<Step n={1} title="Is the message a command or a fact?">
+"Send email to user 42" is a command. "User 42 signed up" is a
+fact. Commands fit queues; facts fit pub/sub or logs.
+</Step>
+<Step n={2} title="How many distinct consumers, now and in 2 years?">
+One forever: queue. Two or three with stable identity: SNS or
+RabbitMQ topic exchange. Unknown / growing: Kafka-class log.
+</Step>
+<Step n={3} title="Do you need replay?">
+Audit, CDC, late-arriving consumer, debugging: yes. Then it's a
+log. Otherwise, a queue is fine and cheaper.
+</Step>
+<Step n={4} title="What's the ordering requirement?">
+None: any broker. Per-entity: partitioned log keyed by entity.
+Total: FIFO queue at low throughput, or accept the partial-order
+reality.
+</Step>
+<Step n={5} title="Who pays for ops?">
+Solo team: managed (SQS, SNS, Confluent Cloud). Platform team
+with capacity: self-hosted Kafka or NATS.
+</Step>
+</Steps>
+
+## In code
+
+A queue and a pub/sub topic look nearly identical from the
+producer:
+
+```js
+// Queue (BullMQ + Redis)
+await queue.add('send-email', { userId, template });
+
+// Pub/sub (Redis publish)
+await pub.publish('user-events', JSON.stringify({
+  type: 'signup', userId,
+}));
+```
+
+The difference is on the **consumer side**:
+
+```js
+// Queue worker: one of N processes pulls each job
+new Worker('send-email', async (job) => {
+  await mailer.send(job.data);
+});
+
+// Pub/sub: each independent service subscribes
+sub.subscribe('user-events');
+sub.on('message', async (_, raw) => {
+  const event = JSON.parse(raw);
+  if (event.type === 'signup') await analytics.track(event);
+});
+```
+
+In Kafka, the consumer group is the dial: one group = queue
+semantics across its members; multiple groups = pub/sub.
+
+```js
+// Two groups, two independent views of the same topic
+const a = kafka.consumer({ groupId: 'analytics' });
+const b = kafka.consumer({ groupId: 'mailer' });
+```
+
+## Anti-patterns
+
+<Callout variant="warning">
+**"We'll use the same queue for two consumers."** That's not
+fanout; that's load splitting. One of them will silently miss
+messages.
+</Callout>
+
+<Callout variant="warning">
+**Pub/sub for commands.** Publishing "ChargeCard" as a fact
+means whoever happens to be listening processes it — including
+zero subscribers, including five. Charge cards via queue.
+</Callout>
+
+<Callout variant="warning">
+**Queue for facts.** If "OrderPlaced" goes to a queue and you
+later need a second consumer (analytics), you can't add one
+without rerouting. Publish facts to a log or pub/sub from day
+one if the domain suggests multiple readers.
+</Callout>
+
+## In summary
+
+- **Queue = one message, one consumer.** Distributes work.
+- **Pub/sub = one message, many consumers.** Broadcasts facts.
+- **Log = pub/sub with retention and replay.** Default for any
+  event stream you'll grow into.
+- Ask **command-or-fact** and **one-or-many-consumers** before
+  picking a broker.
+- Picking the wrong shape costs a migration; picking the right
+  shape costs nothing.

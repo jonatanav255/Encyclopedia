@@ -1,0 +1,177 @@
+export const level = 'mid';
+
+# Timeouts everywhere
+
+Every network call needs a timeout. Without one, a slow
+dependency blocks a thread (or coroutine, or async task)
+forever. Threads exhaust. Service falls over.
+
+The most common architectural bug in production code: a
+missing timeout somewhere.
+
+## Why "no timeout = unbounded"
+
+A `fetch()` call without a timeout will wait as long as the
+network keeps the socket open. With NAT timeouts at 30
+minutes and TCP keep-alives, "waiting forever" can mean
+literal hours.
+
+```js
+// BUG: no timeout
+const r = await fetch('/api/x');
+
+// FIX: timeout
+const r = await fetch('/api/x', {
+  signal: AbortSignal.timeout(2000),
+});
+```
+
+The first version, on a hung downstream, holds the calling
+fiber forever. Repeat thousands of times → out of memory or
+threads or file descriptors.
+
+## How to pick a timeout
+
+The bad way: copy the last service's timeout.
+
+The right way: based on the downstream's **p99.9 latency under
+normal load**, plus a small buffer.
+
+```
+downstream p99.9 latency = 800ms
+chosen timeout = 1000ms
+```
+
+If the downstream takes longer than that, it's slow enough
+that retrying won't fix anything. Better to fail fast.
+
+Caveat: under abnormal load, p99.9 increases. The timeout
+should still be tight; trust the circuit breaker to handle
+the "everything is slow" case.
+
+## Different timeouts at different layers
+
+Every layer in the stack needs its own:
+
+<Cheatsheet>
+| Layer | Timeout |
+|---|---|
+| Browser fetch | A few seconds for user-facing |
+| Load balancer | Higher than service's |
+| API gateway | Slightly higher than upstream |
+| Application HTTP client | Tight (1-5s typical) |
+| HTTP request handler | Higher than its calls (10-60s) |
+| DB query | Per-query (100ms-10s, query-dependent) |
+| TCP connect | Very short (1-3s) |
+| TCP read | Per-read (depends) |
+</Cheatsheet>
+
+A common mistake: a 30s LB timeout in front of a 5s service
+timeout. The LB times out before the service finishes — but
+the service is still doing work, just with no listener.
+Worse: the LB retries, the service does it twice.
+
+Fix: outer timeouts should be **slightly higher** than inner
+timeouts, never lower.
+
+## Deadlines vs timeouts
+
+A **timeout** is "abort after N seconds from this call's
+start." A **deadline** is "abort at this absolute time, no
+matter how many layers you propagate through."
+
+Deadlines propagate well across services:
+
+```
+client sets deadline = now + 5s
+sends to service A (4s budget left)
+A calls service B with deadline = now + 4s
+B has 4s — minus whatever A consumed
+```
+
+Each service knows its **remaining budget**, not just "my
+local timeout." Used in gRPC by default.
+
+## Cascading deadlocks without timeouts
+
+Service A holds DB connection waiting for service B. Service
+B holds Redis lock waiting for service C. Service C holds
+something else waiting for A. Cycle. Without timeouts,
+deadlock holds forever.
+
+With timeouts, the cycle breaks: one call times out, releases
+its lock, others proceed.
+
+The "use timeouts everywhere" advice isn't paranoia — it's
+the difference between a transient slowdown and an
+unrecoverable outage.
+
+## Timeout + retry
+
+When a call times out, do you retry?
+
+- **Idempotent reads**: yes. Retry with backoff.
+- **Idempotent writes (with idempotency key)**: yes. The key
+  protects against double-execution.
+- **Non-idempotent writes**: no. Fail to the user. Better than
+  charging them twice.
+
+Retry blindly without thinking is a common bug. Always answer
+"if this succeeded but the response was lost, is double-executing
+acceptable?"
+
+(See retries-with-backoff and idempotency-keys.)
+
+## Connection timeouts vs request timeouts
+
+These are different:
+
+- **Connection timeout**: time to establish TCP+TLS.
+  Should be very short (1-3 sec). Failure means "couldn't
+  reach the server," retry usually safe.
+- **Request timeout**: time from request sent to full response.
+  Tuned to the operation's expected duration.
+
+Modern libraries let you set both. Always set both.
+
+## Per-attempt vs total
+
+When retrying, distinguish:
+
+- **Per-attempt timeout**: each retry has N seconds.
+- **Total timeout**: the whole operation (including retries)
+  has N seconds.
+
+```js
+const result = await retry({
+  perAttempt: 1000,
+  total: 5000,
+  retries: 3,
+}, () => fetchSomething());
+```
+
+Without a total, three 1-second retries take 3+ seconds. The
+user (or upstream caller) gave you maybe 2. Bound the total.
+
+## Timeouts in legacy code
+
+Adding timeouts to a codebase that's been running without
+them for years: don't go big-bang. Start with the most
+critical paths (login, payments, search). Add timeouts to
+new code by default; instrument the rest as you encounter
+hangs.
+
+## In summary
+
+- Every network call needs a timeout. Always. Period.
+- Pick based on p99.9 latency of the downstream under normal
+  load.
+- Outer timeouts > inner timeouts. Otherwise retries amplify
+  load.
+- Deadlines propagate across services better than per-call
+  timeouts (gRPC-style).
+- Pair timeouts with retries — but only for safe-to-retry
+  operations.
+- Set both connection and request timeouts; they're different
+  failures.
+- Bound total operation time across retries.

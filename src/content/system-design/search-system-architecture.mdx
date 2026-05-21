@@ -1,0 +1,223 @@
+export const level = 'senior';
+
+# Search system architecture
+
+Beyond the inverted index, a production search system has
+many moving parts: ingestion, query processing, ranking,
+caching, monitoring.
+
+The shape is consistent across Elasticsearch, OpenSearch,
+Solr, Vespa, and Algolia — the underlying inverted index plus
+a sprawl of supporting infrastructure.
+
+## The overall shape
+
+```
+content sources
+   ▼
+indexing pipeline (extract, transform, enrich)
+   ▼
+inverted index (sharded, replicated)
+   ▼
+query engine (parse, rank, paginate)
+   ▼
+results cache
+   ▼
+search API
+   ▼
+client (browser, app, downstream service)
+```
+
+## Indexing pipeline
+
+Documents move through a pipeline before joining the index:
+
+<Steps>
+<Step n={1} title="Source extraction.">
+Pull from databases (CDC), filesystems, web crawlers, APIs.
+</Step>
+<Step n={2} title="Parse / normalize.">
+HTML → text. JSON → fields. Encoding normalization.
+</Step>
+<Step n={3} title="Enrich.">
+Add derived fields: language, sentiment, topic tags,
+geocoded coordinates, embeddings.
+</Step>
+<Step n={4} title="Index.">
+Send to the inverted index (Lucene-based or custom).
+</Step>
+<Step n={5} title="Commit / refresh.">
+Make the new documents queryable. Typically 1-second
+latency in Elasticsearch.
+</Step>
+</Steps>
+
+Index pipelines can be batch (daily reindex), streaming (CDC
+from a primary store), or both.
+
+## Sharding and replication
+
+The index is sharded across N nodes; each shard has M
+replicas:
+
+```
+Index: 10 shards × 2 replicas = 20 shards on disk
+Shard 0: primary on node A, replica on node B
+Shard 1: primary on node C, replica on node D
+...
+```
+
+Queries scatter to one replica per shard. Writes go to all
+replicas (sync or async).
+
+A query: parse → scatter to all primary shards → each
+returns top-K → coordinator merges + re-ranks → return top
+final.
+
+## Query parsing
+
+A raw query string becomes a structured query:
+
+```
+input:  "iphone 14 pro -black"
+parsed: { must: ["iphone", "14", "pro"], must_not: ["black"] }
+```
+
+Modifiers: phrases ("exact match"), fields (`title:iphone`),
+boosts (`title:iphone^3`), wildcards (`iphon*`), fuzzy
+(`iphone~2`).
+
+The parsed query becomes operations on posting lists.
+
+## Ranking pipeline
+
+Beyond BM25, modern search has a ranking pipeline. (See
+ranking-pipelines.)
+
+Typical shape:
+
+```
+parsed query
+    ▼
+recall (~1000 candidates via BM25 + filters)
+    ▼
+light ranker (signals + simple model)
+    ▼
+heavy ranker (neural model on top-100)
+    ▼
+re-ranking (personalization, freshness, business rules)
+    ▼
+top 10 returned
+```
+
+Each stage works on a smaller set; total latency stays
+budget.
+
+## Personalization
+
+User-specific signals (location, preferences, history) boost
+or filter results. Usually applied late in the pipeline:
+
+```js
+async function rank(query, results, userId) {
+  const profile = await userProfile.get(userId);
+  return results.map(r => ({
+    ...r,
+    score: r.score * personalizeBoost(r, profile),
+  })).sort(byScore);
+}
+```
+
+## Caching
+
+Search systems cache aggressively:
+
+- **Query cache**: full results for a query string.
+- **Filter cache**: bitmaps of "which docs match this filter."
+- **Field-data cache**: column values for sorting.
+- **Edge cache**: CDN for popular queries.
+
+Tunable per query / per index.
+
+## Aggregations / facets
+
+Beyond search, users want filters:
+
+```
+results: 1000 matches
+facets:
+  category: { electronics: 500, books: 300, ... }
+  price:    { 0-25: 200, 25-100: 600, ... }
+```
+
+Aggregations are computed at query time over the matched
+docs. Expensive for high-cardinality fields; can require
+pre-aggregation (Elasticsearch's "global_ordinals") or
+specialized engines (Solr's faceting).
+
+## Real-time vs near-real-time
+
+Most search engines are **near-real-time**: writes are
+queryable within 1 second (the refresh interval). Strict
+real-time requires per-write commits, which kills throughput.
+
+Trade-off: lower refresh interval → fresher search,
+slower writes. Default 1s is the right balance for most.
+
+## Capacity sizing
+
+Rule of thumb for Elasticsearch:
+
+- **Heap**: 50% of node RAM, capped at ~31 GB.
+- **Shard size**: 10-50 GB per shard. Too small = overhead;
+  too large = slow operations.
+- **Shards per node**: ~20 max.
+- **Replicas**: at least 1 for HA; more for read throughput.
+
+Bigger indexes need more nodes, not bigger shards.
+
+## Hybrid: text + vector search
+
+Modern search systems integrate **vector similarity** for
+embeddings:
+
+```
+query "comfortable running shoes"
+   ▼
+text retrieval (BM25 on inverted index) → 1000 candidates
+   ▼
+vector retrieval (similarity on embeddings) → 1000 candidates
+   ▼
+union, re-rank with a model trained on both signals
+   ▼
+top 10
+```
+
+Elasticsearch, OpenSearch, Vespa, Weaviate all support this.
+The "RAG" (retrieval-augmented generation) pattern lives on
+top.
+
+## Observability
+
+Search-specific telemetry:
+
+- **Per-query latency**: split by recall vs ranking vs
+  presentation.
+- **Index size, segment count, merge throughput**.
+- **Cache hit rates** per cache.
+- **Query patterns**: which queries are slow? what
+  zero-result queries fail consistently?
+
+## In summary
+
+- Search system = indexing pipeline + inverted index +
+  query engine + ranking pipeline + caches.
+- Sharding + replication for scale; queries scatter +
+  merge.
+- Ranking is a pipeline: recall → light → heavy → re-rank.
+- Modern systems integrate vector similarity for hybrid
+  search.
+- Sizing rules: 10-50 GB per shard, 31 GB JVM heap, 20
+  shards per node.
+- Observability matters: per-query latency, zero-result
+  queries, cache hit rates.

@@ -1,0 +1,326 @@
+export const level = 'mid';
+
+# Session management at scale
+
+A session is "the server knows who you are between requests."
+On one box, that's a `Map` in memory. On 50 boxes behind a load
+balancer, that map breaks every other request.
+
+There are four real options. Each makes a different trade
+between server state, revocation speed, payload size, and the
+ability to deploy and fail over cleanly.
+
+## What a session has to do
+
+Three jobs:
+
+1. **Identify** the user across requests (who is this?).
+2. **Authorize** what they can do (what claims do they have?).
+3. **Be revokable** when something goes wrong (logout,
+   compromised account, role change).
+
+Every session design is a tradeoff between making jobs 1+2
+fast and making job 3 fast. The schemes that move state to
+the client are great at 1+2 and terrible at 3.
+
+## Option 1: in-memory sessions on one box
+
+```ts
+const sessions = new Map<string, Session>();
+```
+
+Fine for development. Fine if you'll never run more than one
+process. Otherwise, broken — different replicas have different
+maps, and the user is logged out every time the LB routes them
+to a new box.
+
+Sticky sessions (see sticky-sessions) paper over this but
+introduce their own failure modes. Don't pick this if you
+plan to scale.
+
+## Option 2: sticky sessions
+
+The load balancer pins each user to one replica (by cookie,
+source IP, or consistent hash). That replica has their session
+in memory.
+
+<Compare a="Why it's tempting" b="Why it hurts at scale">
+<>
+- Zero changes to the app.
+- Low latency (session is local).
+- No backing store.
+- Works on day one.
+</>
+<>
+- Deploys evict every user pinned to a replica.
+- Crashes lose sessions on that replica.
+- Autoscaling scale-in events log users out.
+- Uneven traffic — one heavy user crushes one box while
+  others sit idle.
+- Sticky logic gets in the way of L7 features (path
+  routing, header rewriting).
+</>
+</Compare>
+
+Sticky sessions are a smell. They might be acceptable for
+WebSocket connections (where the state is inherently
+connection-local), but they're a poor primary session
+strategy.
+
+## Option 3: central session store
+
+The classic, durable design. Server stores session data in a
+shared key-value store; client holds only the session ID.
+
+```
+client cookie: sid=a1b2c3d4
+                  │
+                  ↓
+            [LB] → any replica
+                       │
+                       ↓
+              GET sid:a1b2c3d4 from Redis
+                       │
+                       ↓
+              session: { userId, roles, expiresAt }
+```
+
+The standard choice is **Redis**. Memcached works too;
+Postgres works at small scale.
+
+```ts
+// On login
+const sid = crypto.randomUUID();
+await redis.set(`sid:${sid}`, JSON.stringify(session), 'EX', 86_400);
+res.cookie('sid', sid, { httpOnly: true, secure: true, sameSite: 'lax' });
+
+// On request
+const sid = req.cookies.sid;
+const raw = await redis.get(`sid:${sid}`);
+if (!raw) return res.status(401).end();
+const session = JSON.parse(raw);
+```
+
+Pros:
+
+- Stateless app servers — any replica handles any request.
+- Instant revocation: `DEL sid:...`.
+- Server controls session contents (no client tampering).
+- Easy to inspect (debug a user: look at their key).
+
+Cons:
+
+- One Redis call per request. Typically under 1 ms but it's there.
+- Redis becomes a single point of failure unless you replicate.
+- Memory cost scales with active sessions.
+
+For most apps with > 1 replica, this is the right answer.
+
+### Sizing the store
+
+Per-session memory is small (~1 KB). 10M active sessions ≈ 10
+GB of Redis. Fits on a single instance. Replicate for HA;
+shard only past tens of GB of session data.
+
+## Option 4: signed tokens (JWT and friends)
+
+Move the session **into the client**. Server signs a token
+containing the claims; client sends it on every request; server
+verifies the signature and reads the claims locally.
+
+```
+client cookie / header: <header>.<payload>.<signature>
+                             │
+                             ↓
+                [LB] → any replica
+                          │
+                          ↓
+                  verify signature (HMAC or RSA)
+                          │
+                          ↓
+                  payload: { userId, roles, exp }
+```
+
+Pros:
+
+- **Zero session-lookup cost**. No DB / Redis call per
+  request. Just a signature verify.
+- **Cross-service** — any service with the public key can
+  verify the same token. Useful for microservices.
+- **Survives backing-store outages**. The session lives in the
+  client.
+
+Cons:
+
+- **Hard to revoke.** A signed token is valid until it expires.
+  Logout doesn't actually invalidate it without extra
+  machinery.
+- **Payload visible** (just base64). Don't put secrets in.
+- **Size**. Tokens grow with claims. Headers, cookies, query
+  strings all have size limits.
+- **Clock skew** matters. `exp` is checked against the local
+  clock; an out-of-sync server can over- or under-accept.
+
+JWTs are the most common implementation. PASETO and Branca are
+alternatives with cleaner security defaults.
+
+### Mitigating the revocation problem
+
+The main weakness of stateless tokens is revocation. Patterns:
+
+- **Short expiry + refresh tokens**: access tokens expire in
+  5–15 minutes; refresh tokens (longer-lived, server-stored)
+  mint new access tokens. Revoke the refresh token at logout;
+  the access token expires soon enough.
+- **Token denylist**: when revoking, write the token's `jti`
+  (JWT ID) to Redis with TTL = remaining lifetime. Each request
+  checks the denylist.
+- **Session-version claim**: include a per-user `session_v`
+  in the token; bump it server-side on logout/password change;
+  reject tokens with older versions.
+
+Each of these reintroduces a server lookup — partially
+defeating the original benefit. Honest accounting: if you need
+fast revocation, central sessions are simpler.
+
+## When to use which
+
+<Cheatsheet>
+| Constraint | Best fit |
+|---|---|
+| Single replica, prototype | In-memory |
+| Multi-replica, monolith, simple ops | Central store (Redis) |
+| Microservices, cross-service auth | JWT (with short expiry + refresh) |
+| Strict revocation SLA (e.g., banking) | Central store |
+| Mobile + web with offline tolerance | JWT with refresh tokens |
+| WebSockets / SSE | Central store for HTTP, sticky for sockets |
+| Edge / serverless functions | JWT (no shared Redis at edge) |
+</Cheatsheet>
+
+A hybrid is common: JWT for inter-service auth (microservice
+calls), Redis sessions for browser sessions.
+
+## Cookie hygiene
+
+Whatever you pick, set the cookie attributes right. These
+matter more than the session scheme:
+
+```
+Set-Cookie: sid=...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400
+```
+
+- **HttpOnly**: JavaScript can't read it. Defends against XSS
+  stealing the session.
+- **Secure**: only sent over HTTPS.
+- **SameSite=Lax** (or Strict for high-security flows): defends
+  against CSRF.
+- **Path=/**: scoped appropriately, not leaking to subdomains
+  unintentionally.
+- **Max-Age** (or **Expires**): set explicitly; don't rely on
+  session cookies for anything you want users to stay logged
+  in to.
+
+## Sessions and horizontal scaling
+
+How session strategy interacts with the rest:
+
+- **Stateless replicas require non-local sessions.** That means
+  Redis or JWT. Sticky sessions and in-memory don't qualify.
+- **Autoscaling assumes stateless.** Scale-in must be safe.
+- **Blue-green deploys assume stateless.** Switching the LB
+  from blue to green should be invisible. Sticky sessions break
+  this; central / JWT survive.
+- **Multi-region requires session replication.** Central store
+  → Redis cross-region replication (CRDT or async). JWT →
+  signed once, valid everywhere with the public key. JWT is
+  much simpler here.
+
+## Real-world failure modes
+
+### Redis goes down
+
+If sessions are in Redis and Redis is down, every user is
+effectively logged out. Mitigations:
+
+- Replicated Redis (Sentinel, Cluster). At least one read
+  replica.
+- Local fallback cache for recent sessions (small TTL) so a
+  brief blip doesn't lock everyone out.
+- Treat Redis as a tier-0 service in your incident response.
+
+JWT survives Redis outage by design — that's a real benefit.
+
+### Token theft
+
+A stolen session ID = full account access until logout. A
+stolen JWT = full access until token expiry, with no easy
+revocation. Defenses:
+
+- **HttpOnly + Secure cookies** — close the XSS exfiltration
+  channel.
+- **Short JWT expiry** + refresh rotation.
+- **IP / device binding** — bind the session to a fingerprint
+  and re-auth on anomaly. Trades UX for safety.
+- **Step-up auth** for sensitive operations (re-enter password
+  for "delete account").
+
+### Sessions never expire
+
+Without explicit expiry, sessions accumulate forever and
+become a privacy liability. Always set Max-Age and re-issue
+on activity if you want sliding sessions.
+
+### Cross-domain pain
+
+Cookies are scoped to one domain (and Same-Site applies). For
+SPA + API on different domains, you either:
+
+- Put both behind one domain via a reverse proxy.
+- Use Authorization headers with tokens (JWTs in
+  `Authorization: Bearer ...`).
+
+Header-based tokens dodge the cross-domain cookie mess. Comes
+at the cost of being readable by JS (no HttpOnly), which
+re-introduces XSS exposure.
+
+## Common pitfalls
+
+### Putting the user's permissions in the JWT and forgetting to refresh on role change
+
+User's role updates from `admin` → `member`. Their JWT still
+says `admin` for 30 minutes. They have escalated privileges
+they shouldn't. Always plan for permission changes.
+
+### Storing too much in the session
+
+Sessions become a dumping ground: shopping cart, last 10
+search queries, UI preferences. Now the session is 50 KB,
+which is in every request. Keep sessions tiny — identifier +
+claims. Stash the cart and the UI state in their own places.
+
+### Mixing schemes haphazardly
+
+Some endpoints check Redis sessions, some check JWTs, some
+check both. Now logout has to invalidate three things and
+miss one. Pick one scheme as authoritative per service.
+
+### CSRF defense forgotten
+
+JWT in localStorage is XSS-vulnerable. Cookie-based session
+without SameSite is CSRF-vulnerable. Pick a scheme and
+implement the corresponding defense; neither is "secure by
+default" without effort.
+
+## In summary
+
+- In-memory sessions don't survive a second replica.
+- Sticky sessions are a smell — they break under deploys,
+  scale-in, and failover.
+- Central session stores (Redis) are the default for most web
+  apps. Cheap, simple, fully revokable.
+- JWTs win for cross-service auth, edge/serverless, and
+  Redis-outage tolerance — at the cost of revocation
+  complexity.
+- Set HttpOnly, Secure, SameSite. Always.
+- Hybrid (JWT for service-to-service + Redis for user
+  sessions) is common and good.

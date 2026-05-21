@@ -1,0 +1,224 @@
+export const level = 'senior';
+
+# The distributed monolith
+
+A distributed monolith is the worst of both worlds: the operational
+cost of microservices, the coupling of a monolith. You pay for the
+network without buying independence. Newman calls it the dominant
+failure mode of microservices migrations.
+
+Diagnose early. Most teams have already built one before they realize.
+
+## The definition
+
+You have a distributed monolith if **any** of these are true:
+
+<Cheatsheet>
+| Symptom | What it really means |
+|---|---|
+| Services must be deployed together, in order. | They are one service, in three repos. |
+| Services share a database (or schema). | Schema changes ripple. There is no boundary. |
+| A single request synchronously fans out across 5+ services. | Failure modes multiply. p99 is the slowest service. |
+| Changes typically touch ≥3 services. | The cut is wrong. Coupling is uniform across the "boundary." |
+| You can't run one service in isolation locally. | The service has hidden dependencies — config, schema, sibling services. |
+| One team owns code in many services; many teams own one service. | Conway's law has been ignored. |
+| Cross-service RPC is the default; events are rare. | Tight temporal coupling. Cascading failure on tap. |
+</Cheatsheet>
+
+Any one of these is a warning. Two or more means you're there.
+
+## Why teams build them
+
+Three patterns dominate, from Newman's *Monolith to Microservices*:
+
+### 1. Entity-per-service decomposition
+
+The team carved out `UserService`, `OrderService`, `ProductService`,
+`CartService` — one per noun. Every real user operation crosses every
+service. The boundary follows the **data**, not the **capability**.
+See **Service boundaries and bounded contexts** for the right
+framing.
+
+### 2. Premature extraction without contracts
+
+The team extracted services before defining contracts. To "ship
+faster" they let services share the database "temporarily." Two
+years later, the shared schema is load-bearing across 15 services
+and nobody owns it.
+
+### 3. Big-bang rewrites
+
+The team rewrote the monolith as N services in 18 months. They moved
+modules to services but kept the call shape. The result is the same
+graph, now over HTTP — slower, less reliable, harder to debug.
+
+The technology changed; the design didn't. You can't refactor your
+way to good architecture by splitting source trees.
+
+## The cost
+
+Compared to a monolith with the same coupling, a distributed monolith
+costs more on every axis:
+
+```
+- Every cross-module call is now a network call.
+- Every shared transaction is now a saga (or, worse, an inconsistency).
+- Every deploy is a choreographed multi-service deploy.
+- Every bug requires tracing across N services.
+- Every refactor that crosses a "service boundary" needs coordinated PRs.
+- Every on-call rotation pages on N services instead of one.
+```
+
+You bought all the operational complexity of microservices and used
+exactly none of the benefit.
+
+## Diagnostic playbook
+
+When you suspect, measure:
+
+<Steps>
+<Step n={1} title="Deploy graph.">
+Plot, for the last 90 days, which services were deployed together
+(same PR, same change, same coordinated push). If two services share
+80%+ of their deploys, they are one service. Merge them or rebuild
+the boundary.
+</Step>
+<Step n={2} title="Fan-out per request.">
+For your top 5 endpoints, count synchronous downstream calls per
+request. >3 is a smell. >5 is a problem. >10 is a distributed
+monolith.
+</Step>
+<Step n={3} title="Schema ownership.">
+For each table, identify the writing service. If more than one
+service writes the same table, that table — and probably the
+services that share it — is a unit of coupling.
+</Step>
+<Step n={4} title="Change graph.">
+For the last 50 features, count services touched. If the median is
+≥3, your cuts are wrong. Decomposition has not happened — it has
+been postponed and disguised.
+</Step>
+<Step n={5} title="Local dev.">
+Try to run one service end-to-end on a laptop with mocked
+dependencies. If the test fails because real siblings are required,
+the service has no real boundary.
+</Step>
+</Steps>
+
+These metrics matter more than architecture diagrams. Diagrams lie;
+deploy logs and code history don't.
+
+## Unwinding it
+
+The honest path back is incremental, and the tools are the same
+as the migration *into* microservices:
+
+### Stop the bleeding first
+
+- Freeze cross-service direct DB access. New code goes through APIs
+  only. Existing reads get an expiry date.
+- Forbid new synchronous fan-out in hot paths. New cross-service
+  communication should default to events.
+- Tag the worst boundaries; don't add features that cross them.
+
+### Re-merge what shouldn't have been split
+
+This is the unpopular move and usually the right one. If two services
+always deploy together, share a database, and call each other on
+every request, they should be **one service**. Merging is reversible;
+the distributed-monolith pattern is not.
+
+Newman is explicit: "It is entirely reasonable to merge
+microservices back into a monolith." The status of having
+microservices is not the goal. Having the right architecture is.
+
+### Re-draw boundaries around bounded contexts
+
+For the services worth keeping separate, redraw boundaries using
+event storming (see **Service boundaries and bounded contexts**). The
+goal is contexts where most requests are local, not fanned out.
+
+### Replace sync chains with events
+
+Replace synchronous RPC chains with async events where possible.
+Choreography reduces coupling at the cost of explicit flow visibility.
+See **Choreography vs orchestration** and **Messaging patterns**.
+
+### Extract data ownership
+
+The shared database is usually the deepest root. Migration steps:
+
+```
+1. Identify the owning service for each table.
+2. Mark all other access as deprecated; instrument it.
+3. Build APIs/events for the access patterns the others need.
+4. Migrate readers off direct DB access, one at a time.
+5. Move the table behind the owner's network boundary (own DB).
+```
+
+This takes months for a real system. There is no shortcut. CDC
+(change data capture) can bridge during migration — see the
+**The shared-database antipattern** page.
+
+## Anti-patterns inside the anti-pattern
+
+A few specific traps:
+
+### "Versioned shared library"
+
+Every service depends on a shared library that contains domain types
+and DB models. A bump in the library forces every service to redeploy
+in lockstep. You've recreated the monolith's compile dependency in
+the worst way: distributed and untyped.
+
+The fix: keep cross-cutting concerns (logging, tracing) in libraries.
+Keep domain types **inside** the service that owns them. Cross-service
+contracts are over the wire, not in code.
+
+### "Synchronous orchestrator everywhere"
+
+A central service that synchronously calls 6 others to fulfill any
+request. It looks like clean architecture (one place to read the
+flow), but it ties availability of the whole product to one service
+and prevents any team from deploying independently.
+
+### "RPC dressed as events"
+
+Services publish an event, then wait for the consequent event before
+returning. That's RPC, not pub/sub — except worse: untraced,
+unbounded latency, broker as single point of failure on the hot path.
+
+## A sanity test
+
+For a team that claims they have microservices, ask:
+
+```
+- Can you deploy service X right now, today, without coordinating?
+- Can a service stay green when service Y is down for an hour?
+- Can a new dev run one service locally on day 1?
+- Is most of your team's PRs scoped to one service?
+- Can you point to schema ownership: one writer per table?
+```
+
+If you answer "no" to two or more, you have a distributed monolith.
+
+<Callout variant="warning">
+The path forward sometimes goes through more services and sometimes
+through fewer. The status of "we have microservices" is not the goal.
+Independent deployability and team autonomy are the goals — judge by
+those.
+</Callout>
+
+## In summary
+
+- A distributed monolith pays microservices' cost without delivering
+  microservices' benefits.
+- Symptoms: lockstep deploys, shared databases, sync fan-out chains,
+  cross-service feature changes, untestable services.
+- Diagnose with deploy graphs, fan-out metrics, schema ownership,
+  and the local-dev test — not with architecture diagrams.
+- The fix is usually a mix: merge what shouldn't be split, redraw
+  boundaries around bounded contexts, replace sync chains with events,
+  and unblock data ownership.
+- The state of having microservices is not the goal. Independent
+  deployability is.

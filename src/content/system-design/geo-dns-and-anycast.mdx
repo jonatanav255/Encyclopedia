@@ -1,0 +1,179 @@
+export const level = 'senior';
+
+# GeoDNS and anycast
+
+Two ways to route users to the geographically closest server.
+
+- **GeoDNS**: a DNS server returns different IP addresses
+  based on the client's location. The closest healthy region
+  wins.
+- **Anycast**: multiple physical locations announce the
+  **same IP address** via BGP. The internet's routing
+  table picks the closest one.
+
+Both serve users from nearby; they have different failure
+modes and operational characteristics.
+
+## GeoDNS
+
+```
+client (in Tokyo) → resolver
+                  → DNS server: "what's example.com?"
+                  → DNS server checks resolver's IP / EDNS-client-subnet
+                  → returns: 203.0.113.5 (Tokyo POP)
+client connects to 203.0.113.5
+```
+
+The DNS server has a database of IP-range → region mappings.
+Returns the IP of the closest region to the client.
+
+### Strengths
+
+- **Works with any client**, any network. No special routing.
+- **Easy to update**: change the DNS record, propagation
+  within TTL.
+- **Per-region health checks**: stop routing to a region
+  that's down.
+- **Cheap to implement**: many DNS providers (Route 53,
+  Cloudflare, NS1) support it.
+
+### Weaknesses
+
+- **DNS caching lag**: client's DNS resolver caches the
+  answer for the TTL. Failover takes minutes.
+- **Inaccurate geolocation**: the client's resolver isn't
+  necessarily near the client (especially for mobile / VPN /
+  large ISPs). EDNS-client-subnet helps but isn't universal.
+- **Each region's TCP connection**: a switch from Tokyo to
+  Singapore requires a new TCP+TLS handshake.
+
+## Anycast
+
+```
+client (in Tokyo) → packet to 198.51.100.1
+                  → internet routing picks the closest
+                    location announcing that IP
+                  → packet arrives at Tokyo POP
+```
+
+The same IP address is advertised from multiple datacenters.
+BGP picks "closest" per the internet's routing topology.
+
+### Strengths
+
+- **Instant failover** at the network layer. If a region's
+  BGP route disappears, traffic shifts in seconds.
+- **Single IP** simplifies client config and certificate
+  management.
+- **Works for UDP** (DNS itself, QUIC). Most public DNS
+  servers are anycast.
+- **Survives DDoS** by spreading attack traffic across many
+  POPs.
+
+### Weaknesses
+
+- **Hard to operate**: requires BGP announcements, peering,
+  knowledge of internet routing.
+- **TCP state isn't shared across POPs**: a connection
+  established with POP A can't migrate to POP B mid-flow
+  without dropping. Long-lived connections complicate this.
+- **Routing changes mid-connection**: a network reconfiguration
+  can shift packets to a different POP, breaking TCP.
+
+Modern CDNs use **stable anycast**: traffic from a single
+client consistently lands on the same POP, even though the
+IP is global.
+
+## Where each fits
+
+### GeoDNS
+
+- **Web apps with sticky sessions**: a user's TCP connection
+  is to one specific region; OK if it doesn't migrate.
+- **Backend services with regional partitioning**.
+- **Failover for outages** measured in minutes (DNS TTL).
+
+### Anycast
+
+- **CDNs**: every user hits a nearby POP, no DNS lookup
+  cost. Cloudflare, Fastly, CloudFront.
+- **DNS resolvers themselves**: 8.8.8.8, 1.1.1.1.
+- **Game / realtime services**: where consistent low latency
+  matters more than per-region sticky session.
+- **DDoS-resistant entrypoints**.
+
+## Combining them
+
+Most production CDN setups use both:
+
+- **DNS resolves a regional name** (`assets.example.com`) to
+  an anycast IP via GeoDNS.
+- **Anycast routes** at the network layer to the nearest CDN
+  POP.
+
+DNS gives high-level steering (e.g., "this customer's traffic
+goes to our enterprise tier"). Anycast handles
+micro-routing.
+
+## Failure modes
+
+### GeoDNS failover lag
+
+Region us-west-2 goes down. DNS is updated to remove its IP.
+But clients' resolvers have cached the old answer for 5
+minutes (TTL). For 5 minutes, those clients try the dead
+region.
+
+Mitigation: short TTLs (60s) for high-availability records.
+But this multiplies DNS query load on the authoritative
+server.
+
+### Anycast prefix withdrawal
+
+Region us-west-2 goes down; its BGP announcement is
+withdrawn. Routing reconverges in seconds — much faster than
+DNS.
+
+But: if the withdrawal is incomplete (some peers still
+announce), traffic black-holes.
+
+### Sticky session across regions
+
+User establishes a WebSocket to anycast IP → POP A. A network
+reconverge sends new packets to POP B. POP B doesn't have the
+WebSocket state → connection drops.
+
+Mitigation: store session state externally; or use
+client-side reconnect with state passed in the connect message.
+
+### Geolocation accuracy
+
+GeoDNS thinks the user is in the US (because their resolver
+is in the US) but they're actually in Asia. Suboptimal
+routing.
+
+EDNS-client-subnet (ECS) carries the client's network in the
+DNS query. Better accuracy. Some resolvers (1.1.1.1) don't
+support ECS for privacy.
+
+## TLS / certs
+
+- **GeoDNS**: each region has its own IP; certs can be
+  per-region or wildcarded.
+- **Anycast**: same IP everywhere; same cert (or SNI-based
+  cert selection).
+
+For SAN certs covering multiple regional domains, you can
+also do per-region cert presentation via SNI.
+
+## In summary
+
+- GeoDNS: DNS returns different IPs based on client
+  location. Works everywhere; failover lag = TTL.
+- Anycast: same IP from multiple locations; internet routing
+  picks closest. Instant failover; harder to operate; not
+  TCP-state-aware.
+- Best CDN setups combine both.
+- Watch for: DNS caching lag, inaccurate geolocation
+  (ECS helps), anycast routing reconverge breaking TCP
+  state.

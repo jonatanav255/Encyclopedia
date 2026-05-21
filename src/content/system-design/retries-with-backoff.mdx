@@ -1,0 +1,212 @@
+export const level = 'mid';
+
+# Retries with backoff
+
+A failed network call should *sometimes* be retried. But
+naïve retries — same instant, same target, every time — cause
+**retry storms** that turn a brief downstream blip into an
+outage.
+
+Three things make retries safe: **idempotency**, **backoff**,
+and **a budget**.
+
+## What's safe to retry
+
+- **Reads** (GET, idempotent queries) — always safe.
+- **Idempotent writes with a key**: PUT to a known URL,
+  POST with an Idempotency-Key header.
+- **Operations whose duplicate execution is harmless**: setting
+  a config value, sending a no-op.
+
+What's not safe to retry:
+
+- **Non-idempotent writes**: `POST /charge` without an
+  idempotency key.
+- **Operations with side effects you can't undo**: sending
+  email, sending SMS, transferring money.
+
+When in doubt, **don't retry without idempotency**. The
+user re-doing the operation manually is safer than your
+infrastructure doing it twice silently.
+
+## Exponential backoff
+
+Retry after 100ms, then 200ms, then 400ms, then 800ms... Each
+retry doubles the wait time.
+
+```js
+async function retry(fn, opts) {
+  let delay = 100;
+  for (let i = 0; i < opts.maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === opts.maxAttempts - 1 || !shouldRetry(err)) throw err;
+      await sleep(delay);
+      delay *= 2;
+    }
+  }
+}
+```
+
+Why exponential? A linear backoff (100ms, 200ms, 300ms)
+doesn't give the downstream enough time to recover under
+sustained pressure. Exponential gives the downstream
+breathing room.
+
+## Add jitter
+
+Without jitter, all clients of a failing service retry at
+exactly the same intervals → simultaneous retries → renewed
+load → more failures.
+
+```js
+delay = baseDelay * Math.pow(2, attempt);
+delay = delay * (0.5 + Math.random() * 0.5);  // full jitter
+```
+
+Variations:
+
+- **Full jitter**: `delay = random(0, exponential)`. Most
+  spread out.
+- **Equal jitter**: `delay = exponential/2 + random(0,
+  exponential/2)`. Half the wait is jittered.
+- **Decorrelated jitter** (AWS recommendation): `delay =
+  random(base, previousDelay * 3)`. Mathematically optimal
+  for avoiding clusters.
+
+Use full or decorrelated jitter; never plain backoff.
+
+## Retry budget
+
+Retries amplify load. If every failed call retries 3 times,
+a service taking 50% failures is now under 1.5× normal load —
+making things worse.
+
+A **retry budget** caps total retries:
+
+```
+Allow N retries per S seconds across the whole client.
+Once exceeded, fail fast — no further retries until the
+budget refreshes.
+```
+
+Implementation: a sliding-window counter of retries. Reject
+new retries when over budget.
+
+Without a budget, retry storms guarantee cascading failure.
+
+## Don't retry 4xx
+
+A 400 Bad Request means *your request is wrong*. Retrying
+won't help; you'll get 400 again. Same for 401, 403, 404,
+422.
+
+Retry only:
+
+- **Timeouts** (the network ate it).
+- **5xx** (the server's bad day).
+- **429 Too Many Requests** — and respect `Retry-After`.
+- **Specific 5xx classes** (often 502, 503, 504 are
+  transient; 500 might be code bugs).
+
+A surprising number of retry implementations retry on every
+error. Don't.
+
+## Hedged requests
+
+For latency-critical paths, **send the same request to two
+replicas**, take whichever responds first. Cuts tail latency
+at the cost of small extra load.
+
+```js
+async function hedged(request) {
+  const a = fetch(replicaA, request);
+  await delay(p95latency);  // wait until p95 elapsed
+  const b = fetch(replicaB, request);
+  return Promise.any([a, b]);
+}
+```
+
+(See hedged-requests.) Not a substitute for retries — they're
+different patterns.
+
+## Idempotency in flight
+
+If retry-without-key is unsafe, idempotency-with-key needs
+careful design:
+
+```js
+const idempotencyKey = uuid();
+async function placeOrder(input) {
+  return retry(async () => {
+    return fetch('/orders', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(input),
+    });
+  });
+}
+```
+
+The key is generated **once** per logical operation, not per
+retry. Server-side, the first call stores the result; retries
+return the stored result without re-executing.
+
+(See idempotency-keys.)
+
+## Server-side retries
+
+The "Retry-After" header tells clients when to retry:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+```
+
+Smart clients respect this. Dumb clients ignore it and
+hammer. Implement Retry-After in your servers; respect it
+in your clients.
+
+## When retries hurt
+
+- **Already-cascading failure**. Service A is down; retrying
+  makes it worse.
+- **Long-running operations**. A 30-second job retried 3
+  times = 90-second wait for the user.
+- **High-cost retries**. The downstream charges per call
+  (LLM APIs, paid services).
+
+The fix: short max attempts (2-3), tight retry budget,
+exponential backoff with jitter, circuit breaker in the same
+client.
+
+## Library defaults
+
+Many HTTP libraries default to *no* retries. Some default to
+3 retries with no jitter. Neither is right.
+
+Set explicitly:
+
+```js
+const client = new HttpClient({
+  retries: 2,
+  backoff: 'exponential',
+  jitter: 'full',
+  retryOn: [429, 502, 503, 504, 'timeout'],
+  retryBudget: { calls: 100, retries: 20, perSecond: 1 },
+});
+```
+
+## In summary
+
+- Retry only safe operations: idempotent reads, idempotent
+  writes with keys, harmless duplicates.
+- Use exponential backoff with full or decorrelated jitter.
+- Bound total retries per operation and per client (retry
+  budget).
+- Don't retry 4xx. Retry timeouts, 5xx, 429-with-Retry-After.
+- Combine with circuit breakers — when the downstream is
+  obviously broken, stop retrying.
+- Test retry behavior; default library settings are usually
+  wrong.

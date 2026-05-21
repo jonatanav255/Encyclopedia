@@ -1,0 +1,175 @@
+export const level = 'senior';
+
+# How to choose: stateful vs stateless services
+
+A **stateless** service holds no per-client memory between
+requests; any replica can serve any request. **Stateful**
+services hold state in memory or local disk.
+
+Default to stateless. State goes in a dedicated stateful
+system (DB, cache, message broker) — not in your service.
+
+## What "stateful" actually means
+
+There are degrees:
+
+- **Strictly stateless**: every request entirely answered by
+  the request payload + external stores. Most REST APIs.
+- **Session-stateful**: holds per-user session in memory
+  during a long connection (WebSocket, RPC stream).
+- **Cache-stateful**: holds a process-local cache of hot data
+  for performance.
+- **Sharded-stateful**: each instance owns a partition of
+  state (matching engine for symbol X; chat server for room
+  Y).
+- **Fully stateful**: maintains primary copy of the system's
+  truth (databases, message brokers themselves).
+
+The further down the list, the more deployment-painful.
+
+## Stateless wins because
+
+- **Trivially scalable.** Add or remove replicas; requests
+  route anywhere.
+- **Trivially resilient.** A replica dies — requests retry to
+  another. No state to recover.
+- **Trivially deployable.** Rolling update or blue-green.
+  No in-flight work to drain (except open requests).
+- **Cheap auto-scaling.** Spin up, accept traffic, spin
+  down.
+
+For 95% of services, stateless is correct.
+
+## When stateful pays off
+
+- **Maintaining persistent connections.** WebSocket / SSE for
+  chat, gaming, collaborative editing. The connection itself
+  is state — and tied to a specific instance.
+- **In-memory aggregation.** A stream processor accumulating
+  per-window state.
+- **Authoritative ordering.** A matching engine, sequencer,
+  or single-leader controller.
+- **Sharded-by-key locality.** "All operations for chat room X
+  go to instance Y" — locality avoids network calls for
+  in-memory state.
+
+## The cost of stateful
+
+### Deployment is harder
+
+Can't just kill the process. State must move first.
+
+- **Drain**: stop accepting new connections, finish active
+  ones, replicate state to a successor.
+- **Snapshot + restore**: serialize state on shutdown, restore
+  on a new instance.
+- **Sticky session rebalancing**: when a node dies, its load
+  has to move to a peer — and peers must accept.
+
+### Failover is harder
+
+A stateless replica dying = ignored. A stateful instance
+dying = its state must be recovered (from a replica, from a
+log, from a backup).
+
+### Scaling out is harder
+
+To add capacity, you can't just spin up replicas; you have to
+**reshard**. Move data, update routing.
+
+### Observability is harder
+
+Per-instance metrics matter (which instance is hot?). Aggregate
+metrics hide hot spots.
+
+## The standard pattern: stateless + external state
+
+```
+clients
+   ▼
+load balancer
+   ▼
+stateless services (5-1000 replicas)
+   ▼
+state in dedicated systems:
+  database, cache, message broker, search index, object storage
+```
+
+Each external state system is purpose-built for its job:
+
+- Postgres for transactions
+- Redis for cache + ephemeral state
+- Kafka for log / queues
+- Elasticsearch for search
+- S3 for blobs
+
+Your service doesn't reinvent any of these.
+
+## When in-memory caching is OK in a "stateless" service
+
+A process-local LRU cache of hot data is fine if:
+
+- **Cache is a performance optimization, not a source of
+  truth.** The DB is the truth.
+- **Cache misses are tolerable.** Replicas start cold and
+  warm naturally.
+- **Cache doesn't need cross-replica consistency.** Different
+  replicas can hold different snapshots.
+
+That's "stateless with cache," not stateful.
+
+## Sharded stateful: when it's the right answer
+
+For services where a partition's state is large and
+performance-critical:
+
+- **Game lobbies / chat rooms**: room X lives on instance
+  Y; all room X operations route there.
+- **Stream processor state**: each operator partition holds
+  windowed aggregation in memory.
+- **Matching engine**: one symbol per instance.
+
+The deployment cost is real but unavoidable. Use libraries
+(Akka Cluster, Apache Helix, custom shard managers) rather
+than hand-rolling.
+
+## Common mistakes
+
+### "Stateless because no DB writes"
+
+A service that holds in-memory user sessions is stateful
+even if it never writes to a DB. Restart it and users lose
+sessions.
+
+Fix: put session in Redis or a stateful session store.
+
+### "Just keep state on disk, problem solved"
+
+Local disk dies with the instance. Persistence ≠ resilience.
+Need replicas, snapshots, or external durable storage.
+
+### "Sticky sessions to make stateless services stateful"
+
+Pinning a user to one instance for performance often hides
+real state in memory. The instance dies → user's "session" is
+gone. Either make it true stateless (no per-instance state)
+or true stateful (managed state with replication).
+
+### "Microservices that all share a database"
+
+You've made every service stateful via the shared DB.
+Schema changes ripple. (See shared-database-antipattern.)
+
+## In summary
+
+- Default to stateless services; state in dedicated systems
+  (DB, cache, broker).
+- Stateful when state has locality requirements (sharded),
+  is performance-critical, or needs in-process processing
+  (stream ops, matching engines).
+- Stateful costs: harder deploy, failover, scaling,
+  observability. Don't take it on without reason.
+- "Stateless with cache" is fine; "session-in-memory" without
+  external persistence is broken.
+- Sharded-stateful patterns benefit from off-the-shelf
+  libraries; don't hand-roll cluster management.

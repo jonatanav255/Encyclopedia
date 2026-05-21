@@ -1,0 +1,278 @@
+export const level = 'senior';
+
+# Synchronous vs asynchronous replication
+
+A primary commits a write. When does it tell the client "done"?
+
+- **Synchronous**: after a replica confirms the write.
+- **Asynchronous**: as soon as the primary has it locally.
+- **Semi-synchronous**: hybrid — wait for some replicas, not
+  all.
+
+This single choice determines whether you can lose data on
+failover, how fast writes are, and what happens when a replica
+is slow or dead.
+
+## What each one guarantees
+
+<Compare a="Asynchronous" b="Synchronous">
+<>
+Primary writes locally, returns success immediately. Replicas
+catch up in the background. **Fast writes**, **never blocked
+by replicas**, **possible data loss** on primary failure
+before replication completes.
+</>
+<>
+Primary writes locally, waits for replica(s) to confirm, then
+returns. **Slow writes** (cross-replica round trip),
+**replica lag = primary stalls**, **zero data loss** on
+primary failure if the surviving replica acknowledged.
+</>
+</Compare>
+
+The trade is fundamental: **latency** vs **durability under
+failure**. There is no third option — you pick.
+
+## The dimensions of "synchronous"
+
+"Sync" hides several distinctions. Postgres exposes them
+explicitly via `synchronous_commit`:
+
+<Cheatsheet>
+| Mode | Primary waits for replica to... |
+|---|---|
+| `off` | Not at all (also async wrt WAL flush) |
+| `local` | Local WAL flush only — async replication |
+| `remote_write` | Receive WAL into memory |
+| `remote_apply` | Apply WAL to its data files |
+| `on` | Receive + flush WAL to disk (durable) |
+</Cheatsheet>
+
+The deeper into the replica's stack you wait, the safer you
+are and the slower writes get.
+
+- `remote_write` is what most "sync" setups actually want:
+  data has crossed the wire and is durable enough that the
+  replica won't lose it on a normal crash. Fast — only one
+  cross-link round trip, no fsync wait on the replica.
+- `remote_apply` is "read-your-writes consistent on the
+  replica" — useful when you immediately read from the
+  replica. Slow.
+- `on` (default for sync) requires a full fsync on the
+  replica before the primary acks. Safest, slowest.
+
+MySQL's `rpl_semi_sync_master_wait_point` has the same
+spectrum: `AFTER_SYNC` (replica has it on disk) vs
+`AFTER_COMMIT` (replica has applied it).
+
+## The latency cost
+
+A synchronous write must include a round trip to the replica.
+
+```
+async write:    primary fsync + ack          ~1 ms
+sync write:     + RTT to replica + ack       ~1 + 0.5 = ~1.5 ms (same DC)
+sync write:     + RTT cross-region            +50–150 ms
+```
+
+Same-DC sync is cheap — sub-millisecond. Cross-region sync is
+catastrophic for write-heavy workloads. Most production
+"sync" setups use a same-DC replica.
+
+Throughput follows latency: a write-heavy workload with 100ms
+sync latency can't exceed 10 writes/sec/connection.
+
+## The availability cost
+
+This is the part most teams underestimate.
+
+In sync replication, **the primary blocks if the replica is
+slow or dead**. If the replica crashes, writes hang until you
+either:
+
+- The replica recovers.
+- Reconfigure to drop the replica (changing
+  `synchronous_standby_names` in Postgres).
+
+If you have **one** sync replica and it dies, your database
+stops accepting writes. This sounds backwards — replication is
+supposed to *help* availability — but it's exactly the trade:
+sync replication trades write availability for data durability.
+
+Mitigations:
+
+- **Multiple sync replicas with a quorum**: `synchronous_standby_names
+  = 'ANY 2 (r1, r2, r3)'` — primary waits for any 2 of 3.
+  Survives one replica down.
+- **Designated sync replicas** that are tightly monitored;
+  others as async.
+- **Automatic reconfiguration** on replica timeout (most
+  systems require human intervention by default).
+
+The pattern: sync is **not** "all replicas confirm." Sync with
+a single replica is fragile. Sync with quorum on N replicas is
+robust.
+
+## Recovery point and recovery time
+
+The two failover metrics:
+
+- **RPO (Recovery Point Objective)**: how much data can you
+  lose? Measured in time.
+- **RTO (Recovery Time Objective)**: how long until you're
+  back? Measured in time.
+
+<Cheatsheet>
+| Setup | RPO | RTO |
+|---|---|---|
+| Single primary, no replicas | unbounded (last backup) | hours |
+| Async replication | seconds (typical lag) | seconds (failover) |
+| Sync replication (1 replica) | zero | seconds (failover), possibly write-stalled |
+| Sync replication (quorum) | zero | seconds (failover) |
+| Async + delayed replica + PITR | seconds OLAP / hours archive | varies |
+</Cheatsheet>
+
+For most products, **zero data loss is mandatory for financial
+or audit-grade data; bounded seconds is acceptable for the
+rest**. Mix accordingly.
+
+## Semi-synchronous
+
+Available in MySQL natively, and effectively in Postgres via
+`synchronous_commit = remote_write`. The compromise:
+
+- The primary waits for **at least one** replica to acknowledge
+  receipt (often in memory, before fsync).
+- Other replicas are async.
+- If the sync replica is unresponsive past a timeout, the
+  primary degrades to async — preserving write availability at
+  the cost of (briefly) accepting writes that might be lost.
+
+This is the production sweet spot for many systems: most of
+the time, zero data loss; under replica failure, brief async
+mode rather than write outage.
+
+## The dual-write problem
+
+A separate but related question: when an application writes to
+the database **and** publishes a message ("user created"), how
+do those stay consistent?
+
+- Write DB, then publish → DB succeeds, broker fails, message
+  lost.
+- Publish, then write DB → message sent, DB fails, message
+  references nonexistent user.
+
+Neither order is safe. This is the dual-write problem.
+
+Solutions:
+
+- **Outbox pattern**: write the message into an `outbox` table
+  in the same DB transaction. A separate worker reads the
+  outbox and publishes. Atomic with the DB write.
+- **CDC**: stream the DB's WAL to the broker via Debezium.
+  Messages mirror commits.
+
+This isn't replication, but it shares the latency-vs-safety
+shape — "two systems must agree before I return success" vs
+"return success and propagate."
+
+## Postgres-specific patterns
+
+Default in production:
+
+```
+wal_level = replica
+max_wal_senders = 10
+synchronous_commit = remote_write
+synchronous_standby_names = 'ANY 1 (replica1, replica2)'
+```
+
+- `remote_write`: replica has WAL in memory; durable enough.
+- `ANY 1 (...)`: wait for any one of two replicas — survives
+  one being down.
+
+Async-only setups (no `synchronous_standby_names`) accept
+seconds of potential data loss on primary failure. For
+applications that can tolerate it (analytics, social feeds,
+non-critical user data), this is fine.
+
+## MySQL-specific patterns
+
+```
+plugin-load = "rpl_semi_sync_master=semisync_master.so"
+rpl_semi_sync_master_enabled = ON
+rpl_semi_sync_master_timeout = 1000  # ms
+rpl_semi_sync_master_wait_point = AFTER_SYNC
+```
+
+- `AFTER_SYNC`: replica has the binlog event on disk before
+  primary commits to clients. Zero data loss.
+- Timeout = 1s: if replica doesn't ack within 1s, degrade to
+  async.
+
+MySQL Group Replication and Galera Cluster offer synchronous
+group commit — every member of the cluster acks every write,
+strict consistency at higher cost.
+
+## Cross-region replication
+
+Two-region sync replication is the most common
+mis-implementation. Engineers want "no data loss" and "active
+in two regions" and configure sync replication across
+continents.
+
+Result: every write incurs 100–200ms cross-region latency.
+Application latency triples. The "no data loss" sells the
+"users can't actually use the app" trade.
+
+Practical patterns:
+
+- **Synchronous in-region, asynchronous cross-region.** Zero
+  data loss for same-region failure; small lag for cross-region
+  disasters.
+- **Single-region primary with async DR replica.** Accept some
+  RPO for DR.
+- **Sharded by region with async cross-region replication for
+  read-only views.** Each region is independent.
+
+Spanner and CockroachDB use Paxos/Raft across regions but
+require careful placement and accept that cross-region writes
+will be slow.
+
+## Operational practice
+
+A handful of things every team running replication should do:
+
+- **Monitor lag**, both per replica and aggregate.
+- **Alert when sync replica count < required quorum**.
+- **Test failover** quarterly. Failover that has never been
+  rehearsed fails when needed.
+- **Document the data-loss tolerance per dataset**. Not all
+  data is equal — billing demands zero RPO; product
+  analytics tolerate minutes.
+- **Watch for "I bumped to sync to be safe" without
+  understanding the latency cost**. The dev-staging-prod
+  config drift here is common.
+
+<Callout variant="warning">
+A single sync replica is a single point of latency and a
+single point of write-availability failure. If you genuinely
+need synchronous replication, configure at least one
+sync-eligible replica with quorum semantics, not strict
+single-replica sync.
+</Callout>
+
+## In summary
+
+- Async replication: fast writes, seconds of potential data
+  loss on primary failure. The default.
+- Sync replication: zero data loss, write latency increased by
+  cross-replica RTT. A sole sync replica also blocks writes
+  when it dies.
+- Semi-sync / `remote_write`: replica receives WAL but doesn't
+  fsync. Production sweet spot.
+- Quorum sync (`ANY k of n`) gives durability without single
+  points of write-availability failure.
+- Cross-region sync is almost always wrong; keep cross-region
+  async unless you've measured the latency cost.

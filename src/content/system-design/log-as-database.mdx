@@ -1,0 +1,287 @@
+export const level = 'staff';
+
+# Log-centric architecture
+
+The idea: take an **append-only log** as the system-of-record,
+derive every other store from it. The OLTP database is a
+materialized view of the log. The search index is a materialized
+view of the log. The cache is a materialized view. The analytics
+warehouse is a materialized view.
+
+Jay Kreps's "Log: What every software engineer should know about
+real-time data's unifying abstraction" (2013) and Kleppmann's
+*DDIA* chapter 11 ("Stream Processing") are the canonical
+references. Kleppmann called it **"turning the database inside-
+out"** — the WAL, traditionally a database internal, becomes the
+external system-of-record, and the database becomes one of many
+derived consumers.
+
+It's not a fit for every system. It is the most coherent
+architecture for organizations whose data ecosystem has grown
+beyond "one OLTP + a few caches."
+
+## The shape
+
+```
+                    ┌─→ [OLTP DB]
+                    │
+[event log] ────────┼─→ [search index]
+(system of record)  │
+                    ├─→ [cache]
+                    │
+                    ├─→ [warehouse / analytics]
+                    │
+                    └─→ [downstream services]
+```
+
+Writes go to the log. Each downstream system **consumes** the log
+to maintain its own copy of the relevant subset, shaped for its
+queries.
+
+The log is the only durable, ordered, replayable source. Other
+stores can be rebuilt from it. If the cache dies, replay. If the
+search index gets corrupted, drop and rebuild. If a new
+downstream consumer is added, point it at the log.
+
+## Why this is different from "we have Kafka"
+
+Most teams running Kafka use it for **eventing** — Kafka is one
+of many systems, and the source of truth is still the OLTP
+database. Events are emitted by the DB (via the outbox pattern)
+to inform other services.
+
+Log-centric inverts this:
+
+- The log is **first**. Application writes events to the log
+  before any other store sees them.
+- The OLTP DB is **derived**. It's a consumer that maintains a
+  current-state view by applying log events.
+- Other services consume the log too; the OLTP DB has no
+  privileged status.
+
+Producers writing first to the log instead of first to the DB
+is the conceptual flip. The full implementation is rarer than
+"we have Kafka and an OLTP DB."
+
+## How writes work
+
+```js
+// Naïve dual-write (wrong)
+await db.users.update({ id, ...changes });
+await broker.publish('user.updated', changes);
+
+// Log-first
+const id = await log.append({ type: 'user.updated', ...changes });
+// downstream consumers (including the OLTP DB) update on their own
+```
+
+The OLTP DB becomes a downstream consumer:
+
+```js
+// One of many log consumers
+for await (const event of log.consume('users')) {
+  switch (event.type) {
+    case 'user.created':
+      await db.users.insert(event.payload);
+      break;
+    case 'user.updated':
+      await db.users.update(event.payload);
+      break;
+  }
+}
+```
+
+Reads still hit the OLTP DB. The OLTP DB is just a materialized
+view of the log.
+
+For services that **must** see their own writes (read-your-
+writes), there are options:
+
+- **Read directly from the log** with a tail consumer. Latency
+  is the log apply time.
+- **Synchronous apply**: the writer waits for the OLTP consumer
+  to catch up to its write before returning. Slow.
+- **Mixed**: the writer holds the new state in a local cache for
+  N seconds, serving its own reads from there while the DB
+  catches up. Pragmatic.
+
+## What the log is
+
+The log itself is usually Kafka — partitioned, retained,
+replayable. The defining properties:
+
+- **Total order per partition.** Critical for state machines.
+- **Long retention or compaction.** Either keep events for N
+  days minimum, or compact to "latest value per key" for
+  unbounded retention.
+- **Multi-consumer.** Every downstream system has its own
+  offset.
+- **Replayable.** Any consumer can rewind and rebuild.
+
+Other logs exist: Pulsar, Kinesis, Redpanda, EventStoreDB. The
+shape is the same.
+
+## Compaction vs retention
+
+A pure event log grows forever. Two strategies bound it:
+
+- **Time/size retention**: keep events for 30 days. Old data is
+  truncated. Adequate for cases where the OLTP DB is the long-
+  term store and the log is just for catch-up.
+- **Log compaction**: keep only the latest event per key. The
+  log becomes the source-of-truth for "current state of each
+  key" forever. Kafka's compacted topics implement this.
+
+Compacted topics + tombstones (a special "deleted" marker
+per key) give you a **key-value store as a log**. A new consumer
+can read the compacted log to rebuild the full current state of
+every entity.
+
+See **Compaction** for the mechanism.
+
+## Materialized views are first-class
+
+In a log-centric architecture, every downstream store is a
+**materialized view** (see Materialized views). Tools that fit
+the architecture:
+
+- **Kafka Streams / Flink / ksqlDB**: SQL or DSL pipelines that
+  consume the log and emit materialized state.
+- **Materialize**: streaming SQL database; consumes the log,
+  serves materialized views directly.
+- **Debezium**: bridges OLTP changes to the log when you can't
+  flip the producer.
+- **Sink connectors**: pre-built consumers that maintain
+  Elasticsearch, Postgres, S3, etc., from a log.
+
+The discipline becomes "what query do I need? Materialize a view
+shaped for it." Not "what's the canonical normalized schema?"
+
+## Stream processors as databases
+
+Materialize, RisingWave, and similar systems make the case that a
+**stream processor with persistent state IS the database** for
+log-centric architectures. Queries go to the stream processor;
+it serves results from continuously-updated state.
+
+```js
+// Materialize-style SQL
+const sql = `
+  CREATE MATERIALIZED VIEW recent_orders AS
+  SELECT user_id, SUM(amount) AS total
+  FROM orders_stream
+  WHERE created_at > now() - INTERVAL '24 hours'
+  GROUP BY user_id;
+
+  SELECT * FROM recent_orders WHERE user_id = 'u-42';
+`;
+```
+
+The SELECT is on the materialized view, kept fresh by the engine.
+No OLTP DB involved.
+
+This is one possible end state of "log as database": dispense
+with the OLTP DB entirely, let stream-processed views serve every
+query. Practically, most production systems keep a relational DB
+for ad-hoc queries and complex joins, supplemented by stream
+views for hot queries.
+
+## Event sourcing is a subset
+
+**Event sourcing** is a domain pattern: store events as the
+domain model rather than current state. Replay events to compute
+current state.
+
+Log-centric is the systemic generalization: not just the domain
+model is event-sourced, **the entire data stack** is event-
+sourced. The OLTP DB, the cache, the search index, the
+warehouse — every store derives from the log.
+
+Event sourcing without log-centric works (you can use Postgres
+as the event store and project to the same DB). Log-centric
+without event sourcing also works (you can have CRUD-style
+services that just happen to emit to a log).
+
+The combination is most powerful for organizations with many
+downstream systems consuming the same domain events.
+
+## Operational realities
+
+The architecture has known costs:
+
+- **Schema evolution is harder.** The log keeps events forever
+  (or for years). Old schemas linger. You need schema
+  registry, versioning, backward compatibility discipline.
+- **Bootstrapping is slow.** A new consumer reading a 1B-row
+  log takes hours to catch up. Snapshots + tail catch-up
+  patterns help.
+- **Operational complexity scales.** Kafka, Schema Registry,
+  Connect, downstream pipelines, stream processors. A small
+  team can't operate this; it needs a platform team.
+- **Cost.** Storage for the log + each materialized view.
+
+Organizations like LinkedIn (Kafka's birthplace) and Confluent's
+customers run it. Mid-size companies often run a hybrid: log-
+centric for the event-rich domains, traditional DB-first for
+the rest.
+
+## When to adopt
+
+<Steps>
+<Step n={1} title="Multiple independent consumers of the same data.">
+If three services each need to know about user signups, log-
+centric is cleaner than three CDC pipelines from the OLTP DB.
+</Step>
+<Step n={2} title="Real-time + historical use cases overlap.">
+The same log feeds real-time fraud detection and nightly
+analytics.
+</Step>
+<Step n={3} title="Audit and replay are first-class.">
+Regulated domains where every change must be traceable; or
+domains where new derived views are added frequently.
+</Step>
+<Step n={4} title="Platform team capacity.">
+Operating Kafka, schema registry, Connect, stream processors is
+not a side project. Plan for a dedicated team.
+</Step>
+</Steps>
+
+## Pitfalls
+
+<Callout variant="warning">
+**Log-centric without log compaction.** Retaining all events
+forever in uncompacted topics is expensive. Compact what can
+be compacted.
+</Callout>
+
+<Callout variant="warning">
+**Treating the OLTP DB as authoritative under log-centric.**
+The DB drifts from the log. Make the log the source-of-truth in
+both code and ops.
+</Callout>
+
+<Callout variant="warning">
+**No schema discipline.** A free-form JSON log becomes
+unreadable after schema drift. Use Avro or Protobuf with a
+schema registry from day one.
+</Callout>
+
+<Callout variant="warning">
+**Reading from the OLTP DB but not realizing it's the log's
+view.** "We changed the log handler and now the DB looks
+wrong." Yes — because the DB is derived.
+</Callout>
+
+## In summary
+
+- **Log = system-of-record**; OLTP DB, search index, cache,
+  warehouse are all materialized views derived from it.
+- **Writes go to the log first.** Everything else is a consumer.
+- **Compaction** keeps the log size-bounded while preserving
+  current-state.
+- **Stream processors with persistent state** can serve queries
+  directly, blurring DB/stream lines.
+- **Heavy ops investment** required; worth it for organizations
+  with many event consumers and real-time use cases.
+- **Event sourcing is the domain version; log-centric is the
+  systemic version.**

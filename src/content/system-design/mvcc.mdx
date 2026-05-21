@@ -1,0 +1,273 @@
+export const level = 'senior';
+
+# Multi-version concurrency control
+
+MVCC is how modern databases let readers and writers run
+concurrently without locking each other. Instead of "one
+canonical row," each row has **versions**, each tagged with the
+transaction that created it. Every transaction reads from a
+**snapshot** consistent with its start time.
+
+Postgres, InnoDB, Oracle, SQL Server (snapshot isolation),
+CockroachDB, MongoDB (WiredTiger), and SQLite (WAL mode) are
+all MVCC. It's the dominant concurrency model.
+
+## The problem MVCC solves
+
+The naïve scheme is **two-phase locking** (2PL): readers take
+shared locks, writers take exclusive locks. A write blocks all
+readers; a long read blocks writes.
+
+For read-heavy OLTP workloads — reports running alongside
+transactions, dashboards over live data — that's unworkable.
+
+MVCC's trick:
+
+> Readers never block writers, and writers never block readers.
+
+A reader sees the **snapshot** of the database as it existed
+when the reader started. A concurrent write produces a new row
+version invisible to the reader. The reader can take its time;
+the writer keeps moving.
+
+## The basic mechanism
+
+Each row stores two transaction ids:
+
+- `xmin`: the transaction that created (inserted) this version.
+- `xmax`: the transaction that deleted or replaced it (or 0 if
+  still live).
+
+```
+users table (physical heap):
+  rowid | xmin | xmax | name
+  ------+------+------+------
+   1    |  100 |  120 | Alice    ← old version
+   2    |  120 |    0 | Alyssa   ← new version (UPDATE by tx 120)
+   3    |  105 |    0 | Bob
+```
+
+A transaction `T` started at snapshot `S` sees a row version
+if and only if:
+
+```
+xmin < S AND (xmax = 0 OR xmax > S OR xmax aborted)
+```
+
+i.e., it was committed before `T` started, and not yet deleted
+by anyone committed before `T` started. Active transactions'
+writes are invisible.
+
+## Snapshots
+
+The "snapshot" is a small object capturing:
+
+- A transaction id watermark (`xmax_snap` — anything below is
+  potentially visible).
+- The set of in-progress transactions at snapshot creation.
+
+Visibility checks are local and cheap: given a row's `xmin` and
+`xmax`, the snapshot decides without locking anything.
+
+Two isolation flavors are typically built on snapshots:
+
+- **Read Committed**: each statement gets a new snapshot, so
+  subsequent statements see committed writes from concurrent
+  transactions.
+- **Repeatable Read / Snapshot Isolation**: the entire
+  transaction sees the snapshot from its start.
+
+See isolation levels for the full taxonomy.
+
+## How writes work
+
+A write doesn't overwrite the row. It:
+
+1. Marks the existing row version's `xmax` with the writing
+   transaction's id.
+2. Inserts a **new row version** with `xmin` = writing
+   transaction's id and the updated values.
+
+If the writer commits, the old version is "dead" and waits for
+cleanup. If it aborts, the old version is still live and the
+new version is dead.
+
+Concurrent writes to the same row:
+
+- Postgres / InnoDB: the second writer blocks on a **row lock**
+  until the first commits or aborts. After the first commits,
+  the second sees the new version; if it tried to update the
+  old version, the engine either retries (snapshot isolation
+  with the right semantics) or raises a serialization error.
+
+This is the part of MVCC people miss: **MVCC removes
+reader-writer blocking but not writer-writer blocking**. Two
+concurrent updates to the same row still serialize.
+
+## The garbage problem
+
+Every update doubles the row count on disk (old + new
+version). Over time, dead versions accumulate. Reads pay for
+them — they have to walk past invisible versions to find the
+visible one.
+
+Solution: a background process collects dead versions whose
+`xmax` is older than the oldest live snapshot.
+
+- **Postgres**: `autovacuum` reclaims space, updates statistics,
+  freezes very old `xmin` values to prevent transaction-id
+  wraparound.
+- **InnoDB**: the purge thread cleans up old undo log entries.
+- **Oracle**: undo segments hold prior versions; they're
+  reclaimed on a rolling basis.
+
+The discipline this imposes:
+
+- **A long-running transaction holds back GC** for everything
+  newer. A reporting query running for 8 hours prevents any
+  rows updated during those 8 hours from being cleaned up.
+- **Bloat** is the resulting on-disk waste — a table can grow
+  10× its live size if GC falls behind.
+- **VACUUM** must keep up on write-heavy tables; tune
+  `autovacuum_*` parameters when it doesn't.
+
+## Indexes and MVCC
+
+Indexes point to row versions, not rows. When a row is updated,
+each affected index either:
+
+- Gets a new entry pointing at the new version (Postgres heap +
+  B-tree, classical case), or
+- Uses a **HOT update** if the new version fits on the same
+  page and no indexed columns changed — the index entry is
+  reused (Postgres optimization).
+
+HOT updates are the difference between "update is cheap" and
+"update is catastrophic" on Postgres with many indexes. Keep
+fill factor below 100% and avoid changing indexed columns when
+HOT matters.
+
+InnoDB uses a clustered primary index; secondary indexes
+contain primary-key values, not row pointers, so secondary
+indexes don't need updates when only non-indexed columns
+change.
+
+## MVCC and snapshot isolation
+
+MVCC implements snapshot isolation by construction. Every
+transaction sees a consistent snapshot; concurrent writes are
+serialized at the row level.
+
+Snapshot isolation prevents:
+
+- Dirty reads
+- Non-repeatable reads
+- Phantom reads (in most implementations, due to MVCC's
+  snapshot semantics)
+
+It **does not** prevent **write skew** — two transactions read
+overlapping data and write disjoint rows, each consistent
+individually but jointly violating an invariant.
+
+Example:
+
+```
+On-call table: (alice: on_call=true), (bob: on_call=true)
+Invariant: at least one person on call.
+
+T1: SELECT count(*) WHERE on_call;  -- sees 2
+T1: if count > 1: set alice.on_call = false
+T2: SELECT count(*) WHERE on_call;  -- also sees 2 (snapshot)
+T2: if count > 1: set bob.on_call = false
+Both commit. Now nobody is on call. Invariant violated.
+```
+
+For workloads with write-skew risk, use **Serializable** —
+either SSI (Postgres serializable_snapshot_isolation, which
+detects the conflict via predicate locks) or row-level locking
+(`SELECT ... FOR UPDATE`).
+
+## Engine-specific notes
+
+### Postgres
+
+- Versions stored in the heap; `pg_xact` records commit/abort.
+- 32-bit transaction ids → **wraparound risk**. `VACUUM FREEZE`
+  marks very old `xmin` values as "always visible" to bound
+  the ring.
+- `autovacuum` is mandatory; turning it off breaks the database.
+- HOT updates require headroom on the page (FILLFACTOR < 100%).
+
+### InnoDB
+
+- Undo log holds prior versions, not the heap itself.
+- Purge thread removes undo entries when no transaction needs
+  them.
+- "Implicit transaction id" minimizes overhead on read-only
+  workloads.
+
+### CockroachDB / Spanner-style
+
+- MVCC is the on-disk model: keys are `(logical_key, ts)`.
+- Reads at timestamp `t` find the latest version with `ts ≤ t`.
+- Compaction in the underlying LSM removes versions older than
+  the GC threshold.
+- Time-travel queries (`AS OF SYSTEM TIME '-30s'`) fall out for
+  free.
+
+### MongoDB (WiredTiger)
+
+- MVCC at the document level; readers see a snapshot taken at
+  the start of the read.
+- Long transactions hold back snapshot release; bloat manifests
+  similarly to Postgres.
+
+## Common pitfalls
+
+### Long-running transactions
+
+The single most common production issue with MVCC databases.
+An analyst's "read the whole table for a report" transaction
+runs for 6 hours; nothing newer than its snapshot can be
+cleaned up; bloat balloons; performance degrades.
+
+Fix: separate OLAP from OLTP, set `statement_timeout` and
+`idle_in_transaction_session_timeout` (Postgres), monitor for
+"oldest snapshot" age.
+
+### Bloat-induced regression
+
+A table that was fast becomes slow because the heap is 80%
+dead rows. Reads still walk past them; the cache no longer fits
+the working set.
+
+Fix: tune autovacuum, run `VACUUM FULL` or `pg_repack` in a
+maintenance window, audit fill factor on hot tables.
+
+### Confusing MVCC with "no locking"
+
+MVCC removes reader-writer blocking. It does not remove
+writer-writer blocking. `SELECT ... FOR UPDATE` still takes a
+row lock; `INSERT` into a unique-indexed column still serializes
+on the index entry.
+
+### Write skew under snapshot isolation
+
+Assume your isolation level is what you set, but check whether
+the engine **actually** prevents write skew. Postgres
+`REPEATABLE READ` is snapshot isolation and **does not**
+prevent it; `SERIALIZABLE` does (via SSI).
+
+## In summary
+
+- MVCC keeps **multiple versions** of each row; readers see a
+  consistent snapshot without locking writers.
+- Versions are tagged with transaction ids (`xmin`/`xmax`);
+  visibility is decided locally by snapshot comparison.
+- The cost is **on-disk bloat** and a mandatory background GC
+  (VACUUM / purge). Long transactions sabotage GC.
+- MVCC implements snapshot isolation; **write skew** still
+  needs Serializable or explicit row locks.
+- Postgres, InnoDB, Oracle, WiredTiger, CockroachDB, and SQL
+  Server snapshot all use MVCC — same idea, different
+  bookkeeping.

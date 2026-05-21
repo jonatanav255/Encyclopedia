@@ -1,0 +1,200 @@
+export const level = 'staff';
+
+# Conflict resolution: LWW and CRDTs
+
+When two writes happen "concurrently" (neither knows about
+the other), the system has to pick a winner. Two main families:
+
+- **Last-write-wins (LWW)**: timestamp-ordered; pick the
+  higher.
+- **CRDTs**: structure the data so concurrent operations
+  merge deterministically.
+
+LWW is simple and lossy. CRDTs are correct and limited in
+shape.
+
+## When you have a conflict
+
+```
+Region A: writes X = "Alice"
+Region B: writes X = "Bob"
+        (neither sees the other yet)
+Both replicate
+        ↓
+What's the final value?
+```
+
+The system needs a deterministic answer that all replicas
+will converge to.
+
+## Last-write-wins
+
+Tag every write with a timestamp. On conflict, the write with
+the higher timestamp wins. Older value is silently dropped.
+
+```js
+function merge(local, remote) {
+  return local.timestamp > remote.timestamp ? local : remote;
+}
+```
+
+Pros:
+
+- Simple, fast, no metadata bookkeeping.
+- Works for any data type.
+
+Cons:
+
+- **Silent data loss**. The losing write disappears.
+- **Clock-skew sensitive**. NTP differences across regions
+  systematically favor one region.
+- **Misordering for "should add both" cases**. Two cart
+  adds: LWW picks one, drops the other. Wrong for cart
+  shape.
+
+LWW is the default in Cassandra, DynamoDB, S3 (within an
+object), most "eventual consistency" systems.
+
+## When LWW is OK
+
+- **Single-value updates** where "newest wins" is correct
+  semantics. Profile name, latest config.
+- **High-frequency updates** where missing a few is invisible.
+  Presence, last-seen, view count.
+- **Idempotent overwrites** where the actual value doesn't
+  matter much.
+
+## When LWW fails
+
+- **Set-shape data**: cart items, friend lists, multi-select
+  preferences. Both adds should persist.
+- **Counters**: two concurrent increments shouldn't replace
+  each other; they should sum.
+- **Multi-field records** with partial updates: A updated
+  field 1, B updated field 2; LWW overwrites both.
+
+## CRDTs: convergent replicated data types
+
+A data type whose merge is **commutative, associative, and
+idempotent**. The order in which operations from different
+replicas arrive doesn't change the final state.
+
+### G-counter (grow-only counter)
+
+Each replica has its own counter slot. Total = sum of all
+slots. Increments go to the local slot. Replicas merge by
+taking the max of each slot.
+
+```
+Replica A: increments slot A → [3, 0, 0]
+Replica B: increments slot B → [0, 2, 0]
+Merge: max each → [3, 2, 0] → total 5
+```
+
+Two concurrent increments converge to the right sum.
+
+### OR-Set (Observed-Remove Set)
+
+A set where adds and removes preserve causality. Removing
+something means "remove these specific add IDs," not "remove
+the value."
+
+If A adds X and B removes X concurrently, the rules are
+explicit: only adds A has *seen* are removable.
+
+### LWW-register
+
+Single value with timestamps; LWW semantics. Tracks the
+write-clock to be deterministic across replicas.
+
+### Maps and complex types
+
+CRDT maps where each field is itself a CRDT. Combine OR-Sets,
+counters, LWW-registers, etc. Used by Riak Map, Automerge,
+Yjs.
+
+## When CRDTs work
+
+- **Counters, set operations, presence**: trivial fit.
+- **Collaborative editing**: text and tree CRDTs handle
+  cursors, edits, formatting.
+- **Multi-user shopping cart**: union semantics.
+- **Reaction systems** (likes, emojis): natural counter
+  shapes.
+
+## When they don't
+
+- **Complex business invariants**: "balance ≥ 0," "doctors on
+  call ≥ 1." CRDTs don't enforce these.
+- **Strict ordering**: workflow state machines often need
+  "must transition A→B→C." CRDTs don't naturally constrain
+  state.
+- **Arbitrary object types**: you have to design the merge.
+  Not every data shape has a clean CRDT.
+
+## Implementation in production
+
+- **Riak Datatypes**: explicit CRDT API (counters, sets, maps,
+  registers).
+- **Redis CRDT** (Enterprise): replicated active-active
+  CRDTs.
+- **AWS DynamoDB Global Tables**: LWW by default; can layer
+  CRDTs in application.
+- **Apple Notes, iMessage**: CRDTs for cross-device sync.
+- **Figma, Linear, Notion**: CRDTs for real-time
+  collaboration.
+- **Automerge, Yjs**: JS libraries for general CRDT use.
+
+## A common pattern: surface conflict to the app
+
+If you can't pick LWW and can't fit a CRDT, **surface the
+conflict** to the application:
+
+```js
+const { value, siblings } = await get('cart:user42');
+if (siblings.length > 1) {
+  const merged = appCustomMerge(siblings);
+  await put('cart:user42', merged);
+}
+```
+
+The app sees both versions and decides. Dynamo's original
+design did this; most apps end up writing the merge code
+they would have had to write anyway with LWW + bugs.
+
+## Operational watchouts
+
+### Clock skew with LWW
+
+If region A's clock is 50ms behind region B's, B's writes
+systematically beat A's. Data from A is "older" and
+discarded. The effect is gradual data loss from A.
+
+Monitor NTP sync; use HLC or hybrid clocks for less skew.
+
+### CRDT metadata growth
+
+Tombstones (deleted markers in OR-Sets), per-replica
+counters, version vectors — CRDT state grows. Periodic
+garbage collection is required; broken GC means memory bloat.
+
+### Concurrent updates aren't fairly-handled
+
+LWW favors "later" clocks; CRDT semantics may favor
+"adds over removes." Users notice these biases over time.
+
+Document the resolution rules explicitly so users (and ops)
+understand.
+
+## In summary
+
+- LWW: timestamp-ordered conflict resolution. Simple,
+  lossy, default for most "eventually consistent" stores.
+- CRDTs: data types where concurrent operations merge
+  deterministically. Counters, sets, maps, text — limited
+  shapes but provably correct.
+- LWW for single-value latest-wins data; CRDTs for
+  multi-value preserve-both data.
+- Surface conflicts to the application when neither fits.
+- Watch for clock skew (LWW data loss) and metadata growth
+  (CRDT bloat).

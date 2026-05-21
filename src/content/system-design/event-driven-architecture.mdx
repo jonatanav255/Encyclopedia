@@ -1,0 +1,184 @@
+export const level = 'senior';
+
+# Event-driven architecture
+
+Services communicate via **events** — immutable records of
+something that happened — rather than synchronous request /
+response. Producers emit; consumers subscribe. The producer
+doesn't know who the consumers are; the consumers can be added
+without changing the producer.
+
+The promise is loose coupling, scalable fan-out, and natural
+audit logging. The cost is harder debugging, eventual
+consistency, and a steeper operational burden.
+
+## Events vs commands vs messages
+
+<Cheatsheet>
+| Type | Tense | Receiver |
+|---|---|---|
+| Command | "do X" (imperative) | Specific service expected to act |
+| Event | "X happened" (past) | Anyone interested |
+| Message | (umbrella term) | Either |
+</Cheatsheet>
+
+The distinction matters. A command implies a target; an event
+is broadcast. Mixing them produces tightly-coupled services
+that just *look* event-driven.
+
+## The pattern
+
+```
+service A → emits "OrderPlaced" → topic
+                                    ▼
+                          ┌────────┼─────────┐
+                          ▼        ▼         ▼
+                    billing    inventory   email
+                    consumer   consumer    consumer
+```
+
+Each consumer subscribes to events it cares about. Adding a
+new consumer (analytics, fraud detection) is a deploy of the
+new service — no change to the producer.
+
+## When event-driven wins
+
+- **Many downstream consumers** for the same event. Sync APIs
+  force the producer to know each consumer.
+- **Different downstream latency tolerances.** Email service
+  can be slow; analytics service can lag minutes; the order
+  doesn't care.
+- **Decoupled deployments.** Each consumer evolves
+  independently.
+- **Audit trail comes free.** The event log is the historical
+  record.
+- **High throughput.** Brokers like Kafka scale to millions
+  of events/sec.
+
+## When it doesn't
+
+- **Tight request/response semantics.** "Give me the user's
+  current balance" needs sync; an async event ping-pong is
+  just a slow RPC.
+- **Strict ordering across all events.** Most brokers give
+  per-partition order; global order doesn't scale.
+- **Small systems.** A 5-service monolith doesn't need a
+  broker; HTTP suffices.
+- **Teams that haven't yet learned distributed-systems
+  debugging.** Causality across async events is genuinely
+  harder.
+
+## Patterns within event-driven
+
+### Choreography vs orchestration
+
+(See choreography-vs-orchestration.) Two flavors of how
+events drive workflows:
+
+- **Choreography**: every service emits events and listens to
+  others. No central conductor. Hard to see the workflow.
+- **Orchestration**: a central orchestrator subscribes to
+  events and emits commands. Easier to visualize and audit.
+
+### Event sourcing
+
+(See event-sourcing.) Take the events as the source of truth.
+The current state of an entity is the result of replaying its
+events.
+
+### CQRS
+
+(See cqrs.) Separate the write model (handle commands, emit
+events) from the read model (build projections from events).
+
+## Schema and contracts
+
+Events are forever. Once an event is in the log, you can't
+change it; you can only deprecate the schema and migrate
+consumers.
+
+Best practices:
+
+- **Schema registry** (Confluent Schema Registry, AWS Glue
+  Schema Registry). Every event must conform.
+- **Forward + backward compatibility**: old consumers can read
+  new events; new consumers can read old events. Use Avro
+  or Protobuf, never plain JSON without a schema.
+- **Version events** when breaking changes are necessary;
+  publish both versions in parallel; migrate consumers; retire
+  old version.
+
+### Consumer-driven contracts
+
+Consumers express what they need; producers test against
+those contracts. Catches "I changed a field that something
+else depended on" before deploy.
+
+## Idempotency and ordering
+
+Brokers deliver **at-least-once** by default. Consumers must
+be idempotent. (See inbox-pattern-idempotent-consumer.)
+
+Ordering: per-partition only. If your domain needs strict
+order across entities (e.g., "all orders for user 42 in
+order"), use the entity ID as the partition key.
+
+## Failure handling
+
+- **Retry with backoff** for transient failures.
+- **Dead-letter queue** for poison events (malformed,
+  unprocessable).
+- **Replay capability**: when a downstream service has a bug,
+  re-run from a checkpoint. Kafka's log makes this natural.
+
+## Observability is harder
+
+Tracing across async events requires:
+
+- **Correlation IDs** propagated through every event.
+- **Distributed tracing context** carried in the event header.
+- **Tooling that follows the event chain** — Jaeger,
+  OpenTelemetry can do this with the right propagators.
+
+Without these, "why is this taking so long?" is
+impossible to answer. Build observability before you build
+event-driven workflows.
+
+## Common antipatterns
+
+### Event-driven monolith
+
+Services share a single broker, share schemas, share storage.
+Adding a new feature requires changing 5 services. You've
+gained the operational complexity of event-driven without
+the deployment independence.
+
+### Events as commands
+
+"OrderShipped" actually means "ship this order" — a command.
+Now the producer expects exactly one consumer; subscribers
+can't be added without coordination. You've built a slow RPC.
+
+### Implicit dependencies via events
+
+Service A emits event X. Service B emits event Y after Y
+sees X. Service C now expects Y within 5 seconds of X. None
+of this is in any contract; it lives in everyone's heads
+until C times out.
+
+Fix: explicit choreography diagrams; SLAs per event; alert
+on missing causal events.
+
+## In summary
+
+- Event-driven: producers emit, consumers subscribe; loose
+  coupling, multiple consumers, deploy independence.
+- Best for many-consumer, mixed-latency, audit-rich
+  workflows.
+- Schema registry + forward/backward compatibility are
+  mandatory.
+- Idempotency, per-entity partition keys for ordering,
+  dead-letter queues for failures.
+- Observability via correlation IDs and distributed tracing —
+  build it first.
+- Antipatterns: shared-schema monoliths, events-that-are-really-commands.

@@ -1,0 +1,229 @@
+export const level = 'senior';
+
+# Hexagonal architecture (ports and adapters)
+
+Coined by Alistair Cockburn in 2005. The application's core
+business logic sits in the center; all I/O — databases, HTTP,
+queues, file systems, external APIs — lives in **adapters**
+around the edges. The core defines **ports** (interfaces)
+that adapters implement.
+
+The goal is testability and replaceability: you can run the
+core in isolation, swap a Postgres adapter for an in-memory
+one, change HTTP for gRPC without touching the domain logic.
+
+## The shape
+
+```
+┌──────────────────────────────────────┐
+│           HTTP adapter               │
+│  ┌──────────────────────────────┐    │
+│  │   Application core           │    │
+│  │   (domain logic)             │    │
+│  │   ports: ITicketRepository,  │    │
+│  │          IEmailSender, ...   │    │
+│  └──────────────────────────────┘    │
+│           Postgres adapter           │
+│           SMTP adapter               │
+│           Stripe adapter             │
+└──────────────────────────────────────┘
+```
+
+The core knows nothing about HTTP, Postgres, or SMTP. It only
+knows about ports. Adapters implement the ports against real
+infrastructure.
+
+## A worked example
+
+Domain:
+
+```ts
+// Core: pure domain logic
+interface TicketRepository {
+  findById(id: string): Promise<Ticket | null>;
+  save(ticket: Ticket): Promise<void>;
+}
+
+interface EmailSender {
+  send(to: string, subject: string, body: string): Promise<void>;
+}
+
+class TicketService {
+  constructor(
+    private repo: TicketRepository,
+    private email: EmailSender,
+  ) {}
+
+  async closeTicket(id: string, agentId: string): Promise<void> {
+    const ticket = await this.repo.findById(id);
+    if (!ticket) throw new NotFound();
+    ticket.close(agentId);
+    await this.repo.save(ticket);
+    await this.email.send(ticket.creator, 'Ticket closed', '...');
+  }
+}
+```
+
+The core has no `import pg from 'pg'`. No HTTP. No knowledge
+of where data comes from or goes.
+
+Adapters:
+
+```ts
+// Postgres adapter
+class PgTicketRepository implements TicketRepository {
+  constructor(private pool: PgPool) {}
+  async findById(id: string) { /* SELECT ... */ }
+  async save(ticket: Ticket) { /* INSERT/UPDATE ... */ }
+}
+
+// HTTP adapter (the inbound port adapter)
+app.post('/tickets/:id/close', async (req, res) => {
+  await ticketService.closeTicket(req.params.id, req.user.id);
+  res.sendStatus(200);
+});
+```
+
+## Inbound vs outbound ports
+
+Two flavors:
+
+- **Inbound (driving) ports**: the application's public API.
+  HTTP, gRPC, CLI, message consumer — all are "drivers" that
+  call into the core.
+- **Outbound (driven) ports**: interfaces the core defines for
+  what it needs. Repositories, mailers, queues — the core
+  uses them, the adapters implement them.
+
+The asymmetry matters: the core *defines* outbound port
+interfaces; it *implements* inbound port handlers (which
+adapters invoke).
+
+## Why people care
+
+### Testability
+
+```ts
+// In tests:
+const fakeRepo = new InMemoryTicketRepository();
+const fakeEmail = new MockEmailSender();
+const service = new TicketService(fakeRepo, fakeEmail);
+
+await service.closeTicket('42', 'agent1');
+expect(fakeEmail.sent).toHaveLength(1);
+```
+
+No database. No HTTP server. Fast tests that exercise the
+domain logic directly.
+
+### Replaceability
+
+Switch from Postgres to DynamoDB by writing a new
+`DynamoTicketRepository`. Core untouched. The test suite for
+the core still works.
+
+### Onboarding clarity
+
+New engineers can read the domain by reading the core. The
+core is small; the adapters are mostly plumbing.
+
+## Why people hate it
+
+### Indirection tax
+
+Every interaction with a DB goes through an interface +
+implementation. Three files for a single CRUD endpoint. For
+small apps the overhead dominates.
+
+### Premature abstraction
+
+You wrote the `IEmailSender` port "in case we change email
+providers." You never did. You added one interface and one
+class for nothing.
+
+### "Pure domain" is harder than it sounds
+
+A domain that genuinely doesn't know about persistence has
+weird APIs ("the caller must call `save` afterwards") and
+duplicates work the ORM could have done.
+
+## Variations
+
+### Clean Architecture (Robert Martin)
+
+Concentric circles instead of a hexagon. Same idea: outer
+layers depend on inner; inner layers depend on no one. Adds
+explicit "use case" and "entity" rings.
+
+### Onion Architecture (Jeffrey Palermo)
+
+Predates Clean but very similar. Domain at the center,
+infrastructure outside.
+
+### DDD's "Anti-Corruption Layer"
+
+When integrating with a legacy system, build an ACL — an
+adapter that translates between the legacy model and your
+clean domain. Same pattern, narrower use case.
+
+## When to use it
+
+Hexagonal works well when:
+
+- The domain logic is **non-trivial** (rules, invariants,
+  workflows). The abstraction pays for itself.
+- You expect to **change infrastructure** during the project's
+  life.
+- You want **high unit-test coverage** of business logic
+  without integration tests.
+- You have **multiple inbound channels** (HTTP + gRPC + CLI +
+  workers).
+
+Don't use it when:
+
+- The "domain" is mostly CRUD.
+- You're a small team that won't maintain the abstractions.
+- The infrastructure won't change.
+
+The Rails / Django / FastAPI default — controllers calling
+ORMs directly — is fine for most apps.
+
+## Common mistakes
+
+### Anaemic domain model
+
+The "core" is just data structures with getters. All logic
+lives in services. You have ports and adapters but no actual
+domain — just a thin layer of indirection over the DB.
+
+Either embrace data-centric architecture (no DDD), or push
+behavior into the entities.
+
+### Adapter logic leaking into core
+
+The core ends up depending on a domain type that includes a
+DB-specific identifier shape or transaction handle. The
+abstraction has failed.
+
+Inspect: does the core have *any* `import` from infrastructure
+packages? If yes, the line has been crossed.
+
+### Too many ports
+
+Every external dependency has a port interface. The codebase
+is a maze. The cure is worse than the disease.
+
+A pragmatic rule: only create a port when you can *name* a
+reason the implementation might change or be mocked.
+
+## In summary
+
+- Hexagonal architecture = domain core + ports (interfaces) +
+  adapters (implementations).
+- Inbound ports = HTTP / gRPC / CLI entry points.
+- Outbound ports = repositories, mailers, queues the core
+  needs.
+- Wins: testability, replaceability, explicit boundaries.
+- Costs: indirection, premature abstraction risk, more files.
+- Use for non-trivial domains with potentially-changing
+  infrastructure; overkill for CRUD apps.

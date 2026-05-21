@@ -1,0 +1,186 @@
+export const level = 'senior';
+
+# CQRS (command-query responsibility segregation)
+
+Split the model that handles **commands** (writes / state
+changes) from the model that handles **queries** (reads). They
+get different schemas, different stores, and can be optimized
+independently.
+
+For most apps, the same database serves both — and that's
+fine. CQRS is a *useful escape hatch* when one model is
+constraining the other.
+
+## The shape
+
+```
+client
+  ▼
+write API ──► command handler ──► write store
+                                       │
+                                       │ events / CDC
+                                       ▼
+                                  projection builder
+                                       │
+                                       ▼
+                                  read store
+                                       ▲
+read API ──► query handler ────────────┘
+```
+
+The read store is built from events emitted by the write
+side. It can be denormalized, indexed for read patterns,
+sharded differently — none of which the write side cares
+about.
+
+## When CQRS pays off
+
+- **Read and write have very different shapes.** Writes update
+  one normalized entity; reads need a dashboard joining 12
+  entities.
+- **Read scale dwarfs write scale.** 10K writes/sec, 1M
+  reads/sec — different storage choices for each.
+- **Multiple read views** of the same data. A user dashboard,
+  an admin panel, an analytics rollup — each a separate
+  projection.
+- **Performance constraints diverge.** Writes must be
+  consistent; reads must be fast.
+
+## When it doesn't
+
+- **Small or simple systems.** Same DB, same model — done.
+  CQRS adds 3× the moving parts.
+- **Strong-consistency reads.** CQRS produces eventually
+  consistent reads. If users *must* see their write
+  immediately, CQRS isn't free.
+- **Team unfamiliar with eventual consistency.** Bugs from "I
+  wrote it, why doesn't the read see it?" will dominate.
+
+## With or without event sourcing
+
+CQRS and event sourcing are often paired but **independent**:
+
+- **CQRS without event sourcing**: write to a normalized DB;
+  project to a read DB via CDC or triggers.
+- **Event sourcing without CQRS**: store events as truth;
+  derive a single read model from them; same read and write
+  API.
+- **Both**: store events; project to multiple read models;
+  serve commands from event log.
+
+For "I need fast reads of complex aggregations," CDC-driven
+CQRS without event sourcing is the simpler choice.
+
+## Concrete example: e-commerce orders
+
+Write side:
+
+```
+orders (id, user_id, status, created_at)
+order_items (order_id, product_id, qty, price)
+shipments (order_id, ...)
+```
+
+Normalized for write correctness. Adding a line item requires
+inserting into `order_items` and updating `orders`. Solid
+ACID, no duplication.
+
+Read side: a user's order history page needs order + items +
+shipment + product names + photos. A 4-way join, sorted by
+date, paginated.
+
+```
+user_order_views (user_id, order_id, summary_json, last_updated)
+```
+
+One row per user-order, denormalized. The page query is a
+single index lookup. Fast.
+
+The projection builder subscribes to events from the write
+side and maintains `user_order_views`. New order → insert.
+Shipment update → update existing row.
+
+## Read model lag
+
+The read model is **always behind** the write model. Typical
+lag: milliseconds to seconds. Implications:
+
+- **User just placed an order, refreshes the page**: read
+  view might not have it yet. Solutions: optimistically
+  render the new item from the write response; or read
+  fresh-write items directly from the write store; or use a
+  causal token (see read-your-writes-consistency).
+- **Read model rebuild**: if a bug corrupts the projection,
+  drop and rebuild from events. Storing the event log
+  (Kafka, an outbox table) is how you make this possible.
+
+## Projection idempotency
+
+The projection builder is a stream consumer. It must be
+idempotent (events may be redelivered). Common pattern:
+
+```js
+async function applyEvent(event) {
+  const seen = await db.exec(
+    `INSERT INTO projection_dedup (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+    [event.id],
+  );
+  if (!seen.rowCount) return;  // already applied
+
+  await updateProjection(event);
+}
+```
+
+## Multiple projections from one stream
+
+The win compounds when multiple read models read the same
+events:
+
+```
+events → projection: user_dashboard
+events → projection: admin_report
+events → projection: analytics_warehouse
+events → projection: search_index
+```
+
+Each projection is an independent service. Adding a new
+projection (a new read use case) is a new service deploy, no
+schema change.
+
+## Common pitfalls
+
+### Drift between write and read models
+
+Write model has a `status` enum {pending, paid, shipped,
+cancelled}. Read model copies it. A new status `refunded`
+is added. The read projection silently drops or breaks on
+unknown statuses.
+
+Fix: schema validation at the projection boundary; alerts on
+new event types; conservative defaults.
+
+### Eventual consistency as a UX bug
+
+User completes purchase, lands on "thank you" page, sees old
+data because the read view hasn't projected yet. Standard fix:
+the write API returns enough data to render the confirmation
+without waiting for the read model.
+
+### Forgetting to rebuild
+
+A projection bug corrupts data. You fix the projection code
+but forget to rebuild from history. The corruption lingers.
+
+Make rebuild a one-command operation, regularly exercised.
+
+## In summary
+
+- CQRS: separate models for commands (writes) and queries
+  (reads); reads built from write events.
+- Pays off when read/write patterns differ sharply or when
+  multiple read views needed.
+- Not free — adds infrastructure and eventual consistency.
+- Pair with event sourcing for full audit + replay, or use
+  CDC-driven CQRS for simpler add-on.
+- Projection builders must be idempotent and rebuildable.
+- Eventual consistency on reads — design UX accordingly.

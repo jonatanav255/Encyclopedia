@@ -1,0 +1,206 @@
+export const level = 'staff';
+
+# Event sourcing
+
+Store the **history of changes** to your entities, not the
+current state. The current state is computed by replaying
+events.
+
+```
+events:
+  1. AccountOpened(id=42, owner=Alice)
+  2. Deposited(id=42, amount=100)
+  3. Deposited(id=42, amount=50)
+  4. Withdrew(id=42, amount=30)
+
+current state: balance=120
+```
+
+Instead of an `accounts` table with `balance=120` (a snapshot
+that hides history), you have an append-only log. The
+snapshot can be regenerated anytime.
+
+## What you get
+
+- **Full audit trail.** Every change is recorded. Regulators,
+  debugging, replays all benefit.
+- **Time travel.** What did the balance look like on March
+  3rd? Replay events up to that timestamp.
+- **Multiple read views.** Each projection of events can be a
+  different read model. Pairs with CQRS.
+- **Recovery from bugs.** Wrong code corrupted data? Fix the
+  code, replay events, get correct state.
+- **Loose coupling via the log.** Other services can react to
+  the same events.
+
+## What you give up
+
+- **Direct mutation simplicity.** You can't just `UPDATE
+  accounts SET balance = 120 WHERE id = 42`. You append an
+  event; state derives from the log.
+- **Schema evolution complexity.** Events are forever. If
+  the meaning of a field changes, you must handle every old
+  version in your projection code.
+- **Query patterns require projections.** No ad-hoc `SELECT
+  ... WHERE balance > 1000`. Build a projection that maintains
+  that view.
+- **Storage cost.** The log grows monotonically. Snapshots +
+  log truncation help but add complexity.
+
+## Implementation: append-only event store
+
+```
+event_log:
+  event_id (uuid)
+  stream_id (entity, e.g., "account:42")
+  sequence_number (per stream, monotonic)
+  event_type
+  payload (json or protobuf)
+  metadata (correlation_id, user_id, timestamp)
+```
+
+Constraints:
+
+- Within a stream, `sequence_number` must be unique and
+  monotonic.
+- Concurrent appends to the same stream — use optimistic
+  concurrency control: "append at seq=10 only if current
+  max is 9."
+
+```js
+async function appendEvent(streamId, expectedSeq, event) {
+  const actualSeq = await db.query(
+    `INSERT INTO event_log (stream_id, sequence_number, event_type, payload)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (stream_id, sequence_number) DO NOTHING
+     RETURNING sequence_number`,
+    [streamId, expectedSeq + 1, event.type, event.payload],
+  );
+  if (!actualSeq) throw new ConcurrencyError();
+  return actualSeq;
+}
+```
+
+Replaying state:
+
+```js
+async function getCurrentState(streamId) {
+  const events = await db.query(
+    `SELECT * FROM event_log WHERE stream_id = $1 ORDER BY sequence_number`,
+    [streamId],
+  );
+  return events.reduce(applyEvent, initialState());
+}
+```
+
+## Snapshots
+
+Replaying 10,000 events to get the current state of a popular
+entity gets slow. Periodic snapshots:
+
+```
+snapshots:
+  stream_id
+  sequence_number
+  state (json)
+```
+
+Load latest snapshot, then replay events from `seq+1` onwards.
+
+```js
+async function getCurrentState(streamId) {
+  const snapshot = await db.getLatestSnapshot(streamId);
+  const state = snapshot?.state ?? initialState();
+  const fromSeq = snapshot?.sequence_number ?? 0;
+  const newer = await db.eventsAfter(streamId, fromSeq);
+  return newer.reduce(applyEvent, state);
+}
+```
+
+Take a snapshot every N events (e.g., 100) or after every
+significant time interval.
+
+## Versioning events
+
+Events are immutable. To evolve:
+
+- **Add new fields**: existing consumers ignore them.
+- **Rename fields**: don't. Add the new name; deprecate the
+  old.
+- **Change semantics**: introduce a new event version,
+  publish both, migrate consumers, retire old.
+
+Old events with old schemas remain in the log. Your
+projection code must handle every historical version
+forever.
+
+## Use case fit
+
+### Fits well
+
+- **Financial systems** — ledgers, accounting, banking.
+- **Commerce** — orders, shipments, returns.
+- **Healthcare records** — versioned, audit-required.
+- **Configuration changes** — who changed what when.
+
+### Doesn't fit
+
+- **Read-heavy CRUD** — overhead per write isn't worth it.
+- **High-frequency state changes per entity** — log grows
+  fast.
+- **Systems where state is the truth** — gaming sessions,
+  caches.
+- **Teams new to distributed-systems debugging** — eventual
+  consistency, replay correctness, schema evolution are real
+  costs.
+
+## Tools
+
+- **EventStoreDB** — purpose-built event store with
+  projections.
+- **Kafka with idempotent producers** — used as event log by
+  many systems, especially with KSQL / ksqlDB.
+- **AxonIQ** — Java-centric event-sourcing framework.
+- **Custom on Postgres** — append-only table + `LISTEN/NOTIFY`
+  for projections. Often enough.
+
+## Gotchas
+
+### Replaying old code
+
+If your projection code changed, replaying old events with
+the new code may produce different state than what historical
+projections wrote. Either keep the old projection code
+versioned, or accept that projections aren't perfectly
+historical-stable.
+
+### Side effects in event handlers
+
+A "send welcome email" handler subscribed to `UserRegistered`
+fires on replay. Send 10,000 welcome emails to existing users
+during a replay. Bad day.
+
+Fix: mark side-effecting handlers separately from
+state-projecting handlers. Only run side effects on **new**
+events.
+
+### Streaming size
+
+A "single entity" stream that accumulates 10M events (like a
+chat room with millions of messages) becomes painful to
+replay. Either snapshot aggressively or split the stream
+(per-month, per-day).
+
+## In summary
+
+- Event sourcing: store changes as events; current state is
+  the result of replaying.
+- Wins: full audit, time travel, multiple read views,
+  recovery from bugs.
+- Costs: harder mutation, schema evolution, storage growth,
+  no ad-hoc queries.
+- Use snapshots for performance; optimistic concurrency on
+  appends.
+- Pair with CQRS for read/write separation.
+- Watch for: side effects on replay, projection code drift,
+  unbounded stream sizes.

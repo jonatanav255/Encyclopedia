@@ -1,0 +1,231 @@
+export const level = 'staff';
+
+# Design a stock exchange / matching engine
+
+The hardest interview problem people actually use in
+production. A matching engine accepts buy and sell orders,
+matches them by price/time priority, executes trades, and
+broadcasts state changes — all with **microsecond latency**
+and **provable correctness** (the regulator will audit you).
+
+## 1. Clarify the scope
+
+- Single matching engine or multiple symbols?
+- Order types: limit, market, IOC, FOK, stop?
+- Tick-level market data feed?
+- Latency target: microseconds (HFT) or milliseconds (retail)?
+- Pre-trade risk checks?
+
+Default: HFT-grade single-symbol engine with limit + market
+orders, sub-100µs latency, market data feed, basic risk checks.
+
+## 2. Estimate scale
+
+```
+US equities total: ~10B trades/day, ~500M orders/day
+Peak per second per popular symbol: 100K orders/sec
+End-of-day archive: ~1 TB/day market data
+```
+
+The cost isn't QPS — it's *latency tail*. p99.99 has to stay
+under 100µs, including network, parsing, matching, publishing.
+
+## 3. API
+
+The "API" is a binary FIX or proprietary TCP protocol, not
+HTTP. But conceptually:
+
+```bash
+NEW ORDER: side, symbol, quantity, type, price, tif
+CANCEL: order_id
+MODIFY: order_id, new_price, new_quantity
+```
+
+Responses:
+
+```bash
+ACK: order_id, sequence_number, timestamp
+FILL: order_id, trade_id, fill_qty, fill_price, counterparty_id
+REJECT: order_id, reason
+```
+
+## 4. High-level design
+
+```
+broker connections (FIX/binary over TCP)
+        ▼
+gateway (validation, pre-trade risk)
+        ▼
+sequencer (assigns monotonic sequence numbers)
+        ▼
+matching engine (single-threaded, in-memory)
+        ▼
+trade publisher
+   ├→ market data feed (multicast to subscribers)
+   └→ audit log (persistent, durable)
+```
+
+The matching engine itself is **single-threaded** and
+in-memory for determinism and latency. Everything around it
+is parallel.
+
+## 5. Data model
+
+Order book: for each symbol, two sides.
+
+```
+Asks (sell), sorted ascending by price:
+  100.05 → [order_A (200), order_B (500)]
+  100.10 → [order_C (1000)]
+  100.15 → [order_D (300)]
+
+Bids (buy), sorted descending by price:
+  100.00 → [order_E (500), order_F (700)]
+  99.95  → [order_G (200)]
+```
+
+Internally: a sorted map (skiplist or red-black tree) keyed
+by price, each entry pointing to a FIFO queue of orders at
+that price.
+
+## 6. Deep dives
+
+### Matching algorithm (price-time priority)
+
+A new limit order:
+
+<Steps>
+<Step n={1} title="Check the opposite side at the order's limit price.">
+For a buy at 100.05: check the ask side at 100.05 or lower.
+</Step>
+<Step n={2} title="Match against the front of the FIFO queue at that price.">
+Trade quantity = min(remaining order qty, queued order qty).
+</Step>
+<Step n={3} title="Continue across price levels.">
+If the buy still has quantity and there's matchable supply
+at a higher price (still under the limit), match there too.
+</Step>
+<Step n={4} title="Remainder rests on the book.">
+Whatever's left of the new order is inserted into the book
+at its limit price, FIFO into the queue.
+</Step>
+</Steps>
+
+Time priority means orders at the same price are matched in
+arrival order. A new order can't "jump the queue" by being
+fractionally cheaper.
+
+### Why single-threaded
+
+The matching engine touches a single global state (the order
+book). Parallelizing it would require locks, which destroy
+the latency budget. The industry pattern:
+
+- One thread, one core, **pinned** to that core (no migration).
+- No locks. All state owned by this thread.
+- Input via lock-free queue (LMAX Disruptor pattern).
+- Output via lock-free queue to publisher.
+
+A modern single core can do millions of matching operations
+per second. Scale horizontally by symbol (different symbols
+on different engines).
+
+### Deterministic ordering: the sequencer
+
+Every order, ack, and trade gets a monotonic sequence number
+**before** entering the matching engine. The sequencer is the
+single point of ordering.
+
+Why this matters: market participants need to know "I sent
+order X at sequence 1000; did order Y at sequence 999 hit the
+book first?" The audit trail and replay must be exact.
+
+The sequencer is typically a separate, single-threaded
+service or part of the gateway.
+
+### Market data feed
+
+After every match, publish the trade and the book delta. Two
+common protocols:
+
+- **Multicast UDP** to all subscribers — same packet, sent
+  once. Used for low-latency subscribers.
+- **Snapshot + delta**: full book snapshot every N minutes,
+  deltas in between. Subscribers can recover if they miss a
+  packet (sequence-numbered).
+
+Latency budget: from match to first multicast send ≤ 10µs.
+
+### Audit log and recovery
+
+Every state change is written to a durable, append-only log.
+Why:
+
+- Regulator can replay every order, every match.
+- Engine can recover from crash by replaying the log into a
+  fresh in-memory book.
+- Cross-DC replication via log shipping.
+
+Tools: usually a custom append-only file format (faster than
+Kafka for tail-latency); some venues use Aeron + Aeron
+Archive.
+
+### Pre-trade risk checks
+
+Before an order enters the matching engine:
+
+- Account balance / margin?
+- Per-symbol position limit?
+- Per-order size limit?
+- Self-trade prevention (don't match against your own
+  resting order)?
+
+These run in the gateway, before sequencer. Failure here =
+order reject, no impact on the engine.
+
+### Cross-engine and venue handoff
+
+Multiple symbols → multiple engines on different cores or
+hosts. Cross-symbol orders (a "smart order router") happen at
+the broker layer, not inside any single matching engine.
+
+Multiple venues (exchanges): the regulatory layer ensures
+"best execution" — orders may route between venues based on
+quoted prices.
+
+## 7. Bottlenecks and scale-ups
+
+- **Single-engine throughput**: shard by symbol; popular
+  symbols get their own host.
+- **Tail-latency from GC**: write in C++ or Rust; or use Java
+  with off-heap allocations and tuned GC (Azul Zing, Shenandoah).
+- **Network**: kernel-bypass NICs (Solarflare, Mellanox);
+  TCP_NODELAY; co-location with subscribers in the same data
+  center.
+- **Audit log**: write to NVMe; replicate async; consider
+  zero-copy file appends.
+
+## 8. Tradeoffs called out
+
+- **Single-threaded engine**: chose determinism + latency
+  over horizontal scale. Hot symbols get their own engine
+  instead.
+- **In-memory book**: chose latency; persisted via log
+  replay.
+- **Multicast market data**: chose latency over delivery
+  guarantees; subscribers re-request via snapshot.
+- **Pre-trade risk in gateway**: chose engine purity; cost is
+  one more hop in the latency budget.
+
+## In summary
+
+- Stock exchange = single-threaded matching engine + sequencer +
+  audit log + market data feed.
+- Order book = sorted map by price, FIFO queue at each price.
+- Price-time priority for matching.
+- Determinism via monotonic sequence numbers; recovery via
+  log replay.
+- Scale horizontally by symbol; never parallelize within a
+  single symbol.
+- Latency budget dictates everything: kernel bypass, no GC
+  pauses, co-location.

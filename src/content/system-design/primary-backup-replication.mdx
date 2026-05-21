@@ -1,0 +1,159 @@
+export const level = 'senior';
+
+# Primary-backup replication
+
+One node accepts writes (the **primary** or **leader**); others
+mirror it (**backups** or **followers**). Reads can come from
+backups (with staleness) or from the primary (consistent).
+
+The simplest replication topology, and the foundation of
+classical databases like Postgres, MySQL, MongoDB, and Redis.
+
+## The shape
+
+```
+        ┌─ writes
+        ▼
+     primary
+     ┌────┼────┐
+     ▼    ▼    ▼
+  backup backup backup
+     ▲    ▲    ▲
+     └─ reads
+```
+
+Writes go to primary. Primary replicates the write stream to
+backups. Backups apply changes in order. Reads can come from
+any node.
+
+## Replication can be sync or async
+
+<Compare a="Synchronous" b="Asynchronous">
+<>
+Primary waits for at least one (or all) backups to ack the
+write before returning success to the client. No data loss
+on primary failure. Slow writes (cross-AZ round-trip).
+</>
+<>
+Primary returns success immediately; replicates in background.
+Fast writes; if primary dies before replicating, that write
+is lost.
+</>
+</Compare>
+
+**Semi-sync** is the common compromise: wait for one backup,
+not all. Postgres `synchronous_commit = on` with at least one
+sync standby. MySQL semi-sync replication.
+
+## Failover
+
+The hard part. When the primary dies:
+
+<Steps>
+<Step n={1} title="Detect.">
+Heartbeat timeout (typically 5–30 sec for soft, 30–60 sec
+for hard). Don't go too fast — a network blip becomes an
+unnecessary failover.
+</Step>
+<Step n={2} title="Elect a new primary.">
+Usually pick the backup most up-to-date. Requires consensus
+(or external coordinator like ZooKeeper) to avoid split
+brain.
+</Step>
+<Step n={3} title="Bring up the new primary.">
+Promote, start accepting writes, redirect clients (DNS,
+service mesh, or proxy update).
+</Step>
+<Step n={4} title="Handle data loss (if async).">
+Writes that the old primary acked but didn't replicate are
+gone. Detect and reconcile or accept loss.
+</Step>
+<Step n={5} title="Re-seed old primary as a backup.">
+When it recovers, it must not become a second primary;
+fencing tokens prevent split brain.
+</Step>
+</Steps>
+
+Failover takes seconds to minutes. During this window, writes
+fail.
+
+## Read scaling on backups
+
+Backups can serve reads. This scales read-heavy workloads
+horizontally:
+
+- **Stale reads OK?** Use any backup; they lag by some
+  amount.
+- **Strong reads required?** Hit primary, or use a
+  "wait-for-log-position" trick on a backup.
+- **Read-your-writes UX?** Hit primary briefly after every
+  write.
+
+(See read-replicas-and-replication-lag.)
+
+## Cascading replication
+
+For very large fan-out, primary → mid-tier backup → leaf
+backups. Reduces load on the primary; adds latency.
+
+```
+primary
+  └─ mid-1
+       ├─ leaf-A
+       └─ leaf-B
+  └─ mid-2
+       ├─ leaf-C
+       └─ leaf-D
+```
+
+Used by large MySQL deployments and Postgres with
+`hot_standby` chained replication.
+
+## Primary-backup vs multi-leader
+
+<Compare a="Primary-backup (single leader)" b="Multi-leader">
+<>
+One node accepts writes. Conflicts impossible. Latency
+across regions for non-primary users. Failover required on
+primary failure.
+</>
+<>
+Multiple nodes accept writes. Conflicts possible — resolve
+via LWW, CRDTs, or app logic. Better cross-region write
+latency. More complex semantics.
+</>
+</Compare>
+
+Almost all classic databases default to primary-backup
+because it's simple to reason about. Multi-leader exists for
+geo-replication where waiting for cross-region round-trip is
+intolerable.
+
+## Limitations
+
+- **Write throughput capped by primary.** Scaling writes
+  needs sharding, not more backups.
+- **Failover window = downtime.** Even fast failover blocks
+  writes for seconds.
+- **Cross-region writes are slow** if primary is in a
+  different region from the user.
+
+## Real systems
+
+| System | Replication |
+|---|---|
+| PostgreSQL | Primary-backup, streaming WAL |
+| MySQL | Primary-backup, binlog replication |
+| MongoDB | Replica set (primary-backup, automatic failover) |
+| Redis | Primary-replica, optional sentinel/Cluster failover |
+| Elasticsearch | Primary-replica per shard (kind of) |
+| Kafka | Per-partition leader, ISR followers |
+
+## In summary
+
+- Primary-backup: one write node, many read replicas.
+- Sync vs async trades data-loss risk for latency; semi-sync
+  is the common compromise.
+- Failover requires detection, election, promotion, fencing.
+- Read scaling on replicas; write scaling needs sharding.
+- Default of nearly all classical databases.

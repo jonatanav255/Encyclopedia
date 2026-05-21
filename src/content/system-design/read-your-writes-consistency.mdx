@@ -1,0 +1,128 @@
+export const level = 'mid';
+
+# Read-your-writes consistency
+
+A **session guarantee**: a client always sees writes it
+performed. The system can otherwise be eventually consistent
+for everyone else — but never for *you*, the writer.
+
+It's the cheapest "feels strong" trick in the book. Without
+it, a user clicks "save profile," reloads, and sees the old
+version because their read hit a replica that hadn't caught up
+yet. They file a bug. They're right.
+
+## Why this matters more than it sounds
+
+Almost every consistency complaint a real user files reduces
+to "I did X and didn't see X." The strict consistency they
+think they want is read-your-writes — which is much cheaper
+than full linearizability.
+
+If you only solve read-your-writes, the user is happy. If you
+solve full linearizability, the user is happy at 5× the
+infrastructure cost.
+
+## Implementation patterns
+
+Four common approaches, in order of complexity:
+
+### 1. Read from the leader after writes
+
+After any write, route reads from this user to the leader for
+a window (5–30 s). The leader has every committed write.
+
+Simple. Doesn't scale if every user just wrote (during a viral
+post or a deploy, everyone hits the leader). Used by GitHub,
+many small services.
+
+```js
+function read(userId, key) {
+  if (recentlyWrote(userId, key, 30_000)) {
+    return readFromLeader(key);
+  }
+  return readFromReplica(key);
+}
+```
+
+### 2. Sticky session to a single replica
+
+Pin the user's session to a specific replica. The first write
+they make goes to the leader and the replica catches up;
+subsequent reads from that replica always include the user's
+writes.
+
+Works well in steady state. Doesn't survive a replica failure
+without a flush of state.
+
+### 3. Causal token in the response
+
+After a write, return a token (an opaque log position or
+timestamp). The client sends it on subsequent reads; the
+replica blocks until it's caught up to that position.
+
+```js
+const { etag } = await put('/profile', body);
+const profile = await get('/profile', { headers: { 'If-Match-Min': etag } });
+```
+
+Cleanest semantics. Used by MongoDB causal consistency,
+DynamoDB transactions, Spanner.
+
+### 4. Optimistic UI
+
+Render the write client-side immediately, without waiting for
+the read to confirm. Most user-facing apps do this. It's not a
+consistency mechanism — it's a UX mask — but it works as long
+as background reconciliation handles the rare server reject.
+
+## Read-your-writes vs other session guarantees
+
+<Cheatsheet>
+| Guarantee | What it gives |
+|---|---|
+| Read-your-writes | A client sees its own writes |
+| Monotonic reads | A client's reads don't go backwards |
+| Monotonic writes | A client's writes apply in order |
+| Writes-follow-reads | A write causally after a read appears after that read for others |
+</Cheatsheet>
+
+A "session consistent" system gives all four. They're
+independent — a system can give read-your-writes but not
+monotonic reads (rare and unpleasant; usually you want both).
+
+## Where it breaks
+
+### Cross-session updates
+
+User logs in on phone, writes. User opens laptop, reads.
+Different session, different replica, different token. The
+laptop session has no read-your-writes guarantee.
+
+Fix: tie the token to the **user**, not the session. Modern
+systems persist the per-user log position in a central store
+(or cookie) so any session can resume.
+
+### Logged-out reads after logged-in writes
+
+User writes, logs out, comes back as anonymous, reads. Same
+problem. Either accept it ("we don't guarantee this") or pin
+to the leader briefly post-write.
+
+### Pagination across replicas
+
+User scrolls feed page 1 (from replica A), page 2 (from
+replica B with slightly different state). New posts appear
+twice, old ones disappear. Not strictly a read-your-writes
+violation, but the same shape of pain.
+
+Fix: snapshot pagination — pin the cursor to a log position.
+
+## In summary
+
+- Read-your-writes: the cheapest "feels consistent" guarantee
+  worth implementing.
+- Four common implementations: leader-pinning, sticky replica,
+  causal token, optimistic UI.
+- Solves most user-visible "I just saved that" bugs.
+- Cheaper than full linearizability by an order of magnitude.
+- Watch for cross-session and cross-device edge cases.

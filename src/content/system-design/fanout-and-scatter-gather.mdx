@@ -1,0 +1,188 @@
+export const level = 'senior';
+
+# Fan-out and scatter-gather
+
+Send one logical request to multiple backends, combine their
+responses, return one result to the caller. The pattern shows
+up in search, recommendation, parallel storage, and many
+distributed query engines.
+
+The key trade-off: parallel work cuts wall-clock latency, but
+the **slowest backend determines the user's latency**.
+
+## The shape
+
+```
+client request
+     ▼
+coordinator (the "scatter")
+     ▼
+   ┌─┴───┬─────┬─────┐
+   ▼     ▼     ▼     ▼
+  shard1 shard2 shard3 shard4
+   │     │     │     │
+   ▼     ▼     ▼     ▼
+   └─→ coordinator (the "gather")
+           ▼
+       merged response
+           ▼
+        client
+```
+
+The coordinator decomposes the request, dispatches to N
+shards in parallel, waits for responses, merges them, returns.
+
+## Examples
+
+- **Search engine**: query "kafka tutorial" goes to N shards
+  of the inverted index. Each returns its top results. The
+  coordinator merges and ranks.
+- **Distributed query**: SQL `SELECT * FROM events WHERE
+  user_id = 42` against a sharded DB. Coordinator asks each
+  shard; gathers results.
+- **News feed**: assemble a user's timeline from N friends'
+  recent posts. Each friend's data might live on a different
+  shard.
+- **Map reduce**: scatter map tasks; gather reduce results.
+
+## The slowest determines
+
+For N backends with per-call p99 latency L:
+
+```
+P(all N return under L) = 0.99^N
+P(at least one over L) = 1 - 0.99^N
+
+N=10: P(slow) ≈ 10%
+N=100: P(slow) ≈ 63%
+N=1000: P(slow) ≈ 99.99%
+```
+
+A scatter to 100 shards almost always has at least one slow
+shard. So user-visible p99 ≈ slow-shard latency.
+
+Mitigations:
+
+### Hedged requests on slow shards
+
+After the p95 timeout for a shard, hedge to a replica. (See
+hedged-requests.)
+
+### Partial results
+
+If some shards are slow, return what you have. Useful for
+search ("showing 8 of 10 shards") and dashboards.
+
+### Skip-the-tail
+
+Have N+M shards; return as soon as N have responded. The
+slowest M are abandoned. Trades completeness for latency.
+
+## The merge step
+
+Merging is non-trivial:
+
+- **Search**: re-rank across all shards' top-K to get the
+  global top-K.
+- **Sort**: K-way merge across pre-sorted shard outputs.
+- **Aggregation**: combine partial sums / counts / histograms.
+- **De-dup**: remove items appearing in multiple shards.
+
+The merge cost itself can be O(N · K), where N is shards and
+K is per-shard results. For large N or K, the merge becomes
+the bottleneck.
+
+## Limiting per-shard work
+
+If each shard does heavy work (a full scan, large sort), the
+coordinator's gather is slow.
+
+- **Push down predicates**: shards filter before returning,
+  not the coordinator.
+- **Push down aggregates**: shards do partial sums; coordinator
+  combines.
+- **Limit per-shard fetch**: ask for top-K from each, not all
+  results.
+
+This is the bedrock of distributed query engines (Presto,
+ClickHouse, Druid, Spark). The query planner figures out what
+can be done in each shard before gather.
+
+## Dealing with shard failures
+
+What if one shard is down?
+
+- **Fail the whole request**: simplest. Correct for strict
+  consistency (financial). Not OK for search.
+- **Partial results**: return what's available, with a marker.
+- **Replicate**: each shard has 2-3 replicas; coordinator
+  tries another on failure.
+
+Most user-facing scatter-gather chooses partial results +
+marker (a "some results may be missing" indicator).
+
+## Avoiding the scatter
+
+For some queries, you don't need to scatter at all:
+
+- **Point lookups on the partition key**: if the query is "get
+  user 42," and "users are sharded by user_id," only one
+  shard needs to be queried.
+- **Index pruning**: a secondary index tells the coordinator
+  which shards have relevant data.
+
+Schema design matters: a good partition key avoids scatter for
+common queries.
+
+## Scatter-gather vs fan-out
+
+These terms are sometimes used interchangeably but mean
+different things:
+
+- **Scatter-gather** (sync): one request, fan out, wait, merge,
+  return. Synchronous from the caller's perspective.
+- **Fan-out** (async): one event, send to many consumers. No
+  gather phase. The caller doesn't wait for all consumers.
+
+This page covers scatter-gather. For event-driven async
+fan-out, see fanout-on-write-vs-read.
+
+## Common mistakes
+
+### Forgetting tail latency math
+
+"Each shard is fast" doesn't mean "the request is fast" when
+you have many shards. Plan for N-amplified tails.
+
+### Coordinator as bottleneck
+
+If 1000 shards all return to one coordinator, the
+coordinator's CPU, memory, or network bandwidth becomes the
+limit. Solutions: hierarchical scatter (coordinator scatters
+to sub-coordinators, each gathers a subset), parallelism in
+the merge step.
+
+### Querying all shards for every operation
+
+Bad partition key forces scatter even for simple lookups. Fix
+the schema rather than scaling the scatter.
+
+### Ignoring replica routing
+
+If shards have replicas, scatter to a single replica per
+shard. Don't scatter to all replicas (that's redundant work).
+Use latency-aware LB to pick the fastest replica.
+
+## In summary
+
+- Scatter-gather: dispatch in parallel, merge, return.
+- Slowest shard determines user latency; tail amplification
+  grows with N.
+- Mitigations: hedge on slow shards, partial results,
+  skip-the-tail.
+- Push predicates and aggregates down into shards to reduce
+  merge cost.
+- Best partition keys avoid scatter entirely for common
+  queries.
+- Watch for coordinator bottleneck on large N; hierarchical
+  scatter helps.

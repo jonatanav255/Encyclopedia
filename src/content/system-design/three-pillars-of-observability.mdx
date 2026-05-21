@@ -1,0 +1,223 @@
+export const level = 'mid';
+
+# The three pillars of observability
+
+Observability is the property of a system that lets you answer
+**arbitrary questions about its internal state from its external
+output** — without shipping new code first. The "three pillars"
+framing names the three classical signal types that, together,
+make that possible: **logs, metrics, traces**.
+
+The framing is older than the term "observability" itself and is
+imperfect — Charity Majors and others argue it understates the
+role of **wide structured events** — but every running system in
+2026 still emits these three.
+
+## What each pillar answers
+
+<Cheatsheet>
+| Pillar | Shape | What it answers | Cost |
+|---|---|---|---|
+| Logs | Discrete events with context | "What happened in this request?" | High volume, cheap per event |
+| Metrics | Numeric time-series | "How is the system behaving in aggregate?" | Tiny, pre-aggregated |
+| Traces | Causally-linked spans across services | "Where did the time go?" | Sampled, medium cost |
+</Cheatsheet>
+
+Each is great at one thing and terrible at another. You need all
+three because no single signal type answers every question.
+
+## Logs
+
+A log is a timestamped event with attached fields. In a healthy
+system, every interesting state transition produces one.
+
+```js
+log.info('payment.captured', {
+  orderId: 'o_123',
+  amount: 4999,
+  currency: 'USD',
+  durationMs: 142,
+});
+```
+
+What logs are good at:
+
+- **High cardinality**: every field can have unlimited distinct
+  values (user IDs, order IDs, error messages).
+- **Forensics**: replay what happened in a specific request,
+  hours after the fact.
+- **Free-form context**: easy to add a new field without changing
+  a schema.
+
+What logs are bad at:
+
+- **Aggregation at scale**: counting "errors per second across
+  the fleet" by scanning text logs is slow and expensive.
+- **Pre-computed dashboards**: querying logs ad-hoc isn't a
+  substitute for a metric you graph in real time.
+
+See structured logging — free-form text logs are nearly useless
+for anything beyond `grep`.
+
+## Metrics
+
+A metric is a numeric value sampled over time, tagged with a small
+set of **low-cardinality** labels.
+
+```js
+httpRequests.inc({ route: '/checkout', status: 200 });
+httpDuration.observe({ route: '/checkout' }, 0.142);
+```
+
+What metrics are good at:
+
+- **Cheap aggregation**: count/sum/percentile over millions of
+  events without scanning them.
+- **Dashboards and alerts**: graph p99 latency, fire when error
+  rate spikes.
+- **Long retention**: pre-aggregated numbers compress well — a
+  year of 10-second samples is megabytes.
+
+What metrics are bad at:
+
+- **High cardinality**: a label per user ID explodes the storage
+  cost. Most TSDBs choke past ~1M unique label combinations per
+  metric.
+- **Individual investigation**: a p99 spike tells you something
+  is slow, not which user or which request.
+
+The cardinality limit is the **fundamental** constraint. If you
+need to graph "p99 latency per customer ID" with 10M customers,
+metrics are the wrong tool — that's a trace or wide-event
+problem.
+
+## Traces
+
+A trace follows a single request across services. Each unit of
+work is a **span** with a start time, duration, parent ID, and
+attached attributes. Spans share a **trace ID**.
+
+```
+trace_id=abc123
+  span: api-gateway          [====]      8 ms
+  span: order-service        [============]    24 ms
+    span: inventory-rpc          [===]         6 ms
+    span: payment-rpc            [========]   18 ms
+      span: db.charge              [====]      9 ms
+```
+
+What traces are good at:
+
+- **Causality across services**: which downstream call ate the
+  latency budget?
+- **Per-request detail with structure**: the parent/child shape
+  is queryable in ways flat logs aren't.
+- **Performance debugging**: find the 1% of requests that hit a
+  slow path.
+
+What traces are bad at:
+
+- **Whole-fleet aggregation**: traces are usually sampled, so
+  rate-based metrics computed from traces are noisy.
+- **Storage cost at 100% sampling**: a full trace per request is
+  expensive — see sampling strategies.
+
+## Why all three
+
+A motivating example. The on-call alert fires: "p99 checkout
+latency above 800ms for 5 minutes." How each signal contributes:
+
+<Steps>
+<Step n={1} title="Metrics — the alarm and the scope.">
+The dashboard shows p99 jumped on the `/checkout` route 4
+minutes ago. p50 is unchanged. Error rate is normal. Throughput
+is normal. So the symptom is **tail latency**, not a global
+outage.
+</Step>
+<Step n={2} title="Traces — find the bottleneck.">
+Sample a few slow traces from the last 5 minutes. They all
+show the same `payment-service → db.charge` span ballooning
+from 10ms to 600ms. The aggregation in metrics told you
+**what** is slow; traces told you **where**.
+</Step>
+<Step n={3} title="Logs — root cause.">
+Pull the structured logs from the payment-service pod handling
+those traces. There's a `WARN db.pool.exhausted` message
+correlated in time. The pool is starving. Now you know **why**.
+</Step>
+</Steps>
+
+Metrics found it, traces localized it, logs explained it. With
+only one pillar, you'd be guessing at one of those steps.
+
+## Overlap and tension
+
+The pillars overlap more than the framing suggests:
+
+- **Logs can produce metrics** — count log events of a given
+  shape. This is how many systems work (Splunk, Loki + recording
+  rules). Drawback: you pay log-storage costs to get a number you
+  could have emitted directly.
+- **Traces can produce metrics** — span counts and durations
+  aggregate into RED-method graphs. Drawback: sampled traces
+  produce noisy aggregates.
+- **Wide events** (Honeycomb-style) try to unify the three: every
+  request emits one fat structured event with hundreds of fields,
+  and you derive logs, metrics, and traces from queries over
+  those events.
+
+The wide-event camp argues the three-pillar split is a historical
+artifact of separate storage backends (Elasticsearch for logs,
+Prometheus for metrics, Jaeger for traces) and that a single
+event store does the job better. There's truth to this — but
+metrics' compression and traces' parent/child structure remain
+genuinely different shapes.
+
+<Callout variant="note">
+Charity Majors, Liz Fong-Jones, and George Miranda's
+*Observability Engineering* makes the case that observability is
+a property of the **questions you can answer**, not of which
+signals you emit. The three pillars are a means; arbitrary-query
+debugability is the end.
+</Callout>
+
+## What each pillar costs
+
+<Compare a="Cheap to add" b="Expensive at scale">
+<>
+**Metrics**. A counter is bytes per scrape. Add as many as you
+want — until the label cardinality explodes. Dashboards and
+alerts come almost free once you have the metric.
+</>
+<>
+**Logs and full-sample traces**. Storage and indexing scale with
+request volume. A high-traffic service producing 10 KB of logs
+per request at 50K QPS is 500 MB/sec — eight figures a year of
+log-storage spend. This is where sampling, retention tiers, and
+aggregation live.
+</>
+</Compare>
+
+## Common mistakes
+
+- **Logging what should be a metric.** Counting `INFO request
+  processed` lines to compute QPS is a metric in log clothing.
+  Emit a counter.
+- **Metric-ing what should be a log.** Tagging a metric with
+  `user_id` blows up cardinality. That's a per-request question
+  — log it or trace it.
+- **Not propagating trace context.** A trace that stops at the
+  service boundary because the next service didn't pull the
+  headers is useless. See distributed tracing.
+- **Treating all three as one budget.** They have different unit
+  economics. Sample traces aggressively; keep metrics cheap;
+  tier log storage (hot 7d, warm 30d, cold 1y).
+
+## In summary
+
+- **Logs** = "what happened" — discrete events with high-cardinality context.
+- **Metrics** = "how it's behaving" — cheap aggregated numbers with low-cardinality labels.
+- **Traces** = "where the time went" — causally linked spans across services.
+- You need all three because each shines at a question the others answer poorly.
+- Wide structured events are a credible unification but don't change the questions.
+- Cost differs by 100x across the pillars; budget them separately.

@@ -1,0 +1,174 @@
+export const level = 'senior';
+
+# Leader-follower pattern
+
+A general coordination shape: **one node is elected the
+leader** for some scope (a partition, a job, a cluster);
+everyone else is a follower. The leader makes decisions; the
+followers do work the leader assigns or replicate the
+leader's state.
+
+This pattern shows up everywhere: database replication
+(primary-backup), Kafka's per-partition leader, distributed
+locks (leader = lock holder), job scheduling (leader = the
+scheduler), service election in K8s controllers.
+
+## Why centralize via a leader
+
+- **Single source of order.** Decisions made by the leader are
+  serialized; no concurrent conflicts.
+- **Simpler protocol than full peer-to-peer.** Followers just
+  obey; no merging needed.
+- **Easier reasoning.** The leader's state is "the truth."
+
+The downside: leader is a bottleneck for writes, a single
+point of failure, and elections are tricky.
+
+## Election
+
+Leaders aren't permanent. They die, get promoted, get demoted.
+Election must:
+
+- Produce **exactly one** leader (avoid split brain).
+- Be **available** despite failures of some nodes.
+- Be **fast** enough that the system isn't stuck without a
+  leader for too long.
+
+Mechanisms:
+
+### Consensus-based
+
+Raft, Paxos, ZAB. A quorum of nodes votes; whoever gets
+majority is the leader. Provably correct under bounded
+failures.
+
+Used by: etcd, Consul, ZooKeeper, CockroachDB, Kafka KRaft.
+
+### External coordinator
+
+A separate consistent store (ZooKeeper, etcd, Redis with
+WATCH/MULTI) holds the leadership lease. The lease holder is
+the leader.
+
+```js
+async function tryAcquireLeader(nodeId) {
+  return await etcd.put('/leader', nodeId, {
+    ttl: 10,
+    onlyIfNotExists: true,
+  });
+}
+
+// Heartbeat: every few seconds, refresh the TTL.
+// If you fail to refresh, you lost leadership.
+```
+
+Used by: K8s controllers (via Lease objects in etcd), HashiCorp
+products.
+
+### Bully algorithm
+
+The node with the highest ID wins. Each round, higher-ID
+nodes claim leadership; lower-ID nodes defer.
+
+Simple; works in static clusters. Not great for dynamic ones.
+
+## Lease-based leadership
+
+A leader holds a **lease** for a fixed duration. Must renew
+before expiry or lose the leadership. If a leader is paused
+(GC, freeze), it can think it's still leader after the lease
+expired.
+
+Mitigation: **fencing tokens**. Every operation includes a
+monotonic lease ID. Storage layer rejects operations with
+stale tokens.
+
+```
+Leader A acquires lease, token=42.
+A pauses 30s.
+A's lease expires. B acquires lease, token=43.
+A wakes up, sends write with token=42.
+Storage: "current token is 43, reject."
+```
+
+Without fencing, a paused-then-resumed leader can corrupt
+state.
+
+## Common applications
+
+### Database replication
+
+The leader (primary) accepts writes; followers (replicas)
+mirror. See primary-backup-replication.
+
+### Per-partition leader (Kafka, Cassandra)
+
+The cluster has thousands of partitions, each with its own
+leader. Different leaders live on different brokers, spreading
+load. Kafka's controller (a meta-leader) orchestrates these
+leader assignments.
+
+### Single-leader job scheduler
+
+In a fleet of N workers, exactly one should be the
+"scheduler" that picks up new jobs. Election ensures no
+duplicates.
+
+### Cluster controller
+
+K8s controllers, Kubelet's leader election for HA control
+plane components.
+
+### Distributed lock
+
+A "lock holder" is the leader for a critical section. Lease
++ fencing is the right pattern.
+
+## Failure modes
+
+### Leader becomes slow but not dead
+
+Heartbeats arrive on schedule. Writes take 30 seconds each.
+Cluster doesn't failover. Throughput collapses.
+
+Fix: detect leader slowness as well as failure; soft-failover
+(elect a new leader without declaring the old dead) when SLOs
+slip.
+
+### Election storm
+
+Network partition: nodes can ping some peers, not others.
+Each subset elects a leader. Multiple leaders emerge.
+Heartbeats from now-defunct leaders keep restarting elections.
+
+Fix: quorum-based election (only elect if you have a majority);
+exponential backoff on repeated elections.
+
+### Leader-eligible vs follower-only roles
+
+Sometimes you want some nodes to never be leaders (smaller
+hardware, different region). Many systems support
+`leader_eligible=false` on those nodes — they participate in
+election but never win.
+
+## Multi-Raft for scale
+
+A single Raft group caps at low write throughput (~10k/sec).
+For higher, run **many independent Raft groups**, each
+handling a subset of data. Each has its own leader.
+
+CockroachDB does this — every range has its own Raft group.
+TiKV too. Effectively, partition-then-leader.
+
+## In summary
+
+- Leader-follower: one node elected to coordinate; others
+  obey or mirror.
+- Simpler protocol than full P2P; single point of bottleneck
+  and failure.
+- Election: consensus, external coordinator, or lease.
+- Lease + fencing tokens prevent paused-leader corruption.
+- Applications: DB replication, partition leadership, job
+  scheduling, locks, controllers.
+- Scale by partitioning into many small Raft/leader groups
+  (multi-Raft).

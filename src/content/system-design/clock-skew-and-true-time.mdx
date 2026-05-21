@@ -1,0 +1,173 @@
+export const level = 'staff';
+
+# Clock skew and TrueTime
+
+Distributed systems can't trust wall clocks. Even with NTP,
+clocks across nodes can differ by tens or hundreds of
+milliseconds. Worse, a clock can **go backwards** when NTP
+adjusts. If your system uses wall time for ordering, this
+silently corrupts everything that depends on order.
+
+Google's Spanner solved this by building hardware that
+**bounds** the uncertainty: TrueTime. Most of the rest of us
+use HLC or vector clocks to dodge the problem entirely.
+
+## How clocks go wrong
+
+<Steps>
+<Step n={1} title="Drift.">
+Cheap quartz oscillators drift up to 30 µs/sec. Over a day,
+that's ~2.5 seconds without sync.
+</Step>
+<Step n={2} title="NTP corrections.">
+NTP nudges the clock forward or **backward** to match. A
+clock can jump from 10:00:00 to 09:59:55, then go back
+forward through 10:00:00 a second time.
+</Step>
+<Step n={3} title="Step changes.">
+After a leap second, a long offline period, or a manual
+admin action, the clock can jump arbitrarily.
+</Step>
+<Step n={4} title="VM pauses.">
+A virtualized clock can stall during VM live migration or
+hypervisor pauses, then "catch up" all at once.
+</Step>
+</Steps>
+
+## Why this matters
+
+If two replicas timestamp writes with wall time, and their
+clocks differ by 200ms, the system has a 200ms window where:
+
+- A "later" write from one replica might lose to an "earlier"
+  write from another.
+- Last-write-wins picks the wrong winner.
+- Snapshot reads might see writes from "the future" or miss
+  "current" writes.
+- TLS certs expire one node's reads before another's.
+
+NTP keeps clocks within ~10–100ms in good conditions, several
+seconds in bad ones. **You cannot assume better.**
+
+## TrueTime: Google's answer
+
+Spanner's machines have GPS receivers and atomic clocks in
+every datacenter. The TrueTime API returns not a timestamp but
+an **interval**:
+
+```js
+const { earliest, latest } = TT.now();
+// real time is somewhere in [earliest, latest], guaranteed.
+// Typically (latest - earliest) is around 7ms.
+```
+
+The width of the interval is the **uncertainty**. Spanner
+uses TrueTime to give linearizable transactions across
+continents.
+
+## The commit-wait protocol
+
+Spanner uses TrueTime like this:
+
+<Steps>
+<Step n={1} title="Pick a commit timestamp.">
+Get the current TrueTime interval. Pick `commit_ts = latest`.
+</Step>
+<Step n={2} title="Wait out the uncertainty.">
+Wait until `TT.now().earliest > commit_ts`. Now any other
+transaction's "now" is **strictly after** this commit
+timestamp.
+</Step>
+<Step n={3} title="Release.">
+The commit is durable and linearizable globally.
+</Step>
+</Steps>
+
+The wait is typically 5–10ms — small enough to be acceptable,
+large enough to absorb clock uncertainty. **Spanner's
+latency floor is the clock uncertainty.** Better clocks =
+faster transactions.
+
+## Why most systems don't have TrueTime
+
+You need GPS antennas in every datacenter and atomic clocks
+in every rack. Hyperscalers can afford this; almost nobody
+else can.
+
+Cloud providers are starting to expose APIs that look similar:
+
+- **AWS Time Sync Service** + bounded-uncertainty primitives.
+- **GCP's open-sourced TrueTime-lite** for non-Google
+  Spanner-style users.
+- **Microsoft Project Silica** experiments with similar
+  primitives.
+
+But for most teams, the practical answer is HLC.
+
+## HLC as the alternative
+
+(See hybrid-logical-clocks.) HLC pairs a physical timestamp
+with a logical counter. It's bounded in size, monotonic, and
+preserves causality — but its precision is bounded by NTP
+skew, not by hardware atomic clocks.
+
+For most workloads (single-region, or geo with eventual
+consistency), HLC is sufficient. For strict serializability
+across regions, you need TrueTime-class precision.
+
+## Clock-related failure modes you'll actually hit
+
+### NTP skew during failover
+
+Leader fails over. New leader's clock is 500ms behind. New
+writes timestamped 500ms in the past. Subsequent reads see
+"newer" writes from before the failover.
+
+Mitigation: HLC, or "wait until clock has advanced past last
+known commit timestamp."
+
+### Negative time jumps
+
+NTP adjusts the clock backward. Now two writes can have the
+same wall-clock timestamp, or a "later" event has an
+"earlier" stamp.
+
+Mitigation: use a **monotonic** clock for elapsed-time
+measurements (`CLOCK_MONOTONIC` on Linux, `process.hrtime()`
+in Node, `Stopwatch` in Java). Never use wall time for
+relative ordering of events that happened on the same node.
+
+### TLS / token expiry
+
+JWTs and TLS certs use wall time. A 5-minute clock skew
+between client and server means tokens accepted at one
+machine are rejected at another.
+
+Mitigation: tolerate small skew (`clockTolerance` in JWT
+libraries); monitor NTP sync; alert when skew exceeds 1
+second.
+
+### Distributed locks with TTL
+
+A node holds a lock with a 30-second TTL. Its clock jumps
+forward 60 seconds. The lock TTL expires from its
+perspective; it releases the lock. But the cluster (with
+correct time) still thinks the node holds it. Now two clients
+hold the lock.
+
+Mitigation: fencing tokens — the storage layer rejects writes
+with stale tokens, regardless of who thinks they own the
+lock.
+
+## In summary
+
+- Clocks across nodes can disagree by tens to hundreds of
+  milliseconds and can go backwards.
+- Wall-time-based ordering is unreliable at scale.
+- TrueTime (Google Spanner) bounds the uncertainty via GPS +
+  atomic clocks, enabling strict serializability via
+  commit-wait.
+- Most teams use HLC instead — software-only, bounded size,
+  precision bounded by NTP skew.
+- For elapsed-time measurements always use monotonic clocks.
+- Distributed locks need fencing tokens, not just TTL.

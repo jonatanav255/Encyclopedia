@@ -1,0 +1,262 @@
+export const level = 'senior';
+
+# Mutual TLS between services
+
+In a normal TLS handshake the **client** verifies the
+**server's** certificate. In mutual TLS (mTLS), both sides
+verify each other. The server checks the client's cert too. The
+result: every connection has a **cryptographic identity** for
+both parties, signed by an internal certificate authority.
+
+Inside a microservice cluster, that's the foundation of zero
+trust at the service-to-service layer. No more "trust 10.0.0.0/8"
+firewalls; trust shifts to "this connection is from a
+certificate issued to `payment-service` and the cert is valid
+right now."
+
+## Why it's the right primitive
+
+A short list of properties:
+
+<Cheatsheet>
+| Property | What it gives you |
+|---|---|
+| Authentication | The server knows the client is who it claims |
+| Identity | The cert carries the workload identity (`spiffe://prod/payment`) |
+| Encryption | TLS encrypts in transit — no plaintext on the wire |
+| Integrity | TLS detects tampering — no MITM in your VPC |
+| Revocation | Pull or expire the cert and the workload's access stops |
+| Standardized | Every language has a TLS library — no custom protocol |
+
+</Cheatsheet>
+
+mTLS subsumes "service-to-service auth" and "transport
+encryption" in one mechanism. The alternative — application-layer
+signed tokens (JWT, HMAC) over plaintext TCP — leaves you to
+solve encryption separately and is one more layer of bespoke
+code to get wrong.
+
+## The handshake
+
+```
+client                                server
+  |                                    |
+  |---- ClientHello (ciphers, SNI) --->|
+  |<--- ServerHello + ServerCert -----|
+  |       (client verifies)           |
+  |<--- CertificateRequest -----------|  <-- the mTLS step
+  |                                    |
+  |---- ClientCert + ClientKeyExch -->|
+  |                                    |
+  |     (server verifies client cert)  |
+  |                                    |
+  |==== TLS-encrypted application =====|
+```
+
+Two extra messages over normal TLS: the server asks for a cert,
+the client supplies one. The server verifies it against the
+trusted CA bundle. If it doesn't trust the issuer or the cert
+is expired/revoked, the connection drops before any application
+data flows.
+
+## Identity in the certificate
+
+The cert's **subject** or **SAN** (Subject Alternative Name)
+carries the workload identity. Two common shapes:
+
+- **SPIFFE ID**: a URI like `spiffe://prod.acme.com/ns/orders/sa/api`.
+  Standard from the SPIFFE/SPIRE project. Designed for workload
+  identity.
+- **DNS-style**: `payment-service.prod.svc.cluster.local`.
+  Familiar; ties identity to the cluster's DNS naming.
+
+The receiver maps identity → authorization policy:
+"`spiffe://prod/orders` may call `POST /charge` on
+`spiffe://prod/payments` but not `DELETE /refund`." The cert
+proves who's calling; the policy decides what they can do.
+
+See zero trust architecture for the broader pattern.
+
+## The operational cliff: cert lifecycle
+
+mTLS as a concept is straightforward. mTLS as an operational
+discipline is where teams fall over.
+
+Every workload needs:
+
+<Steps>
+<Step n={1} title="A cert issued at startup.">
+Generated keypair, CSR sent to the CA, cert returned. The cert
+must be valid (signed by a trusted CA, has the right
+identity).
+</Step>
+<Step n={2} title="The CA's chain installed.">
+The workload trusts the CA's root + intermediates. Without
+this, peers can't be verified.
+</Step>
+<Step n={3} title="Rotation before expiry.">
+Short-lived certs (hours, not years) need automatic renewal.
+Long-lived certs are a security smell — they accumulate risk
+and can't be quickly revoked.
+</Step>
+<Step n={4} title="Revocation.">
+On compromise, the cert must stop being trusted. Either OCSP
+stapling, CRLs, or — most practically with short-lived certs —
+just don't renew it.
+</Step>
+<Step n={5} title="Key storage.">
+The private key must live somewhere only the workload can read.
+On Kubernetes: project-scoped secret or memory-only via a
+sidecar.
+</Step>
+</Steps>
+
+Doing this by hand for 200 services is not viable. Hence the
+service mesh.
+
+## Why service meshes exist
+
+A **service mesh** automates mTLS plus traffic management. The
+shape:
+
+- Each pod gets a **sidecar proxy** (Envoy is the typical
+  choice) injected next to the app container.
+- The sidecar speaks mTLS to other sidecars on the cluster.
+- The app speaks plaintext HTTP to its own sidecar over
+  localhost.
+- A **control plane** issues and rotates certificates, pushes
+  routing and authorization policy to all sidecars.
+
+```
++-----------+ localhost +-----------+         mTLS         +-----------+ localhost +-----------+
+|  app A    |---------->| sidecar A |--------------------->| sidecar B |---------->|  app B    |
++-----------+           +-----------+                      +-----------+           +-----------+
+                            ^                                    ^
+                            |       control plane (Istiod)       |
+                            +------------------------------------+
+                              cert issuance, policy, telemetry
+```
+
+Application code is unchanged. The sidecar handles cert
+acquisition, rotation, mTLS handshake, retry, circuit-breaking,
+and metrics emission.
+
+Examples: **Istio** (Envoy + Istiod), **Linkerd** (Rust-based
+proxies, lighter weight), **Consul Connect**, **AWS App Mesh**.
+SPIFFE / SPIRE provides the identity layer independently of any
+mesh.
+
+The mesh is what makes mTLS **operationally tolerable** in a
+cluster of any size.
+
+## Without a mesh
+
+You can still do mTLS without a sidecar — wire it into each
+service's HTTP server. Reasonable for a small number of
+services; quickly painful past 10.
+
+A bare-bones Node example, illustrative only:
+
+```ts
+import https from 'node:https';
+import fs from 'node:fs';
+
+const server = https.createServer({
+  key: fs.readFileSync('server.key'),
+  cert: fs.readFileSync('server.crt'),
+  ca: fs.readFileSync('ca.crt'),
+  requestCert: true,
+  rejectUnauthorized: true,
+}, (req, res) => {
+  const peer = req.socket.getPeerCertificate();
+  // peer.subject.CN or peer.subjectaltname → identity
+  res.end('ok');
+});
+```
+
+A client speaks back with its own cert:
+
+```ts
+import https from 'node:https';
+import fs from 'node:fs';
+
+const agent = new https.Agent({
+  key: fs.readFileSync('client.key'),
+  cert: fs.readFileSync('client.crt'),
+  ca: fs.readFileSync('ca.crt'),
+});
+
+await fetch('https://server.internal/', { agent });
+```
+
+Then add: cert rotation, CA distribution, revocation, identity
+parsing, authorization policy, ergonomic error messages. By
+service 20, you've written your own mesh poorly.
+
+## mTLS vs signed JWTs
+
+The two common patterns for service-to-service auth:
+
+<Compare a="mTLS" b="Signed JWTs">
+<>
+- Identity is the **connection itself** — bound to the TLS
+  session.
+- Encryption comes for free.
+- The identity check happens at the transport layer before any
+  application code runs.
+- Cert rotation has more moving parts than token rotation.
+- Hard to forward identity across hops without re-handshake.
+</>
+<>
+- Identity is a **bearer token** in a header.
+- Encryption requires separate TLS (usually still on, but
+  decoupled).
+- App-layer code must check the signature on every request.
+- Easy to forward across hops (delegated identity, "act as").
+- Token revocation is harder; rely on short TTL.
+</>
+</Compare>
+
+Many production stacks use **both**: mTLS for the transport
+identity ("which service is calling") and JWTs for the
+**caller's** identity ("which user is the request on behalf
+of"). They answer different questions.
+
+## Common pitfalls
+
+- **Long-lived certs.** Year-long certs feel safer
+  operationally — and remove your ability to revoke quickly.
+  Aim for hours-to-days TTL with automatic rotation.
+- **Self-signed everywhere.** Mixing self-signed certs across
+  teams pushes you back into the "is this cert trusted?" mess.
+  Use one internal CA per environment.
+- **Disabled verification "for now."** A `rejectUnauthorized:
+  false` shipped to production is the breach waiting to happen.
+- **No identity validation in the app.** mTLS alone proves
+  identity; **authorization** still needs to check that the
+  proven identity is allowed to do the requested thing.
+- **Mesh upgrade pain.** A service mesh is itself a
+  distributed system. Upgrading the control plane carefully is a
+  real ongoing burden.
+
+<Callout variant="info">
+Istio, Linkerd, and Consul all default to **mTLS on by
+default** for traffic between meshed workloads. Adopting any
+of them gives you transport identity essentially for free — the
+work is in fitting the rest of the org around the mesh.
+</Callout>
+
+## In summary
+
+- mTLS authenticates both sides of a TLS connection.
+- The cert carries a workload identity; identity drives
+  authorization policy.
+- Short-lived certs + automated rotation are non-negotiable.
+- Service meshes (Istio, Linkerd) make mTLS operationally
+  tolerable.
+- Without a mesh, doing mTLS yourself works for a handful of
+  services and stops scaling.
+- Pair mTLS for service identity with JWTs for user identity;
+  they answer different questions.
+- A breach inside the cluster gets you the access of one cert,
+  not the whole network.

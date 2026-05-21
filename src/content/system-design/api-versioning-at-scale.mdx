@@ -1,0 +1,292 @@
+export const level = 'senior';
+
+# API versioning at scale
+
+Once an API has long-tail clients (mobile apps in app stores, partner
+integrations, customer scripts), versioning stops being "what does
+the URL look like" and becomes "**how do we deprecate without
+breaking people who can't update**."
+
+Continuous API Management and Geewax's *API Design Patterns* are the
+canonical references. The honest answer is: versioning policy
+matters more than version mechanism.
+
+## The four mechanisms
+
+<Cheatsheet>
+| Mechanism | Example | Pros | Cons |
+|---|---|---|---|
+| URL versioning | `/v1/users`, `/v2/users` | Visible, easy to route, cache-friendly. | Breaks REST URL stability; multiple URLs per resource. |
+| Header / content negotiation | `Accept: application/vnd.api.v2+json` | Same URL; clean REST. | Invisible in logs; harder to debug; harder to cache. |
+| Query param | `/users?api-version=2` | Easy to opt in. | Caches diverge; URL is mutable. |
+| Parallel deployment | `api.v2.example.com` vs `api.v1.example.com` | Total isolation; independent SLOs. | Operational overhead of N deployments. |
+</Cheatsheet>
+
+The dominant choice for public APIs is **URL versioning**. It's
+ugly to REST purists; it works because everyone — caches, gateways,
+logs, alerts — can see the version without parsing semantics.
+
+For internal services, **schema-evolution-only** (no explicit version
+bump) is often the right call. See **Schema evolution**.
+
+## What "v2" actually means
+
+A version bump should mean **a breaking change**. Definitions vary;
+the practical contract:
+
+```
+- Adding a field to a response → NOT a new version. Clients ignore
+  unknown fields.
+- Removing or renaming a field → new version.
+- Changing the type of a field → new version.
+- Changing the semantics of an existing field → new version.
+- Adding a required request field → new version.
+- Adding an optional request field → NOT a new version.
+- Tightening validation → potentially a new version (it can break
+  callers that used to slip through).
+```
+
+The discipline: **never break a v1 client**. v2 exists; v1 stays
+operable alongside it. The moment you change v1 semantics, you've
+broken clients you can't update.
+
+## Long-tail clients
+
+The hard part isn't picking a mechanism. It's that **some clients
+never update**:
+
+- Mobile apps from 3 years ago, still in the field on old phones.
+- Partner integrations whose maintainer left the company.
+- Customer scripts running on cron with `api/v1` hardcoded.
+- IoT devices with no update mechanism.
+
+You can't force these to upgrade. You can:
+
+1. Measure who's still calling v1 and which endpoints.
+2. Communicate deprecation with long lead times.
+3. Cut off only when usage drops below an acceptable threshold —
+   or set a hard sunset date in the contract from day one.
+
+Long-tail clients are the **whole point** of versioning policy. If
+you could ship a server-side rename and break nobody, you wouldn't
+need versions.
+
+## Deprecation lifecycle
+
+A version lives through stages, from Continuous API Management:
+
+<Steps>
+<Step n={1} title="Active.">
+The current recommended version. New integrations use this. Bugs
+fixed; new features added (compatibly).
+</Step>
+<Step n={2} title="Maintained.">
+Still functional, no new features. Critical bugs and security
+patches only. New clients should not use this.
+</Step>
+<Step n={3} title="Deprecated.">
+Officially scheduled for removal. Responses include deprecation
+headers. No bug fixes except security. Documented sunset date.
+</Step>
+<Step n={4} title="Sunset.">
+Removed. Calls return 410 Gone with a pointer to the migration
+guide.
+</Step>
+</Steps>
+
+A real example timeline for a stable API:
+
+```
+v1 launches             → t = 0
+v2 launches             → t + 18 months. v1 enters "maintained".
+v2 active              → t + 18 to t + 30 months.
+v1 deprecated          → t + 30 months. Sunset: t + 48 months.
+v1 sunset              → t + 48 months. v1 endpoints return 410.
+```
+
+Two years from "deprecated" to "sunset" is reasonable for a public
+API with paying customers. Internal APIs can move faster; consumer
+mobile apps often need longer (people don't update iPhones).
+
+## Deprecation signaling
+
+When v1 is officially deprecated, responses should announce it:
+
+```
+HTTP/1.1 200 OK
+Deprecation: Sun, 11 Nov 2027 23:59:59 GMT
+Sunset: Sun, 31 Dec 2028 23:59:59 GMT
+Link: <https://api.example.com/v2/users>; rel="successor-version"
+Link: <https://docs.example.com/migration/v1-to-v2>; rel="deprecation"
+Warning: 299 - "v1 is deprecated; migrate by 2028-12-31"
+```
+
+RFC 8594 defines `Sunset`; RFC 9745 (2024) standardizes `Deprecation`.
+Use both. Clients that parse headers (the well-behaved ones) get a
+machine-readable signal; humans reading logs see it too.
+
+Track which clients ignore the deprecation. They are the ones who
+will be most surprised at sunset.
+
+## Communication, not engineering
+
+Most "we broke a client at sunset" incidents are **communication
+failures**, not technical ones:
+
+- Deprecation announced in a blog post nobody read.
+- Email to a stale partner contact list.
+- A console banner in a developer portal where the affected partner
+  never logged in.
+
+A working policy:
+
+```
+- 12 months before sunset: deprecation header active.
+- 6 months before: email to every API-key owner with usage stats.
+- 3 months: rate-limit v1 to coax migration.
+- 1 month: brownouts (10 min of 410 every day) to surface forgotten
+  callers.
+- T = 0: full sunset.
+```
+
+Brownouts are the canonical "wake them up" move — a brief planned
+outage of the deprecated version that forces dependent systems to
+either fail loudly or migrate. Use sparingly.
+
+## Parallel deployment as a strategy
+
+For high-stakes migrations (auth, billing), deploy v1 and v2 as
+**separate services**, not the same service handling both:
+
+```
+api.example.com/v1/* → [v1 service cluster]
+api.example.com/v2/* → [v2 service cluster]
+```
+
+Benefits:
+
+- Bugs in v2 can't break v1 traffic.
+- Performance characteristics are independent; v2 can scale alone.
+- You can sunset v1 by removing infrastructure, not by code change.
+- Rollback of v2 doesn't risk v1.
+
+Cost:
+
+- Two deployments to operate. Double the SLO burden during the
+  overlap.
+- Database changes must be backwards-compatible to both — or the
+  data layer is shared and only the API is split.
+
+Many big public APIs (AWS, GitHub) effectively run multiple parallel
+service versions for years.
+
+## Internal vs external
+
+The bar is very different:
+
+<Compare a="External API" b="Internal API">
+<>
+Long-tail clients exist. You don't control them. Deprecation timelines
+are years. Breaking changes require a new version. Communication is
+hard. Sunset is a project.
+</>
+<>
+You control all clients. Coordinated deploys are possible. Schema
+evolution (no breaking changes, no version bump) is sufficient for
+most cases. Versions, if any, are mostly markers for major rewrites.
+</>
+</Compare>
+
+For internal APIs, the right answer is usually:
+
+```
+- Never break an existing client. Add fields with sensible defaults.
+- If you must break: deploy old + new in parallel; flip clients;
+  remove old. No "v2" suffix needed; just a coordinated migration.
+- For protobuf/gRPC: respect field-number rules; never reuse a
+  number; deprecate fields with `[deprecated = true]`.
+```
+
+This is how Google and AWS internal APIs largely operate. Schema
+discipline replaces version mechanics. See **Schema evolution**.
+
+## Versioning vs feature flags
+
+People sometimes conflate. They're not the same:
+
+- **Version** = a stable contract. Once published, immutable.
+- **Feature flag** = a runtime toggle. Internal to the service.
+
+A feature flag doesn't replace a version. A version doesn't replace
+a feature flag. A new version is permanent (or sunsetable); a flag
+is temporary (or it shouldn't exist).
+
+A common mistake: shipping "v2-behavior" behind a flag and never
+finishing the migration. Now v1 endpoints have two behaviors
+depending on a header — and nobody can tell which from the docs.
+Either it's v2 (in v2's URL) or it's not.
+
+## Failure modes
+
+### Big-bang v2 launch
+
+You design v2 in private, launch it, and tell everyone "migrate
+within 6 months." The migration takes 3 years and clients break.
+
+The fix: **release v2 in increments**. Start with the most
+problematic endpoints; co-launch with migration guides; expand
+gradually. v2 isn't a monolithic version — it's a collection of
+versioned routes.
+
+### Wrong things bumped
+
+v2 bumps because of an internal refactor that wasn't actually a
+breaking change. Clients now have two near-identical APIs and don't
+know why.
+
+The fix: discipline. A version bump is **for breaking changes
+only**. Add a section to the design review: "what specifically is
+breaking?"
+
+### Version proliferation
+
+`/v1`, `/v2`, `/v3`, `/v4`, `/v5` — each kept "for compatibility."
+The team operates 5 parallel versions for a small API.
+
+The fix: enforce maximum N concurrent versions (typically 2). When
+v3 launches, v1 enters mandatory sunset.
+
+### Skew between gateway and service
+
+The gateway routes `/v2` to the service, but the service handles
+both v1 and v2 from one codebase. A v2-only bug slips into v1
+because the code path was reused. Versions exist in URL but not in
+the service's mental model.
+
+The fix: parallel deployment for high-stakes versions. Otherwise,
+strict per-version test coverage.
+
+<Callout variant="warning">
+Versioning is the *easy* part. Sunset is the *hard* part. Design
+your sunset policy before you launch v1, because day-1 decisions
+(which clients can authenticate, how key revocation works, how
+you contact API consumers) determine whether sunset is possible
+years later.
+</Callout>
+
+## In summary
+
+- Versioning policy matters more than mechanism. URL versioning is
+  the practical default for public APIs; internal APIs often need
+  no explicit versions, just schema discipline.
+- A version bump is for **breaking changes only**. Never break v1
+  in place.
+- Deprecation has a lifecycle: active → maintained → deprecated →
+  sunset. Signal with `Deprecation` and `Sunset` headers (RFC 9745,
+  RFC 8594).
+- Long-tail clients are the whole reason versioning exists. Long
+  timelines, brownouts, and aggressive communication are required.
+- Parallel deployment of versions isolates risk for high-stakes
+  migrations.
+- Limit concurrent versions; sunset old ones aggressively. Each
+  version is a maintenance bill.

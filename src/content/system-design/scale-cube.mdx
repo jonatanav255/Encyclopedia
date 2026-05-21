@@ -1,0 +1,316 @@
+export const level = 'senior';
+
+# The scale cube (X/Y/Z axes)
+
+The scale cube is a vocabulary, introduced in *The Art of
+Scalability* (Abbott & Fisher), for distinguishing three
+fundamentally different ways to scale a system. Each axis
+solves a different problem; each has a different cost. You
+will eventually use all three in any large system, but mixing
+them up — using one when you needed another — is the source of
+a huge fraction of "we scaled and it didn't help" outages.
+
+The three axes:
+
+- **X axis: clone**. More copies of the same thing behind a
+  load balancer.
+- **Y axis: split by function**. Different services for
+  different responsibilities.
+- **Z axis: split by data**. Same service, but each instance
+  owns a slice of the data (a shard).
+
+A useful diagram:
+
+```
+                      Z (data partitioning)
+                      ▲
+                      │
+                      │
+                      │
+                      │
+                      │
+                      └────────────►  Y (functional split)
+                     ╱
+                    ╱
+                   ╱
+                  ▼
+                X (clones)
+```
+
+A monolith on one box sits at the origin: one process, one
+function set, one data set. Real systems move outward along
+all three axes — but they don't have to, and they shouldn't
+unless forced.
+
+## X axis: horizontal duplication (clones)
+
+The most familiar form of scaling. Take the existing service.
+Run N copies. Put a load balancer in front. Done.
+
+```
+              [LB]
+             ╱  │  ╲
+            ╱   │   ╲
+        [app] [app] [app]
+            ╲   │   ╱
+             ╲  │  ╱
+              [DB]
+```
+
+What it solves:
+
+- **Throughput**: N replicas handle ~N× the requests (subject
+  to downstream).
+- **Availability**: lose one, the others carry on.
+- **Geographic placement**: a copy per region.
+
+What it does not solve:
+
+- **A bottlenecked database**. All N replicas hit the same DB.
+  Adding more app replicas only moves the queue.
+- **Complexity of the codebase**. The monolith is still a
+  monolith; deploys are still all-or-nothing.
+- **Team ownership**. 50 engineers work on one repo, deploy
+  the same artifact. Coordination cost stays constant.
+
+X-axis scaling is **cheap and always-first**. Modern cloud
+infrastructure makes it trivial: ASG with min/max, ALB in
+front, you're done. Reach for X before you reach for Y or Z.
+
+The ceiling: when X stops helping because the bottleneck moved
+elsewhere (DB, cache, broker), or when the codebase becomes
+too big for one team to deploy safely.
+
+## Y axis: functional decomposition (split by responsibility)
+
+Break the monolith into multiple services along
+**responsibility lines**. Each service owns a distinct
+capability with its own code, deploy cadence, and (often) its
+own database.
+
+```
+            [LB]
+           ╱  │  ╲
+          ╱   │   ╲
+   [users] [orders] [search]
+          │   │   │
+       [UDB] [ODB] [SIDX]
+```
+
+What it solves:
+
+- **Team scaling**. Different teams own different services and
+  deploy independently. Conway's Law goes from problem to
+  feature.
+- **Resource isolation**. A bug in search doesn't bring down
+  orders. Memory growth in users doesn't crash payments.
+- **Independent scaling**. The search service might need 50
+  replicas; users service might need 5. With one monolith
+  you'd run 50 of everything.
+- **Polyglot tech**. Each service can pick the right tool —
+  search in a Go service against Elasticsearch, payments in
+  Java against Postgres, ML in Python against a vector DB.
+
+What it costs:
+
+- **Network in the request path**. Every cross-service call is
+  a hop, retries, timeouts, failure modes.
+- **Distributed transactions are hard**. The two-phase commit
+  trap (see distributed-transactions).
+- **Observability complexity**. A single user request touches
+  10 services; tracing it becomes essential, not optional.
+- **Versioned APIs and breaking changes**. You can't refactor
+  across services as easily as within one.
+
+Y-axis scaling is **microservices** — when it's done well. It's
+**a distributed monolith** — when it's done badly. The
+difference is whether services have clean ownership boundaries
+or share databases and chatty interfaces.
+
+The premature-Y trap: a 5-person team adopts 10 microservices
+"to scale." Each engineer ends up maintaining 2 services and
+the cross-service plumbing eats 80% of velocity. Stay on the
+X axis until team size and codebase make Y unavoidable.
+
+See microservices-overview and bounded-contexts for the
+discipline.
+
+## Z axis: data partitioning (split by entity)
+
+Same service, same code, but **each replica owns a slice of
+the data**. Different users, different shards.
+
+```
+            [LB / router]
+            ╱   │    │   ╲
+           ╱    │    │    ╲
+       [app-A][app-B][app-C][app-D]
+          │      │     │     │
+       [DB-A] [DB-B] [DB-C] [DB-D]
+       (users (users (users (users
+        A-F)   G-L)   M-S)   T-Z)
+```
+
+What it solves:
+
+- **Write throughput past a single primary.** The only way to
+  exceed ~10K writes/sec on a single relational DB is to
+  partition data.
+- **Storage size past a single disk.** Petabyte-scale data
+  doesn't fit on one box. Cassandra, DynamoDB, sharded
+  Postgres all do this.
+- **Latency for geographically-localized users**. Shard by
+  region; each region serves its own users locally.
+
+What it costs:
+
+- **Cross-shard queries**. "List all users" now touches every
+  shard. Scatter-gather + merge.
+- **Resharding pain**. Adding a 5th shard to a 4-shard system
+  is a major operation if you used naive hashing. Consistent
+  hashing makes it tractable.
+- **Hot shards**. If your shard key is uneven (one customer
+  with 50% of traffic), Z-axis scaling doesn't help — you
+  need to split that customer further.
+- **Transactions across shards**. Same problem as Y axis,
+  usually worse.
+
+Z-axis scaling is **the most powerful and the most painful**.
+A typical large system: X-axis throughout, Y-axis at the
+service boundaries, Z-axis only for the components that
+actually need it (the user DB, the message store, the
+analytics events).
+
+See sharding-strategies and consistent-hashing for the
+mechanics.
+
+## When each axis is the answer
+
+<Cheatsheet>
+| Pain | Axis |
+|---|---|
+| One app server can't handle the request rate. | X (more replicas) |
+| Adding app replicas saturates the database with connections. | Add a pooler, then X. Then look at Z. |
+| Different parts of the system have wildly different scale or deploy needs. | Y (split by function) |
+| One team can't ship without stepping on another team's code. | Y (split by ownership) |
+| The DB primary is at 100% on writes, can't scale up further. | Z (shard) |
+| Storage exceeds what one DB can hold. | Z (shard) |
+| Specific feature has spiky load 100× the rest. | X for the rest; isolate it into its own service (Y). |
+| Latency is bad for users on another continent. | X with global routing + Z by region. |
+</Cheatsheet>
+
+## The classic order
+
+Most successful large systems evolve along the axes in this
+order:
+
+<Steps>
+<Step n={1} title="X first.">
+Monolith, two replicas behind a load balancer, one DB
+primary + a read replica. Get this working before anything
+else. This handles 99% of products forever.
+</Step>
+<Step n={2} title="Add Y when teams or features demand it.">
+The first team boundary that creates merge conflicts daily.
+The first feature that needs a wildly different scale profile
+(real-time chat alongside a CRUD app). Split *one* service
+out, not all of them at once.
+</Step>
+<Step n={3} title="Add Z when a single primary genuinely can't keep up.">
+You've vertically scaled the DB box to the largest SKU. You've
+moved hot reads to replicas and caches. Writes are still
+maxed. Now shard — but only the table(s) actually under
+pressure.
+</Step>
+<Step n={4} title="Iterate.">
+Each axis introduces new bottlenecks. Routing layers. Cross-
+service tracing. Resharding tools. Solve them as they come up,
+not preemptively.
+</Step>
+</Steps>
+
+## Using the cube as a diagnostic
+
+In an interview or design review, when someone says "the system
+is slow," ask which axis they're trying to scale on:
+
+- "We added 10 more app servers and it's still slow." → Wrong
+  axis (X). The bottleneck is probably the DB (needs Z) or a
+  downstream service (needs Y isolation).
+- "We split into microservices and it's slower." → Wrong axis
+  (premature Y). The serialization, the network hops, and the
+  retries cost more than they save below a certain size.
+- "We sharded the database and queries take forever." → Wrong
+  axis or unfinished work (Z). Cross-shard queries (scatter-
+  gather) are expensive; either redesign the queries to be
+  shard-local or add a denormalized read store on top.
+
+The framework: **identify the bottleneck**, then pick the axis
+that addresses that bottleneck — not the axis that's
+fashionable.
+
+## Real-world combinations
+
+Nothing serious sits on one axis only. A typical large product:
+
+- **X**: every service runs 10–500 replicas behind an LB.
+- **Y**: 30–200 services, owned by independent teams.
+- **Z**: a handful of services (auth/users, primary data,
+  events log, search index) shard at the data layer; most
+  services don't.
+
+The temptation in a design interview is to draw all three
+axes for every component. Don't. Most components only need
+X. Some need Y. A few need Z. Reserving the heavyweight
+axes for the components that actually need them is the mark
+of a senior design.
+
+## Common pitfalls
+
+### Calling X "scaling" and ignoring the others
+
+A team adds replicas, plateaus, and concludes "we don't scale."
+They haven't tried Y or Z. There's still room.
+
+### Skipping straight to Y
+
+"We need microservices to scale." No, you need to identify the
+bottleneck. If it's the DB, microservices don't help unless
+you also split data ownership (Z). Premature Y produces a
+distributed monolith — worse than the monolith you started
+with.
+
+### Sharding before exhausting vertical and replicas
+
+A 5K-write/sec service shards across 4 nodes. Each shard now
+runs at 1.25K writes/sec — well within a single big box.
+You've added all the complexity of cross-shard queries for
+zero scaling benefit. Verify the single-box limit before
+sharding.
+
+### Mistaking copies for shards
+
+"We have 4 databases" sounds like Z. If all 4 hold the same
+data (replicas), it's X (read scaling). If each holds 1/4 of
+the data, it's Z. The difference matters: replicas don't help
+write throughput; shards do.
+
+### Inconsistent axis per component
+
+You shard users (Z), microservice search (Y), and replicate
+the app tier (X). Now a user query has to route to a specific
+shard *and* call a specific service *and* fan out across
+replicas. Each axis adds routing complexity; using all three
+unnecessarily multiplies it.
+
+## In summary
+
+- X = clone. Y = split by function. Z = split by data.
+- X first. Y when team/feature divergence demands it. Z only
+  when single-primary write throughput or storage is genuinely
+  exhausted.
+- The axes solve different problems. Diagnose the actual
+  bottleneck before picking an axis.
+- Real systems use all three, sparingly, in the places they're
+  needed.
+- The scale cube isn't a target — it's a diagnostic tool.

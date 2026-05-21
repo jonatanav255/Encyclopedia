@@ -1,0 +1,255 @@
+export const level = 'staff';
+
+# FLP impossibility
+
+The FLP result is the most cited theoretical result in
+distributed systems, and the most operationally misread.
+Fischer, Lynch, and Paterson proved in 1985:
+
+> In a **fully asynchronous** system where even **one process
+> may crash**, there is **no deterministic consensus
+> algorithm** that always terminates.
+
+That sentence, decoded, explains why distributed databases
+look the way they do. It also explains why every real system
+sidesteps FLP rather than violates it.
+
+## What it actually says
+
+The model FLP assumes:
+
+- **Asynchronous network**: messages take arbitrary time;
+  there is no upper bound. You can't tell a slow message from
+  a lost one.
+- **Crash failures only** (no Byzantine behavior — that's
+  weaker than FLP needs).
+- **Deterministic algorithm**: given the same input and
+  message history, the algorithm makes the same decisions.
+- **Consensus**: every non-faulty process must eventually
+  decide on the same value, drawn from values proposed by some
+  process.
+
+In this model: **no algorithm can guarantee termination** for
+all execution traces while preserving safety (agreement +
+validity). For any deterministic protocol, there exists an
+execution where consensus is never reached.
+
+## What it does not say
+
+A list of common misreadings:
+
+- **"Consensus is impossible."** No — only **deterministic,
+  always-terminating** consensus in **fully asynchronous**
+  systems is impossible. Real systems use randomness, partial
+  synchrony assumptions, or accept that progress isn't always
+  guaranteed.
+- **"Distributed systems can't reach agreement."** They can.
+  FLP is about worst-case termination, not the common case.
+- **"Networks can't be reliable enough."** FLP holds even with
+  reliable message delivery — the issue is that "slow" and
+  "dead" are indistinguishable when there's no timing bound.
+- **"Paxos / Raft violate FLP."** They don't. They sacrifice
+  guaranteed termination to preserve safety — they may not
+  decide in pathological scenarios, but they never decide
+  *wrongly*.
+
+## Why the proof works
+
+The core argument: in an asynchronous system, you can't tell
+whether a process is **dead** or **slow**. Any deterministic
+algorithm that tries to make progress despite one possible
+failure has a "critical" decision moment that can be derailed
+indefinitely by carefully timing message delays.
+
+Sketch:
+
+<Steps>
+<Step n={1} title="Define bivalent configurations.">
+A protocol configuration is **bivalent** if executions from it
+could decide either 0 or 1. Initially the system is bivalent
+(values are proposed but not yet decided).
+</Step>
+<Step n={2} title="Define univalent configurations.">
+Eventually the protocol must commit to one decision —
+"univalent". The transition from bivalent to univalent happens
+on some specific event (a message delivery).
+</Step>
+<Step n={3} title="Show that bivalence can be preserved.">
+By carefully delaying that critical message and delivering
+something else first, the adversary can keep the system
+bivalent. Repeated indefinitely, the protocol never decides.
+</Step>
+</Steps>
+
+The adversary doesn't need to crash processes or drop
+messages — just delay them. And in an asynchronous model,
+arbitrary delay is allowed.
+
+## How real systems sidestep FLP
+
+Real protocols don't violate FLP; they relax one of its
+assumptions.
+
+### 1. Partial synchrony
+
+The most common escape. Assume the network is **eventually
+synchronous** — there exist (unknown) bounds on message delay
+and processing time, eventually. After some unknown "global
+stabilization time," timeouts are reliable.
+
+Paxos, Raft, and Multi-Paxos all rely on this. They preserve
+**safety** (never decide wrongly) unconditionally; **liveness**
+(eventually decide) holds once the network behaves.
+
+In practice: a healthy datacenter satisfies eventual synchrony
+nearly always. Pathological partitions or extreme overload
+break it temporarily; protocols halt rather than decide
+incorrectly, and resume when conditions improve.
+
+### 2. Randomization
+
+Ben-Or's randomized consensus terminates in expected finite
+time. Each process flips a coin to escape symmetric scenarios
+the deterministic version can't.
+
+Used by: PBFT-style protocols, some cryptocurrencies.
+Practical for small clusters; doesn't scale to large ones.
+
+### 3. Failure detectors
+
+Chandra and Toueg formalized **unreliable failure detectors**
+as a way to model "noisy crash detection." With a "weak
+accuracy" failure detector (no process is detected dead before
+it actually fails), consensus is solvable.
+
+Real heartbeat-based failure detectors don't meet this
+strictly — they sometimes flag healthy processes as dead — but
+they approximate it well enough in practice. See failure
+detectors for details.
+
+### 4. Quorum-based progress
+
+Instead of requiring all processes to agree, require a
+**majority quorum**. As long as a majority is alive and
+reachable, the protocol can decide.
+
+This is how Paxos / Raft / ZAB practically achieve liveness:
+they decide when a majority responds, ignore the minority,
+and let the minority catch up later.
+
+## Consequences for system design
+
+FLP's practical implications shape every distributed database:
+
+### 1. Quorum is fundamental
+
+If you need consensus across N nodes, you need a majority to
+agree. 3 nodes survive 1 failure; 5 nodes survive 2. This is
+not arbitrary — it's the only way to guarantee that two
+distinct decisions can't be reached on opposite sides of a
+partition.
+
+### 2. Timeouts are heuristics, not truths
+
+A timeout doesn't tell you a process is dead. It tells you
+you're tired of waiting. Algorithms must be safe under
+false-positive failure detection — re-elections, retries,
+fencing tokens, etc.
+
+### 3. Liveness vs safety
+
+Production protocols choose **safety always, liveness when
+possible**. A Raft cluster without majority halts (no liveness)
+but doesn't elect two leaders (safety preserved). The
+alternative would be unsafe — and FLP shows there's no way to
+have both guaranteed.
+
+### 4. Designing for the common case
+
+Most of the time the network is well-behaved; consensus
+finishes in a round trip. The pathological FLP-style scenarios
+are vanishingly rare. Protocols are designed to be fast in the
+common case and **safe in the pathological case** — never
+fast in pathological cases (FLP forbids it).
+
+### 5. Why ZooKeeper / etcd exist
+
+A coordination service is "FLP solved well enough so you
+don't have to think about it." Build your distributed system
+on top of one, and use Paxos-/Raft-backed primitives instead
+of reinventing them.
+
+## Common misuses in interviews and design docs
+
+- **"FLP says consensus is impossible, so we use eventual
+  consistency."** No. Eventual consistency isn't "consensus
+  weakened"; it's a different consistency model entirely.
+  FLP is irrelevant to LWW or CRDTs.
+- **"Raft violates FLP."** No. Raft preserves safety; it
+  doesn't guarantee termination in pathological asynchrony.
+- **"FLP means distributed transactions are impossible."**
+  No. Distributed transactions exist; they just may not
+  terminate in pathological cases (the same protocols handle
+  the common case fine).
+- **"FLP is only about consensus."** It's specifically about
+  consensus, but consensus is the foundation of leader
+  election, atomic commit, distributed locks, replicated logs,
+  and configuration management. Most "I need a distributed X"
+  reduces to consensus.
+
+## The relationship to CAP
+
+CAP is the brittle, partition-flavored cousin of FLP. Both say
+that distributed agreement has fundamental costs. CAP frames
+it as "during partitions, sacrifice C or A." FLP frames it as
+"in async systems with failures, sacrifice guaranteed
+termination."
+
+The two are deeply related:
+
+- **Linearizable systems are CP** by CAP. They use consensus
+  protocols (Paxos/Raft) that hit FLP's wall during sustained
+  asynchrony — they halt rather than violate safety.
+- **AP systems** sidestep both CAP and FLP by not requiring
+  consensus for every write. They accept conflicts and
+  reconcile.
+
+If you need linearizability, you must accept FLP's tax — a
+small probability of unavailability under pathological network
+conditions.
+
+## Useful mental shortcut
+
+> Consensus is solvable when the network mostly works and you
+> have a majority alive. Otherwise, protocols halt — by
+> design, because halting is safer than disagreeing.
+
+That captures everything you need from FLP in practice.
+Whenever someone says "this system has 99.999% uptime for
+writes," what they mean is "the network behaves long enough,
+often enough, that consensus terminates routinely — FLP's
+worst-case never strikes."
+
+<Callout variant="info">
+Lamport's quip: "A distributed system is one in which the
+failure of a computer you didn't even know existed can render
+your own computer unusable." FLP makes that quip rigorous.
+Quorum + partial-synchrony assumptions are how we live with
+it.
+</Callout>
+
+## In summary
+
+- FLP: in a **fully asynchronous** system with even **one
+  crash failure**, no deterministic consensus algorithm can
+  guarantee termination.
+- Real systems sidestep with **partial synchrony**,
+  **randomization**, **failure detectors**, and **quorum-based
+  progress**.
+- Paxos and Raft preserve **safety always**, sacrificing
+  **liveness in pathological cases**.
+- Quorum (majority) is the structural answer to FLP-style
+  failures — you can't have linearizability without a
+  majority alive and reachable.
+- Use coordination services (etcd, ZooKeeper) so the FLP
+  workaround is solved once and inherited.

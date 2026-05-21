@@ -1,0 +1,197 @@
+export const level = 'senior';
+
+# Design a web crawler
+
+A system that discovers and downloads pages from the web for
+indexing (search engine), archiving (Wayback Machine), or
+analysis. The hard parts: politeness, dedup, scale, freshness.
+
+## 1. Clarify the scope
+
+- Number of pages: 10B URLs (search engine) or 1M (vertical
+  crawl)?
+- Freshness: re-crawl daily, weekly, never?
+- JavaScript rendering needed (SPAs)?
+- Respect robots.txt? Geographic locale?
+
+Default: 10B URLs, weekly freshness, no JS rendering, respect
+robots.txt.
+
+## 2. Estimate scale
+
+```
+10B URLs × avg 100 KB per page = 1 PB downloaded per cycle
+Avg per second over a week = 16K URLs/sec
+Bandwidth = 1.6 GB/sec sustained download
+```
+
+For depth comparison, Google indexes ~100B pages and refreshes
+on a sliding schedule (popular pages hourly, dead corners
+yearly).
+
+## 3. API
+
+External: configure seeds and policies via admin API.
+Internal:
+
+```bash
+POST /crawler/seed
+  Body: { urls: ["..."], depth: 5 }
+
+POST /crawler/policy/<domain>
+  Body: { rate_limit_qps: 1, max_depth: 3, refresh_days: 7 }
+
+GET /crawler/stats
+  Returns: { pages_crawled, queue_size, errors }
+```
+
+## 4. High-level design
+
+```
+seed urls
+   ▼
+URL frontier (queue, sharded by domain)
+   ▼
+URL dedup (Bloom filter + persistent store)
+   ▼
+robots.txt + politeness governor
+   ▼
+fetcher workers (HTTP clients)
+   ▼
+parser (extract links, content)
+   ├→ link extractor → URL frontier (with seen-URL filter)
+   └→ content store (object storage)
+```
+
+Each component is a separate service; they communicate via
+queues and Kafka.
+
+## 5. Data model
+
+- **URL frontier**: priority queue per domain (so we don't
+  hammer one site).
+- **Seen URLs**: Bloom filter (in-memory, ~10 bits per URL ≈
+  12 GB for 10B URLs) + persistent KV (for true positives
+  recheck).
+- **Content store**: S3-class blob storage, keyed by URL hash.
+- **Metadata DB**: URL → (fetched-at, status, size, etag,
+  last-modified, content-hash).
+
+## 6. Deep dives
+
+### URL dedup
+
+A web has cycles; without dedup, you'd crawl forever.
+
+Bloom filter for the hot path: O(1) "have we seen this URL?"
+with ~1% false-positive rate (which means re-crawling a few
+URLs). On positive (might be seen), check the persistent store.
+
+For massive scale, partition the Bloom filter by URL hash
+prefix; one Bloom filter per crawler shard.
+
+### Politeness and robots.txt
+
+Hit one site too hard and they'll IP-ban you. Respect:
+
+- **`robots.txt`** — cache per-domain for 24 hours; abide.
+- **Per-domain rate limit** — typically 1 QPS by default;
+  large sites might allow more.
+- **`Crawl-delay`** directive from robots.txt.
+- **Backoff on 429 / 5xx** — exponentially up to a max.
+
+Implement politeness via per-domain queues and per-domain
+token buckets.
+
+### URL canonicalization
+
+Two different URLs that point to the same page should hash
+to the same key:
+
+- Lowercase scheme + host.
+- Sort query parameters.
+- Strip tracking params (`utm_*`, `fbclid`, etc.).
+- Strip fragment (`#section`).
+- Resolve relative URLs.
+- Normalize encoding (`%20` vs `+`).
+
+Without this, you crawl the same page many times.
+
+### JavaScript-heavy pages
+
+Modern web is JS-rendered. Two approaches:
+
+- **Headless browser** (Chromium via Puppeteer/Playwright):
+  full render, expensive (~1s/page, lots of CPU/RAM).
+- **Server-side rendering hint**: many sites ship a
+  `<noscript>` fallback or `<link rel="canonical">` static
+  version; use it when available.
+
+For 10B URLs, only render JS for sites that have
+JS-only content; static-fetch everything else.
+
+### Distributed crawler architecture
+
+A single fetcher box does maybe 100 URLs/sec. For 16K URLs/sec
+you need ~160 fetcher boxes. They share:
+
+- The URL frontier (sharded by domain hash).
+- The seen-URLs Bloom filter (sharded by URL hash).
+- The content store and metadata DB.
+
+Each worker pulls from its frontier shard, fetches, parses,
+emits new URLs back to frontiers (potentially other shards).
+
+### Freshness scheduling
+
+Pages change at different rates. Naïve: re-crawl everything
+weekly. Better:
+
+- **Track change rate** per URL (based on prior crawls).
+- **Adapt re-crawl interval**: every 30 minutes for a news
+  homepage; every 90 days for archived content.
+- **Sitemap.xml + RSS** hints for popular sites.
+- **`Last-Modified` + `If-Modified-Since`** — get a 304 and
+  skip the body.
+
+### Storage of crawled content
+
+Object storage (S3-class). Key = hash of canonical URL.
+Content stored compressed (zstd). Metadata in a separate
+database (DynamoDB / Cassandra). Indexing pipeline reads from
+content store, builds inverted index downstream.
+
+## 7. Bottlenecks and scale-ups
+
+- **Frontier hot domain**: a giant site with 1B URLs queues
+  faster than we can crawl politely. Cap per-domain queue
+  length; spill to cold storage.
+- **DNS rate-limit**: cache DNS lookups; respect upstream
+  rate limits.
+- **IP-ban**: rotate IPs from a large pool; identify yourself
+  in User-Agent so admins can throttle politely instead of
+  banning.
+- **Bloom filter memory**: shard the filter; persistent KV as
+  backstop.
+
+## 8. Tradeoffs called out
+
+- **Bloom filter + persistent store**: balances memory and
+  exact recall.
+- **Per-domain queue**: chose politeness over raw throughput.
+- **Don't render JS by default**: chose CPU savings; selective
+  rendering for sites that need it.
+- **S3 for content, separate metadata DB**: chose schema-on-write
+  for metadata, schema-on-read for content blobs.
+
+## In summary
+
+- Crawler = URL frontier + dedup + fetcher + parser + content
+  store.
+- Politeness (robots.txt, per-domain QPS) is mandatory.
+- URL canonicalization + Bloom filter dedup are the foundation
+  of scale.
+- JS rendering only when necessary; expensive.
+- Freshness scheduling beats blind re-crawl every time.
+- The hard parts aren't downloading pages — they're keeping
+  the system polite, deduped, and adaptive.

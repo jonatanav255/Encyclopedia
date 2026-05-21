@@ -1,0 +1,165 @@
+export const level = 'staff';
+
+# Erasure coding vs replication
+
+Two strategies for surviving disk and node failures.
+
+- **Replication**: store N full copies of every block on N
+  different machines. Storage cost = N×.
+- **Erasure coding**: split each block into K data chunks +
+  M parity chunks; spread across K+M machines. Can lose any
+  M; reconstruct from the remaining K. Storage cost = (K+M)/K
+  × ≈ 1.x.
+
+EC is dramatically more storage-efficient but more
+CPU-intensive on writes and reconstruction.
+
+## The math
+
+**Replication N=3**: each byte stored 3 times → 3× overhead.
+Survives 2 simultaneous failures.
+
+**Erasure coding (10, 4)**: 10 data + 4 parity → 14 total →
+1.4× overhead. Survives 4 simultaneous failures.
+
+EC gives **stronger durability per storage dollar**:
+
+- 3-replica: 200% overhead, survives 2 failures.
+- EC (10,4): 40% overhead, survives 4 failures.
+
+For petabyte-scale storage, the savings are enormous.
+
+## How EC works
+
+Reed-Solomon is the standard algorithm. Given K data chunks,
+compute M parity chunks via linear algebra over a finite
+field. Spread all K+M chunks across different machines.
+
+To reconstruct:
+
+- If a chunk is missing, fetch K of the remaining K+M-1
+  chunks and recompute.
+- Any K chunks suffice — data or parity.
+
+The math is well-understood, hardware-accelerated on modern
+CPUs (AVX2, NEON), and battle-tested.
+
+## Where each fits
+
+### Replication
+
+- **Hot data**, frequently read.
+- **Small data sets** where storage isn't the bottleneck.
+- **Operationally simple** systems (one disk = one copy).
+- **Low-write but high-read** patterns benefit from many read
+  replicas.
+
+Examples: HDFS replicate-3, default S3 Standard, etcd
+replication.
+
+### Erasure coding
+
+- **Cold or warm data** read less frequently.
+- **Massive scale** where storage cost dominates.
+- **High-durability requirements** (cheap path to 11+ nines).
+- **Background storage tier** (archival, backup).
+
+Examples: S3 IA (and others use EC under the hood), Backblaze
+B2, Ceph cold tier, MinIO, HDFS Erasure Coding mode (Hadoop
+3.x).
+
+## The reconstruction cost
+
+Replication: lose a copy → copy from a peer. O(block size)
+network.
+
+EC: lose a chunk → fetch K chunks, compute the missing one.
+O(K × block size) network. For (10,4), 10× more
+reconstruction traffic.
+
+When a disk fails, repair time matters: how long until
+durability is restored? EC's reconstruction is slower, so the
+window where another failure could cause loss is longer.
+
+Mitigation: rate-limited but continuous background repair;
+prioritize partially-failed objects.
+
+## Hybrid: replicate hot, EC cold
+
+A modern object store often:
+
+- **Hot tier**: 3-replica for low latency.
+- **Warm tier**: EC (10,4) for cost savings.
+- **Cold tier**: EC (with greater K+M ratios) or tape /
+  Glacier.
+
+Data automatically migrates between tiers as access patterns
+shift.
+
+## Failure mode considerations
+
+EC handles **independent failures** well. It handles
+**correlated failures** badly:
+
+- A whole rack goes down → if multiple EC chunks were on that
+  rack, you might lose the object.
+- A network partition isolates a datacenter → reconstruction
+  can't proceed.
+
+Mitigation: place chunks across failure domains explicitly
+(rack-aware EC, datacenter-aware EC). S3 spreads across AZs;
+HDFS-EC places chunks across racks.
+
+## Operational nuances
+
+### Read amplification
+
+Reading a full object usually only reads K chunks (no
+reconstruction needed). But:
+
+- **Range reads** within an object may need to fetch from all
+  K+M.
+- **Reconstruction during read** doubles latency.
+
+### Small objects
+
+EC has fixed per-chunk overhead. For tiny objects, EC has
+high overhead — sometimes more than replication.
+
+Many EC systems coalesce small objects into larger "stripes"
+before EC.
+
+### Write amplification
+
+Modifying part of an EC-encoded object requires reading + recomputing
+the entire stripe. EC is **append-only friendly**, not
+update-friendly.
+
+Most EC systems either disallow partial updates or implement
+copy-on-write.
+
+## When to choose
+
+| Property | Replication | EC |
+|---|---|---|
+| Storage overhead | 2-3× | 1.4× |
+| Failures tolerated | 2 (for 3-rep) | 4+ (for typical 10+4) |
+| Write CPU | Low | Higher |
+| Reconstruction cost | Cheap | More expensive |
+| Update friendliness | Good | Poor |
+| Small object overhead | Same | Worse |
+| Best for | Hot reads, small data | Cold data, massive scale |
+
+For hot transactional data: replicate. For warm/cold
+analytic and archival data: EC.
+
+## In summary
+
+- Replication: full copies, simple, expensive in storage.
+- Erasure coding: chunks + parity, cost-efficient, more CPU
+  and reconstruction overhead.
+- EC for cold/archival, large-scale, durability-critical
+  workloads.
+- Replication for hot, small, frequently-updated data.
+- Modern systems use both: replicate hot, EC cold.
+- Watch failure domains and small-object overhead.

@@ -1,0 +1,166 @@
+export const level = 'senior';
+
+# Edge caching and compute
+
+Pushing both **data** and **code** out of central regions and
+into hundreds of POPs near users. Edge caching is the natural
+extension of CDN; edge compute lets you run arbitrary logic at
+the same locations.
+
+The promise is single-digit-ms latency for users worldwide.
+The cost is a new mental model: distributed state, cold
+starts, limited compute primitives at the edge.
+
+## Edge caching: beyond static files
+
+Modern edge caching includes dynamic content with short TTLs.
+Cloudflare, Fastly, AWS CloudFront, and Akamai all support:
+
+- **Cache personalized responses** by including auth identity
+  in the cache key.
+- **Vary on geography** — different prices, languages, content
+  per country.
+- **Cache API responses** with short (seconds–minutes) TTLs
+  while the origin can be a few hops slower.
+- **Stale-while-revalidate / stale-if-error** — serve stale
+  content immediately, refresh in background.
+
+The win for dynamic content is modest (less than 100ms saved)
+but cumulative — every API call shaved makes a measurable UX
+difference.
+
+## Edge compute platforms
+
+<Cheatsheet>
+| Platform | Runtime | Cold start |
+|---|---|---|
+| Cloudflare Workers | V8 isolates | ~0 ms |
+| Fastly Compute@Edge | WebAssembly | ~1 ms |
+| AWS Lambda@Edge | Node.js, Python | 100s of ms |
+| AWS CloudFront Functions | Restricted JS | ~0 ms |
+| Vercel Edge Functions | V8 isolates | ~0 ms |
+| Deno Deploy | V8 isolates | ~0 ms |
+</Cheatsheet>
+
+V8 isolates and WebAssembly let providers run thousands of
+tenants in a single process — startup is so fast it's
+effectively free. This is the technical breakthrough behind
+the "no cold start" pitch.
+
+Lambda@Edge uses full Node.js containers, which have real
+cold starts (100s of ms) but more capability.
+
+## What you can do at the edge
+
+The good fit:
+
+- **Personalization** — read user identity from a cookie,
+  fetch a tiny per-user JSON from a nearby KV store, inject
+  into HTML.
+- **A/B testing** — assign a variant deterministically by
+  user ID, serve the right HTML.
+- **Auth gating** — verify JWT signature, route accordingly.
+- **Geographic routing** — pick the right backend for the
+  user's region.
+- **Header rewriting** — add security headers, normalize
+  request shape before origin.
+- **Bot filtering** — challenge suspicious clients before
+  origin sees them.
+
+What you can't easily do:
+
+- **Heavy compute** — limited CPU per request (typically
+  10–50 ms), small memory (128 MB).
+- **Long-lived connections** — most edge runtimes are
+  request-scoped.
+- **Strong consistency reads** — edge KV stores are eventually
+  consistent.
+- **Large data ops** — edges have small disks if any.
+
+## Edge data primitives
+
+Each provider has a slightly different toolkit:
+
+- **Cloudflare**: Workers KV (eventually-consistent global
+  KV), R2 (S3-compatible), D1 (SQLite at edge), Durable
+  Objects (per-key strong-consistency primitive).
+- **Fastly**: KV Store (eventually-consistent), Object
+  Store.
+- **AWS**: DynamoDB Global Tables for multi-region, CloudFront
+  Functions can't access state directly.
+- **Vercel**: Edge Config (read-mostly, eventually
+  consistent), KV (Redis-backed).
+
+The pattern: **read at edge, write to a central region**.
+Writes propagate via the provider's replication; reads serve
+from the nearest edge. Eventual consistency is the default.
+
+## Cache invalidation at the edge
+
+Hundreds of POPs make invalidation harder than a single
+region:
+
+- **TTL-based**: still works, just slower to propagate.
+- **Versioned URLs**: still the safest.
+- **Active purge**: Cloudflare and Fastly promise seconds for
+  global purge; older providers measure in minutes.
+- **Tag-based purge**: tag objects (`product-42`, `user-123`)
+  and purge by tag. Saves enumeration.
+
+For systems where edge cache lag is fatal (price changes,
+critical alerts), bypass edge for those paths or use very
+short TTLs.
+
+## Cost model
+
+Edge costs more per request than origin compute but saves
+**a lot** on bandwidth (no return trips from origin) and
+origin scale.
+
+Typical pricing:
+
+- Edge compute: ~$0.50 per million requests + ~$0.05 per
+  million ms CPU.
+- Origin compute: ~$0.05 per million requests but pay for
+  long-running instances.
+
+For high-volume, cacheable, latency-sensitive traffic, edge
+is cheaper. For heavy compute, origin is cheaper.
+
+## Designing for the edge
+
+Three patterns that work:
+
+### 1. Edge as a smart cache
+
+Most logic stays at origin. Edge does cache lookup, header
+manipulation, personalization injection. Easiest to adopt.
+
+### 2. Edge as the primary handler
+
+API logic runs at edge, only touches origin for the database.
+Latency wins are largest. Requires the database to be
+edge-accessible (Cloudflare D1, Vercel Postgres at edge,
+PlanetScale via edge proxy).
+
+### 3. Edge + Durable Objects
+
+State that needs strong consistency lives in Durable Objects
+or similar primitives. Each object has a single home POP;
+edge requests for that object hop to its home. Compromises
+on edge latency for some keys, but gives true strong
+consistency.
+
+## In summary
+
+- Edge caching: short TTL caches for dynamic content; cheap
+  latency wins beyond static.
+- Edge compute: V8 isolates / Wasm let providers run tenants
+  with near-zero cold start.
+- Best for personalization, auth gating, A/B, header
+  rewriting; bad for heavy compute or strong-consistency
+  state.
+- Each provider has an eventually-consistent KV; pair with
+  central writes.
+- Cache invalidation at the edge is harder than at a single
+  region — TTL + versioned URLs are still the safest.

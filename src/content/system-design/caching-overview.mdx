@@ -1,0 +1,334 @@
+export const level = 'junior';
+
+# Caching overview
+
+A cache is a place to store the result of work so you don't
+have to do that work again. The work might be a database query,
+an HTTP response, a computed aggregate, an image transform. The
+"place" can be anywhere — browser memory, a CDN, an edge POP,
+your app server's heap, a Redis cluster, even another layer of
+the database itself.
+
+Almost every system more complex than a toy uses multiple
+caches at multiple layers. Done well, caches multiply effective
+capacity 10–100×. Done badly, they introduce inconsistency,
+stampedes, and bugs that are hard to reproduce.
+
+## What a cache buys you
+
+Three things:
+
+1. **Latency**. A cache hit is faster than the underlying
+   work. A memory lookup is ~1000× faster than an SSD read,
+   which is ~100× faster than a network round-trip.
+2. **Load reduction**. Each cache hit is a request the source
+   didn't have to serve. At 90% hit rate, the source sees
+   1/10th the traffic.
+3. **Cost**. Caches are usually cheaper per request than the
+   source. A Redis op is microseconds and pennies; a Postgres
+   query with joins is milliseconds and proportionally more
+   expensive.
+
+## What a cache costs you
+
+The same three things, inverted, when things go wrong:
+
+1. **Staleness**. The cache might serve data older than the
+   source. For some data (a search result page), that's fine.
+   For other data (an account balance), it's a serious bug.
+2. **Complexity**. Now there are two sources of truth that
+   must agree. The hardest bugs in cached systems are
+   "everything looks fine, the values are just wrong."
+3. **Operational burden**. Caches are infrastructure to
+   monitor, scale, and recover. Caches that crash at peak load
+   take their backing system down with them.
+
+The famous Phil Karlton quote: **"There are only two hard
+things in computer science: cache invalidation and naming
+things."** People laugh, then go re-learn it. See
+cache-invalidation-strategies.
+
+## Where caches live
+
+A request usually passes through many caches on its way to data:
+
+```
+   browser cache (HTTP cache, service worker)
+        │
+        ▼
+   CDN / edge POP
+        │
+        ▼
+   reverse proxy cache (Varnish, NGINX)
+        │
+        ▼
+   app-tier cache (in-process LRU, Redis nearby)
+        │
+        ▼
+   data-tier cache (DB buffer pool, materialized view)
+        │
+        ▼
+   the actual source of truth
+```
+
+Each layer catches some fraction of requests; only the misses
+fall through to the next layer.
+
+### Browser / client cache
+
+The cheapest cache: don't ask the server at all. The HTTP
+`Cache-Control`, `ETag`, and `Last-Modified` headers tell the
+browser when it can reuse a previous response.
+
+For static assets (images, CSS, JS), the browser cache eats
+99% of repeat traffic. For dynamic API responses, the browser
+cache is rarely used (correctness is fragile).
+
+### CDN / edge
+
+The next layer. CDNs (Cloudflare, Fastly, Akamai, CloudFront)
+cache responses at hundreds of POPs worldwide. A request from
+Tokyo hits the Tokyo POP; if the response is cached, it
+returns in single-digit ms. If not, the POP fetches from the
+origin and caches.
+
+See cdn-architecture.
+
+### Reverse proxy
+
+A proxy in front of the app — Varnish is the classic, NGINX
+can do it, ATS, Squid. Sits in your data center; caches
+based on URL + headers. Less common now that CDNs do edge
+caching directly, but still used internally.
+
+### Application cache
+
+Inside or alongside the app. Two flavors:
+
+- **In-process** (per-replica): a `Map` with LRU eviction,
+  `lru-cache`, Caffeine in Java. Microsecond access. Caveats:
+  per-replica (no sharing), evicted on restart.
+- **Out-of-process** (shared): Redis or Memcached, a few ms
+  network hop. Shared across replicas. The default
+  "application cache" in 2025.
+
+The two are usually layered: in-process cache first (small,
+fast), Redis behind (larger, slightly slower), the database
+behind that.
+
+### Database cache
+
+The DB itself caches: Postgres's shared buffers, MySQL's
+InnoDB buffer pool. Recent queries hit memory; old data goes
+to disk. Mostly invisible to you, but tuning the buffer pool
+to fit hot data is the difference between a fast and slow DB.
+
+## What to cache
+
+Three properties make data a good cache candidate:
+
+1. **Read-heavy**. Caching writes is meaningless — you have to
+   write through to durable storage anyway.
+2. **Cost to compute is high**. A cheap query doesn't benefit
+   much from caching; an expensive aggregate does.
+3. **Tolerates some staleness**. If the answer must be exact,
+   caching adds complexity that may not be worth it.
+
+Classic candidates:
+
+- User profiles, settings (hot, slowly changing).
+- Computed aggregates (top-N, leaderboards, dashboards).
+- Static-ish content (blog posts, product descriptions).
+- Authentication tokens, session data.
+- Permission checks (per-user role lists).
+- Expensive joins or analytical queries.
+
+Bad candidates:
+
+- Per-request unique data (caching it makes no sense — only
+  used once).
+- Real-time prices, balances, inventory at sale.
+- Anything where staleness is a correctness bug.
+
+## Cache hit ratio
+
+The single most important cache metric.
+
+```
+hit_ratio = hits / (hits + misses)
+```
+
+A 90% hit ratio means the source sees 1/10th the load. A 99%
+hit ratio means it sees 1/100th. The difference between 90%
+and 99% is order-of-magnitude — sizing the cache to push from
+one to the other often justifies its cost on the spot.
+
+Cache sizing rule of thumb: cache as much data as your **hot
+working set**. Below that, hit ratio drops fast; above that,
+returns diminish.
+
+## TTL — the simple knob
+
+The simplest expiry policy: each cache entry lives for `N`
+seconds, then is automatically removed.
+
+```ts
+await redis.set('user:42', JSON.stringify(user), 'EX', 300); // 5 min
+```
+
+TTL is the answer to "how stale can this data be?" 5 minutes
+for user profiles is fine; 5 minutes for an inventory count
+during a flash sale is a disaster.
+
+Stronger guarantees (TTL of 1 second, instant invalidation on
+write) cost more — see cache-invalidation-strategies.
+
+## Eviction policies
+
+When the cache is full, something must go. LRU (least recently
+used) is the default — evict the entry that hasn't been
+touched in the longest time.
+
+Other policies (LFU, ARC, TinyLFU, FIFO) make different
+trade-offs. For most workloads, LRU is fine. For some
+(skewed access, scan-resistant workloads), more sophisticated
+policies measurably beat it.
+
+See eviction-policies.
+
+## Caching patterns
+
+The four classical patterns:
+
+- **Cache-aside (lazy loading)**: app checks cache; on miss,
+  reads from DB and writes to cache. The default.
+- **Write-through**: writes go to cache and DB synchronously.
+- **Write-back**: writes go to cache first, flush to DB
+  asynchronously.
+- **Refresh-ahead**: refresh entries proactively before they
+  expire.
+
+Each has dedicated pages here. The right pattern depends on
+how much staleness you can tolerate and how much write
+throughput you need.
+
+## Cache as a hot-path optimization, not a crutch
+
+A common mistake: relying on the cache to make a fundamentally
+slow query fast enough. Then the cache cold-starts (deploy,
+cluster restart, key expiry), the DB takes the full load, and
+the system melts.
+
+Rules to keep yourself honest:
+
+- **Optimize the source first.** Make the underlying query
+  acceptable without the cache. The cache is an
+  amplifier, not a fix for `SELECT *` with no indexes.
+- **Test cold-cache behavior.** Spin up a fresh cache;
+  measure source load. If the system tips over, you have a
+  capacity problem, not just a cache problem.
+- **Monitor hit ratio.** A drop from 95% to 60% triples
+  source load. Alert on it.
+- **Plan for the cache being down.** Can the system serve
+  (degraded) without it? Or is it a tier-0 dependency?
+
+## Multi-layer caching: the rule of locality
+
+A small, fast cache close to the consumer + a larger,
+slower cache further away is almost always better than one
+single-tier cache. The math:
+
+```
+Layer 1 (per-replica, in-process):
+  100 MB, 1 µs access, 70% hit ratio
+Layer 2 (Redis):
+  10 GB, 1 ms access, 90% of remaining misses
+Source (DB):
+  any size, 10 ms access, the rest
+```
+
+Expected latency:
+
+```
+0.7 × 1 µs + 0.3 × 0.9 × 1 ms + 0.3 × 0.1 × 10 ms
+≈ 270 µs + 300 µs
+≈ 0.57 ms average
+```
+
+Without the in-process layer:
+
+```
+0.9 × 1 ms + 0.1 × 10 ms ≈ 1.9 ms
+```
+
+Three times slower on average. The L1 cache is the difference.
+
+## Caching is not free — when to skip it
+
+Caching adds machinery: a cache to operate, an extra failure
+mode, a staleness model to reason about. If the data is
+already fast (small, simple, well-indexed), or if usage is
+trivial (low QPS), don't cache.
+
+The rule of thumb: cache when you've **measured** the source
+is too slow or too loaded, not because "caches are good."
+Caching premature is a real category of architectural debt.
+
+## Common pitfalls
+
+### Cache stampede
+
+A hot key expires. Thousands of concurrent requests all miss
+the cache simultaneously, all hit the DB, all compute the
+same value, all write it back. The DB melts. See
+cache-stampede.
+
+### Cache penetration
+
+Clients repeatedly request keys that don't exist (404s).
+Every request misses the cache and hits the DB. Mitigation:
+cache the "not found" answer with a short TTL. See
+negative-caching.
+
+### Caching the unique
+
+A request with a session token or a user ID in the URL is
+unique per user; caching it gains nothing. Don't cache it.
+Skip URLs with high-cardinality query parameters in CDN
+configs.
+
+### Forgetting to invalidate
+
+A user updates their profile. The cache still has the old
+value. Reads return stale data until TTL. The standard
+patterns (cache-aside with delete-on-write, write-through,
+CDC-driven invalidation) all address this — pick one
+deliberately.
+
+### Cache becoming the source of truth
+
+A cache should always be derivable from the source. If you
+write to the cache and not to the source, a cache failure =
+lost data. Be honest about which layer is authoritative.
+
+### Caching the wrong thing
+
+Caching the database row is one option. Caching the rendered
+HTML is another. Caching the JSON API response is a third.
+Each has different consequences. Cache the most expensive,
+most reusable unit — often the API response or computed
+aggregate, not the raw DB row.
+
+## In summary
+
+- A cache stores results to avoid re-doing work.
+- Layers: browser, CDN/edge, reverse proxy, app, DB. Each
+  layer absorbs some traffic.
+- Hit ratio is the metric. 90% vs 99% is a 10× difference in
+  source load.
+- Pick a pattern (cache-aside, write-through, write-back,
+  refresh-ahead) per data type, not globally.
+- Caches add staleness, complexity, and operational burden.
+  Use them when they pay, not because they're fashionable.
+- Test cold-cache scenarios. The cache will be cold
+  occasionally; the system must survive that.

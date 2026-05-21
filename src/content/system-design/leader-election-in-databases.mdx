@@ -1,0 +1,322 @@
+export const level = 'staff';
+
+# Leader election in databases
+
+A replicated database needs exactly one node accepting writes
+at a time. When the leader dies, the cluster must agree on a
+replacement — quickly, without ambiguity, and without two nodes
+believing they're leader simultaneously. That agreement is
+**leader election**, and it's the part of distributed
+databases where folklore meets actual algorithms.
+
+## Why this is hard
+
+In a single-machine world, electing a leader is a function
+call. In a distributed system, the difficulties multiply:
+
+- **Failure detection is unreliable.** A "dead" node may be
+  slow, garbage-collecting, or partitioned.
+- **Multiple nodes might decide independently.** Without
+  coordination, two replicas could both promote themselves.
+- **The network can lie.** Messages drop, duplicate, reorder,
+  arrive late.
+- **The old leader might not know it's been replaced.** Its
+  writes after demotion are dangerous.
+
+The hard requirement: **at most one** leader at any time. Two
+leaders accepting writes is **split brain** — data divergence
+that takes manual reconciliation to repair.
+
+## What "election" actually does
+
+A leader election protocol provides three properties:
+
+<Steps>
+<Step n={1} title="Agreement.">
+All non-faulty nodes agree on the same leader for a given
+epoch (term).
+</Step>
+<Step n={2} title="Termination.">
+The protocol eventually elects a leader when the network is
+stable enough.
+</Step>
+<Step n={3} title="Validity (uniqueness).">
+The elected leader is one of the participating nodes; only
+one leader exists per term.
+</Step>
+</Steps>
+
+What it does not provide:
+
+- Liveness during persistent partition. By FLP, no
+  deterministic protocol can guarantee liveness with
+  asynchronous failures.
+- Strict simultaneity. The old leader may still believe it's
+  leader briefly — fencing handles this.
+
+## Three families of mechanisms
+
+Real databases get leader election from one of these:
+
+### 1. External coordinator (etcd, ZooKeeper, Consul)
+
+The database itself does not run consensus. Instead, candidate
+nodes race to acquire a **lease** in a coordination service.
+The lease holder is leader for the lease duration.
+
+Used by:
+
+- **Patroni** for Postgres: stores cluster state in etcd or
+  Consul; the holder of `/leader` is the primary.
+- **MySQL with Orchestrator + etcd/Consul** as the source of
+  truth.
+- **Kafka pre-KRaft**: ZooKeeper coordinated controller
+  election.
+- **HBase, Solr, older HDFS**: ZooKeeper-backed.
+
+The pattern:
+
+```
+candidates → coordinator (CAS / atomic create) → holds lease (e.g., 10s)
+candidate that wins → promotes itself to primary
+old leader → loses lease → demotes itself
+```
+
+The coordinator solves the consensus problem once; databases
+reuse it. The trade: another system to operate, with its own
+quorum and failure modes.
+
+### 2. Built-in Raft
+
+The database embeds Raft directly. Each replica group runs Raft,
+which includes leader election as a step.
+
+Used by:
+
+- **etcd** itself (Raft on top of bbolt).
+- **CockroachDB**: each range is a Raft group with its own
+  leader.
+- **TiKV / TiDB**: same.
+- **YugabyteDB, RethinkDB, M3DB, OpenSearch's cluster manager
+  in newer versions.**
+
+Election within Raft:
+
+- Each replica runs a randomized election timer (e.g.,
+  150–300ms).
+- When a follower hears nothing from the leader before its
+  timer expires, it becomes a **candidate**, increments its
+  term, and asks others for votes.
+- A node votes for at most one candidate per term, preferring
+  those with a log at least as up-to-date as its own (safety
+  property).
+- A candidate that receives votes from a majority becomes
+  leader for that term.
+- The new leader sends heartbeats to suppress further
+  elections.
+
+The randomized timer is the key innovation — it makes split
+votes rare. See the Raft page for details.
+
+### 3. Built-in Paxos / variants
+
+The database embeds Multi-Paxos, Viewstamped Replication, or
+ZAB.
+
+Used by:
+
+- **Spanner**: Paxos per shard.
+- **Chubby** (Google's lock service): Paxos.
+- **ZooKeeper itself**: ZAB (a Paxos variant tailored to
+  primary-backup).
+- **Older systems** that pre-date Raft.
+
+The mechanism is similar to Raft conceptually but is less
+prescriptive about the "leader" — vanilla Paxos doesn't require
+a stable leader; Multi-Paxos elects one for efficiency.
+
+## Postgres + Patroni: the canonical pattern
+
+Postgres has no built-in cluster coordination. Patroni
+(Zalando) is the de facto wrapper.
+
+```
+[etcd cluster]            ← source of truth
+   ↑↓
+[patroni on db1]          ← agent on each node
+[patroni on db2]
+[patroni on db3]
+```
+
+Patroni's loop on each node:
+
+1. Read cluster state from etcd.
+2. If no leader, race to take the leader lock (atomic
+   create-if-not-exists).
+3. If you hold the leader lock, configure Postgres as
+   primary; sync replicas attach to you.
+4. Renew the lock every few seconds.
+5. If you lose the lock (network blip, GC pause), demote
+   immediately to follower.
+
+The lease (`ttl`) is typically 10–30s. If the leader can't
+renew before TTL, the lock expires; another node takes it.
+
+The old leader, on losing the lease, must demote — even if it
+believes it's healthy. This is **fencing** via cooperative
+behavior. Stronger fencing (STONITH — "shoot the other node
+in the head") forcibly powers off the old leader.
+
+## MySQL: Orchestrator, MHA, MySQL Cluster
+
+MySQL's HA story is more fragmented:
+
+- **MHA (deprecated but still in use)**: a manager process
+  detects failure and promotes a replica. Brittle without a
+  coordinator.
+- **Orchestrator**: a discovery and failover tool. Often
+  paired with Consul or etcd. Same lease pattern as Patroni.
+- **MySQL Group Replication**: built-in Paxos-like
+  (XCom). Members coordinate to elect a primary.
+- **InnoDB Cluster**: bundles Group Replication with MySQL
+  Shell tooling.
+
+The mature production setup is Group Replication + MySQL
+Router. Self-coordinated, no external etcd.
+
+## MongoDB replica sets
+
+MongoDB has built-in elections.
+
+- Each replica set has 3 or 5 members (always odd for
+  majority).
+- A replica's `priority` and `votes` configure election
+  eligibility.
+- On primary failure, eligible secondaries call for an
+  election; majority wins.
+- Uses an extension of Raft (since MongoDB 3.2).
+
+The model is essentially: Raft for membership and leader
+election, custom replication for data.
+
+## Failure modes — what goes wrong
+
+Five distinct kinds of incidents.
+
+### 1. Split brain
+
+Two nodes believe they are leader simultaneously. Both accept
+writes. Data diverges. Most damaging form of failure.
+
+Causes:
+
+- Network partition without proper quorum-based election.
+- Old leader doesn't realize it's been demoted (no fencing).
+- Coordinator (etcd) split during election.
+
+Prevention:
+
+- **Majority quorum** required for election (Raft, Paxos):
+  only one majority can exist at a time.
+- **Leases with bounded clock drift**: the old leader's lease
+  expires before the new one is granted.
+- **Fencing tokens**: every write carries an
+  ever-increasing epoch number; the data store rejects
+  writes from a stale epoch.
+
+### 2. Elected the wrong replica
+
+The elected node's log is behind. Promoting it loses recent
+writes.
+
+Prevention:
+
+- Raft's "log-up-to-date" voting rule: candidates with stale
+  logs cannot win.
+- Patroni's `pg_rewind` integration: when an old leader
+  rejoins, it rewinds to a common WAL point.
+
+### 3. Flapping elections
+
+Nodes keep timing out and triggering elections; cluster never
+stabilizes.
+
+Causes:
+
+- Election timer too short.
+- Network is intermittent.
+- Coordinator under load.
+
+Prevention:
+
+- Tune timers (Raft: 150–300ms randomized).
+- Stable network is a precondition.
+- Pre-vote phase (some Raft variants) to test candidacy
+  before incrementing terms.
+
+### 4. Quorum impossible
+
+The cluster has fewer than majority of nodes alive. No new
+leader can be elected. Database is read-only or down.
+
+This is **the correct behavior**: better to fail than to risk
+split brain. Plan capacity so any single failure doesn't drop
+you below majority (3 nodes survives 1 failure; 5 nodes
+survives 2).
+
+### 5. Coordinator outage
+
+When the coordinator (etcd) is unhealthy, the database may be
+unable to fail over even if the primary is fine. The
+coordinator becomes a single point of failure for the cluster.
+
+Prevention: run etcd as its own multi-node quorum (3 or 5
+nodes), separate from the database nodes, with monitoring.
+
+## Practical guidance
+
+<Steps>
+<Step n={1} title="Always run an odd cluster size.">
+3 or 5. Even sizes don't survive more failures and risk
+split-vote scenarios.
+</Step>
+<Step n={2} title="Use a built-in or proven external coordinator.">
+Don't write your own. Patroni + etcd or Raft-based engines.
+</Step>
+<Step n={3} title="Test failover.">
+Kill the leader weekly in staging. Measure RTO. Verify no
+data loss. Verify clients reconnect.
+</Step>
+<Step n={4} title="Plan for the coordinator's failure.">
+What happens if etcd is unreachable? Patroni's default is to
+demote the primary if it can't reach etcd. Make sure this is
+what you want.
+</Step>
+<Step n={5} title="Use fencing.">
+Make sure the old leader cannot continue accepting writes
+after a new one is elected. Either via lease semantics or
+explicit fencing tokens.
+</Step>
+</Steps>
+
+<Callout variant="info">
+KRaft is Kafka's replacement for ZooKeeper-based controller
+election. Built-in Raft removes the external coordinator,
+simplifies operations, and is the direction the industry is
+moving — fewer external coordinators, more
+embedded-consensus databases.
+</Callout>
+
+## In summary
+
+- Leader election in a distributed database produces **one and
+  only one** leader per term, even under failure.
+- Three families: external coordinator (etcd, ZooKeeper),
+  built-in Raft (CockroachDB, TiKV, etcd, MongoDB), or
+  Paxos/ZAB (Spanner, ZooKeeper, older systems).
+- Split brain is the worst failure: two leaders accept writes
+  and diverge. Quorum-based election + fencing prevents it.
+- Odd-sized clusters, tested failover, and a healthy
+  coordinator are non-negotiable in production.
+- The trend is **embedded consensus** (Raft per shard), not
+  external coordinators.

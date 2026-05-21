@@ -1,0 +1,300 @@
+export const level = 'senior';
+
+# Partitions and consumer groups
+
+The Kafka-shaped scaling model in one sentence: **a topic is split
+into partitions, each partition is a totally-ordered log, and each
+partition is consumed by exactly one consumer within a group**.
+Everything else — ordering, rebalancing, hot keys, throughput
+ceilings — falls out of this rule.
+
+It applies almost verbatim to Pulsar, Kinesis, Pub/Sub Lite, and
+even partly to RabbitMQ Streams. Learn the shape once.
+
+## The partition
+
+A partition is an append-only file (logically). Producers append
+records, consumers read sequentially by offset.
+
+```
+partition 0: [r0][r1][r2][r3][r4][r5]...
+partition 1: [r0][r1][r2][r3][r4][r5]...
+partition 2: [r0][r1][r2][r3][r4][r5]...
+```
+
+Three properties matter:
+
+1. **Strict order** within a partition. Across partitions, no
+   promises (see Message ordering).
+2. **Each partition has a leader broker** plus a configurable
+   number of in-sync replicas (ISR). Writes go to the leader, are
+   replicated to ISR, then acknowledged.
+3. **A partition is the unit of parallelism**. More partitions
+   means more concurrent consumers in a group can read.
+
+The partition key (the field the producer hashes on) decides
+which partition a message lands in. Same key → same partition →
+ordered.
+
+## The consumer group
+
+A consumer group is a set of processes sharing a `group.id`. The
+group is the unit of subscription: each message in the topic is
+delivered to **exactly one** consumer in each group that
+subscribes.
+
+```
+topic with 4 partitions
+group "A" (3 consumers):  c1 ← p0
+                          c1 ← p1   ← imbalance: c1 has 2
+                          c2 ← p2
+                          c3 ← p3
+group "B" (4 consumers):  c1 ← p0
+                          c2 ← p1   ← balanced
+                          c3 ← p2
+                          c4 ← p3
+```
+
+Rules:
+
+- **Consumers in a group ≤ partitions**. Extra consumers sit
+  idle. Adding more than there are partitions doesn't help.
+- **Each partition is owned by exactly one consumer at a time**
+  within a group. No two consumers read the same partition.
+- **Each group has independent offsets**. Group A and group B see
+  every message, both at their own pace. This is how the same
+  topic powers analytics, search indexing, and cache
+  invalidation simultaneously.
+
+## How rebalancing works
+
+A "rebalance" reassigns partitions to consumers when membership
+changes:
+
+- A consumer joins (scale-out, deploy).
+- A consumer leaves (crash, deploy, scale-in).
+- The topic gains partitions.
+
+The classic "stop-the-world" rebalance:
+
+<Steps>
+<Step n={1} title="Trigger.">
+A consumer sends heartbeats to the group coordinator (a broker).
+If a heartbeat is missed past `session.timeout.ms` (default 45s),
+the coordinator declares the consumer dead.
+</Step>
+<Step n={2} title="Revoke.">
+All consumers in the group stop processing and revoke their
+partition assignments. **No messages are being consumed during
+this window.**
+</Step>
+<Step n={3} title="Re-assign.">
+The group leader (a designated consumer, not a broker) runs the
+partition assignment strategy (`range`, `roundrobin`, `sticky`,
+`cooperative-sticky`) and broadcasts the new assignment.
+</Step>
+<Step n={4} title="Resume.">
+Consumers seek to the last committed offset of their newly
+assigned partitions and start processing.
+</Step>
+</Steps>
+
+The cost: **N seconds of latency** for the whole group every
+rebalance. With 100 partitions and a busy group, this is real
+back-pressure.
+
+### Cooperative rebalancing (the fix)
+
+KIP-429 (Kafka 2.4, 2019) introduced **cooperative-sticky**: only
+the partitions that need to move are revoked. Consumers keep
+processing the partitions they're keeping. Standard for new
+deployments.
+
+```js
+const consumer = kafka.consumer({
+  groupId: 'svc-1',
+  partitionAssigners: [PartitionAssigners.cooperativeSticky],
+});
+```
+
+If you see "rebalance storms," check that you're not still on
+the legacy eager strategy.
+
+## Throughput math
+
+Three knobs:
+
+- **N**: partition count.
+- **C**: consumers in the group.
+- **T**: per-consumer throughput in messages/sec.
+
+```
+Group throughput ≤ min(N, C) × T
+```
+
+Cases:
+
+- **C < N**: some consumers own multiple partitions. Scaling out
+  consumers raises throughput linearly until C = N.
+- **C = N**: balanced. Adding consumers does nothing.
+- **C > N**: extra consumers idle. Add partitions to scale
+  further.
+
+A typical capacity-planning exercise: **partitions = peak
+expected parallelism × 2** for headroom. Halving partitions later
+is a painful repartition; doubling is cheap if data is
+key-ordered.
+
+## Hot partitions
+
+The worst pathology. One key produces 10× the traffic of any
+other, so one partition is 10× as loaded as the rest. That one
+consumer pegs CPU; the others are idle.
+
+```
+partition 0: ████████████████ (Celebrity user)
+partition 1: ██               (rest of users)
+partition 2: ██
+partition 3: ██
+```
+
+Symptoms:
+
+- Consumer lag on partition 0 grows; the others are at 0.
+- CPU on one consumer is 100%; others are 5%.
+- Adding consumers doesn't help.
+
+Fixes, in increasing intrusiveness:
+
+1. **Sub-partition the hot key**. Use `(user_id, bucket)` where
+   bucket = hash(message_id) % K. Spreads one user's load across
+   K partitions, at the cost of losing per-user order.
+2. **Salt the key** for write-heavy patterns.
+3. **Skim the celebrity** to a separate topic with its own
+   processing.
+
+See **Fan-out on write vs read** for the related newsfeed
+problem.
+
+## Common operational pitfalls
+
+### Consumers can't keep up
+
+Lag grows; the broker retains messages until retention; eventually
+the consumer is older than the retention horizon and **loses
+data**. Monitor lag per partition, alert when it exceeds N
+minutes.
+
+```js
+// expose consumer lag as a metric
+consumer.on('consumer.group_join', (e) => log.info(e));
+const offsets = await consumer.fetchOffsets({ topic: 't' });
+// compare with admin.fetchTopicMetadata to compute lag
+```
+
+### Long-running message handlers
+
+If a message takes longer than `max.poll.interval.ms` (default 5
+minutes) to process, the consumer is declared dead and kicked
+from the group, triggering a rebalance. The same message is then
+processed by another consumer, who also gets kicked. Loop.
+
+Fixes:
+
+- Make handlers fast. Offload heavy work to a worker pool.
+- Raise `max.poll.interval.ms` if the work genuinely takes longer.
+- Use **pause/resume** to control polling explicitly:
+
+```js
+await consumer.run({
+  eachMessage: async ({ message, topic, partition }) => {
+    await consumer.pause([{ topic, partitions: [partition] }]);
+    await longWork(message);
+    consumer.resume([{ topic, partitions: [partition] }]);
+  },
+});
+```
+
+### Committing offsets too eagerly
+
+```js
+// Bug: commits before processing
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    consumer.commitOffsets([...]);  // commits before
+    await processMessage(message);
+  },
+});
+```
+
+On crash, the broker thinks the message was processed; it isn't
+redelivered. **Data loss.**
+
+Default in KafkaJS: commit **after** the handler returns. Don't
+override unless you know exactly why.
+
+### Topic with one partition for ordering
+
+"We want global order, so one partition." Now your topic is
+capped at one consumer's throughput forever. Either accept the
+ceiling (often fine for low-volume domain events) or rethink
+"global" — usually per-key is what was meant.
+
+## Adding partitions later
+
+You can add partitions, but **existing keys may move**. A key
+that previously hashed to partition 2 of 4 might now hash to
+partition 5 of 8. Per-key order across the boundary is broken.
+
+The cleanest path:
+
+1. Stop producers briefly (drain).
+2. Add partitions.
+3. Reset consumer state if downstream relies on per-key state
+   continuity.
+4. Resume.
+
+For systems that can't tolerate the gap, the alternative is to
+double-write to a new topic with new partition count and cut
+over. Painful. **Size partitions for the long term up front.**
+
+## Rebalancing pattern: static membership
+
+For deployments where you frequently roll instances (every PR),
+the constant rebalances eat throughput. **Static membership**
+(`group.instance.id`) tells the broker "consumer 4 is still
+consumer 4 even though it just restarted." No rebalance on a
+clean restart.
+
+```js
+const consumer = kafka.consumer({
+  groupId: 'svc-1',
+  groupInstanceId: 'svc-1-pod-3',
+});
+```
+
+Set this in production. It's free latency.
+
+## Pitfalls beyond Kafka
+
+The same logic applies elsewhere:
+
+- **Kinesis shards** = partitions. **KCL** does the rebalancing.
+- **Pulsar partitions** are the same; subscription type
+  (`Shared`, `Failover`, `Key_Shared`) controls who gets which
+  message.
+- **SQS** has no partitions in the standard queue. FIFO queues
+  use **message group ID** as a soft partition.
+
+## In summary
+
+- **Partition = ordered log + unit of parallelism**.
+- **Consumer group = subscription**; each partition owned by one
+  consumer in a group.
+- **Add consumers up to partition count; beyond that, add
+  partitions**.
+- **Hot partition = one key dominates**; sub-partition or skim.
+- **Cooperative-sticky rebalancing**, **static membership**, and
+  **fast handlers** keep groups stable.
+- **Plan partition count up front** — increasing it later moves
+  keys.

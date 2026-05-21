@@ -1,0 +1,327 @@
+export const level = 'senior';
+
+# Design YouTube
+
+User-generated video sharing: anyone uploads, anyone watches.
+The difference from Netflix: **the upload path is hot too**.
+Hundreds of hours of video per minute, billions of views per
+day, comments, likes, subscribers, recommendations.
+
+Compare with `design-netflix`: same delivery problem on the
+read side, plus a massive ingestion pipeline and a metadata
+problem at billions of videos.
+
+## 1. Clarify the scope
+
+- Upload video, transcode to multiple renditions, stream
+  globally.
+- Browse/search, channels, subscriptions, recommendations.
+- Comments, likes, view counts, watch later.
+- Live streaming, monetization/ads: out of scope here.
+- Auth/payment/account ops: out of scope.
+
+## 2. Estimate scale
+
+```
+Daily uploads        = 500 h × 60min × 60sec = ~30M video-seconds/day
+                     ≈ 500 hours uploaded *per minute* (YouTube actual)
+                     ≈ 700K new videos/day
+Avg upload size      = 100 MB (after compression) → 70 TB/day ingest
+Storage:
+  raw + encodings    = 5x of original → 350 TB/day ingest into long storage
+  yearly             = ~130 PB/year
+
+Views:
+  Daily views        = ~5B
+  Concurrent peak    = 100M streams (rough)
+  Average bitrate    = 3 Mbps
+  Peak egress        = 300 Tbps
+
+Comments/day         = 1B
+View events/day      = 5B (heartbeats, plays, drops)
+```
+
+Two enormous numbers: 300 Tbps egress (CDN problem), and 350 TB/day
+of new content with metadata explosion (transcoding pipeline +
+distributed storage).
+
+## 3. API
+
+```bash
+# Upload (resumable)
+POST /v1/uploads
+  Resp: { uploadUrl }   # signed PUT to object storage
+PUT  <uploadUrl>        # chunked upload
+POST /v1/videos { uploadId, title, description, visibility }
+  Resp: { videoId, status: "processing" }
+
+# Watch
+GET  /v1/videos/:id            -- metadata
+POST /v1/videos/:id/view       -- heartbeat
+GET  /v1/videos/:id/manifest   -- via CDN URL
+GET  /<edge>/<id>/<seg>.ts
+
+# Engagement
+POST /v1/videos/:id/like
+GET  /v1/videos/:id/comments?cursor=
+POST /v1/videos/:id/comments { text, parentId? }
+
+# Browse
+GET  /v1/feed/home?cursor=
+GET  /v1/channels/:id
+GET  /v1/search?q=
+```
+
+## 4. High-level design
+
+```
+Upload:
+  client → [ Upload gateway ] → [ Object storage (raw) ]
+                                       │
+                                       ↓
+                              [ Kafka: NewUploads ]
+                                       │
+                                       ↓
+                          [ Transcoding pipeline ]
+                                       │
+                          [ Encoded segments → CDN origin ]
+                                       │
+                                       ↓
+                          [ Videos DB ] (metadata + status)
+                                       ↓
+                                Mark "playable"
+
+Watch:
+  client → [ edge LB ] → [ Watch service ]   (metadata, perms)
+                              │
+                              └── manifest URL → [ CDN edge → segments ]
+                                                              │
+                                                              ↓
+                                                      [ Origin object store ]
+
+Engagement:
+  client → [ Comments svc ] → [ Comments DB ]
+  client → [ Reactions svc ] → [ Counters (Redis + stream) ]
+  view events → [ Kafka ] → [ View counter pipeline ] → [ counts cache ]
+
+Search & recs:
+  Video metadata → [ Search index (Elasticsearch / Vespa) ]
+  View/click events → [ ML feature store ] → [ Recommendation models ]
+```
+
+The split between the upload pipeline (write-heavy, async) and
+the watch path (read-heavy, edge-cached) is non-negotiable.
+
+## 5. Data model
+
+```
+videos {
+  id              string PK
+  channel_id      bigint INDEX
+  title           string
+  description     text
+  duration_sec    int
+  status          enum(uploading, processing, ready, failed, takedown)
+  visibility      enum(public, unlisted, private)
+  created_at      timestamp
+  view_count      bigint        -- denormalized, eventually consistent
+}
+
+encodings {
+  video_id        string
+  rendition       string
+  manifest_path   string
+  PRIMARY KEY (video_id, rendition)
+}
+
+comments {
+  id              string PK
+  video_id        string INDEX (video_id, created_at DESC)
+  user_id         bigint
+  parent_id       string?
+  text            string
+  created_at      timestamp
+}
+
+subscriptions {
+  subscriber_id   bigint
+  channel_id      bigint
+  created_at      timestamp
+  PRIMARY KEY (subscriber_id, channel_id)
+}
+
+view_events  (Kafka topic, not a table)
+  { videoId, userId, sessionId, ts, position, action }
+```
+
+Sharding: `videos` by `id` hash; `comments` by `video_id` (so a
+hot video's comments live together); `subscriptions` by
+`subscriber_id`.
+
+## 6. Deep dives
+
+### 6.1 Resumable upload
+
+Network blips during a 500 MB upload are common. Resumable
+upload protocol (tus, GCS resumable, or custom):
+
+<Steps>
+<Step n={1} title="Client requests upload session">
+Server creates an upload session, returns a signed URL +
+session ID.
+</Step>
+<Step n={2} title="Client uploads in chunks">
+8-16 MB chunks, with byte ranges. Each chunk PUT is idempotent.
+</Step>
+<Step n={3} title="On resume, query progress">
+Client asks "what bytes do you have?" and resumes from there.
+</Step>
+<Step n={4} title="On completion, mark ready">
+Server validates checksums, fires `NewUpload` event.
+</Step>
+</Steps>
+
+Direct-to-object-storage (signed URLs) lets the upload bytes
+**bypass** application servers — those would be the bottleneck
+at 70 TB/day ingest.
+
+### 6.2 Transcoding pipeline
+
+Each upload produces 10-30 encodings. Pipeline:
+
+```
+NewUpload event
+    ↓
+[ shot-detect + chunk source video ]
+    ↓
+[ per-shot encoding workers, in parallel ]
+    ↓
+[ for each rendition: stitch + package → HLS/DASH manifest ]
+    ↓
+[ thumbnail extraction, audio normalization, subtitle ASR ]
+    ↓
+[ write to CDN origin ]
+    ↓
+[ set videos.status = 'ready' ]
+    ↓
+[ index in search + recommendations ]
+```
+
+For most videos, "ready" within minutes of upload. For long-form
+content, total pipeline can be hours. UX: video is playable as
+soon as one rendition is ready; better renditions appear as
+they finish.
+
+### 6.3 Watch path & CDN
+
+Same shape as Netflix: edge PoPs cache hot videos; long-tail
+content served from regional caches; origin only on cold miss.
+
+The difference: YouTube's catalog is enormous (~10B videos),
+and the long tail is heavy. Pre-positioning works for hot
+content; cold content is served best-effort with origin reads.
+
+Caching strategy by popularity tier:
+
+<Cheatsheet>
+| Tier | What | Where |
+|---|---|---|
+| Hot (top 100K videos) | Most views | Edge PoPs globally |
+| Warm (top 10M) | Long tail with regional popularity | Regional caches |
+| Cold | Everything else | Origin object storage |
+</Cheatsheet>
+
+A "Joey Chestnut highlight" trending in the US sits in US edges
+but not Asia. Promotion is event-driven: viral spike → push to
+more edges.
+
+### 6.4 View counts
+
+5B views/day → ~60K view-event QPS avg, far more at peak. Naïve
+per-video counter is hot-key hell.
+
+Pipeline:
+
+```
+view event → Kafka → stream processor (Flink)
+    ↓
+[ per-video sharded counter, in Redis ]
+    ↓
+periodic flush → [ videos.view_count ] (eventually)
+```
+
+Counts are eventually consistent. Anti-fraud (de-duplicate
+views by session, throttle bot-like patterns) happens in the
+stream, not the DB.
+
+Display: read from Redis counter; round to nearest 1K for very
+popular videos to avoid showing changing-by-the-second numbers.
+
+### 6.5 Comments at scale on hot videos
+
+A trending music video can take 100s of comments per second.
+Per-video sharding fights insertion contention; **two-tier
+display**:
+
+- **Top comments** (engagement-ranked): cached, refreshed
+  every few minutes.
+- **New comments** (chronological): paginate with cursor; only
+  loaded when user clicks the tab.
+
+For viral videos, sample insertions: write all, display top by
+engagement, hide most.
+
+### 6.6 Recommendations
+
+Two-stage system (industry standard):
+
+- **Candidate generation** (cheap, recall-heavy): retrieve a few
+  hundred candidates from user history, channel subscriptions,
+  collaborative filtering, embedding similarity. Async,
+  pre-computed.
+- **Ranking** (expensive, precision-heavy): ML model scores
+  candidates with realtime features. Done per request.
+
+Click + watch-time events feed back as training signal.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 3 Pbps egress | CDN edge bandwidth | More PoPs; better pre-positioning; lower default bitrate |
+| 700 TB/day ingest | Transcoder fleet | More workers; deferred low-priority encodings |
+| Comments DB on viral video | Single shard hot | Per-video shard rotation; read-heavy cache |
+| View counter writes | Per-key contention | Sharded counters; coarsen display |
+| Hot recommendation candidate | Same N videos served everywhere | Long-tail boost; freshness weighting |
+| Search index size | Single ES cluster | Tiered indices: hot / warm / cold |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Direct-to-storage uploads** over app-server-mediated: 100x
+  fewer servers; auth via signed URLs.
+- **Per-shot parallel encoding** over single-pass: minutes
+  instead of hours for hot uploads; compute spike absorbed by
+  fleet.
+- **Tiered CDN** over flat: 80% of bytes served from edge at
+  near-zero hop cost.
+- **Eventual view counts** over exact: 10x cheaper; users don't
+  notice rounding.
+- **Two-stage recommendations** over single model: scales to
+  10B-item corpus; only the candidate set is ranked online.
+
+## In summary
+
+- Upload + watch are different systems sharing a metadata
+  store. Solve them independently.
+- Resumable, direct-to-storage uploads keep the upload tier
+  thin.
+- Transcoding is offline, per-shot, massively parallel; output
+  is many renditions per video.
+- Watch path is a tiered CDN: edge PoP → regional → origin;
+  popularity drives placement.
+- View counts and comments need sharding and eventual
+  aggregation; exact counts at scale are antipatterns.
+- Recommendations split into candidate generation (async) and
+  ranking (online) — the same shape as the newsfeed page.

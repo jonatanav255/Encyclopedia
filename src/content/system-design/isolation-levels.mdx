@@ -1,0 +1,310 @@
+export const level = 'senior';
+
+# Transaction isolation levels
+
+Isolation levels are the contract between concurrent
+transactions: what can each one see of the others? The SQL
+standard names four levels; real engines implement six or
+seven shades, often labeled inconsistently. Understanding the
+**anomalies** each level prevents matters more than the names.
+
+## The anomalies
+
+Five concurrency anomalies are worth knowing.
+
+<Cheatsheet>
+| Anomaly | What it is |
+|---|---|
+| Dirty read | Read uncommitted data from another transaction |
+| Non-repeatable read | Re-read the same row, get a different value |
+| Phantom read | Re-run a range query, get extra rows |
+| Lost update | Two transactions overwrite each other's changes |
+| Write skew | Two transactions read overlapping data, write disjoint rows, jointly violating an invariant |
+</Cheatsheet>
+
+These aren't theoretical. Each shows up in real applications:
+
+- **Dirty read**: showing a balance that the other transaction
+  will roll back.
+- **Non-repeatable read**: a counter changes between two
+  reads in the same business operation.
+- **Phantom read**: "verify uniqueness then insert" sees no
+  conflict, but a concurrent insert breaks the invariant.
+- **Lost update**: two users edit the same record from the
+  UI; one's edit silently disappears.
+- **Write skew**: the classic "both doctors go off call"
+  example.
+
+## The standard levels
+
+The SQL-92 standard defines four levels in terms of which
+anomalies they prevent.
+
+<Cheatsheet>
+| Level | Dirty | Non-repeatable | Phantom |
+|---|---|---|---|
+| Read Uncommitted | possible | possible | possible |
+| Read Committed | prevented | possible | possible |
+| Repeatable Read | prevented | prevented | possible (standard) |
+| Serializable | prevented | prevented | prevented |
+</Cheatsheet>
+
+This table is half-right and half-misleading because real
+engines don't implement these levels uniformly.
+
+## What engines actually do
+
+<Cheatsheet>
+| Engine | Read Uncommitted | Read Committed | Repeatable Read | Serializable |
+|---|---|---|---|---|
+| Postgres | = Read Committed | Default; snapshot per statement | Snapshot Isolation per tx | Serializable Snapshot Isolation (SSI) |
+| MySQL InnoDB | Permits dirty reads | Snapshot per statement | Snapshot per tx + gap locks | Strict 2PL |
+| Oracle | Not supported | Default; snapshot per statement | Not supported | Snapshot Isolation |
+| SQL Server | Permits dirty reads | Default (locking); also "read committed snapshot" | Locks rows for entire tx | Strict 2PL or SSI option |
+| CockroachDB / Spanner | N/A | N/A | N/A | Serializable (default) |
+| MongoDB | N/A | "snapshot" read concern | "snapshot" read concern | "snapshot" + writeConcern |
+</Cheatsheet>
+
+Things this table hides:
+
+- **Postgres "Read Uncommitted" doesn't exist.** Setting it
+  gives you Read Committed.
+- **Postgres "Repeatable Read" is actually Snapshot
+  Isolation** — stronger than the standard says (it does
+  prevent phantoms via snapshots) but does **not** prevent
+  write skew.
+- **MySQL "Repeatable Read" uses gap locks** which incidentally
+  prevent phantoms but introduce deadlock surprises.
+- **Oracle skipped Repeatable Read entirely.**
+- **SQL Server has two flavors of Read Committed** — old-style
+  locking and `READ_COMMITTED_SNAPSHOT` (RCSI). The latter is
+  MVCC; the former isn't.
+
+The naming is genuinely broken. Always check your engine's
+docs.
+
+## Read Uncommitted
+
+Reads see uncommitted writes from other transactions.
+
+In practice: nearly extinct. MVCC engines don't even offer it
+meaningfully. Use it nowhere; if you see it in code, suspect a
+bug.
+
+## Read Committed
+
+The default in nearly every relational engine.
+
+Semantics: each statement (not each transaction) gets a fresh
+snapshot. Subsequent statements within the same transaction
+see new commits from concurrent transactions.
+
+What it prevents: dirty reads.
+
+What it allows:
+
+- **Non-repeatable reads**: re-read a row, get a new value if
+  someone updated it.
+- **Phantoms**: re-run a range query, get more rows.
+- **Lost updates**: two transactions read-modify-write the
+  same row; both succeed; one's change is lost.
+
+It's the right default for most workloads — fast, low
+contention, easy semantics for short transactions.
+
+```js
+// Pseudocode that *will* lose updates under Read Committed
+await tx.begin();
+const row = await tx.query('SELECT balance FROM accounts WHERE id = 1');
+const newBalance = row.balance + 100;
+await tx.query('UPDATE accounts SET balance = $1 WHERE id = 1', [newBalance]);
+await tx.commit();
+```
+
+If two transactions run this simultaneously, each reads the
+old balance, each writes `old + 100`. One increment is lost.
+
+Fixes:
+
+- Use `UPDATE accounts SET balance = balance + 100 WHERE id = 1`
+  — the engine does the read and write atomically.
+- Or `SELECT ... FOR UPDATE` to lock the row across the
+  read-then-write.
+
+## Repeatable Read (Snapshot Isolation)
+
+The whole transaction sees one snapshot taken at start. Re-reads
+return the same data the entire transaction. Concurrent commits
+are invisible.
+
+What it prevents (in MVCC engines like Postgres):
+
+- Dirty reads.
+- Non-repeatable reads.
+- Phantom reads (in Postgres specifically; the standard does
+  not require this).
+- Many but not all lost-update scenarios. Postgres raises
+  `could not serialize access` if you try to update a row that
+  was modified after your snapshot.
+
+What it allows:
+
+- **Write skew**: classic doctor-on-call example.
+- **Read skew** of derived values in some implementations.
+
+For most workloads where you read several rows, derive
+something, and write, Snapshot Isolation is enough — but you
+must understand write skew and handle the edge cases
+explicitly.
+
+## Serializable
+
+The strongest level. Concurrent transactions produce a result
+**equivalent to some serial order**. No anomalies.
+
+Implementations:
+
+- **Strict two-phase locking (S2PL)**: shared locks for reads,
+  exclusive locks for writes, all held until commit. Correct
+  but kills throughput. MySQL Serializable, SQL Server
+  Serializable.
+- **Serializable Snapshot Isolation (SSI)**: optimistic. Run
+  transactions under Snapshot Isolation, track read-write
+  dependencies, abort transactions whose serialization graph
+  has a cycle. Postgres, CockroachDB.
+- **Globally ordered timestamps**: Spanner uses TrueTime to
+  assign commit timestamps consistent with real time, then
+  enforces serial ordering. CockroachDB uses HLC.
+
+SSI is the practical sweet spot for OLTP: most transactions
+commit normally; a small fraction get aborted and retried.
+Throughput is close to Snapshot Isolation; semantics match the
+SQL standard.
+
+## Choosing a level
+
+A pragmatic checklist:
+
+<Steps>
+<Step n={1} title="Start at the engine default (Read Committed).">
+For 80% of OLTP, this is correct. Make sure individual
+read-modify-write operations are either single-statement
+expressions (`balance = balance + 100`) or guarded by
+`SELECT FOR UPDATE`.
+</Step>
+<Step n={2} title="Use Snapshot Isolation (Repeatable Read) when a single transaction must see a consistent view.">
+Multi-step reports, multi-row consistency checks within one
+transaction, ETL into a transactional target.
+</Step>
+<Step n={3} title="Use Serializable for invariants that span multiple rows.">
+"At most N active subscriptions", "at least one doctor on
+call", "no overlapping bookings". Serializable + retry on
+serialization failures is dramatically simpler than locking
+schemes.
+</Step>
+<Step n={4} title="Beware of bumping the global default.">
+Setting the entire database to Serializable surprises most
+codebases — abort/retry handling must be everywhere.
+Per-transaction overrides are safer.
+</Step>
+</Steps>
+
+## SELECT FOR UPDATE and friends
+
+Sometimes the cleanest fix is an explicit lock at Read
+Committed.
+
+```js
+await tx.begin();
+const row = await tx.query(
+  'SELECT balance FROM accounts WHERE id = 1 FOR UPDATE'
+);
+// no other transaction can read FOR UPDATE or update this row
+const newBalance = row.balance + 100;
+await tx.query('UPDATE accounts SET balance = $1 WHERE id = 1', [newBalance]);
+await tx.commit();
+```
+
+`FOR UPDATE` is a row-level exclusive lock until commit. It
+prevents lost updates without raising the whole transaction's
+isolation level.
+
+`FOR SHARE` is a row-level shared lock — readers can coexist,
+writers block. Less common.
+
+`FOR NO KEY UPDATE` (Postgres) is a weaker lock that still
+permits foreign-key reads on the row.
+
+Use locks surgically. A `FOR UPDATE` on a hot row serializes
+every transaction touching it.
+
+## Handling serialization failures
+
+At Serializable and sometimes Repeatable Read, the engine may
+abort a transaction with a serialization error.
+
+```js
+async function withRetry(fn, max = 5) {
+  for (let i = 0; i < max; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.code === '40001' /* serialization_failure in Postgres */) {
+        const backoff = 2 ** i * 10 + Math.random() * 10;
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('exhausted retries');
+}
+```
+
+Retry is mandatory for Serializable to work. Without it,
+abort-on-conflict becomes user-facing errors.
+
+Side effects inside the transaction (sending emails, charging
+cards) **must not happen until after commit** — they'd be
+double-executed on retry. Use the outbox pattern or
+post-commit hooks.
+
+## Pitfalls
+
+### Misreading the level name
+
+`REPEATABLE READ` means different things in Postgres (snapshot
+isolation) and MySQL (snapshot + gap locks). Don't assume
+portability.
+
+### Mixing levels in the same workload
+
+A reporting transaction at Serializable will conflict with
+concurrent OLTP. Either keep reports at Read Committed
+explicitly, or run them on a replica.
+
+### Holding transactions open
+
+Long-running transactions at higher isolation levels prevent
+GC (see MVCC), hold locks (in 2PL), and increase the chance of
+abort under SSI. Keep transactions short — open, do the work,
+commit.
+
+### Trusting the level to prevent application bugs
+
+Isolation prevents *concurrency* anomalies. It doesn't fix
+buggy logic that overwrites with a stale UI value, doesn't
+validate input, or doesn't honor business rules.
+
+## In summary
+
+- Five anomalies (dirty, non-repeatable, phantom, lost update,
+  write skew). Each level prevents a subset.
+- Read Committed is the default and is fine for most OLTP if
+  you write read-modify-write carefully.
+- Snapshot Isolation (Postgres `REPEATABLE READ`) gives a
+  consistent per-transaction view; still allows write skew.
+- Serializable (especially SSI) prevents all anomalies at
+  modest cost. Retry on serialization failure is mandatory.
+- Engine names lie. Always check what your specific engine
+  actually does.

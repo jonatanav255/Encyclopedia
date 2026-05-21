@@ -1,0 +1,201 @@
+export const level = 'senior';
+
+# Object store architecture
+
+S3-class systems serve billions of GETs and millions of PUTs
+per second, store exabytes of data, and promise 11 nines of
+durability. How?
+
+The architecture is a clean separation of:
+
+- **Metadata layer**: tracks objects, their locations, ACLs.
+- **Storage layer**: holds the actual bytes, durably and
+  redundantly.
+- **Frontend**: handles API requests, auth, routing.
+
+## The frontend layer
+
+Stateless. Massively parallel. Behind a load balancer that
+spreads requests across thousands of frontends.
+
+Each frontend:
+
+- Authenticates (sig V4, IAM).
+- Parses HTTP / range requests.
+- Resolves the object's metadata (which storage nodes have
+  it).
+- Streams the data through to the client.
+
+## The metadata layer
+
+The hardest part. Object key → location + size + ACL +
+versions + tags.
+
+Trillions of objects in S3 means the metadata index can't
+fit on one machine. Sharded by:
+
+- **Bucket + key prefix**: route every object to a
+  deterministic shard.
+- **Hash of key**: balance load across shards.
+
+S3 originally used hash-based shards. The "hot prefix" problem
+(per-second PUTs to objects starting with the same prefix)
+was a known limit; S3 has since added "request rate scaling"
+that increases per-prefix capacity dynamically.
+
+The metadata layer itself is a distributed KV with strong
+consistency — etcd, Spanner-class, or homegrown.
+
+## The storage layer
+
+Bytes live across many disks across many nodes across many
+racks across many datacenters.
+
+For durability, every object is:
+
+- **Replicated** (3+ copies) or **erasure-coded** (10+4 or
+  similar).
+- **Spread across failure domains**: different racks,
+  different AZs.
+- **Periodically verified** via checksum scrubs.
+
+Lose a disk → background reconstruct from peers. Lose a rack
+→ same, but more work. Lose an AZ → other AZs hold copies;
+re-replicate.
+
+(See erasure-coding-vs-replication.)
+
+## Consistency model
+
+S3 (since 2020) provides **strong read-after-write consistency**:
+
+- Right after a PUT returns, a GET sees the new object.
+- After a DELETE returns, GET returns 404.
+- LIST is also consistent.
+
+This required architectural work in the metadata layer (no
+more "lazy eventual" for the index). The data layer is still
+asynchronously replicated; the metadata layer makes sure no
+read sees a half-written state.
+
+## Throughput characteristics
+
+A single object's throughput is capped by one server's
+network. To get more, **split into multiple objects**:
+
+- Multipart upload: chunks uploaded in parallel.
+- Range reads: download chunks in parallel.
+
+S3 advertises that each "prefix" supports 3,500 PUTs/sec and
+5,500 GETs/sec. Beyond that, shard your keys with random
+prefixes:
+
+```
+bad:  /images/2026/05/21/img_*.jpg → all hashed to one prefix
+good: /<random4>/2026/05/21/img_*.jpg → spread across many
+```
+
+Modern S3 auto-scales prefixes dynamically; the random-prefix
+advice is less critical than it used to be.
+
+## API patterns
+
+The S3 API is the de facto standard. Even non-AWS object
+stores implement it (MinIO, Cloudflare R2, Backblaze B2):
+
+```bash
+PUT /bucket/key HTTP/1.1
+Authorization: AWS4-HMAC-SHA256 ...
+Content-Length: ...
+
+(bytes)
+```
+
+```bash
+GET /bucket/key HTTP/1.1
+Range: bytes=0-1023
+```
+
+Stateless, RESTful, single-object-per-call. Multipart upload
+APIs are layered on top for large files.
+
+## Multipart upload
+
+Files larger than a few MB: split into chunks (typically 5-100
+MB each), upload in parallel:
+
+```
+initiate → returns uploadId
+upload part 1 (parallel)
+upload part 2 (parallel)
+upload part 3 (parallel)
+complete → assembles parts in order
+```
+
+If a part fails, retry just that part. If the upload is
+abandoned, abort to free storage.
+
+## Versioning
+
+Each PUT creates a new version of the object. Old versions
+remain until explicitly deleted (or lifecycle-expired).
+Versioning protects against accidental overwrite.
+
+Storage cost goes up with version count; lifecycle rules can
+archive old versions to cheaper tiers.
+
+## Object metadata vs object data
+
+The system stores both:
+
+- **System metadata**: size, modified date, ACL, encryption
+  key reference, ETag (content hash).
+- **User metadata**: arbitrary KV pairs the application
+  attaches.
+- **Tags**: searchable KV pairs (different from metadata in
+  the API).
+
+Metadata operations (PUT-metadata, GET-metadata) are much
+cheaper than full data reads.
+
+## What you don't get
+
+- **Random update**: PUTs replace the whole object. No
+  "modify byte 500 of this file."
+- **POSIX semantics**: no directories, no file modes (though
+  prefixes and ACLs simulate them).
+- **Strong consistency on LIST cross-bucket**: same-bucket
+  LIST is strong; cross-bucket isn't.
+- **Latency for small reads**: ~10-50 ms first-byte; not
+  database-class.
+
+## Use cases that fit
+
+- **Blob storage**: images, videos, ML model artifacts.
+- **Data lake / warehouse**: parquet files, columnar
+  datasets.
+- **Logs, backups, archives**: durable cold storage.
+- **Static asset hosting**: combined with CDN.
+- **Multipart input/output for batch pipelines**: Spark,
+  EMR, Hadoop reading from S3 directly.
+
+Use cases that don't:
+
+- **Transactional row updates**.
+- **Sub-ms reads**.
+- **Many small files** (overhead is high; better to batch).
+
+## In summary
+
+- Object store: frontend (stateless) + metadata layer
+  (sharded strong-consistent KV) + storage layer (replicated
+  / EC across failure domains).
+- 11 nines durability via aggressive replication + EC + scrubbing
+  + multi-AZ placement.
+- S3-class systems give strong read-after-write consistency
+  on the metadata path.
+- Sharded by key prefix or hash; "hot prefix" problem solved
+  by S3's auto-scaling.
+- Best for blobs, lakes, archives, static assets, batch I/O.
+- Not for transactional rows, sub-ms reads, or
+  partial-object updates.

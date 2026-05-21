@@ -1,0 +1,229 @@
+export const level = 'mid';
+
+# Structured logging
+
+A structured log is a log line where every field is a named
+key-value pair, encoded so a machine can parse it without
+regular expressions. Usually JSON. The alternative —
+free-form text — is a string designed for humans, which means
+useless for everything else.
+
+If you only do one observability upgrade in a codebase, do this
+one. Every downstream tool (queries, alerts, dashboards, SIEM,
+audit) gets dramatically more capable.
+
+## The contrast
+
+<Compare a="Free-form" b="Structured">
+<>
+```
+2026-05-20 14:32:11 INFO User logged in: alice@example.com from 10.0.0.5 in 142ms
+```
+
+To find "all logins from IPs in 10.0.0.0/8 that took over 1s,"
+you write a regex. To count per-user logins, a different regex.
+Adding a field means the regex breaks.
+</>
+<>
+```json
+{"ts":"2026-05-20T14:32:11Z","level":"info","event":"user.login","email":"alice@example.com","ip":"10.0.0.5","durationMs":142}
+```
+
+The same questions are queries: `event = "user.login" AND
+durationMs > 1000 AND ip LIKE "10.%"`. Adding `userAgent` is a
+new field, not a new regex.
+</>
+</Compare>
+
+## The shape of a good log event
+
+Five fields are non-negotiable. The rest are domain.
+
+<Cheatsheet>
+| Field | Why |
+|---|---|
+| `ts` (ISO 8601 UTC) | Time, in a parseable format. Never local time |
+| `level` | `debug`/`info`/`warn`/`error`/`fatal` — filters, not vibes |
+| `event` or `msg` | A short, stable name. `user.login`, not `User has logged in` |
+| `service` / `env` | Which service, which environment |
+| `trace_id` / `span_id` | Correlates the log to a trace |
+
+</Cheatsheet>
+
+The `event` field is the most under-rated. Pick **stable names**
+(`order.captured`, `payment.rejected`) so future queries against
+them keep working. A free-text `msg` field that humans tweak
+breaks every dashboard built on it.
+
+## What to log
+
+A useful rule: log every **state transition** at INFO and every
+**rejection** at WARN or ERROR. Don't log every step inside a
+function.
+
+<Steps>
+<Step n={1} title="Inputs to your boundary.">
+A request received, a message dequeued, a webhook fired. One
+log line per inbound work unit.
+</Step>
+<Step n={2} title="State transitions.">
+`order.created`, `order.paid`, `order.shipped`. The verbs of
+your domain. Each one with the IDs needed to reconstruct the
+sequence.
+</Step>
+<Step n={3} title="Rejections and external failures.">
+A validation failure, a downstream 5xx, a timeout. Include the
+specific reason, not a generic message.
+</Step>
+<Step n={4} title="Unexpected paths.">
+The `else` branch you wrote "just in case." When it fires, log
+loud. These are the lines that explain weird production
+behavior.
+</Step>
+</Steps>
+
+What **not** to log: PII you don't need (emails are usually
+fine; passwords, full credit cards, social security numbers are
+not), large request/response bodies (cost), and "we are about to
+do X" followed by "we did X" pairs (one line per thing is
+enough).
+
+## Levels with discipline
+
+Levels exist so you can dial production verbosity without code
+changes. They only work if the team agrees what each level means.
+
+<Cheatsheet>
+| Level | When | Where it goes |
+|---|---|---|
+| `debug` | Step-by-step internals. Off in prod | Dev console |
+| `info` | Successful state transitions | Hot log store |
+| `warn` | Recoverable failures, retried errors, deprecations | Hot log store, dashboards |
+| `error` | Unexpected failures, dropped work | Hot store + alerts |
+| `fatal` | Process is going down | Page someone |
+
+</Cheatsheet>
+
+If every line is `info`, you have no levels. If every line is
+`error`, your error rate dashboard is meaningless. Discipline.
+
+## Correlation IDs
+
+A log line that says "payment failed" is worthless without
+context. Every log emitted while handling a request must carry
+the **same correlation ID** (a trace ID works; a UUID per
+request is the bare minimum).
+
+```js
+// Express middleware
+app.use((req, res, next) => {
+  req.traceId = req.headers['x-trace-id'] || crypto.randomUUID();
+  res.setHeader('x-trace-id', req.traceId);
+  req.log = log.child({ trace_id: req.traceId });
+  next();
+});
+```
+
+Then in a handler, `req.log.info('order.created', { orderId })`
+emits a line tagged with the trace. Search by trace ID, get the
+entire request's log story across files.
+
+If you have distributed tracing, **use the OpenTelemetry trace
+ID and span ID as your log correlation IDs**. That way logs and
+traces join naturally in your backend.
+
+## Context propagation
+
+A common bug: the correlation ID exists at the entry point and
+gets lost two function calls deep, because someone called the
+plain `log` object instead of the child logger.
+
+Solutions:
+
+- **Pass `log` through your call stack** as a parameter. Verbose
+  but explicit.
+- **Async context (Node `AsyncLocalStorage`, Go `context.Context`,
+  thread-locals in JVMs)**. Looks invisible; works for 99% of
+  cases; can leak across continuations if misused.
+
+The async-context approach with `AsyncLocalStorage` is the
+modern default in Node and serves most cases without per-call
+plumbing.
+
+## Sampling and rate-limiting
+
+A bug in a hot path can produce 10K identical error logs per
+second. Two defenses:
+
+- **Sample**: only emit 1 in N of repeated errors with the same
+  signature. Most loggers (pino, zap, slog) have built-in
+  samplers.
+- **Aggregate**: instead of logging each occurrence, emit a
+  counter ("47 dropped events in the last minute") periodically.
+  Better when the question is "how often" not "exactly which."
+
+Don't sample errors at the application layer **before** you've
+checked the cost — sometimes the right answer is "fix the bug."
+
+## Storage tiers
+
+Logs are cheap per byte and ruinous at scale. Tier them:
+
+<Cheatsheet>
+| Tier | Retention | Cost | Used for |
+|---|---|---|---|
+| Hot | 7–14 days | Highest | Live debugging, recent dashboards |
+| Warm | 30–90 days | Medium | Incident reviews, recent audits |
+| Cold | 1–7 years | Cheapest | Compliance, forensic forensics |
+
+</Cheatsheet>
+
+The line in code is the same. The pipeline routes by index/age.
+Most teams underestimate how quickly hot-tier costs grow — a 1
+KB log line at 100K QPS hot-indexed for 14 days is on the order
+of $100K/year before you've done anything clever.
+
+## Schema discipline
+
+Two failure modes kill structured logs at scale:
+
+- **Field-type drift**: `userId` is a string in one service and
+  an integer in another. Queries silently break or coerce.
+- **Field explosion**: 5000 services each invent their own
+  `req_duration_ms`, `responseTimeMs`, `latencyMs`.
+
+A shared **logging schema** in a library — even a wiki page that
+lists field names and types — prevents both. Treat field names
+as a contract.
+
+<Callout variant="warning">
+Free-text logs are forward-compatible: anyone can add anything.
+Structured logs need a small amount of governance. The payoff is
+that queries work — which is the whole point.
+</Callout>
+
+## Common mistakes
+
+- **`console.log` in production**. No level, no timestamp, no
+  fields, no transport. Use a real logger (pino, winston, slog,
+  zap, log4j2).
+- **Stringifying objects into the message**. `log.info('user=' +
+  JSON.stringify(user))` defeats the point. Pass `user` as a
+  field.
+- **Logging the same event twice** — once at the boundary and
+  again inside. Inflates rates and confuses dashboards. Pick
+  one place.
+- **Logging secrets**. The HTTP `Authorization` header. Stripe
+  keys. JWT tokens. Configure redaction in the logger; don't
+  rely on people remembering.
+
+## In summary
+
+- Every log line is JSON with `ts`, `level`, `event`,
+  `trace_id`, and a small set of domain fields.
+- Field names are a contract; treat them like one.
+- Levels mean something; agree on what.
+- Always propagate a correlation ID through the request.
+- Tier storage by age — hot logs are expensive.
+- Free-form text is fine for humans; structured fields are
+  what tools query.

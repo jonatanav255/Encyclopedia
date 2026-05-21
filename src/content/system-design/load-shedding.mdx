@@ -1,0 +1,210 @@
+export const level = 'senior';
+
+# Load shedding
+
+When the system is overloaded, **drop low-priority work** so
+high-priority work can complete. Better to fail a small
+fraction immediately than to slow down everything and have
+everything fail.
+
+The principle: a system that's at 105% capacity is broken; a
+system that drops 5% of traffic and serves 95% normally is
+healthy.
+
+## Why "just queue everything" fails
+
+The naive approach: when overloaded, accept everything,
+process at max rate, queue the rest. Eventually catches up.
+
+Problems:
+
+- **Latency tails explode.** The 100th request in queue waits
+  for 99 ahead. p99 latency goes from 100ms to 10s.
+- **Memory fills up.** Each queued request holds connections,
+  buffers, contexts.
+- **Upstream times out.** Clients give up after their timeout
+  (typically 30s); the server processes their request anyway;
+  the response is dropped.
+- **Retries make it worse.** Clients retry; queue grows
+  faster.
+
+The result: instead of dropping 5%, you fail 100%. **Worse
+in every dimension** than just rejecting some traffic.
+
+## Shed at the edge
+
+The right time to drop is **before queueing**. Best at the
+load balancer or API gateway. The earlier the rejection, the
+less work wasted.
+
+```
+client request
+    ▼
+load balancer (load-shed)
+    ▼
+API gateway (load-shed)
+    ▼
+service (load-shed)
+    ▼
+queue / processing
+```
+
+Each layer can shed independently. The earlier a request is
+rejected, the cheaper the rejection.
+
+## What to shed first
+
+Prioritize work into tiers:
+
+<Cheatsheet>
+| Tier | Examples |
+|---|---|
+| Critical | Auth, payments, account creation |
+| High | User-facing reads (their own data) |
+| Medium | User-facing reads (browsing, search) |
+| Low | Background sync, analytics events, scheduled reports |
+| Optional | Recommendations, prefetching, decorations |
+</Cheatsheet>
+
+Under overload, shed from the bottom up. First drop optional
+features (recommendations). Then low (analytics). Then medium
+(non-essential reads). Last critical (only when truly
+desperate).
+
+## Signals for "we're overloaded"
+
+What triggers shedding?
+
+- **Concurrency**: too many in-flight requests.
+- **Queue depth**: incoming queue is too deep.
+- **Latency**: p95 latency exceeds a threshold (likely
+  starting to back up).
+- **CPU / memory utilization**: at high % for sustained time.
+- **Backpressure from downstream**: dependency is rejecting
+  us.
+
+Combine multiple signals. Single signals false-positive too
+often.
+
+## How to shed
+
+### Hard rejection
+
+Return 429 (or 503) immediately. The client retries (with
+backoff, jitter, budget).
+
+```bash
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+```
+
+Cleanest. Make sure the rejection is **cheap** — don't do
+work just to reject.
+
+### Random sampling
+
+Drop a percentage of incoming requests at random. Smooth, but
+unfair (no respect for tier).
+
+### Priority-based shedding
+
+Inspect the request, classify by tier, drop low tiers first.
+Requires the request to be classifiable (header, path, user
+type) before the expensive part.
+
+```js
+function shouldShed(req) {
+  const tier = classifyTier(req);
+  if (currentLoad > 0.95 && tier > 1) return true;  // shed non-critical
+  if (currentLoad > 0.99) return true;  // shed everything
+  return false;
+}
+```
+
+### Adaptive concurrency limits
+
+Libraries like Netflix's `concurrency-limits` measure how
+many in-flight requests result in good latency. They adapt
+dynamically — under load, the limit goes down; under light
+load, up.
+
+This is the modern standard for serving load-shedding.
+Libraries: `concurrency-limits-java`, `vegeta` for testing.
+
+## CoDel and active queue management
+
+Borrowed from network routers. CoDel watches the time each
+packet sits in queue; if too long, drop it.
+
+For application queues:
+
+- Tag each request with arrival time.
+- Before processing, check `now - arrived`. If > threshold,
+  reject (client already timed out).
+
+This prevents the "process a request whose response will be
+discarded" pathology.
+
+## Communicating to clients
+
+A good 429:
+
+- **Includes `Retry-After`**: tells the client when to come
+  back.
+- **Doesn't penalize repeat 429s**: client respecting
+  Retry-After shouldn't be punished.
+- **Distinguishes rate-limit from overload**: 429 with "you
+  exceeded your quota" is different from 503 "system is
+  shedding."
+
+For internal services, gRPC has explicit `RESOURCE_EXHAUSTED`
+status to signal shedding distinct from other errors.
+
+## Common mistakes
+
+### Reject after expensive work
+
+The auth check, the DB query, the assembly — all done. Then
+the response queue is full so we drop. Wasted everything.
+
+Fix: shed **before** expensive work. The cheaper the decision,
+the better.
+
+### Shed without telemetry
+
+You're shedding 30% of traffic but nobody knows. The
+dashboard shows "system healthy." Then you notice revenue is
+down.
+
+Fix: every shed should emit a metric. Alert when shedding
+exceeds a threshold (say 5% sustained).
+
+### Shed too aggressively
+
+A small spike causes 50% shed. Customers complain. The "spike"
+was a normal busy hour.
+
+Fix: tune signals carefully. Test with chaos load tests.
+Start conservative.
+
+### Forgetting client-side backoff
+
+You shed 50%. Clients all retry immediately. Your server is
+back to 100% load again — but now serving retries instead of
+new traffic.
+
+Fix: clients must respect `Retry-After` and use jittered
+backoff.
+
+## In summary
+
+- Load shedding: drop low-priority work under overload so
+  high-priority work completes.
+- Shed early — at the edge, before expensive work.
+- Prioritize by tier; drop low first.
+- Signals: concurrency, queue depth, latency, CPU,
+  downstream backpressure.
+- Adaptive concurrency libraries are the modern standard.
+- Always communicate via 429 + Retry-After; clients must
+  respect it.
+- Telemetry-first: a shed without a metric is invisible.

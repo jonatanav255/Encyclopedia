@@ -1,0 +1,299 @@
+export const level = 'senior';
+
+# Design a distributed cache
+
+A distributed in-memory cache (Memcached/Redis-class) shared
+across a service fleet. Hundreds of GBs of memory, hundreds of
+thousands of QPS, sub-millisecond latency. The interesting parts:
+**partitioning**, hot-key handling, eviction, replication for
+availability, and consistency with the underlying source of
+truth.
+
+## 1. Clarify the scope
+
+- Get/set with TTL; large value support (KBs, not MBs).
+- Increment/decrement for counters.
+- LRU eviction default; configurable.
+- Single-region first; cross-region as an extension.
+- Optional persistence (snapshots), not durable like a DB.
+- Optional pub/sub layer: out of scope here.
+
+## 2. Estimate scale
+
+```
+Working set            = 1 TB hot
+Total QPS              = 1M
+Read:write ratio       = 100:1 → 10K writes/s, ~1M reads/s
+Value size             = 1 KB avg
+Latency budget         = p99 < 1 ms
+Number of keys         = ~10^9
+Memory/node            = 64 GB → need ~16 nodes minimum
+                         (with replication factor 2 → ~32 nodes)
+```
+
+The numbers say: sharded cluster, 16-32 nodes, in-memory data
+structure, careful network handling. The product looks simple
+on paper; ops at this scale is not.
+
+## 3. API
+
+```bash
+GET key                              -- returns bytes + ttl
+SET key value ttl                    -- writes with TTL
+DEL key
+INCR key amount                      -- atomic counter
+EXPIRE key ttl
+MSET k1 v1 k2 v2 ...                 -- batch
+MGET k1 k2 ...                       -- batch read
+
+# Admin
+INFO                                  -- cluster status
+SLOTS                                 -- partition map
+```
+
+Clients are libraries that talk to the cluster directly (or via
+a proxy). The protocol is binary (e.g. RESP-like) and connection-
+oriented.
+
+## 4. High-level design
+
+```
+[ client ] (with smart cache library)
+   │
+   │ (computes hash slot from key, picks shard)
+   ↓
+[ Proxy / direct connection ] → [ Cache node N ]
+                                       │
+                                       └── replicates async/sync to → [ replica ]
+                                                                          ↑
+                                       cluster gossip / membership ↔ [ replica ]
+
+
+Components:
+  - Cache nodes: in-memory key-value store, single-threaded event loop
+  - Membership: gossip-based or coordinator-based view of cluster
+  - Partition map: consistent hash → shard → primary + N replicas
+  - Client: library that knows partition map and routes
+  - Optional: proxy fleet (Twemproxy/Envoy/cache-proxy) for clients
+    that can't speak the protocol
+```
+
+Single-threaded per-node (Redis-style) makes per-key consistency
+trivial and removes locking overhead. Many cores per box → many
+processes, each pinned to a CPU.
+
+## 5. Data model
+
+A single node stores:
+
+```
+hash_table   key (bytes) → entry {
+   value             bytes
+   expiry            timestamp
+   lru_prev, lru_next pointers
+   meta              size, hit_count, ...
+}
+lru_list      doubly-linked list, head = MRU, tail = LRU
+slab_allocator  size classes for value buffers
+```
+
+Cluster-level:
+
+```
+slots         16 384 hash slots (Redis Cluster idea)
+slot_owner    slot → primary nodeId
+replica_map   nodeId → list of replicas
+```
+
+Keys map via `slot = hash(key) % 16 384`; slots map to nodes.
+Resharding moves slots, not individual keys, simplifying
+migration.
+
+## 6. Deep dives
+
+### 6.1 Partitioning: consistent hashing
+
+The naïve `hash(key) % N` rehashes everything when N changes.
+
+**Consistent hashing** places nodes on a ring; each key lives
+on the next node clockwise. Adding/removing a node only moves
+keys in one arc; most stay put. With **virtual nodes** (each
+physical node gets ~100 ring positions), the distribution is
+even and rebalancing is smooth.
+
+```
+ring positions:
+  node1 → [vn1_a, vn1_b, vn1_c, ...]   100 virtual positions
+  node2 → [vn2_a, vn2_b, ...]
+  ...
+
+on lookup(key):
+  pos = hash(key)
+  walk ring clockwise → first vn we hit → that node owns the key
+
+on add node5:
+  insert vn5_* into ring
+  for each vn5: the previous owner streams a range to node5
+  online migration; old reads can fall through to old owner during transition
+```
+
+Redis Cluster uses a simpler model — 16 384 fixed slots, each
+assigned to a node — but the principle is the same.
+
+### 6.2 Hot keys and shard-level capacity
+
+A single Redis instance does ~100K ops/sec single-threaded. A
+viral key on one shard saturates that shard while others sit
+idle.
+
+Mitigations:
+
+<Steps>
+<Step n={1} title="Read replicas per shard">
+2-3 replicas per primary. Client reads from any replica (with
+eventual consistency).
+</Step>
+<Step n={2} title="Key splitting">
+For known-hot keys, the client distributes reads/writes across
+N suffixed variants (`feed:home:user42:0`, `:1`, ..., `:9`).
+Picks one at random for writes; reads merge.
+</Step>
+<Step n={3} title="Process-local caching">
+Application servers cache hot keys for a few hundred milliseconds
+in-process. Burns less network and shaves Redis QPS.
+</Step>
+<Step n={4} title="Pre-aggregation">
+For counter-like hot keys, increment locally and flush to Redis
+periodically. Sacrifices precision in exchange for throughput.
+</Step>
+</Steps>
+
+### 6.3 Eviction policies
+
+Memory is finite; old keys must be removed.
+
+<Cheatsheet>
+| Policy | Idea | Best for |
+|---|---|---|
+| LRU | Evict least recently used | General purpose |
+| LFU | Evict least frequently used | Skewed access (Zipfian) |
+| TTL only | Evict only on expiry | Caches where every entry has a deadline |
+| Random | Pick random | Constant-time eviction; surprisingly OK for uniform access |
+| Allkeys-LRU | Including TTL'd | When memory is the binding constraint |
+</Cheatsheet>
+
+Redis exposes a dozen variants. LRU is the default; LFU is
+better when access patterns are heavy-tailed (a hot 1% of keys
+gets 90% of traffic — LRU evicts the cold majority but readmits
+them constantly, churning).
+
+### 6.4 Replication
+
+Two flavors:
+
+- **Async replication**: writes return when primary completes;
+  replicas catch up. Sub-millisecond writes, ~1s replication
+  lag. Risk: failover drops un-replicated tail.
+- **Sync replication** (Redis WAIT, or majority quorum):
+  primary waits for N replicas to ack. Higher write latency;
+  no data loss on single failure.
+
+Caches typically use **async** — losing the last few KB of
+cache state on failover is acceptable; cold load from source of
+truth rebuilds quickly. Strong durability isn't this system's
+job.
+
+### 6.5 Failure handling and failover
+
+Node deaths happen; we expect a member to fail every few days
+at this scale.
+
+- **Detection**: gossip + periodic pings. Marked PFAIL after
+  several missed pings; FAIL after quorum agreement.
+- **Failover**: a replica is elected primary; cluster updates
+  slot ownership; clients refresh partition map.
+- **Client behavior**: on `MOVED slot newNodeId` response,
+  client refreshes map and retries. On hard failure with no
+  replica, client falls through to source of truth (graceful
+  degradation).
+
+### 6.6 Consistency with the source of truth
+
+Cache + DB has classic update problems:
+
+<Compare a="Cache-aside" b="Write-through">
+<>
+App reads cache; on miss, reads DB and populates cache.
+App writes DB and invalidates (or updates) cache.
+
+**Simple**; "stampede on cold start"; possible read of stale
+data if write-and-invalidate race.
+</>
+<>
+App writes to cache and DB synchronously (cache as the front
+door).
+
+**Strong-ish consistency**, at the cost of latency and a cache
+that must always be available.
+</>
+</Compare>
+
+**Cache stampede** (thundering herd) on a hot key expiry:
+thousands of requests miss the cache simultaneously and slam
+the DB. Mitigations:
+
+- **Probabilistic early expiration** — each reader randomly
+  refreshes before TTL, smoothing the wave.
+- **Lock + refill** — only one request refills; others wait or
+  return stale.
+- **Background refresh** — a worker pre-warms hot keys before
+  TTL.
+
+### 6.7 Persistence (optional)
+
+Memcached: no persistence; cache is volatile. Redis: optional
+RDB snapshots and/or AOF (append-only file).
+
+For a pure cache, persistence is **operational comfort** — after
+a planned restart, the cache is warm. It is **not durability** —
+on failure of a node mid-flush, the AOF lags writes by up to a
+second.
+
+## 7. Bottlenecks and scale-ups
+
+<Cheatsheet>
+| At 10x scale | Breaks | Fix |
+|---|---|---|
+| 10M QPS | Cluster bandwidth, NIC limits | More shards; faster network; topology-aware clients |
+| Hot key | Single shard saturated | Replicate hot key; key splitting; process-local cache |
+| Memory exhausted | Eviction churn | More nodes; tier rarely-used keys to cold cache |
+| Cross-AZ latency | Replication lag | Place replicas same-AZ for hot reads; remote AZ for failover |
+| Resharding | Slot migration slow | Background migration; hash-tag colocation for related keys |
+</Cheatsheet>
+
+## 8. Tradeoffs called out
+
+- **Single-threaded per node** over multi-threaded: simpler
+  consistency, predictable latency; horizontal scaling via more
+  processes/nodes.
+- **Async replication** over sync: cache-grade durability;
+  failover may drop a few writes.
+- **Consistent hashing** over fixed mod-N: graceful rebalance;
+  small extra metadata.
+- **Cache-aside** over write-through: simpler, cheaper, with a
+  carefully-handled stampede story.
+- **Hot key replication** at the client over server-side
+  routing: cheap, no server changes; client gets more complex.
+
+## In summary
+
+- Distributed cache = sharded in-memory KV, single-threaded
+  per node, with consistent hashing for partitioning.
+- Hot keys are the dominant failure mode; replicate or split
+  them; cache them locally too.
+- Cache-aside is the standard pattern; the stampede problem is
+  real and worth designing around.
+- Async replication; cache is not the source of truth.
+- Failover via gossip + replica election; clients learn new
+  topology via `MOVED` responses or a coordinator.
+- Persistence (if any) is for warm restart, not durability.

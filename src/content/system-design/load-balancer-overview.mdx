@@ -1,0 +1,302 @@
+export const level = 'junior';
+
+# Load balancers overview
+
+A load balancer sits between clients and a pool of backend
+servers. It receives every request, picks a backend, and
+forwards the request. If a backend dies, it stops sending
+traffic there. If load doubles, you add more backends and the
+LB starts using them.
+
+Without an LB, horizontal scaling is impossible. With one, it's
+almost an afterthought.
+
+## What an LB actually does
+
+Five jobs in order of importance:
+
+1. **Distribute traffic** across N backends, by some
+   algorithm.
+2. **Health-check** backends and stop sending to unhealthy
+   ones.
+3. **Terminate connections** so backends don't deal with every
+   client TCP/TLS handshake.
+4. **Expose a single stable address** so clients don't need to
+   know about N backends.
+5. **Apply cross-cutting features**: TLS termination, rate
+   limiting, request logging, sometimes WAF.
+
+The first two are the minimum. Real production LBs do all
+five and more.
+
+## Where the LB sits
+
+```
+   clients
+      │
+      ▼
+   [load balancer]   ← public IP, DNS target
+   ╱   │   │   ╲
+  ▼    ▼   ▼    ▼
+ [app][app][app][app]   ← private backends
+```
+
+Clients talk to the LB. The LB talks to backends. Backends
+never see clients directly.
+
+This indirection is the whole point. Backends become
+**replaceable** — kill one, the LB stops sending to it; add a
+new one, the LB starts. Deploys, scaling, and failover all
+flow from this.
+
+## Three places to put a load balancer
+
+A request typically passes through more than one LB on its way
+to a backend. The three common positions:
+
+### DNS-based
+
+The DNS server returns one of N IPs for the same name. The
+client picks one and connects directly.
+
+```
+client → DNS resolve api.example.com → 1.2.3.4
+       (or 5.6.7.8, or 9.10.11.12)
+```
+
+Pros: zero per-request infrastructure. The "balancing" is a
+DNS lookup, which clients already do.
+Cons: DNS caching is opaque (TTLs are not respected by all
+resolvers). Health-check is slow — a dead IP can stay in DNS
+for minutes after death. Granularity is per-client, not
+per-request.
+
+Best for: coarse global routing (region selection), not
+fine-grained traffic shaping.
+
+### Server-side
+
+A dedicated LB tier (HAProxy, NGINX, Envoy, AWS ALB/NLB, GCP
+Cloud Load Balancing) sits between clients and backends. Every
+request goes through it.
+
+```
+client → [LB] → backend
+```
+
+Pros: per-request balancing, instant health-check response,
+rich features (path routing, TLS, rate limits).
+Cons: the LB is itself a system to operate, scale, and pay for.
+
+The default for any HTTP service today.
+
+### Client-side
+
+The client knows all the backends and picks one itself. No
+dedicated LB tier.
+
+```
+client (with list of backends) → backend
+```
+
+Pros: no LB hop, lowest latency.
+Cons: clients have to discover the backend list (service
+discovery), implement balancing logic, handle health failures.
+Adds complexity to every client.
+
+Used by gRPC clients in some setups, service-mesh sidecars
+(Envoy is a client-side LB embedded in each pod), and some
+distributed databases (Cassandra clients pick coordinators).
+
+A typical large system uses all three: DNS for region routing,
+a server-side LB at the region edge, and client-side LBs
+inside the service mesh.
+
+## Layer 4 vs Layer 7
+
+The OSI reference model is mostly a historical artifact, but
+two of its layers map directly to LB types:
+
+- **L4 (transport)**: the LB operates on TCP/UDP packets. It
+  knows source/destination IP and port. It does not know
+  whether the bytes inside are HTTP or anything else.
+- **L7 (application)**: the LB parses the protocol — usually
+  HTTP. It knows methods, paths, headers, query strings,
+  cookies.
+
+L7 LBs can do more (route `/api` to one backend, `/static` to
+another; rewrite headers; terminate TLS). L4 LBs are faster
+(no parsing, no buffering) and protocol-agnostic.
+
+See l4-vs-l7-load-balancing for the full breakdown.
+
+## What "balancing" actually means
+
+The algorithm matters more than people think. A round-robin
+LB and a least-connections LB will produce wildly different
+backend utilization for the same workload.
+
+The common algorithms:
+
+- **Round robin**: backend 1, 2, 3, 1, 2, 3, ...
+- **Weighted round robin**: backend with weight 2 gets twice
+  as many requests.
+- **Least connections**: send the next request to the backend
+  with the fewest open connections.
+- **Least response time**: send to the backend with the lowest
+  recent latency.
+- **Random**: pick uniformly at random.
+- **Power of two choices**: pick two at random, send to the
+  one with fewer active requests.
+- **Consistent hash**: hash the request key (user ID, URL),
+  always pick the same backend for the same key.
+
+See load-balancing-algorithms for which fits which workload.
+
+## Health checks
+
+The LB constantly checks whether each backend is alive. Two
+flavors:
+
+- **Active**: LB sends a request (typically `GET /health`)
+  every N seconds. If M consecutive checks fail, mark down.
+- **Passive**: LB watches real traffic. If a backend returns
+  errors or times out, mark down for a cooldown period.
+
+Most production setups use both. Active for definitive
+detection; passive for fast reaction to live traffic problems.
+
+See health-checks-and-circuit-breaking-at-lb for the surprising
+ways health checks themselves cause outages.
+
+## Stateful vs stateless connections
+
+HTTP/1.1 is connection-oriented but the *request* is the unit
+of work. The LB can balance each request to a different
+backend.
+
+WebSockets, gRPC streams, SSE, and HTTP/2 with long-lived
+connections are different: once a connection is established
+to a backend, it stays there. Balancing happens **at connection
+establishment**, not per request.
+
+This matters for:
+
+- **Long sessions skewing distribution**: if some users have
+  10-minute streams and others have 1-second requests, simple
+  round-robin can leave one backend slammed with streams
+  while another sits idle.
+- **Deploys**: rolling out a new version requires draining
+  existing connections, not just rerouting new ones.
+
+L4 LBs are typically used in front of long-lived connection
+backends (gRPC, WebSocket). L7 LBs *can* handle them but need
+careful configuration.
+
+## TLS termination
+
+Most production LBs terminate TLS. The client connects to the
+LB over HTTPS; the LB connects to backends over plain HTTP
+(or re-encrypted HTTPS).
+
+```
+client === HTTPS ===> [LB] ──── HTTP ────> backend
+              ↑
+        certificate lives here
+```
+
+Pros:
+
+- Backends don't deal with TLS — they're simpler, faster.
+- Certificate management is centralized — rotate once.
+- LB can inspect the request (path routing, header rewriting).
+
+Cons:
+
+- The link from LB to backend is unencrypted. In a trusted
+  network this is fine; in a multi-tenant cloud, you may want
+  to re-encrypt.
+- The LB has the keys — it's a high-value attack target.
+
+mTLS termination at the LB is common for zero-trust setups —
+clients present a cert, LB verifies it, then forwards a header
+(`X-Forwarded-Cert`) so backends know who's calling.
+
+## Stickiness
+
+The LB can pin a client to the same backend for some period of
+time (cookie-based, IP-based, or consistent-hash-based). Useful
+when backends hold per-session state.
+
+It's also a smell. Stateless backends (see stateless-services)
+don't need stickiness, and stickiness breaks during deploys
+and scale-in events. See sticky-sessions for the full critique.
+
+## Load balancer capacity
+
+A typical LB capacity:
+
+<Cheatsheet>
+| LB | Approximate throughput |
+|---|---|
+| Single NGINX instance (HTTPS) | ~10K – 50K RPS |
+| Single HAProxy instance | ~50K – 100K RPS |
+| AWS ALB | ~100K RPS, scales further |
+| AWS NLB | ~1M+ RPS, line-rate |
+| Cloudflare / Fastly edge | effectively unbounded (millions RPS) |
+| GCP Cloud Load Balancing | ~1M RPS, anycasted globally |
+</Cheatsheet>
+
+These numbers vary by workload, request size, and TLS settings.
+The point: a single LB instance can usually handle several
+backends' worth of traffic. You don't run an LB per backend.
+
+For huge scale, the LB itself is horizontally scaled — a fleet
+of LB instances behind anycast or a global front-end. The
+client-facing IP is anycasted to many LBs worldwide.
+
+## Common pitfalls
+
+### Treating the LB as just a router
+
+The LB is a piece of production infrastructure. It needs
+health checks, alerting, capacity planning, redundancy (don't
+run one). When the LB has issues, *everything* breaks.
+
+### Forgetting the LB is a single point of failure
+
+Run two LBs (active-active or active-passive) with floating
+IPs, DNS failover, or anycast. A solo LB is a liability.
+
+### Mixing L4 and L7 features
+
+Trying to do L7 features (path routing) on an L4 LB requires
+hacks. Trying to do L4-grade throughput on an L7 LB hits CPU
+ceilings fast. Pick the right layer for the job.
+
+### Forwarding client info incorrectly
+
+When the LB terminates TLS, the backend sees the LB's IP, not
+the client's. You need `X-Forwarded-For`, `X-Real-IP`, or
+Proxy Protocol so backends know who's actually calling. Get
+this wrong and your rate limiter rate-limits the LB.
+
+### Trusting LB self-reported health
+
+The LB says all backends are healthy. Users say everything's
+broken. The health check probably hits `/health` which doesn't
+exercise the actual code paths that are failing. Health checks
+need to test what matters. See health-checks-and-circuit-
+breaking-at-lb.
+
+## In summary
+
+- LBs sit between clients and backends, distributing traffic
+  and isolating backend failures.
+- DNS, server-side, and client-side LBs each have their place.
+- L4 = fast and protocol-agnostic. L7 = smart and HTTP-aware.
+- Health checks, TLS termination, algorithm choice, and
+  stateful-connection handling all matter.
+- A single LB is a single point of failure. Always run more
+  than one.
+- The LB is infrastructure — operate it like one.

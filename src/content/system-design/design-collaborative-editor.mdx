@@ -1,0 +1,238 @@
+export const level = 'staff';
+
+# Design a collaborative editor
+
+Google Docs class systems. Multiple users editing the same
+document, seeing each other's cursor positions, with edits
+merging without conflicts and an undo stack that survives
+across sessions.
+
+The interview classic is "how do edits merge?" Two competing
+answers: **Operational Transformation (OT)** and **CRDTs**.
+
+## 1. Clarify the scope
+
+- Plain text only, or rich text with formatting and embeds?
+- Number of concurrent editors: 10? 1000?
+- Offline support?
+- Document size: thousands of words or millions?
+- History / undo across sessions?
+
+Default: rich text up to 100K words, 50 concurrent editors,
+offline editing, full history.
+
+## 2. Estimate scale
+
+```
+DAU = 50M, docs/user = 5 → 250M active docs
+Edits/active user/sec during editing = 5
+Concurrent editors per doc = avg 2; peak 50
+Average doc size: ~50 KB
+Total storage: 250M × 50 KB × replication = ~50 TB
+```
+
+## 3. API
+
+```bash
+WS /doc/<id>
+  Subscribe to a document; receive ops; send ops.
+
+GET /doc/<id>/snapshot?at=<version>
+  Returns: { content, version, ops_since }
+
+POST /doc/<id>/ops
+  Body: { ops: [{ type, position, content, ...}, ...], base_version }
+  Returns: { applied_version, transformed_ops? }
+```
+
+WebSocket is the primary transport during editing. REST is
+for snapshots and offline reconciliation.
+
+## 4. High-level design
+
+```
+clients (WebSocket)
+        ▼
+edge LB (sticky to doc)
+        ▼
+session servers (one per doc, soft affinity)
+        ▼
+ops applier (CRDT or OT)
+        ▼
+durable doc store (snapshots + ops log)
+        ▼
+sync to other regions
+```
+
+Each document has a "home" server during active editing for
+ordering. When idle, the home reference releases.
+
+## 5. Data model
+
+Two stores per doc:
+
+- **Snapshot**: current resolved state (the text + formatting).
+- **Op log**: every operation applied since the last
+  snapshot, ordered.
+
+A new client joins → fetch snapshot at version V, subscribe
+to ops from V+1 onward. Periodically (every 1000 ops or 1 day),
+the server merges the snapshot with the recent ops and writes
+a new snapshot, then truncates the log.
+
+## 6. Deep dives
+
+### Approach 1: Operational Transformation (OT)
+
+Every edit is an operation (`insert at position 12: "hello"`).
+When two clients edit concurrently, the server **transforms**
+one operation against the other so they can apply in any
+order.
+
+Example:
+
+```
+Doc: "Hello world"
+
+Client A inserts " beautiful" at position 5.
+Client B deletes character at position 6.
+
+If A applies first: "Hello beautiful world", then B deleting
+pos 6 deletes the 'b' — wrong.
+
+OT transforms B's op to delete pos 16 (post-A position),
+giving "Hello beautifulworld" — what B intended.
+```
+
+OT is complex; correctness proofs are notoriously hard.
+Google Docs uses a custom OT. Etherpad uses it. The original
+Wave was OT.
+
+### Approach 2: CRDTs
+
+Each character (or block) has a unique, globally-orderable
+ID. Edits commute — the order of applying ops doesn't change
+the final state.
+
+For text: **RGA**, **WOOT**, **Logoot**, **Yjs**, **Automerge**.
+Each takes a different approach to how IDs are assigned and
+how garbage is collected.
+
+Pros:
+
+- No central coordinator needed; clients can merge directly.
+- Offline edits trivially merge on reconnect.
+- Provably correct.
+
+Cons:
+
+- Each character carries an ID — larger document size on the
+  wire and in memory.
+- Garbage collection of "tombstones" (deleted but
+  remembered for ordering) is tricky.
+- Older CRDTs had bad performance; modern ones (Yjs,
+  Automerge 2) are good enough for production.
+
+Figma uses CRDTs. Yjs has powered Replit, Notion, Linear
+collaborative features.
+
+### Choice between OT and CRDT
+
+<Compare a="OT" b="CRDTs">
+<>
+Smaller wire/memory footprint. Server must mediate (central
+ordering). Correctness proofs hard. Better for plain text.
+</>
+<>
+Larger wire/memory footprint. No server needed for merge
+correctness. Provably correct. Better for offline-first.
+</>
+</Compare>
+
+Modern systems lean CRDT for new builds; legacy systems
+(Google Docs) keep OT because they already work.
+
+### Presence and cursors
+
+Each editor's cursor / selection is broadcast as ephemeral
+state (not in the op log). On every cursor move:
+
+```
+WS broadcast: { user_id, cursor: { start, end } }
+```
+
+Server fanouts to other clients of the same doc. No
+persistence; lost on disconnect.
+
+### Undo across sessions
+
+Local undo is easy: keep a stack of inverse ops. Cross-session
+undo (you closed the tab, want to undo on a new device) needs:
+
+- The op log to be addressable per user.
+- Each user's undo stack = subset of ops they authored.
+- Undo emits an inverse op to the log, applied like any other
+  edit.
+
+Edge case: I undo my op, you've already built on it. The
+inverse op may not perfectly invert if you've modified the
+text I added. Both OT and CRDTs handle this differently.
+
+### Conflict-free vs "no conflict"
+
+Both OT and CRDTs guarantee **convergence** — every replica
+ends up with the same document state. They don't guarantee
+that state is what the user expected. Concurrent edits to the
+same word can produce gibberish.
+
+UX mitigation: present ambiguous merges visually (e.g., "Alice
+and Bob both changed this sentence") and let users decide.
+
+### Storage and snapshots
+
+The op log grows forever. Periodic snapshots:
+
+- Every N ops or every day: compact the snapshot.
+- Old ops can be archived (for history viewing) or deleted.
+- Snapshots are full JSON or binary, several KB each.
+
+### Multi-region
+
+For globally distributed editors, the doc has a "home"
+region. Other regions cache the doc and serve reads;
+writes route to home.
+
+For active editing across regions, a fallback to local
+processing with CRDT merge on reconnect — the doc is
+eventually consistent across regions.
+
+## 7. Bottlenecks and scale-ups
+
+- **Hot doc (large meeting all editing same line)**: rate-limit
+  ops per editor; coalesce small ops.
+- **Region failure**: replicate the doc home to another
+  region; switch on failure.
+- **Op log size**: aggressive snapshotting; truncate after N
+  ops.
+
+## 8. Tradeoffs called out
+
+- **CRDT for new systems**: chose for offline-first and merge
+  correctness; cost is metadata overhead.
+- **Snapshots + op log**: chose for fast load (snapshot) +
+  replay (log).
+- **Presence as ephemeral**: chose simplicity; cost is no
+  history of cursor movements.
+- **Visual UX for conflicts**: when text genuinely conflicts,
+  the editor surfaces it to the user.
+
+## In summary
+
+- Collaborative editor = WebSocket + per-doc ordering + op
+  log + snapshots.
+- Merging: OT (transform ops) or CRDT (commutative ops).
+- Modern systems lean CRDT (Yjs, Automerge) for new builds.
+- Presence is ephemeral, not in the op log.
+- Undo emits inverse ops; cross-session via per-user stacks.
+- Concurrent edits converge mathematically; the UX layer
+  surfaces meaningful conflicts.

@@ -1,0 +1,229 @@
+export const level = 'senior';
+
+# Sidecar pattern
+
+A sidecar is a helper process co-located with the main application,
+sharing its lifecycle and (usually) its network namespace. The main
+app talks to the sidecar over localhost; the sidecar handles a
+cross-cutting concern that doesn't belong in app code.
+
+It's the unit primitive of Kubernetes pods and the building block
+behind service meshes, log shippers, and many platform features.
+
+## The shape
+
+```
+┌─── pod ─────────────────────────────────┐
+│                                         │
+│   [ app container ]   [ sidecar ]       │
+│        ↑                  ↑             │
+│        └── localhost ─────┘             │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+Both containers share:
+
+- **Network namespace**: they reach each other via `localhost`.
+- **Lifecycle**: scheduled together, scaled together, restarted
+  together (with Kubernetes' new sidecar containers, terminated in
+  ordered fashion).
+- **Storage volumes**: they can share files via mounted volumes.
+
+They do **not** share:
+
+- The application's process / language runtime.
+- The application's dependencies, binaries, or memory.
+
+That isolation is the entire point: a sidecar can be written in any
+language, upgraded independently, and crash without taking the app
+down (and vice versa).
+
+## What it's used for
+
+Common sidecar jobs, from Newman's *Building Microservices* and the
+SRE Workbook:
+
+<Cheatsheet>
+| Sidecar | Why it's a sidecar |
+|---|---|
+| Service-mesh proxy (Envoy, linkerd-proxy) | Intercept all traffic; same lifecycle as the app. |
+| Log shipper (Fluent Bit, Vector) | Tail app logs from a shared volume; ship to backend. |
+| Metrics agent (Prometheus exporter, OTel collector) | Scrape or accept push from app; forward to backend. |
+| Config / secrets agent (Vault Agent) | Fetch and refresh secrets; expose via file or socket. |
+| Identity proxy (Workload Identity, SPIFFE) | Get and rotate workload identity tokens. |
+| TLS termination (legacy app + sidecar TLS) | Run plaintext in the app; TLS handled adjacent. |
+| Init or bootstrap (data sync, migrations) | Run before the app starts; share state via volume. |
+| Adaptors (legacy protocol bridge) | App speaks HTTP; sidecar speaks SOAP/Thrift externally. |
+</Cheatsheet>
+
+The pattern is "**this concern is cross-cutting, language-agnostic,
+operationally distinct — pull it out**."
+
+## Why a sidecar instead of a library
+
+Three reasons the same job belongs in a sidecar more often than in
+the app:
+
+<Steps>
+<Step n={1} title="Polyglot fleet.">
+You have 5 languages. A library means 5 implementations, 5 release
+cadences, 5 bug surfaces. A sidecar is one implementation. The mesh
+proxy is the canonical case.
+</Step>
+<Step n={2} title="Independent lifecycle.">
+You want to upgrade the log shipper or rotate certificates without
+redeploying the app. A sidecar can be upgraded independently (with
+care; lifecycle ordering is delicate).
+</Step>
+<Step n={3} title="Privilege isolation.">
+The sidecar needs credentials (Vault token, cloud IAM, mTLS keys).
+You don't want the app process to have those. Sidecar holds them;
+app gets short-lived tokens via localhost.
+</Step>
+</Steps>
+
+If none of these apply, the concern probably belongs in a library or
+in the app. Sidecars are not free — every extra process is more
+CPU, memory, and ops surface.
+
+## Why a sidecar instead of a node-level agent
+
+You could run one log shipper per node instead of one per pod. Both
+work; trade-offs are real:
+
+<Compare a="Sidecar (per-pod)" b="DaemonSet (per-node)">
+<>
+- Same lifecycle as the app; restarts together.
+- Per-workload config: each app can configure its sidecar.
+- Resource overhead is per-pod — worse at very high pod density.
+- Stronger isolation between tenants.
+- The pattern of the mesh.
+</>
+<>
+- One agent per node, serves all pods on that node.
+- Cheaper at scale (one process vs N).
+- Shared blast radius: agent crash hits every pod.
+- Coarser config; not per-workload.
+- Common for cluster-wide log collection and metrics.
+</>
+</Compare>
+
+In practice many platforms use both: sidecars where per-workload
+config or isolation matters (mesh, secrets); DaemonSets where one
+shared agent is fine (node-level metrics, OS log collection).
+
+## Sidecar containers in Kubernetes
+
+Kubernetes shipped first-class **sidecar containers** as GA in
+v1.33 (mid-2025). Before that, sidecars were "just another container"
+in the pod, with awkward lifecycle problems:
+
+- The sidecar might shut down before the app is done draining
+  (mesh proxy gone → app's last requests fail).
+- The sidecar might not be ready before the app starts (app's first
+  requests fail).
+- Job pods didn't terminate because a sidecar didn't exit.
+
+Sidecar containers (declared as `initContainers` with
+`restartPolicy: Always`) fix the ordering:
+
+```yaml
+initContainers:
+  - name: envoy-sidecar
+    restartPolicy: Always
+    image: envoyproxy/envoy
+```
+
+(YAML shown for shape; equivalent JSON config also works.)
+
+Now: sidecar starts before app containers, terminates after them.
+Use this whenever lifecycle ordering matters — which is most sidecar
+use cases.
+
+## Adapter and ambassador variants
+
+The pattern has two named flavours, from *Designing Distributed
+Systems* (Burns):
+
+<Cheatsheet>
+| Variant | Purpose |
+|---|---|
+| Ambassador | Sidecar proxies outbound calls from app to external world. E.g., the app talks plain HTTP to localhost; ambassador adds TLS, retries, service discovery. |
+| Adapter | Sidecar normalizes the app's external interface. E.g., legacy app emits weird metrics format; adapter converts to Prometheus. |
+| Sidecar (generic) | Any helper alongside the app sharing its lifecycle. |
+</Cheatsheet>
+
+All three are sidecars; the names describe the **direction of the
+data flow** (outbound vs. inbound) and the **purpose** (proxying vs.
+translating). Useful vocabulary; same physical pattern.
+
+## Implementation considerations
+
+A few things that bite first-time sidecar adopters:
+
+### Resource accounting
+
+The sidecar's CPU and memory count against the pod. A fleet-wide
+sidecar at 50 MB × 10 000 pods is 500 GB of cluster RAM. Set request
+and limit carefully; profile in real workloads.
+
+### Startup ordering
+
+The app must not crash if the sidecar isn't ready. Either use
+Kubernetes sidecar containers (ordered startup), or have the app
+retry localhost calls during boot. Mesh proxies famously fail this
+test; readiness gates exist for it.
+
+### Shutdown ordering
+
+When the pod is terminating, the sidecar must outlive the app's
+in-flight requests. With sidecar containers, the platform handles
+this. Without, you implement preStop hooks and pray.
+
+### Localhost is not always loopback
+
+In sandboxes (gVisor, certain CNI plugins, KubeVirt), pod-local
+"localhost" has surprises. Test in your real platform, not just on
+your laptop.
+
+### Sidecars cannot fix the app
+
+A sidecar is a wrapper. If the app crashes on bad input, the mesh
+won't save it. If the app retries unsafely, the mesh adds retries
+on top. The sidecar handles cross-cutting concerns; the app must
+still be a competent network citizen.
+
+## When NOT to use a sidecar
+
+Some honest counterexamples:
+
+- **Single-language fleet with stable client libraries.** A library
+  is simpler and uses no extra resources.
+- **Latency-sensitive hot paths** (financial trading, low-latency
+  data planes). A sidecar adds 1–5 ms; sometimes that's too much.
+- **Very small clusters / function-as-a-service.** The per-pod
+  overhead dominates when pods are short-lived or tiny.
+- **The "concern" is actually domain logic.** Domain logic in a
+  sidecar is a debugging nightmare. Sidecars are for **plumbing**.
+
+<Callout variant="info">
+The test for "is this a sidecar?" is: would this code be the same
+in every language, owned by a platform team, and operationally
+distinct from the app? If yes, sidecar. If it has business logic in
+it, it belongs in the app.
+</Callout>
+
+## In summary
+
+- A sidecar is a co-located helper process: same lifecycle, same
+  network namespace, different runtime.
+- It carries cross-cutting concerns out of app code: mesh proxy,
+  log shipper, metrics agent, secret broker, protocol adapter.
+- Prefer sidecar over library when you have a polyglot fleet, want
+  independent lifecycle, or need privilege isolation.
+- Prefer DaemonSet when the agent is node-level and per-workload
+  config doesn't matter.
+- Kubernetes' first-class sidecar containers (GA 1.33) finally make
+  the lifecycle ordering reliable; use them.
+- Sidecars are for plumbing; never push domain logic into one.

@@ -1,0 +1,233 @@
+export const level = 'senior';
+
+# Design Ticketmaster / booking
+
+A system for selling concert tickets, flight seats, hotel
+rooms, or any other limited inventory. The defining
+constraint: **never sell the same seat twice.** Performance,
+fairness, and scale all flow from that.
+
+## 1. Clarify the scope
+
+- Inventory size: 10K seats per event, 100K events?
+- Peak load: a Taylor Swift drop = 14M people refreshing at
+  10:00:00.
+- Hold time: how long a user can sit on a seat before
+  paying?
+- Waiting room / queue?
+- Resale market?
+
+Default: thousands of events, ~50K seats each, occasional viral
+events, 8-minute hold before paying.
+
+## 2. Estimate scale
+
+```
+Normal day: 1M tickets/day → 12 sales/sec
+Viral event: 1M tickets in 5 minutes → 3.3K sales/sec, but
+   10–100x that in *attempts* → ~300K attempts/sec
+Storage: 1B tickets/year × 1KB metadata = 1 TB
+```
+
+The big number isn't sales QPS. It's the **read amplification**
+during high-demand sales: every refresh, every "is this
+available?" check, every "hold this seat" attempt.
+
+## 3. API
+
+```bash
+GET /event/<id>/availability
+  Returns: { sections: [{ id, available, price_band }] }
+
+POST /event/<id>/hold
+  Body: { seat_ids: [...], session_id }
+  Returns: { hold_id, expires_at } | 409 if any unavailable
+
+POST /event/<id>/purchase
+  Body: { hold_id, payment_token, contact }
+  Returns: { ticket_ids: [...] } | 410 if expired
+
+DELETE /event/<id>/hold/<hold_id>
+  (releases a hold early)
+```
+
+## 4. High-level design
+
+```
+client → waiting room (queue ticket assigned)
+            ▼
+       inventory service (Redis + Postgres)
+            ▼
+       hold service (Redis with TTL)
+            ▼
+       payment service
+            ▼
+       ticket service (issues final ticket)
+            ▼
+       audit log (Kafka)
+```
+
+Critical paths separated by strong isolation. A failure in
+payment can't corrupt inventory.
+
+## 5. Data model
+
+```
+event_seat:
+  event_id (partition key)
+  seat_id
+  state: AVAILABLE | HELD | SOLD
+  current_hold_id (nullable)
+  current_owner_id (nullable)
+  updated_at
+
+hold:
+  hold_id
+  event_id, seat_ids
+  user_id
+  expires_at (TTL)
+```
+
+The seat state machine is `AVAILABLE → HELD → SOLD` with a
+release path back from `HELD` (timeout or user cancel).
+
+Storage:
+
+- **Redis** for the hot path (state lookups, atomic
+  transitions). One Redis instance per event for hot events
+  to avoid hot keys.
+- **Postgres** for source of truth and history; writes
+  asynchronously from Redis.
+
+## 6. Deep dives
+
+### Atomic seat hold
+
+Two users click "hold seat A12" simultaneously. Only one
+succeeds. Implementation: Redis Lua script (atomic):
+
+```js
+const script = `
+  local state = redis.call('GET', KEYS[1])
+  if state == 'AVAILABLE' then
+    redis.call('SET', KEYS[1], 'HELD')
+    redis.call('SET', KEYS[1] .. ':hold', ARGV[1], 'EX', ARGV[2])
+    return 1
+  else
+    return 0
+  end
+`;
+const ok = await redis.eval(script, 1, `seat:${event}:${seat}`, holdId, 480);
+```
+
+Atomic compare-and-swap-equivalent. Only one user gets the
+seat.
+
+### Virtual waiting room
+
+For high-demand events, you can't let everyone hit the
+inventory service simultaneously. Push them into a queue:
+
+<Steps>
+<Step n={1} title="User clicks 'buy'.">
+Get a queue token (a UUID) and a position.
+</Step>
+<Step n={2} title="Wait in queue.">
+A worker dequeues tokens at a controlled rate (e.g., 1K/sec)
+into the inventory service.
+</Step>
+<Step n={3} title="User reaches the front.">
+Receives a temporary access token for the inventory service.
+</Step>
+<Step n={4} title="Holds and purchases as normal.">
+Token expires in N minutes — they have to be quick or
+they're back in queue.
+</Step>
+</Steps>
+
+Caps inventory load at a sustainable rate. Without this, the
+inventory service melts under refresh storms.
+
+### Hold timeout
+
+The hold has a TTL (typically 8 min). If the user doesn't pay,
+the seat returns to `AVAILABLE`. Two implementations:
+
+- **Redis TTL on the hold key**, with a background job that
+  sweeps expired holds and updates seat state.
+- **Explicit timer event** on a delay queue (e.g., SQS, RabbitMQ
+  delayed messages).
+
+Edge case: user starts payment at second 7:59, payment succeeds
+at second 8:01, but hold has technically expired. Solution:
+on payment, extend the hold automatically; reconcile with
+Postgres source of truth.
+
+### Payment integration
+
+Idempotency-Key on every payment request. Two paths to handle
+flakiness:
+
+- **Payment succeeds, ticket service down**: retry ticket
+  issuance; idempotency-key ensures one ticket per payment.
+- **Payment times out**: status-check the payment provider
+  before assuming failure.
+
+A reconciliation job nightly compares Stripe payments to
+issued tickets and surfaces discrepancies.
+
+### Inventory release on partial failure
+
+User holds 4 seats. Payment for 4 fails. Need to release all
+4. The hold service must support atomic release of multi-seat
+holds.
+
+If one seat in the hold has already been "promoted" to
+SOLD by an out-of-order event, release only the rest. Audit
+log captures this.
+
+### Read scaling
+
+Most traffic is reading "is this seat available?" — far more
+than writing. Mitigations:
+
+- **Edge caching** of the section overview (5-second TTL
+  during sale; longer otherwise).
+- **WebSocket push** of state changes to clients viewing the
+  same event (no polling).
+- **Approximate availability** for the lobby ("Section 102:
+  ~50 seats available") — exact count only when user clicks a
+  section.
+
+## 7. Bottlenecks and scale-ups
+
+- **One viral event = one hot Redis instance**: shard by
+  event; pre-warm Redis instances for known big events.
+- **Queue fairness**: bot detection at the queue entrance
+  (CAPTCHA, device fingerprint, rate limits per IP).
+- **Multi-region**: events are usually local; data lives in
+  the event's home region. Cross-region access pays latency.
+
+## 8. Tradeoffs called out
+
+- **Redis for hot path, Postgres for truth**: chose dual
+  store for performance + durability.
+- **Virtual waiting room**: chose UX wait over inventory
+  meltdown.
+- **Approximate availability in lobby**: chose lower QPS for
+  the long tail.
+- **Hold TTL with reconciliation**: chose simplicity over
+  perfect first-come-first-served (a slow user can still lose
+  their seat).
+
+## In summary
+
+- Booking system = atomic state machine on inventory + virtual
+  waiting room + hold-then-purchase flow.
+- Atomic state transitions via Redis Lua or DB unique
+  constraints.
+- Virtual queue protects inventory from refresh storms.
+- TTL holds + reconciliation handle payment flakiness.
+- Read load dominates; cache + WebSocket push handle it.
+- Idempotency-keys on payments; nightly reconciliation jobs
+  catch discrepancies.

@@ -1,0 +1,343 @@
+export const level = 'staff';
+
+# Distributed transactions
+
+A distributed transaction commits a single logical change
+across multiple independent resources — typically multiple
+databases, or services with their own state. The textbook
+answer is two-phase commit (2PC). The production answer is
+**don't, unless you must**, and reach for sagas, outbox, or
+idempotent retries instead.
+
+Understanding why is the difference between a senior and a
+staff engineer's distributed systems judgment.
+
+## What a distributed transaction is supposed to give you
+
+ACID across more than one resource:
+
+- **Atomicity**: either every participant commits or every
+  participant aborts. No partial state.
+- **Consistency**: invariants spanning resources hold.
+- **Isolation**: concurrent distributed transactions don't see
+  each other's intermediates.
+- **Durability**: once committed everywhere, survives.
+
+Examples that *seem* to need it:
+
+- Transfer money from account A in DB1 to account B in DB2.
+- Order placement: write the order, debit inventory, charge
+  the card.
+- Multi-shard write where rows live in different shards.
+
+In practice, sub-services for inventory and payments are
+usually different systems with different SLAs, and asking them
+to all be in a global transaction breaks everything.
+
+## Two-phase commit (2PC)
+
+The classical protocol.
+
+```
+[coordinator] → prepare → [participant 1]
+              → prepare → [participant 2]
+              → prepare → [participant 3]
+                                 ↓
+              (each replies "yes" or "no", and durably persists "I voted yes")
+
+if all yes:
+  [coordinator] → commit → [participant 1, 2, 3]
+else:
+  [coordinator] → abort  → [participant 1, 2, 3]
+```
+
+Phase 1 (prepare): coordinator asks each participant if it can
+commit. Participants vote, durably persisting their vote and
+all locks needed.
+
+Phase 2 (commit/abort): coordinator decides based on votes,
+tells everyone.
+
+**Properties:**
+
+- **Atomicity**: if every participant votes yes, every one
+  commits. If any votes no, all abort.
+- **Locks held through both phases**: participant locks rows
+  for the duration. Other transactions wait.
+- **Coordinator is a single point of failure**: if it dies
+  between phase 1 and phase 2, participants are stuck holding
+  locks waiting for the decision — the **blocking problem**.
+- **Slow**: at minimum, two round trips per transaction, and
+  fsync per round-trip per participant.
+
+2PC works correctly under crashes — it's not "wrong" — but the
+operational cost is brutal. Even short partitions cause
+in-doubt transactions that need manual intervention.
+
+## Three-phase commit (3PC)
+
+Adds an intermediate "pre-commit" phase to avoid blocking. In
+theory, participants can decide independently if the coordinator
+dies.
+
+In practice:
+
+- Requires synchronous networks with bounded message delay,
+  which the real internet violates.
+- Adds another round trip — slower than 2PC.
+- Still has corner cases under network partitions.
+
+3PC is mostly textbook material. Nobody runs it in production
+at scale.
+
+## XA transactions
+
+The standardized 2PC protocol used between databases and
+external transaction managers (Java's JTA, MS DTC).
+
+Common combinations:
+
+- Java EE app server coordinating a database + JMS queue.
+- Distributed application server + Oracle + MSMQ.
+
+Reasons people abandoned them:
+
+- **In-doubt transactions** lock rows for hours when a
+  coordinator crashes.
+- **Latency is poor** — every transaction is two round trips.
+- **Recovery requires careful operations** — manual XA
+  RECOVER commands on each participant after coordinator
+  failure.
+- **The driver matrix is messy** — not every database driver
+  cleanly supports XA in 2026.
+
+Most companies that ran XA in the 2000s have ripped it out.
+
+## Why modern systems avoid 2PC
+
+Three structural reasons:
+
+<Steps>
+<Step n={1} title="Coordinator failure is catastrophic.">
+Participants holding locks waiting for a dead coordinator
+either hang until manual recovery or use heuristic commits
+(commit/abort the in-doubt transaction without coordinator
+confirmation) — which sometimes diverges. Either way,
+operational pain.
+</Step>
+<Step n={2} title="Tail latency is unacceptable.">
+Two phase × multiple participants × fsync each = high p99.
+Distributed transactions are routinely 10–100× slower than
+local ones.
+</Step>
+<Step n={3} title="Cross-service is harder than cross-database.">
+A payment provider isn't going to participate in your 2PC.
+You don't control their commit protocol. The protocol is only
+useful when you control all participants, which is rare.
+</Step>
+</Steps>
+
+## What modern systems use instead
+
+### Sagas
+
+A saga is a **sequence of local transactions** with explicit
+**compensating actions** for rollback.
+
+```
+T1: create order
+T2: reserve inventory   ← if fails, run C1 (cancel order)
+T3: charge card         ← if fails, run C2 (release inventory) and C1 (cancel order)
+T4: confirm order
+```
+
+Each step is a normal local transaction. If a step fails,
+the saga runs compensations in reverse to logically undo prior
+steps.
+
+Two flavors:
+
+- **Choreography**: each service emits events; downstream
+  services react. No central coordinator. Simple at first,
+  hard to reason about as it grows.
+- **Orchestration**: a saga orchestrator (state machine) calls
+  each service in turn and decides compensations. Easier to
+  observe and debug.
+
+Properties:
+
+- **No global locks**: each local transaction is short.
+- **Eventually consistent**: between steps, the system is in
+  an inconsistent intermediate state.
+- **Compensations may not fully undo** (sending an email
+  can't be unsent). Design business logic to be tolerant.
+- **Idempotency required**: each step may be retried; effects
+  must be safe.
+
+Sagas are the right pattern for "place an order across order,
+inventory, payment, shipping services."
+
+### Outbox pattern
+
+For the narrower case of "write to DB + emit message"
+atomically.
+
+```js
+await db.transaction(async (tx) => {
+  await tx.orders.insert({ ...order });
+  await tx.outbox.insert({ type: 'order.placed', payload: order });
+});
+
+// Separate worker tails outbox and publishes to broker
+```
+
+DB write + outbox row are atomic (one local transaction).
+Worker reads the outbox, publishes to the broker, marks the
+row processed. At-least-once delivery downstream.
+
+This avoids the **dual-write problem** without distributed
+transactions. Most "I need a transaction across DB and queue"
+problems are solved by outbox.
+
+### Idempotent operations + retries
+
+Often the simplest approach. Design each downstream call so
+that **retrying it produces the same result**.
+
+- A charge has a client-supplied idempotency key. Stripe sees
+  the same key twice → one charge.
+- An inventory decrement uses `version` to prevent double
+  decrements.
+- A row insert uses `ON CONFLICT DO NOTHING`.
+
+Now the orchestrator can retry steps without worrying about
+double-effects. Most distributed workflows reduce to "do step,
+retry on failure, eventually succeed or compensate."
+
+### Transactional outbox + CDC
+
+A composition: write to outbox, but the worker is replaced by
+CDC reading the WAL. Same atomicity guarantee, cleaner
+operational story. Debezium + Kafka is the canonical
+implementation.
+
+### Embedded distributed transactions
+
+Some modern databases offer real distributed ACID transactions
+internally:
+
+- **Spanner, CockroachDB**: use two-phase commit **within the
+  database** across shards, but with sophisticated mitigations
+  (Raft for coordinator durability, TrueTime/HLC for ordering,
+  intent records for in-doubt resolution).
+- **YugabyteDB**: similar.
+- **MongoDB 4.0+ cross-shard transactions**: 2PC-like, with
+  significant performance cost.
+
+The lesson: 2PC isn't bad in principle — what's bad is
+**hand-rolling it across heterogeneous systems you don't
+control**. Database engines that own all the participants can
+make it work.
+
+## When you actually need distributed transactions
+
+Genuinely rare in application architecture. Real cases:
+
+- **Financial transfers** that must be atomic across legal
+  entity boundaries. Even here, the modern approach is
+  **double-entry ledgers** with eventual reconciliation, not
+  2PC.
+- **Within a single sharded database** (Spanner, CockroachDB).
+  Use the database's built-in feature.
+- **Legacy systems** where the cost of redesign exceeds the
+  cost of XA. Pay the operational tax.
+
+Outside these, design the system so distributed transactions
+aren't needed. This is usually a service-boundary problem: if
+two services need to atomically commit together, they may be
+the same service in disguise.
+
+## Decision framework
+
+<Steps>
+<Step n={1} title="Is this one database?">
+Yes → local ACID transaction. Done.
+</Step>
+<Step n={2} title="Is this one DB + a message broker?">
+Yes → outbox pattern. Done.
+</Step>
+<Step n={3} title="Is this one sharded ACID database?">
+Yes → use its distributed transaction feature (Spanner,
+CockroachDB). It's been engineered for this.
+</Step>
+<Step n={4} title="Is this multiple independent services / systems?">
+Yes → saga with compensations + idempotent steps. Plan for
+intermediate inconsistent states.
+</Step>
+<Step n={5} title="Do you really need atomicity across them?">
+Often the answer is "no, eventual consistency with
+retries is fine." Push back on the requirement.
+</Step>
+<Step n={6} title="Is the value of strict atomicity worth XA's pain?">
+Almost never. If yes, plan for in-doubt recovery, manual
+intervention runbooks, and the latency cost.
+</Step>
+</Steps>
+
+## Common pitfalls
+
+### Reaching for XA before redesigning
+
+Many "we need a distributed transaction" requirements dissolve
+when the services are redrawn or when eventual consistency is
+accepted. Spend time on the boundary, not on the protocol.
+
+### Sagas without compensations
+
+Half the team writes the happy path; nobody writes
+compensations. The first partial failure leaves the system
+inconsistent and on-call writes a one-off script.
+
+### Idempotency keys not enforced
+
+The system claims to be idempotent but doesn't store
+idempotency keys. Replays produce duplicates. Always persist
+keys; check before mutating.
+
+### Synchronous orchestrators
+
+An orchestrator that does step → step → step synchronously
+blocks until everything completes, with the latency and
+failure surface of the slowest dependency. Async (event-driven)
+orchestrators are more resilient.
+
+### Confusing "distributed transaction" with "distributed system"
+
+A workflow that spans services and takes seconds to complete
+isn't a transaction — it's a business process. Don't shoehorn
+ACID semantics where the actual requirement is reliable
+eventual completion.
+
+<Callout variant="warning">
+2PC and XA solve a real problem, but in 2026 they are
+operational anti-patterns outside of databases that own all
+participants. The instinct should be "design so I don't need
+this," not "let me find a 2PC implementation."
+</Callout>
+
+## In summary
+
+- 2PC and 3PC give cross-resource atomicity at the cost of
+  blocking on coordinator failure, high latency, and
+  operational pain.
+- XA / JTA / MS DTC implement 2PC and have largely been
+  abandoned outside legacy systems.
+- Modern alternatives: **sagas with compensations**, **outbox
+  pattern**, **idempotent retries**, and **CDC-based
+  propagation**.
+- Distributed-transactional databases (Spanner, CockroachDB)
+  encapsulate 2PC internally; use those when sharded ACID is
+  required.
+- Most "I need a distributed transaction" requirements are
+  actually "I need a reliable workflow with idempotency."
+  Redesign accordingly.
