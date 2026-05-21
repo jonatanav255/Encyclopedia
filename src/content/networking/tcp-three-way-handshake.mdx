@@ -1,0 +1,237 @@
+export const level = 'mid';
+
+# TCP three-way handshake
+
+Every TCP connection starts with three packets and ends with four
+(roughly). Knowing the sequence — and what state the kernel keeps
+afterwards — explains TIME_WAIT exhaustion, why your load balancer
+goes haywire under reconnect storms, and why HTTP keep-alive is the
+single most important throughput knob you have.
+
+## Opening — SYN, SYN-ACK, ACK
+
+```
+Client                                    Server
+  │  ── SYN (seq=x) ───────────────────▶  │   LISTEN → SYN_RECEIVED
+  │  ◀── SYN-ACK (seq=y, ack=x+1) ─────   │
+  │  ── ACK (ack=y+1) ─────────────────▶  │   → ESTABLISHED
+  │                                       │
+  │   <data flows>                        │
+```
+
+What's happening:
+
+1. Client sends `SYN` — "I want to talk, my starting sequence
+   number is x."
+2. Server replies `SYN-ACK` — "OK, mine is y, and I acknowledge
+   x+1."
+3. Client sends `ACK` — "acknowledged y+1."
+
+After step 3, both sides are `ESTABLISHED`. The client can start
+sending data immediately (it often piggybacks data on the final
+ACK).
+
+One round trip. On a 100ms-RTT link, that's 100ms before you've
+sent a single byte of useful data. Add TLS 1.3 and it's 200ms; TLS
+1.2 is 300ms. Add DNS if uncached, more.
+
+## SYN backlog and `EAGAIN` storms
+
+The kernel maintains two queues:
+
+- **SYN queue** — half-open connections (SYN received, SYN-ACK
+  sent, waiting for the final ACK). Size: `net.ipv4.tcp_max_syn_backlog`.
+- **Accept queue** — fully established connections waiting for the
+  app to `accept()`. Size: `min(backlog arg, somaxconn)`.
+
+If your app is slow to `accept()` (event loop blocked, GC pause),
+the accept queue fills. New connections sit in the SYN queue
+longer; once that fills, the kernel drops new SYNs. Clients see
+`ECONNREFUSED` or just time out.
+
+Symptoms:
+
+```bash
+ss -lntp 'sport = :3000'
+# Send-Q column = current accept queue depth
+# Recv-Q = backlog limit
+```
+
+```bash
+netstat -s | grep -i 'syn\|listen'
+# "X SYNs to LISTEN sockets dropped" → backlog overflow
+```
+
+Fix: faster event loop, larger `somaxconn`, more worker processes,
+LB in front.
+
+## Closing — the FIN dance
+
+```
+Client                                    Server
+  │  ── FIN (seq=m) ──────────────────▶  │   ESTABLISHED → CLOSE_WAIT
+  │  ◀── ACK (ack=m+1) ────────────────  │
+  │                                      │   <server finishes sending>
+  │  ◀── FIN (seq=n) ──────────────────  │   → LAST_ACK
+  │  ── ACK (ack=n+1) ────────────────▶  │   → CLOSED
+  │   (client enters TIME_WAIT)          │
+```
+
+Four packets. TCP is full-duplex — each direction is closed
+independently. The side that sends FIN first enters **TIME_WAIT**
+after the final ACK.
+
+A simultaneous close (both send FIN at once) is legal but rare.
+
+## TIME_WAIT — the misunderstood state
+
+After an active close, the socket sits in TIME_WAIT for **2 * MSL**
+(Maximum Segment Lifetime). On Linux, MSL is 60s — so TIME_WAIT
+lasts 60s (not 120s; Linux uses MSL, not 2*MSL).
+
+Why TIME_WAIT exists:
+
+1. **Catch stray retransmits.** If the final ACK is lost, the
+   server resends FIN. TIME_WAIT lets the client re-ACK it.
+2. **Prevent late packets from a *previous* incarnation of the
+   4-tuple being interpreted as packets for a *new* connection
+   reusing the same 4-tuple.** This is the load-bearing reason.
+
+While in TIME_WAIT, the kernel holds the 4-tuple
+`(local-ip, local-port, remote-ip, remote-port)` reserved.
+
+## TIME_WAIT exhaustion — the real outage mode
+
+The **client** side that initiates closes is the one that suffers,
+because the client's local port is consumed.
+
+Scenario: a service makes short outbound requests to one upstream
+(say, an internal API at `10.0.0.1:443`). Each request opens a
+fresh connection (no keep-alive), does its thing, and closes.
+
+The ephemeral port range is ~28k. TIME_WAIT lasts 60s. Maximum
+sustainable rate of new connections to *that one upstream*:
+
+```
+28000 ports / 60 seconds ≈ 466 conn/sec
+```
+
+Above that, the client runs out of ephemeral ports for that
+`(local-ip, *, 10.0.0.1, 443)` tuple. Connect calls fail with
+`EADDRNOTAVAIL`.
+
+The fix order, from cheapest to most invasive:
+
+1. **HTTP keep-alive / connection pooling.** Reuse connections.
+   `undici`'s default pool size is 10 per origin — that's 10
+   connections handling all your traffic to that origin, instead
+   of one per request.
+2. **`net.ipv4.tcp_tw_reuse = 1`.** Lets the kernel reuse
+   TIME_WAIT sockets for new *outbound* connections when the
+   timestamps prove safety. Safe in practice on modern Linux.
+3. **Multiple source IPs.** Bind connections to different local
+   IPs to multiply the effective port space.
+4. **Make the upstream listen on multiple ports.** Fewer engineers
+   reach for this; it does work.
+
+The server side rarely suffers from TIME_WAIT exhaustion in the
+same way — it's not initiating closes, and even when it does, its
+4-tuple varies on the client side (different client IPs and ports),
+so the local port isn't a bottleneck.
+
+## Why load balancers care
+
+Layer-4 LBs sit in the middle. If they're configured as the
+*active closer* (e.g., enforcing a max idle time, or for HTTP/1.1
+without keep-alive from the client), they accumulate TIME_WAIT
+state for every short-lived connection. On a busy LB this can mean
+millions of TIME_WAITs — memory pressure, slow socket lookups.
+
+Mitigations LB operators reach for:
+
+- Long-idle keep-alive between LB and backends (avoid LB initiating
+  closes).
+- Multiple backend IPs to spread the 4-tuple space.
+- Tuned `tcp_max_tw_buckets`, `tcp_tw_reuse`.
+- Sometimes a dedicated NIC/IP per backend pool.
+
+This is invisible to app developers — until the LB cracks under a
+deploy that churns connections.
+
+## Why HTTP keep-alive matters
+
+HTTP/1.1 defaults to keep-alive: the TCP connection stays open
+after a response, ready for the next request. HTTP/2 and /3
+multiplex many requests over one connection by design.
+
+Without keep-alive, every request pays the full handshake (1 RTT)
++ TLS handshake (1-2 RTTs) + TIME_WAIT cost on close. With
+keep-alive on a warm pool: zero RTTs for the connection, you just
+send the request.
+
+Difference on a 50ms-RTT link:
+
+- Cold: 50ms (TCP) + 50ms (TLS 1.3) + 50ms (request) = 150ms.
+- Warm: 50ms (request). 3x faster, and no port pressure.
+
+The Node default for `fetch` (via undici) uses a pool. The legacy
+`http.request` does not — pass an `Agent({ keepAlive: true })`.
+
+## Connection pools — what they actually do
+
+A pool keeps N connections to an origin open. New requests pick an
+idle one; if none, either wait, open a new one (up to a limit), or
+reject.
+
+```js
+import { Agent } from 'undici';
+
+const pool = new Agent({
+  connections: 50,           // max per origin
+  pipelining: 1,             // HTTP/1.1 doesn't safely pipeline
+  keepAliveTimeout: 60_000,  // how long to keep idle conns
+});
+```
+
+Tuning: `connections` should be ≥ your concurrency to that origin.
+Too low and requests queue; too high and you waste FDs and the
+upstream sees too much load.
+
+For your own services, the upstream's max connection count plus
+your replica count gives a ballpark for per-replica pool size.
+
+## Useful diagnostics
+
+```bash
+ss -t state time-wait | wc -l       # count TIME_WAITs
+ss -t state established | wc -l     # count active conns
+ss -s                               # summary by state
+```
+
+```bash
+sysctl net.ipv4.tcp_tw_reuse
+sysctl net.ipv4.ip_local_port_range
+sysctl net.core.somaxconn
+sysctl net.ipv4.tcp_max_syn_backlog
+```
+
+On macOS, replace `ss` with `netstat -an | grep -i wait`.
+
+For per-connection RTT, retransmits, and congestion window:
+
+```bash
+ss -tin                             # 'i' for internal info
+```
+
+That's how you actually learn whether the network or your app is
+the bottleneck.
+
+## The mental model
+
+A TCP connection is **state on both ends and along the path**.
+Setup costs an RTT. Teardown costs you a port for a minute. Burn
+through both faster than your machine can recycle them, and the
+network "just stops working" in ways that don't look like network
+problems.
+
+Keep-alive. Pool. Don't churn connections. That's 90% of the win.

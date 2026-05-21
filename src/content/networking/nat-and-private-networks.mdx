@@ -1,0 +1,239 @@
+export const level = 'mid';
+
+# NAT and private networks
+
+Your laptop's IP is `192.168.1.42`. Your phone's is `192.168.1.43`.
+The server they're hitting sees both as `203.0.113.5`. The thing
+doing that rewrite is **NAT** — Network Address Translation — and
+it shapes more of modern networking than the spec writers ever
+expected.
+
+## Private address ranges
+
+RFC 1918 reserves three IPv4 ranges that won't appear on the public
+internet:
+
+```
+10.0.0.0/8          → 10.0.0.0    – 10.255.255.255   (16M addrs)
+172.16.0.0/12       → 172.16.0.0  – 172.31.255.255   (1M addrs)
+192.168.0.0/16      → 192.168.0.0 – 192.168.255.255  (65k addrs)
+```
+
+Plus link-local `169.254.0.0/16` (the "I gave up on DHCP" range
+you see when wifi is broken) and the loopback `127.0.0.0/8`.
+
+Every home router, AWS VPC, and Kubernetes pod network uses these.
+Routers on the public internet drop packets *to* these addresses —
+they're explicitly non-routable.
+
+That's the whole point: private addresses can be reused everywhere.
+Your home network and mine can both use `192.168.1.0/24` without
+collision, because neither one's packets ever leak out.
+
+## What NAT actually does
+
+A NAT (specifically, **PAT** — Port Address Translation, which is
+what "NAT" colloquially means now) rewrites the source IP+port of
+outbound packets and remembers the mapping so it can rewrite the
+destination of replies.
+
+Outbound packet from your laptop:
+
+```
+src 192.168.1.42:54123  →  dst 203.0.113.5:443
+```
+
+Hits the router. Router picks a free port on its public IP, say
+`60001`, rewrites:
+
+```
+src 203.0.113.5:60001   →  dst 203.0.113.5:443
+```
+
+Router stores `(192.168.1.42, 54123) ↔ (60001)` in its NAT table.
+
+Reply comes back:
+
+```
+src 203.0.113.5:443  →  dst 203.0.113.5:60001
+```
+
+Router looks up `60001`, rewrites:
+
+```
+src 203.0.113.5:443  →  dst 192.168.1.42:54123
+```
+
+Laptop sees the packet on its original socket. The remote server
+never knew about `192.168.1.42`.
+
+## Why NAT exists
+
+IPv4 has ~4 billion addresses. Earth has ~10x that many devices.
+NAT lets one public IP serve a whole household, office, or cloud
+VPC. It was a stopgap that became permanent because IPv6 deployment
+has been... gradual.
+
+IPv6 has enough addresses (~3.4 × 10^38) that NAT shouldn't be
+needed. But NAT also accidentally functions as a firewall —
+unsolicited inbound connections have no NAT entry to map to — so
+plenty of IPv6 networks NAT anyway out of habit / paranoia.
+
+## The asymmetry — NAT only works for client-initiated traffic
+
+A NAT entry is created when an internal host sends an outbound
+packet. There's no automatic mapping for inbound connections — the
+router doesn't know which internal host the packet is for.
+
+This is why:
+
+- Your laptop can connect to any server.
+- Random hosts on the internet cannot connect to your laptop.
+
+For self-hosted services behind NAT, you need explicit **port
+forwarding**: "anything arriving on public port 8080, send to
+`192.168.1.42:8080`." Manual, per-port, fragile.
+
+## NAT traversal and hole punching
+
+Two clients both behind NAT can't directly connect to each other.
+This breaks p2p apps — file sharing, VoIP, gaming, WebRTC.
+
+The trick: **hole punching**, mediated by a public **rendezvous
+server** (STUN).
+
+1. Alice and Bob both contact the STUN server. STUN tells each
+   one its public IP+port (the NAT mapping created by talking to
+   STUN).
+2. Alice and Bob exchange these via the rendezvous (e.g., a
+   signaling server).
+3. Both simultaneously send a packet to the other's public
+   IP+port. Each NAT sees the *outbound* packet first, creates a
+   mapping. When the other side's packet arrives, the mapping
+   exists, so it gets through.
+
+This works for **cone NATs** (the mapping depends only on the
+internal `(ip, port)`). It fails for **symmetric NATs** (the
+mapping is per-destination), where you need a **TURN** server to
+relay the entire conversation.
+
+The acronym soup:
+
+- **STUN** — discover your public mapping.
+- **TURN** — relay traffic when hole punching fails.
+- **ICE** — orchestrate trying STUN first, falling back to TURN.
+
+Every WebRTC app uses all three. Most "video call quality issues
+behind corporate VPNs" are really "symmetric NAT forcing a TURN
+relay."
+
+## Cloud egress IPs ($)
+
+Your AWS Lambdas, EKS pods, and EC2 instances make outbound calls
+through a NAT gateway. The internet sees those calls as coming
+from the NAT gateway's public IP.
+
+Implications:
+
+- **Allowlists work.** Tell a third-party API to allow your NAT
+  gateway IP; all your services get through.
+- **Per-GB egress costs through the NAT gateway add up.** AWS
+  charges $0.045/GB processed through a NAT gateway (in addition
+  to data transfer). For a service moving terabytes egress, this
+  becomes a real line item — sometimes the biggest line item.
+- **VPC endpoints** (PrivateLink) bypass the NAT gateway for AWS
+  service calls (S3, DynamoDB, etc.). Free for most, much cheaper
+  for the rest. Always use them when available.
+- **Source IP exhaustion.** A single NAT gateway IP shares the
+  ephemeral port space. AWS scales this for you — but `EAI_AGAIN`
+  and connect timeouts at very high concurrency can indicate the
+  NAT gateway is the bottleneck.
+
+## "Why does my WebSocket disconnect after 5 min on cellular?"
+
+NAT mappings expire. The router has to evict idle entries because
+the table is finite. Typical timeouts:
+
+- **TCP connections**: 2-4 hours when idle.
+- **UDP "connections"**: 30 seconds to a few minutes.
+- **Cellular carrier NATs**: as low as **30-60 seconds** for both
+  TCP and UDP.
+
+When the mapping expires, the next packet from the server arrives
+at the NAT, which has no entry for it → drops it. The client's
+socket appears alive (no FIN received), but no data flows.
+Eventually the TCP keep-alive (if enabled) or the app's heartbeat
+fires and notices.
+
+The fix in the app: **send heartbeats**. WebSocket pings every
+20-30s on cellular. Without them, you'll see "phantom"
+disconnects when the user puts the phone in their pocket.
+
+For long-lived UDP (game state, VoIP), the cadence is even
+tighter — every few seconds.
+
+## VPNs and NAT
+
+A VPN tunnels your traffic through a remote server, which then NATs
+it onto the public internet. Two layers of NAT (yours + the VPN
+provider's) are common.
+
+This is why some sites geo-detect "you're in this country" wrongly
+when you're on a VPN, and why some sites flat-out block VPN exit
+IPs (they're well-known and overrepresented in abuse traffic).
+
+For corporate VPNs, the company controls the egress. Your home IP
+gets NATed to the corporate egress IP, which is allowlisted for
+internal services. From the internal services' perspective, you're
+"inside" — same trust boundary as someone in the office.
+
+## Carrier-grade NAT (CGNAT)
+
+Mobile carriers and many residential ISPs run a NAT layer above
+yours. Your modem hands you `192.168.1.42` → NAT to `100.64.0.5`
+(the CGNAT range) → NAT again to a real public IP shared by
+hundreds of customers.
+
+Two consequences:
+
+- You truly cannot accept inbound connections at all. Port
+  forwarding on your router is pointless; the CGNAT layer drops
+  everything.
+- Many customers share one public IP. Abuse reports get attributed
+  to your IP that you didn't cause. Anti-spam blocklists hit you
+  for someone else's behavior.
+
+This is the practical death of "self-host at home." For real
+self-hosting, you need either a static IP from your ISP (often a
+business plan upsell), a VPS in the cloud, or a tunnel service
+(Cloudflare Tunnel, Tailscale Funnel, ngrok) that punches out from
+your network.
+
+## NAT inside Kubernetes
+
+A pod's IP is from a private range (the pod CIDR). Outbound
+traffic to outside the cluster goes through the node's NAT (often
+iptables MASQUERADE). Inbound traffic to a Service goes through
+kube-proxy's iptables/IPVS rules — itself a form of NAT.
+
+The pod sees its own IP, not the node's. The destination sees the
+node's IP, not the pod's. This is why pod-to-pod traffic across
+nodes "just works" but external-to-pod traffic needs an Ingress or
+NodePort to bridge in.
+
+## What this means in practice
+
+- Private IP ranges are reused everywhere; don't assume yours are
+  unique outside your network.
+- Servers run in public IP space (or behind a load balancer with
+  one). Clients are almost always behind NAT.
+- Long-lived connections on cellular need heartbeats every ~30s.
+- p2p apps need STUN/TURN; budget for TURN bandwidth.
+- Cloud egress through NAT gateways is metered; optimize when it
+  bites.
+- "Why can't I reach this service from outside?" — check the NAT
+  / firewall before anything else.
+
+NAT is invisible until it isn't. When it isn't, the symptom is
+usually "the connection works one way" or "it disconnects at
+random." That asymmetry is the signature.

@@ -1,0 +1,278 @@
+export const level = 'staff';
+
+# Memory barriers
+
+In single-threaded code, the CPU and compiler can reorder
+operations freely as long as the observable result is the same as
+program order. In multithreaded code with shared memory, that
+guarantee disappears: **what one thread reorders, another thread
+can see**. Memory barriers (a.k.a. fences) restore order where
+correctness demands it.
+
+If you've ever written code that "works on x86 but breaks on ARM,"
+or stared at a Java field, wondered why `volatile` was needed, or
+asked why `Atomics.store` exists separately from a plain write —
+this page is your map.
+
+## Why CPUs reorder
+
+A modern CPU executes many instructions in flight (see
+`fundamentals/cpu-pipelining-and-branch-prediction.mdx`). The
+store buffer holds writes that haven't yet been pushed to L1
+cache. The load buffer holds outstanding loads. Out-of-order
+execution lets independent operations finish in any order.
+
+From a single thread's view, none of this matters — the CPU
+guarantees the in-order *observable* effect of its own program.
+But what **other threads see** depends on when stores become
+globally visible (drain from the store buffer) and the order in
+which a thread's loads see other threads' writes.
+
+Result: a thread can write A then B, and a different thread can
+see B before A.
+
+## A canonical example
+
+Thread 1:
+
+```
+data = 42;
+ready = true;
+```
+
+Thread 2:
+
+```
+while (!ready) { /* spin */ }
+print(data);
+```
+
+You'd expect Thread 2 to print 42. On a CPU with weak memory
+ordering (or with a compiler that reorders), Thread 2 can see
+`ready = true` *before* `data = 42` becomes visible — and print
+0. The compiler might also reorder the two writes in Thread 1 if
+it sees no dependency.
+
+The fix: a memory barrier between the two stores in Thread 1, and
+between the load of `ready` and the load of `data` in Thread 2.
+Or — and this is what you usually do — use atomic operations with
+acquire/release semantics on the `ready` flag.
+
+## Strong vs weak memory models
+
+The set of reordering rules a CPU allows is its **memory model**.
+A "strong" model preserves most of program order; a "weak" model
+allows aggressive reordering and demands explicit barriers from
+the programmer.
+
+- **x86 / x86-64**: **TSO (Total Store Order)**. Loads can be
+  reordered before earlier stores (to different addresses). Most
+  other reorderings are forbidden. Few explicit barriers needed;
+  a `lock`-prefix instruction (used by atomic ops) is a full
+  barrier.
+- **ARM, ARM64, RISC-V**: **weakly ordered**. Loads can be
+  reordered with loads. Stores can be reordered with stores.
+  Loads can be reordered with stores in either direction. You
+  need barriers more often.
+- **PowerPC**: similarly weak.
+
+This is why "works on x86, breaks on ARM" is a real and recurring
+pattern. Code that "looks correct" only happens to work because
+TSO covers up missing barriers; ARM exposes the bug. Apple Silicon
+Macs (ARM64) have been a great forcing function for libraries to
+fix latent ordering bugs.
+
+## Sequential consistency
+
+The strongest model: all threads agree on a single global ordering
+of all reads and writes, consistent with each thread's program
+order. Easy to reason about; expensive to implement (full barriers
+everywhere).
+
+JS `Atomics` operations are **sequentially consistent** by
+default. So is Java `volatile`. So are C++ `std::atomic`
+operations with `memory_order_seq_cst` (the default if you don't
+specify). The default is the safe choice; relaxing it for
+performance requires understanding the rest of this page.
+
+## Acquire and release semantics
+
+Weaker than SC, sufficient for the most common pattern (publishing
+data to other threads via a flag):
+
+- **Release store**: this store, plus all writes that happened
+  before it in program order, become visible to other threads
+  **before** the store itself.
+- **Acquire load**: this load, plus all reads/writes that come
+  after it in program order, see at least everything that was
+  visible **before** the matching release store.
+
+Together they implement the "synchronizes-with" relation: if
+Thread 2's acquire-load sees Thread 1's release-store, then
+everything Thread 1 did before that store is visible to Thread 2
+after the load.
+
+For the example above, with acquire/release:
+
+```
+// Thread 1:
+data = 42;
+release-store(ready, true);     // data write must complete before ready=true
+
+// Thread 2:
+while (acquire-load(ready) == false) {}
+print(data);                     // sees data=42 — guaranteed
+```
+
+Acquire/release is the standard pattern for lock-free publishing.
+It's cheaper than full sequential consistency on weak architectures
+(no full barrier needed; just enough barrier for the one
+direction).
+
+## Relaxed atomics
+
+Even weaker: just atomicity, no ordering. Useful for counters
+where the only thing you care about is that the increment is not
+torn:
+
+```js
+Atomics.add(counter, 0, 1);   // JS atomics are seq-cst, no relaxed mode here
+// C++ equivalent with explicit relaxed:
+counter.fetch_add(1, std::memory_order_relaxed);
+```
+
+Relaxed is fine when there's no "publication" — no other writes
+that need to be visible alongside this one. A statistics counter
+incremented from many threads, never used to gate reads of other
+data, is the canonical case.
+
+## "The compiler is allowed to reorder"
+
+CPU memory models are only half the story. **The compiler is also
+allowed to reorder operations** — and does, aggressively, in
+optimization passes. The reorderings have the same rule: must not
+change single-thread observable behavior.
+
+This means even on an x86 with strong CPU memory model, you can
+get wrong results from missing barriers, because the **compiler**
+moved a store. Marking a variable `volatile` in C/C++ (or using
+`std::atomic` with explicit ordering, or Java `volatile`) tells
+the compiler "don't reorder around this." The CPU barrier is
+separate.
+
+In JS, the engine has the same freedom. Plain reads/writes to
+shared memory (a `SharedArrayBuffer` view accessed without
+Atomics) can be reordered by the JIT. That's why `Atomics.load /
+Atomics.store` exist separately from plain element access — they
+prevent both compiler reordering and CPU reordering, providing
+seq-cst semantics.
+
+```js
+const view = new Int32Array(sharedBuf);
+
+view[0] = 1;             // plain store, no ordering guarantees
+Atomics.store(view, 0, 1);   // seq-cst store
+Atomics.load(view, 0);       // seq-cst load
+```
+
+Use Atomics for any shared memory you care about. Plain access is
+fine only when one thread is writing and you don't care when other
+threads see it (and they don't either).
+
+## Memory barriers in JS
+
+Through Atomics:
+
+- **`Atomics.load` / `Atomics.store`** — seq-cst load/store. No
+  explicit acquire/release in the JS API; you get seq-cst whether
+  you want it or not.
+- **`Atomics.exchange` / `Atomics.compareExchange`** — seq-cst
+  CAS-style ops.
+- **`Atomics.fence`** (not standardized as of 2026 — proposal
+  exists but not landed everywhere) — pure barrier with no value.
+
+For most JS shared-memory code, just use Atomics for every shared
+access and you get the seq-cst guarantees for free. Optimize down
+to weaker semantics only with extreme care and measurement.
+
+## In the JVM
+
+Java's memory model (JMM):
+
+- **`volatile`** = acquire on load, release on store. Plus the
+  "happens-before" rule for ordering.
+- **`synchronized`** entry and exit have full barrier semantics.
+- **`java.util.concurrent.atomic.*`** classes give explicit
+  fine-grained atomics.
+
+Same shape in C# (`volatile`, `Interlocked`, `Volatile.Read/Write`).
+
+## Practical guidance
+
+You'll most commonly want barriers for:
+
+1. **Publishing initialized data via a flag**. Use a release-store
+   on the flag, acquire-load on the reader side. (In JS,
+   `Atomics.store` and `Atomics.load`.)
+2. **Double-checked locking**. The "checked" load must be acquire;
+   the "initialized" store must be release. Easy to get wrong;
+   most languages give you a singleton helper that hides it.
+3. **Lock-free queues**. Producer's `tail` update is a release;
+   consumer's `tail` load is an acquire. The actual item store
+   must complete before tail update.
+4. **Fences between phases of work**. After all worker threads
+   write into a shared buffer, a barrier before the reducer reads
+   it.
+
+## What "the compiler is allowed to reorder" really means
+
+The classic example:
+
+```js
+// Single-threaded:
+let x = 0, y = 0, r1 = 0, r2 = 0;
+
+// Thread 1:
+x = 1;
+r1 = y;
+
+// Thread 2:
+y = 1;
+r2 = x;
+```
+
+On sequentially consistent hardware, at least one of `r1` or `r2`
+must end up as 1. (Either Thread 1 wins and sees `y=0` → Thread 2
+later sees `x=1`, or Thread 2 wins → similar.)
+
+On a weakly-ordered machine **or** with compiler reordering, you
+can observe `r1 == 0 && r2 == 0`. Both threads' stores can be
+held back in the store buffer until after their loads. The
+"impossible" outcome occurs in practice on real ARM hardware.
+
+This is **store-load reordering** — the one reordering even x86
+TSO permits. To rule it out, you need a full memory barrier
+between the store and the load.
+
+## The takeaway
+
+- CPUs and compilers reorder operations. In single-threaded code
+  it's invisible; with shared memory it's not.
+- Memory models tell you which reorderings the platform allows.
+  x86 is strong (TSO); ARM and friends are weak.
+- Sequential consistency = strongest, easiest to reason about,
+  default for atomics.
+- Acquire/release = the standard "publication" pattern, cheaper
+  than seq-cst.
+- Relaxed = pure atomicity, no ordering — use only when the
+  ordering genuinely doesn't matter.
+- **In JS, use `Atomics` for any cross-thread shared-memory access**.
+  Plain accesses give you no ordering. The Atomics API is seq-cst.
+- "Works on x86, breaks on ARM" is the canonical symptom of
+  missing barriers. CI on multiple architectures catches this
+  early.
+
+Reordering is the price of speed. Barriers are the cost of
+correctness under sharing. Reach for them deliberately — and
+use the highest-level primitive that does the job, not the
+lowest.

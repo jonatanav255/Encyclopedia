@@ -1,0 +1,220 @@
+export const level = 'senior';
+
+# B-trees
+
+A B-tree is a balanced search tree where each node holds many keys
+(hundreds, not two). It exists because disks and SSDs read in
+**pages**, not individual values, and the entire database-indexing
+industry runs on this one observation. `data/indexing.mdx` covers
+how to *use* indexes; this page is what's actually inside them.
+
+## Why not a binary search tree?
+
+A balanced BST has O(log₂ n) lookup. For a billion entries, that's
+~30 levels. Each level is a potential cache miss in RAM and a
+potential disk seek when the index spills past memory.
+
+A B-tree node holds (say) 200 keys, so the branching factor is
+200, not 2. log₂₀₀(1e9) ≈ 4. **Four** node reads to find a key in
+a billion-entry index. That's the entire pitch.
+
+## Page-sized nodes
+
+Disks and SSDs do I/O in pages — typically 4KB (filesystem), 8KB
+(Postgres), or 16KB (InnoDB). Reading 1 byte costs the same as
+reading 4KB. So you want each B-tree node to be exactly one page:
+maximize keys-per-read.
+
+Postgres example with an 8KB page:
+
+- Per index entry: ~10 bytes for an int8 key + ~6 bytes overhead.
+- Roughly 500 entries per leaf page.
+- A 4-level tree holds 500⁴ ≈ 60 billion entries.
+
+Four page reads to find one row. The top 2-3 levels live in
+shared buffers (RAM); usually only the leaf and maybe one parent
+hit disk. In practice: 1-2 disk pages per lookup.
+
+## The shape
+
+A B-tree of order `m` (max children per node):
+
+- Every node has between `m/2` and `m` children (except the root,
+  which can have fewer).
+- All leaves at the same depth (perfectly balanced — always).
+- Keys within a node are sorted.
+
+```
+                  [50, 100]
+                /     |     \
+        [10,30]   [60,80]   [120,150,180]
+        / | | \    / | \      / | | | \
+     leaves ...
+```
+
+When a node fills up, it splits — the middle key promotes to the
+parent, the two halves become siblings. When a node underflows on
+delete, it borrows from a sibling or merges. The tree only grows
+*upward* (when the root splits) and shrinks *upward* (when the
+root has only one child after a merge). All leaves stay at the
+same level.
+
+## B-tree vs B+ tree
+
+This distinction matters because **database indexes are almost
+always B+ trees**, not classical B-trees.
+
+| | B-tree | B+ tree |
+|---|---|---|
+| Values stored in | Internal + leaf nodes | Leaf nodes only |
+| Internal nodes | Hold keys *and* row pointers | Hold only keys (routing) |
+| Leaves | Independent | Linked together |
+| Range scan | Tree traversal | Linked-list walk through leaves |
+| Internal fanout | Lower (carries values) | Higher (just keys) |
+
+The B+ tree wins on databases for two reasons:
+
+1. **Higher fanout in internal nodes** — they're just keys plus
+   child pointers, no values. Smaller per-entry size, more keys
+   per page, shallower tree.
+2. **Range scans are linked-list walks across leaves.** After
+   finding the first matching leaf, just follow `next` pointers
+   until you hit the end of the range. No tree traversal per row.
+
+```
+       [50, 100]            <- internal (routing only)
+      /    |    \
+ [10|30][60|80][120|150|180]    <- leaves (all the data)
+   \____/  \____/  \________      <- leaves are a linked list
+```
+
+Postgres, MySQL/InnoDB, SQL Server, Oracle, MongoDB, SQLite — all
+B+ trees. When you say "B-tree index," you almost always mean B+
+tree.
+
+## Range scans are why
+
+This is the killer feature.
+
+```
+SELECT * FROM events
+WHERE created_at BETWEEN '2026-01-01' AND '2026-02-01'
+ORDER BY created_at;
+```
+
+The index walks down to the first leaf with `created_at >=
+'2026-01-01'`, then traverses the leaf-level linked list forward
+until `created_at > '2026-02-01'`. The keys come back already
+sorted — no extra sort step.
+
+A hash index can't do this at all. A binary search tree could in
+theory, but the per-page overhead would dominate. B+ trees are
+purpose-built.
+
+## Splits and merges
+
+**Insert**: walk down to the leaf, insert in sorted order. If the
+leaf is full, split into two leaves and promote the middle key to
+the parent. If the parent is full, propagate up. If the root
+splits, the tree grows a level.
+
+**Delete**: walk down to the leaf, remove. If the leaf falls below
+`m/2`, borrow a key from a sibling, or merge with a sibling and
+remove the separator key from the parent. Propagate up. If the
+root has one child after a merge, the tree shrinks a level.
+
+In practice, real databases don't merge aggressively on delete —
+they tolerate underfilled pages until a `VACUUM` / `OPTIMIZE
+TABLE` / `REINDEX` happens. This is bloat, and it's why Postgres
+indexes get fragmented and benefit from periodic rebuilding.
+
+## Why the branching factor is so high
+
+You'd think "more is always better" — but bigger nodes mean:
+
+- More CPU work per node (binary search within the node).
+- Bigger split/merge writes.
+- More wasted space when a node is half-full.
+
+The sweet spot is dictated by the page size. Postgres uses 8KB
+pages because that's the historical Unix filesystem page; MySQL
+defaults to 16KB. SSDs natively read 4KB pages but the layers
+above don't always align.
+
+You'd rarely change this. But if you ever build your own on-disk
+index, **node size = page size** is the rule.
+
+## In-memory B-trees
+
+B-trees aren't only for disk. **Cache lines** are the in-memory
+analog of disk pages — 64 bytes, fetched as a unit. An in-memory
+B-tree sized for cache lines (e.g., 16 keys per node for 4-byte
+keys) outperforms a red-black tree by a noticeable margin on
+modern CPUs, even with much higher branching factor.
+
+Rust's `BTreeMap` is exactly this — an in-memory B-tree, not a
+red-black tree like C++'s `std::map`. The cache-locality argument
+wins.
+
+For application code in a managed language, you almost never
+implement one — your standard library or database provides it.
+
+## Concurrent B-trees
+
+Real databases run B-trees with thousands of concurrent
+readers/writers. The naive approach (lock the whole tree)
+serializes everything. Real implementations use:
+
+- **Latch coupling (crab latching)** — hold a latch on the
+  current node, take a latch on the child, release the parent.
+  Walks the tree without locking everything above.
+- **Optimistic concurrency** — read with version numbers, retry
+  if the page changed.
+- **Lock-free B-trees** — Bw-trees (used in SQL Server Hekaton).
+  Research-grade, complex.
+
+You will not implement these. But understanding "the index has
+internal latches separate from the row-level locks" explains
+some weird performance behaviors when DBA folks talk about
+"latch contention."
+
+## Cross-references
+
+- `data/indexing.mdx` — how to *use* B-tree indexes effectively
+  (composite indexes, covering indexes, partial indexes,
+  EXPLAIN). This page is what's underneath.
+- `binary-search-trees.mdx` — the conceptual ancestor. B-trees
+  are BSTs generalized for paged storage.
+- `hash-tables-internals.mdx` — the alternative index type for
+  exact-match-only lookups.
+
+## Common misconceptions
+
+- **"B" stands for "binary."** It doesn't. The "B" is officially
+  unexplained ("Bayer" after the inventor, "Boeing" because of
+  Bayer's employer at the time, or "balanced" — the original
+  paper doesn't say). It's not binary.
+- **"All databases use B-trees."** Most relational ones do. But
+  Cassandra uses LSM trees, Redis uses skip lists for sorted
+  sets, full-text search uses inverted indexes (GIN). The right
+  index depends on the workload.
+- **"B-trees beat hash indexes always."** They don't. Hash
+  indexes beat B-trees on point lookups (one bucket access vs.
+  log_b(n) page reads). But hash can't do range or sort, so
+  general-purpose indexes are B-trees.
+- **"Index height doesn't matter, it's all in RAM."** Until your
+  data outgrows RAM, at which point the bottom one or two levels
+  start hitting disk and latency explodes. Plan for it.
+
+## The discipline
+
+- B+ tree = the database index. Internal nodes route, leaves
+  hold data and form a linked list.
+- Node size = page size. Maximize fanout, minimize depth.
+- Range scans walk the leaf-level linked list — that's why
+  `ORDER BY indexed_col LIMIT N` is fast.
+- In-memory variants (Rust's `BTreeMap`) win on cache locality
+  vs. binary trees.
+- For application work, you use them through the database — you
+  don't implement them. But knowing the shape explains EXPLAIN
+  output, index bloat, and concurrent-access weirdness.

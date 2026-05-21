@@ -1,0 +1,365 @@
+export const level = 'senior';
+
+# Consistent hashing
+
+Consistent hashing is the algorithm that lets distributed systems
+add and remove nodes without remapping (almost) all of their data.
+It's the math underneath DynamoDB partitioning, Cassandra ring
+membership, memcached client libraries, and CDN edge routing.
+
+The promise: when you add or remove a node, only **K/N keys** move
+(where K is total keys and N is node count). Naive hash-mod-N
+remaps **almost all** keys. That's the difference.
+
+For sticky-session routing and the LB-strategy view, see
+**Load balancing strategies**. This page is the algorithm.
+
+## The problem with `hash(key) mod N`
+
+```js
+function pickNode(key, nodes) {
+  return nodes[hash(key) % nodes.length];
+}
+```
+
+Works perfectly for a fixed `N`. Then you add a node:
+
+```
+nodes: 3        hash mod 3
+nodes: 4        hash mod 4
+```
+
+For most keys, `hash(k) % 3 != hash(k) % 4`. **About (N-1)/N of all
+keys** remap to a different node. For a 100-node cluster, ~99% of
+your cache invalidates the moment you add one node. Cache stampede.
+Cold start. Pain.
+
+The fix: a hash function that doesn't depend on `N`.
+
+## The ring
+
+Consistent hashing (Karger et al., 1997) places both **nodes** and
+**keys** on a circular hash space — typically a 32-bit or 64-bit
+integer range, conceptually a clock face from 0 to 2^32.
+
+```
+hash space:    0 ----------------- 2^32
+
+Place nodes:   A at hash(A) = 5
+               B at hash(B) = 17
+               C at hash(C) = 28
+               ...
+
+Place key:     K at hash(K) = 12
+```
+
+To find the owner of K, walk **clockwise** from K's position until
+you hit a node. K belongs to B.
+
+```js
+class HashRing {
+  constructor() { this.ring = []; }   // sorted [{ pos, node }]
+
+  addNode(node) {
+    const pos = hash(node);
+    this.ring.push({ pos, node });
+    this.ring.sort((a, b) => a.pos - b.pos);
+  }
+
+  removeNode(node) {
+    const pos = hash(node);
+    this.ring = this.ring.filter(e => e.pos !== pos);
+  }
+
+  getNode(key) {
+    const pos = hash(key);
+    // Binary search for first ring entry with pos >= key pos
+    for (const e of this.ring) {
+      if (e.pos >= pos) return e.node;
+    }
+    return this.ring[0]?.node;   // wrap around
+  }
+}
+```
+
+(Use binary search in real code; the linear scan above is for
+clarity.)
+
+When you add node D at position 22:
+- Keys with hash in (17, 22] move from C to D.
+- Everything else stays put.
+- **Only the keys in one arc of the ring move.**
+
+When you remove a node, the same arc's keys move to the *next*
+node clockwise.
+
+In expectation, **K/N keys move per node change**, not (N-1)*K/N.
+
+## The hot-node problem and virtual nodes
+
+Plain consistent hashing has uneven load. If you have 3 nodes
+hashing to positions 1, 2, and 1000 (out of 2^32), node 3 owns
+99.8% of the ring. The hash function is uniform, but with few
+nodes the ring is sparse.
+
+**Virtual nodes** (vnodes) solve this. Each physical node is
+represented by hundreds of points on the ring:
+
+```js
+addNode(node, vnodes = 150) {
+  for (let i = 0; i < vnodes; i++) {
+    const pos = hash(`${node}#${i}`);
+    this.ring.push({ pos, node });
+  }
+  this.ring.sort((a, b) => a.pos - b.pos);
+}
+```
+
+With 150 vnodes per physical node, even 3 physical nodes get
+~450 points distributed roughly evenly. The load imbalance becomes
+negligible (the variance shrinks with vnode count).
+
+Vnodes also let you add **weights** — a beefier machine gets more
+vnodes, proportionally more keys.
+
+Cassandra historically defaulted to 256 vnodes per node; from
+Cassandra 4.0 (2021) the default dropped to 16 (better streaming
+behavior, easier ops). DynamoDB, ScyllaDB, Riak — all use vnode
+schemes. The exact number trades memory (storing the ring) for
+balance quality.
+
+## Why this matters in production
+
+### DynamoDB and Cassandra
+
+Both use consistent hashing on the partition key. Adding a node
+moves ~1/N of the data to the new node — the rest of the cluster
+keeps serving requests during rebalancing. Without consistent
+hashing, every cluster expansion would be a full reshuffle.
+
+DynamoDB exposes this as "partitions" backed by a ring; Cassandra
+exposes it as "tokens." Same algorithm, different vocabulary.
+
+### Memcached client libraries
+
+Memcached itself doesn't shard — the *client* picks which node to
+send each key to. The well-known `ketama` algorithm (used by
+libmemcached, dalli, mc) is consistent hashing with 160 vnodes per
+server.
+
+When a memcached node dies, the client's ring updates and only
+~1/N of keys remap. The other 999,000 entries in a million-entry
+cache stay hot.
+
+### CDN edge selection
+
+CDNs hash request URLs to pick an edge server. Consistent hashing
+ensures:
+- Same URL routes to the same edge (high cache hit rate).
+- Adding a new edge only "steals" 1/N of URLs from existing edges.
+
+Cloudflare, Fastly, and Akamai all use some variant.
+
+### Sharded Redis
+
+Redis Cluster uses **hash slots** — 16,384 fixed slots distributed
+across nodes. Adding a node redistributes some slots. The slot
+count is fixed (not a true ring), but the rebalancing property is
+the same: only the moved slots' keys move.
+
+### Distributed locks and queues
+
+Consistent hashing is also how some distributed work queues assign
+tasks to workers. Each task hashes to a worker; worker failure
+moves only that worker's tasks to a peer.
+
+## The math
+
+For K total keys and N nodes:
+
+| Operation | Plain hash mod N | Consistent hashing |
+| --- | --- | --- |
+| Add a node | ~(N-1)/N * K keys move | K/(N+1) keys move |
+| Remove a node | ~K keys move | K/N keys move |
+| Lookup time | O(1) | O(log V) with V vnodes |
+
+The lookup cost is the trade-off: instead of one modulo, you do a
+binary search in a sorted vnode list. For thousands of vnodes,
+that's ~12 comparisons — still trivial.
+
+## Jump consistent hash — the simpler alternative
+
+Google's **Jump Hash** (Lamping & Veach, 2014) is a beautifully
+minimal consistent-hashing algorithm:
+
+```js
+function jumpHash(key, numBuckets) {
+  let b = -1, j = 0;
+  let h = BigInt(key);
+  while (j < numBuckets) {
+    b = j;
+    h = (h * 2862933555777941757n + 1n) & 0xFFFFFFFFFFFFFFFFn;
+    j = Math.floor((b + 1) * (1 << 31) / Number((h >> 33n) + 1n));
+  }
+  return b;
+}
+```
+
+(Algorithm; the BigInt arithmetic in JS is approximate — use a
+proper port.)
+
+Properties:
+
+- **No data structures** — no ring, no vnodes. Just a key and the
+  current bucket count.
+- **O(log N)** time per lookup.
+- **Optimal balance** — buckets are perfectly even (modulo the
+  hash function).
+- **Same rebalance property** — adding bucket N+1 moves only
+  K/(N+1) keys.
+
+The catch: Jump Hash only handles **monotone bucket addition** —
+you can grow from N to N+1 buckets, but you can't easily remove an
+arbitrary bucket from the middle. (Removal forces you to
+renumber.)
+
+For systems where nodes are added but rarely removed
+(append-mostly clusters), Jump Hash is simpler and faster than ring
+hashing. For dynamic clusters with node churn, stick with vnode
+rings.
+
+Used by Google's internal systems and recommended in their
+papers; you'll see it in newer distributed datastores.
+
+## Rendezvous hashing (HRW)
+
+Another alternative: **Highest Random Weight** hashing. For each
+key, compute `hash(key, node)` for every node, pick the node with
+the maximum value.
+
+```js
+function pickNode(key, nodes) {
+  let best = null, bestHash = -1;
+  for (const node of nodes) {
+    const h = hash(`${key}:${node}`);
+    if (h > bestHash) { bestHash = h; best = node; }
+  }
+  return best;
+}
+```
+
+Properties:
+
+- O(N) per lookup (must hash against every node).
+- Same rebalance property — adding/removing a node only moves K/N
+  keys.
+- No data structures, no vnodes needed for balance.
+- Easy to weight (multiply hashes by node weight).
+
+For small N (say, fewer than 100), HRW's simplicity often wins. For large
+clusters, ring + vnodes scales better.
+
+## Bounded-load consistent hashing
+
+A 2017 Google paper added **bounded loads** — each node is
+guaranteed at most ~`(1 + epsilon)` times the average load. When a
+node hits its cap, overflow keys go to the next node clockwise.
+
+Solves the worst-case hot-spot problem in vanilla consistent
+hashing while preserving most of its locality. Used in Google's
+load balancers.
+
+## Common pitfalls
+
+### Forgetting the ring wraps around
+
+```js
+getNode(key) {
+  const pos = hash(key);
+  for (const e of this.ring) if (e.pos >= pos) return e.node;
+  // forgot to wrap to ring[0]
+}
+```
+
+The largest-hash keys belong to the first (smallest-position) node
+on the ring. Always wrap.
+
+### Too few vnodes
+
+With 1-10 vnodes per physical node, you'll see big load imbalances.
+Use 16-256 depending on cluster size and operational priorities
+(streaming/repair cost goes up with more vnodes).
+
+### Re-hashing when adding vnodes
+
+If you change the vnode count, **every** vnode's position changes,
+and the rebalance benefit is lost — you've effectively re-keyed
+the cluster. Pick a vnode count and stick with it.
+
+### Using a weak hash function
+
+If `hash(node)` clusters node positions (e.g., sequential names like
+`node-1`, `node-2` with a bad hash), one node ends up owning a huge
+arc. Use a hash with good avalanche properties: SHA-1 (truncated),
+MurmurHash3, xxHash. MD5 also works; cryptographic strength isn't
+required, just good distribution.
+
+### Plain hash mod N "because it's simpler"
+
+It's simpler until you scale. Then every node addition causes a
+cache stampede. If you're building a system where node count will
+ever change in production, start with consistent hashing.
+
+### Forgetting replication
+
+In Cassandra and DynamoDB, each key lives on N consecutive nodes
+on the ring (where N is the replication factor). The "owner" is
+the first; "replicas" are the next N-1 clockwise. Consistent
+hashing makes this natural — failover moves only the failing
+node's primary slice to the next node, which already has the data
+as a replica.
+
+### Storing the ring as a hashmap
+
+The lookup is "first node with position >= key position." You need
+a *sorted* structure (sorted array + binary search, or a TreeMap).
+A hashmap can't answer "successor" queries.
+
+## When NOT to use it
+
+- **Fixed cluster size, no churn.** Plain hash mod N is simpler and
+  marginally faster. (Many real systems get away with this for
+  years.)
+- **Tiny clusters (1-3 nodes).** The ring overhead exceeds the
+  benefit; plain partition tables work fine.
+- **When you need range queries.** Consistent hashing scatters
+  consecutive keys across the ring. For range-scan workloads, use
+  range partitioning (B-tree-style).
+
+DynamoDB's range queries within a partition key work *because*
+range is supported within a single partition; the partition key
+itself is hashed (no range queries across partition keys).
+
+## The mental model
+
+Consistent hashing solves **"distribute data across N nodes such
+that changing N is cheap."**
+
+Two practical rules:
+
+1. **Use a vnode ring** for general-purpose distributed caches and
+   databases. ~100-500 vnodes per physical node. Hash with
+   MurmurHash or similar.
+2. **Use Jump Hash** for append-only bucket-style sharding (no
+   removals). Simpler, faster, but less flexible.
+
+You usually don't implement consistent hashing yourself — the
+datastore does it. The value of knowing the algorithm is making
+informed decisions about:
+- How big a cluster you can grow without disrupting users.
+- Why your cache hit rate craters when you scale up naively.
+- Which datastore's sharding model fits your access pattern.
+
+When you see "minimal data movement on cluster resize" claimed by
+a distributed system, consistent hashing is almost always the
+mechanism.

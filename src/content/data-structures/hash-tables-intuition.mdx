@@ -1,0 +1,181 @@
+export const level = 'junior';
+
+# Hash tables: intuition
+
+A hash table maps keys to values with average O(1) lookup. That's the
+sales pitch, and it's roughly true. The interesting part is *why* it
+works, *when* it breaks, and *what a bad key choice can do to your
+production latency*.
+
+This page is the mental model. For the JS API surface (`Map`, `Set`,
+`Object.create(null)`), see `javascript/maps-sets-and-collections.mdx`.
+For collision strategies, resizing math, and what V8 actually does
+internally, see `hash-tables-internals.mdx`.
+
+## The trick
+
+You want O(1) key lookup. With a plain array, you have that — but the
+"key" has to be an integer index. A hash table generalizes that to
+arbitrary keys by computing an integer index *from* the key:
+
+```js
+// Pretend this exists as a primitive
+const buckets = new Array(16);
+
+function set(key, value) {
+  const i = hash(key) % buckets.length;
+  buckets[i] = { key, value };
+}
+
+function get(key) {
+  const i = hash(key) % buckets.length;
+  return buckets[i]?.value;
+}
+```
+
+That's the entire idea. A **hash function** turns a key into a
+pseudo-random integer; you mod by the table size to pick a bucket;
+you index into the array.
+
+## What `hash()` has to do
+
+Two properties:
+
+1. **Deterministic.** `hash(k)` always returns the same number for
+   the same `k`. Otherwise you can never find anything again.
+2. **Spreads keys uniformly.** If different keys cluster into the
+   same bucket, performance degrades.
+
+Common real-world hash functions: FNV-1a, MurmurHash, xxHash,
+SipHash. They're cheap (a handful of ns) and spread well across
+common input distributions.
+
+JS's built-in `Map` uses an engine-internal hash; you can't see it.
+For object keys, identity (the pointer) is what gets hashed.
+
+## Collisions
+
+Two keys can land in the same bucket — the **pigeonhole principle**
+guarantees it once you have more keys than buckets, and the birthday
+paradox guarantees it well before that. So real hash tables have a
+**collision resolution strategy**:
+
+- **Chaining**: each bucket holds a small list of `(key, value)`
+  entries. On lookup, walk the list.
+- **Open addressing**: if a bucket is taken, try the next one (linear
+  probing) or a hashed offset (quadratic, double hashing).
+
+Either way, when collisions are *rare*, lookup is one bucket access —
+O(1). When collisions are *common*, lookup degrades toward O(n). The
+hash function and the **load factor** (entries / buckets) control
+how often that happens.
+
+`hash-tables-internals.mdx` digs into the tradeoffs.
+
+## Why O(1) is "average"
+
+Big-O for hash tables is conventionally written:
+
+- Average: O(1) for lookup, insert, delete.
+- Worst case: O(n) — every key collides.
+
+The average assumes a good hash function and a reasonable load
+factor. Both are usually true. The worst case happens when:
+
+- Your hash function is bad and clusters keys.
+- An adversary chose keys to *deliberately* collide (HashDoS attack).
+- You're using object identity as the key but accidentally creating
+  new objects for the same logical key:
+
+```js
+// Bug: every lookup creates a new object
+m.set({ id: 1 }, 'a');
+m.get({ id: 1 });   // undefined — different reference
+```
+
+## A worked example of the latency trap
+
+You wrote a cache keyed by user ID + date:
+
+```js
+// Composite key as a stringified object
+const k = JSON.stringify({ userId, date });
+cache.set(k, result);
+```
+
+`JSON.stringify` is fine here — strings hash quickly. But:
+
+```js
+// Subtle bug: object key order isn't guaranteed
+JSON.stringify({ a: 1, b: 2 });   // '{"a":1,"b":2}'
+JSON.stringify({ b: 2, a: 1 });   // '{"b":2,"a":1}'
+```
+
+Different strings, different hashes, different buckets. Your "cache
+hit" is now a cache miss every time the input came from a path where
+the key fields landed in a different insertion order. Latency
+silently doubles. You won't see it until a metrics dashboard tells
+you cache hit rate is at 30%.
+
+Fix: canonicalize the key. `${userId}|${date}` or sort the JSON keys
+before stringifying.
+
+## What HashDoS looks like
+
+Pre-2012-ish, web frameworks parsed query strings and form bodies
+into hash tables using deterministic hash functions. Attackers would
+send POST bodies with 10,000 form fields whose keys all hashed to
+the same bucket. Every parse turned into an O(n²) operation. One
+request consumed seconds of CPU.
+
+Modern languages mitigate this by:
+
+- **Randomized hashing** — the seed changes per process. SipHash is
+  the standard choice; it's slow enough that distinguishing two
+  similar keys' hashes from across the network is impractical.
+- **Tree-backed buckets** — Java's `HashMap` switches a chain to a
+  red-black tree once it gets long enough. Worst case becomes
+  O(log n) per operation, not O(n).
+
+V8 randomizes its hash seed per isolate. You're protected by
+default. But if you write your own hash table on top of `Map`
+keyed by user-controlled strings, you're at the mercy of V8's
+choices — which are generally good but not your design decision.
+
+## Picking good keys
+
+- **Use the right type.** Don't stringify a number every operation;
+  let `Map` hold it as a number.
+- **Identity vs value semantics.** Object keys hash by identity, not
+  content. If you want value semantics, canonicalize first (a
+  stable string, a tuple, etc.).
+- **Stable representation.** If you build a composite key, build it
+  the same way everywhere. Sort fields. Pick one separator. Reject
+  inputs containing the separator (`|` in a userId is rare but
+  worth a thought).
+- **Avoid huge keys.** A 1MB string as a key means every lookup
+  hashes 1MB. Use a digest of it if the value is the point.
+
+## Compared to other lookup structures
+
+| Structure | Avg lookup | Sorted? | Range queries? | Overhead |
+|---|---|---|---|---|
+| Hash table | O(1) | No | No | Buckets + load factor slack |
+| Balanced BST | O(log n) | Yes | Yes | One node per entry |
+| Sorted array | O(log n) | Yes | Yes | Minimal, but inserts are O(n) |
+| B-tree | O(log n) | Yes | Yes | Bigger nodes, disk-friendly |
+
+If you don't need ordered traversal or range queries, hash table.
+If you do, see `binary-search-trees.mdx` and `b-trees.mdx`.
+
+## The discipline
+
+- Default to a hash table (`Map` in JS) for "key → value" lookups.
+- Canonicalize composite keys. Same input → same string → same hash.
+- Watch for accidental object-identity bugs with composite keys.
+- If you control the hash function, randomize the seed.
+- If keys are user-controlled and the hash table is critical-path,
+  understand HashDoS and either use a hardened structure or limit
+  input size.
+- Average O(1) is the design intent. Worst-case O(n) is the failure
+  mode you have to be aware of.

@@ -1,0 +1,229 @@
+export const level = 'senior';
+
+# `mmap` and the page cache
+
+`mmap` is the syscall that maps a file (or anonymous memory) into a
+process's address space. The **page cache** is the kernel's cache of
+file-backed pages in RAM. Together they're the foundation behind most
+high-performance storage systems (SQLite, LMDB, RocksDB's read path,
+Kafka's log, Postgres's shared buffers' alternative model) and the
+reason your "free memory" number on Linux is essentially meaningless.
+
+## What `mmap` does
+
+```js
+void *p = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, offset);
+```
+
+Asks the kernel: "map `length` bytes starting at `offset` of `fd`
+into my address space." The kernel returns a pointer. Reading
+through that pointer reads the file. **No data is actually copied at
+mmap time** — the pages are marked demand-paged.
+
+When you read a byte at `p[1000000]`:
+
+1. CPU translates the virtual address — page table entry is "not
+   present."
+2. **Page fault** to the kernel.
+3. Kernel finds the corresponding file page in the **page cache**.
+   If not present, reads it from disk.
+4. Maps that physical page into your address space.
+5. CPU retries the load; succeeds.
+
+After the fault, subsequent accesses to that page are free (no
+syscall, just a memory read).
+
+## File-backed vs anonymous
+
+```js
+mmap(..., MAP_SHARED, fd, off);        // file-backed, writes go to disk
+mmap(..., MAP_PRIVATE, fd, off);       // copy-on-write view of file
+mmap(..., MAP_ANONYMOUS, -1, 0);       // zero-filled, no file
+```
+
+- **File-backed `MAP_SHARED`** — what databases use. Writes through
+  the mapping update the file (eventually, via writeback).
+- **File-backed `MAP_PRIVATE`** — common for loading executables and
+  shared libraries. Writes don't propagate to the file; they
+  trigger a CoW into a private page.
+- **Anonymous** — `malloc` for large allocations is built on this.
+  No file, just zero-initialized pages.
+
+## Copy-on-write semantics
+
+`MAP_PRIVATE` and `fork()` both use CoW. The pages start shared
+(same physical frame, both mappings have it marked read-only in
+their page tables). A write to a shared page traps, the kernel
+copies the page, updates that process's mapping to the new copy,
+and resumes.
+
+The benefit: cheap initial mapping (no copy). The cost: the **first
+write to each page** pays the page-copy latency.
+
+Shared libraries (`/lib/x86_64-linux-gnu/libc.so.6`) get mmap'd
+`MAP_PRIVATE` into every process. The code pages stay shared
+across all of them — one physical copy of libc, used by hundreds of
+processes. That's why `RSS` over-counts memory: each process counts
+the shared pages in its RSS.
+
+## The page cache
+
+The kernel's cache of file content in RAM. Whenever you `read()` a
+file, the data lands in the page cache; subsequent reads of the
+same file pages don't hit disk at all. Same for mmap — the mmap
+mechanism *is* the page cache mechanism, just exposed via memory
+mapping instead of syscalls.
+
+The page cache uses **all otherwise-free memory**. Linux's policy is
+"unused memory is wasted memory" — if there's 16 GB of RAM and only
+4 GB of process memory, the kernel caches up to ~12 GB of recent
+file content.
+
+This is why `free -h` shows misleading numbers:
+
+```bash
+$ free -h
+              total      used       free    shared   buff/cache   available
+Mem:           32Gi      8Gi        1Gi       0.5Gi      23Gi       22Gi
+```
+
+- `used` — process memory + kernel structs. Not really "used up."
+- `free` — completely unallocated. Looks alarmingly low; it isn't.
+- `buff/cache` — the page cache. Reclaimable on demand.
+- `available` — what's actually available to new allocations
+  (= free + reclaimable cache). **The number that matters.**
+
+Don't panic when `free` is near zero. Panic when `available` is.
+
+## Warming the page cache
+
+```bash
+$ cat bigfile.bin > /dev/null
+```
+
+This reads the entire file. Output is discarded, but the **pages
+land in the page cache**. Subsequent reads of the same file by any
+process are served from RAM at memcpy speed (~20 GB/s), not from
+disk (~3 GB/s NVMe, ~150 MB/s spinning).
+
+Some servers (Postgres, ElasticSearch, Kafka) explicitly warm
+critical files at startup with this trick or with `posix_fadvise(...,
+POSIX_FADV_WILLNEED)` / `madvise(..., MADV_WILLNEED)`.
+
+Conversely, `posix_fadvise(POSIX_FADV_DONTNEED)` tells the kernel
+"I'm done with these pages, please evict them" — useful when you've
+just done a one-shot read of a huge file and don't want it stuck in
+cache evicting your real working set.
+
+## Writes and dirty pages
+
+Writes through `MAP_SHARED` or `write()` go to the page cache,
+marking the pages **dirty**. The kernel writes them back to disk
+asynchronously — usually within a few seconds, driven by
+`vm.dirty_writeback_centisecs` and friends.
+
+This means: `write()` returning success **does not mean it's on
+disk**. The data is in the page cache, queued for writeback.
+
+To force durability:
+
+- `fsync(fd)` — wait until all dirty pages for this file are on
+  disk.
+- `fdatasync(fd)` — same but only the data, not metadata.
+- `msync(addr, len, MS_SYNC)` — same for mmap'd regions.
+
+Databases call `fsync` at transaction commit. If you skip it, a
+power loss between `write()` returning and the kernel's writeback
+loses your data. This is the basis of all "write-ahead log + fsync"
+durability arguments.
+
+## Why mmap-based DBs are popular
+
+**SQLite** (default mode), **LMDB**, **Kafka** (log segments), and
+many embedded stores rely heavily on mmap because:
+
+- **Reads are essentially zero-copy.** The page cache *is* the
+  read cache. No `read()` syscall per access.
+- **The OS handles caching, prefetch, eviction.** Many person-decades
+  of tuning, free.
+- **The address space is the cache.** No separate "buffer pool"
+  data structure to maintain.
+
+Trade-offs:
+
+- You don't control eviction policy precisely.
+- TLB churn matters at huge dataset sizes (huge pages help).
+- Writes-then-fsync still go through the page cache writeback path
+  — durability tuning is OS-shaped, not DB-shaped.
+- Memory pressure can evict your hot pages.
+
+Postgres famously goes the other way: maintains its **own shared
+buffer pool** in shared memory, bypassing reliance on the page
+cache (though writes still hit it). The Postgres argument is "we
+know what's hot better than the kernel does." The mmap-DB argument
+is "the kernel has been optimizing this for 30 years; we shouldn't
+reinvent it." Both are correct in their contexts.
+
+## "Free memory" is misleading
+
+Once more, for the senior engineer:
+
+```bash
+$ cat /proc/meminfo
+MemTotal:       32987600 kB
+MemFree:          812400 kB
+MemAvailable:   22115040 kB
+Buffers:           71200 kB
+Cached:         20984600 kB
+SwapCached:            0 kB
+...
+Dirty:               340 kB
+Writeback:             0 kB
+```
+
+- `MemFree` low = normal, **expected**. Kernel uses RAM for cache.
+- `Cached` huge = good. Hot files are warm.
+- `Dirty` growing = writes accumulating, watch for write-storm during
+  fsync.
+- `MemAvailable` low = the actual problem. New allocations will
+  swap or OOM-kill.
+
+Production memory dashboards should show `MemAvailable`, not
+`MemFree`. K8s memory metrics get this right (working set size,
+not RSS-by-itself).
+
+## madvise hints
+
+```js
+madvise(addr, len, MADV_RANDOM);       // expect random access — don't prefetch
+madvise(addr, len, MADV_SEQUENTIAL);   // expect sequential — aggressive prefetch
+madvise(addr, len, MADV_WILLNEED);     // I'll read this soon
+madvise(addr, len, MADV_DONTNEED);     // free physical pages, keep mapping
+madvise(addr, len, MADV_HUGEPAGE);     // try to back with huge pages
+```
+
+Most code never calls these. High-performance storage systems
+(LMDB, ScyllaDB, RocksDB) do — they know their access patterns and
+can shave significant latency.
+
+## When *not* to mmap
+
+- **Tiny files**: mmap setup overhead (page table entries, VMAs) is
+  bigger than a `read()` of a few KB.
+- **Writes you need to ack durably** in tight loops: explicit
+  `write()` + `fsync()` gives clearer semantics than mmap +
+  `msync()`.
+- **Files larger than your virtual address space** (32-bit
+  processes): can't map all at once. (Not a concern on 64-bit.)
+- **Files that need to grow dynamically**: mmap of a growing file
+  requires remapping; explicit I/O is simpler.
+
+## The takeaway
+
+mmap maps a file into your address space. The page cache uses all
+spare RAM to keep recent file content hot. Together they make
+"file I/O" and "memory access" the same operation from the
+hardware's point of view — and that's why high-performance storage
+systems get so much done with so little explicit code. The trade is
+that you stop being the one managing what's cached: the kernel
+becomes your collaborator, for better and for worse.

@@ -1,0 +1,201 @@
+export const level = 'mid';
+
+# Blocking vs non-blocking I/O
+
+The fundamental choice an I/O API gives you:
+
+- **Blocking**: "Do this I/O. Don't return until it's done."
+- **Non-blocking**: "Tell me when this I/O is ready / completed.
+  I'll do something else in the meantime."
+
+Most performance problems and most async architectures (event loops,
+threading models, reactor patterns) trace back to this distinction.
+
+## What "blocking" actually means
+
+When you call `read(fd, buf, len)` in blocking mode on a socket with
+no data yet, the kernel **puts your thread to sleep**. Specifically,
+it moves the thread from `R` (running) to `S` (interruptible sleep)
+in the scheduler, marks it as waiting on that FD, and runs something
+else. When data arrives, the kernel marks the thread runnable. The
+scheduler picks it up; `read` returns.
+
+While the thread is asleep:
+
+- It uses **no CPU**.
+- It can be killed by a signal (which is why it's "interruptible
+  sleep").
+- The whole call stack is frozen mid-function.
+
+Blocking is fine for a one-shot script, terrible for a server that
+needs to handle thousands of connections concurrently. One blocked
+thread = one connection served at a time.
+
+## The four classic answers
+
+### 1. Thread per connection (blocking + threads)
+
+Apache `prefork` / Java pre-Loom servers. Spin up a thread or process
+per concurrent client, let each block freely. Simple programming
+model, but limited by:
+
+- Each thread costs ~MB of stack + kernel scheduler bookkeeping.
+- 10,000 concurrent connections = 10,000 threads = many GB of stack +
+  significant context-switch overhead.
+- This is "C10K problem" territory.
+
+Project Loom (Java 21+) makes this viable again with **virtual
+threads** that are cheap (KBs, not MBs). Go's goroutines are the
+same idea. The OS thread isn't the unit of concurrency anymore.
+
+### 2. Non-blocking + readiness (`select` / `poll` / `epoll` / `kqueue`)
+
+```js
+fcntl(fd, F_SETFL, O_NONBLOCK);   // mark the fd non-blocking
+
+while (true) {
+  const n = read(fd, buf, len);
+  if (n > 0) handleData(buf, n);
+  if (n === -1 && errno === EAGAIN) break;   // would block — try later
+}
+```
+
+In non-blocking mode, `read` returns `-1` with `errno=EAGAIN` (or
+`EWOULDBLOCK`) instead of sleeping. The caller's job is to come back
+later when the FD is ready.
+
+To know when "later" is, use a **readiness-notification API**:
+
+| API | Where | What |
+| --- | --- | --- |
+| `select` | Everywhere | Old, capped at FD_SETSIZE (1024), rescans all FDs each call. |
+| `poll` | Everywhere | Same shape, no FD count cap, still O(N) per call. |
+| `epoll` | Linux | O(1) modifications, returns only ready FDs. The Linux default. |
+| `kqueue` | BSD / macOS | epoll-equivalent on BSDs. |
+| `IOCP` | Windows | Completion-based, not readiness — different model. |
+| `io_uring` | Modern Linux | Completion-based, batched, lower syscall overhead. |
+
+You hand the kernel a list of FDs you care about. The kernel returns
+when any of them is **ready**. You then call `read` / `write` /
+`accept`, knowing it won't block.
+
+This is the foundation of every modern event-loop server (nginx,
+Node, Redis, Envoy). One thread, thousands of FDs, multiplexed via
+epoll/kqueue.
+
+### 3. Completion (`IOCP`, `io_uring`)
+
+A different shape:
+
+- **Readiness** (`epoll`): kernel says "this FD has data; come do
+  the I/O yourself."
+- **Completion** (`io_uring`, IOCP): you say "do this I/O for me";
+  kernel says "here's the result when done."
+
+Completion APIs do the I/O **inside the kernel** and only notify you
+when the buffer is filled. You skip the post-readiness `read`
+syscall. For disk I/O on Linux this is huge — `epoll` doesn't help
+with regular files (they're always "ready" — the read still blocks
+on disk). `io_uring` actually solves async disk I/O.
+
+io_uring is also batched: you push multiple ops into a submission
+ring, the kernel processes them, and you read completions from a
+completion ring — **without a syscall per op**.
+
+### 4. Async I/O via thread pool emulation
+
+Node's libuv does this for **disk I/O**: there's no good async
+disk API on Linux (historically — `io_uring` is changing this), so
+libuv keeps a **thread pool** (default 4 threads) and runs blocking
+`read`/`write` calls on them. From JS's perspective, the call is
+async; underneath, a thread pool thread did a blocking syscall.
+
+Many "async" runtimes hybridize: epoll/kqueue for sockets,
+thread-pool emulation for disk and DNS.
+
+## What is an event loop, really?
+
+An event loop is a `while (true)` around the readiness/completion
+API:
+
+```js
+while (running) {
+  const events = epoll_wait(epfd, eventsBuf, maxEvents, timeoutMs);
+  for (const ev of events) {
+    // FD ev.fd is ready
+    handleReadyFd(ev.fd, ev.events);   // run user JS callbacks
+  }
+  runDueTimers();
+  runMicrotasks();
+}
+```
+
+Node's event loop (see `node/event-loop-deep.mdx`) is essentially
+this, with phases for ordering. The "single-threaded" magic is:
+**one thread, blocked in `epoll_wait`**, woken whenever any of
+thousands of FDs has data. As long as user callbacks don't block,
+the loop stays responsive.
+
+When user code **does** block (a CPU-heavy `JSON.parse`, a sync
+`fs.readFileSync`, a regex catastrophic backtrack), the loop can't
+service its other FDs. That's exactly the "event loop lag" symptom
+that watchdog metrics track.
+
+## Why blocking calls in async code are catastrophic
+
+```js
+app.get('/whoever', (req, res) => {
+  const data = fs.readFileSync('/etc/large-config.json');   // blocks
+  res.json(JSON.parse(data));
+});
+```
+
+While `readFileSync` runs, the event loop **can't dispatch any other
+connection** — not the websocket heartbeats, not the health-check
+ping, nothing. Every concurrent request stalls. Multiply by traffic
+and you've got a tail-latency disaster.
+
+Async equivalent:
+
+```js
+app.get('/whoever', async (req, res) => {
+  const data = await fs.promises.readFile('/etc/large-config.json');
+  res.json(JSON.parse(data));
+});
+```
+
+`await fs.promises.readFile` returns a promise; underneath, libuv
+puts the work on its thread pool. The event loop is free to handle
+other requests in the meantime. Same overall latency, vastly better
+concurrency.
+
+## Backpressure
+
+Non-blocking writes return `EAGAIN` when the kernel buffer is full
+— you're producing faster than the network can drain. If you ignore
+that and keep buffering in user space, your memory grows unbounded.
+
+Node streams expose this as `writable.write()` returning `false` —
+the signal to stop producing until `'drain'` fires. Same shape in
+every async I/O system: **you must respect backpressure, or the
+slowest consumer becomes your memory leak**.
+
+## The mental model
+
+- Blocking I/O = "thread sleeps until done." Simple, expensive at
+  scale.
+- Non-blocking + readiness = "thread asks who's ready, dispatches,
+  loops." Cheap at scale, more complex.
+- Completion = "thread submits, kernel does the work and reports
+  back." Cleanest for batched / disk I/O.
+- Event loops are non-blocking + readiness + a queue of callbacks.
+  They scale to thousands of concurrent FDs on one thread — **as
+  long as no callback blocks.**
+- Goroutines / Loom virtual threads bring back "thread per
+  connection" without the cost, by making threads cheap.
+
+The choice between these models defines the architecture of every
+modern network server. Node picked event loop + thread-pool for
+disk; Go picked goroutines + multiplexed M:N; nginx is pure epoll;
+PostgreSQL is process-per-connection. All of them work — they just
+trade complexity for throughput differently.

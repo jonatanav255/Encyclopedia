@@ -1,0 +1,353 @@
+export const level = 'mid';
+
+# Topological sort
+
+A topological sort orders the nodes of a directed acyclic graph
+(DAG) so that every edge points "forward" — from earlier in the
+order to later. If A depends on B, B comes before A.
+
+This is the algorithm behind build systems, task schedulers,
+database migrations, package resolvers, and module loaders.
+Anywhere you have "do this before that," topo sort is underneath.
+
+## Why it matters
+
+Concrete examples:
+
+- **`make`**: compile `main.o` before linking `main`. The Makefile
+  is a DAG; `make` topo-sorts targets.
+- **Vite / esbuild**: bundle modules in dependency order so each
+  import is defined before it's used.
+- **Database migrations**: `001_create_users` before `002_add_email`.
+  Migration runners topo-sort by declared dependencies.
+- **Task schedulers** (Airflow, Prefect, GitHub Actions): a DAG of
+  jobs; run each only after its dependencies.
+- **Package managers** (npm, pip, cargo): install deps in topo
+  order so each package's deps are present when it's installed.
+- **Spreadsheets**: cell `B1` depends on `A1`. Recompute in topo
+  order to avoid using stale values.
+
+If the graph has a cycle, **no topological order exists** — you've
+got a circular dependency. Detecting that is half the job.
+
+## Two algorithms
+
+There are two standard approaches: **Kahn's algorithm** (BFS-based,
+in-degree count) and **DFS-based** (post-order reverse).
+
+Both are O(V + E). Pick based on which extras you need.
+
+## Kahn's algorithm
+
+The intuition: a node with **no incoming edges** has no dependencies
+unmet — it can be processed first. Process it, remove its outgoing
+edges, repeat.
+
+```js
+function topoSortKahn(graph) {
+  // graph[node] = array of dependent nodes (edges out)
+  const inDegree = new Map();
+  for (const node in graph) inDegree.set(node, 0);
+  for (const node in graph) {
+    for (const next of graph[node]) {
+      inDegree.set(next, (inDegree.get(next) ?? 0) + 1);
+    }
+  }
+
+  // Start with all nodes that have no incoming edges
+  const queue = [];
+  for (const [node, deg] of inDegree) {
+    if (deg === 0) queue.push(node);
+  }
+
+  const result = [];
+  while (queue.length) {
+    const node = queue.shift();
+    result.push(node);
+    for (const next of graph[node]) {
+      inDegree.set(next, inDegree.get(next) - 1);
+      if (inDegree.get(next) === 0) queue.push(next);
+    }
+  }
+
+  if (result.length !== Object.keys(graph).length) {
+    throw new Error('Cycle detected — no topological order exists');
+  }
+  return result;
+}
+```
+
+How it works:
+
+1. Count in-degree for every node.
+2. Seed the queue with all zero-in-degree nodes.
+3. Pop one, append to result, decrement in-degree of its neighbors.
+4. Any neighbor that hits zero gets enqueued.
+5. If you stop before processing all nodes, there's a cycle.
+
+**Cycle detection is free** — if the queue empties before you've
+processed every node, the remaining nodes form a cycle.
+
+Why use Kahn's:
+
+- **Cycle detection comes naturally.**
+- **Stable order** if you use a min-heap instead of FIFO queue —
+  great for deterministic builds where you want "lex-smallest valid
+  order."
+- **Streamable** — you can process nodes as soon as they're ready,
+  not after a full traversal.
+
+## DFS-based topological sort
+
+```js
+function topoSortDFS(graph) {
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = new Map();
+  for (const node in graph) color.set(node, WHITE);
+
+  const result = [];
+
+  function visit(node) {
+    if (color.get(node) === GRAY) {
+      throw new Error(`Cycle detected at ${node}`);
+    }
+    if (color.get(node) === BLACK) return;
+
+    color.set(node, GRAY);
+    for (const next of graph[node]) visit(next);
+    color.set(node, BLACK);
+    result.push(node);   // post-order
+  }
+
+  for (const node in graph) {
+    if (color.get(node) === WHITE) visit(node);
+  }
+
+  return result.reverse();
+}
+```
+
+How it works: a node's post-order position (when DFS leaves it) is
+the *reverse* of its topological order — a node can only "finish"
+after all its dependencies finish. Reverse the finish list.
+
+The three colors (WHITE/GRAY/BLACK) detect cycles — a back edge to
+a GRAY (currently-on-stack) node means a cycle.
+
+Why use DFS:
+
+- **Often shorter code.**
+- **Naturally gives you the cycle path** if you trace back through
+  GRAY nodes.
+- **Suits problems** that already need DFS (strongly-connected
+  components, dominator trees).
+
+Downside: DFS recursion can blow the stack on deep graphs. See
+**Recursion and tail calls**. For very deep DAGs, convert to
+iterative DFS or use Kahn's.
+
+## Cycle detection
+
+Both algorithms detect cycles, but Kahn's gives you "did the
+algorithm terminate fully?" while DFS gives you "which node
+re-entered the GRAY frontier?"
+
+For better error messages, capture the cycle:
+
+```js
+function findCycle(graph) {
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = new Map();
+  const parent = new Map();
+  for (const node in graph) color.set(node, WHITE);
+
+  function visit(node) {
+    color.set(node, GRAY);
+    for (const next of graph[node]) {
+      if (color.get(next) === GRAY) {
+        // Walk parents back to next, that's the cycle
+        const cycle = [next];
+        let cur = node;
+        while (cur !== next) {
+          cycle.push(cur);
+          cur = parent.get(cur);
+        }
+        cycle.push(next);
+        return cycle.reverse();
+      }
+      if (color.get(next) === WHITE) {
+        parent.set(next, node);
+        const c = visit(next);
+        if (c) return c;
+      }
+    }
+    color.set(node, BLACK);
+    return null;
+  }
+
+  for (const node in graph) {
+    if (color.get(node) === WHITE) {
+      const c = visit(node);
+      if (c) return c;
+    }
+  }
+  return null;
+}
+```
+
+Now `findCycle` returns the actual cycle path, which beats a
+generic "circular dependency" error in build tooling.
+
+## Real-world applications
+
+### Build systems
+
+`make`, `bazel`, `ninja`, Webpack, Vite — all topo-sort targets so
+each one is built after its prerequisites. When you change `b.c`,
+the build system recomputes the topo order of dirty targets and
+rebuilds them in dependency order.
+
+Vite's dev server does an incremental topological sort on every
+file change — only the affected subgraph rebuilds.
+
+### Task schedulers
+
+Airflow DAGs are literal directed graphs. Airflow topo-sorts tasks
+and runs each as soon as its upstream dependencies complete.
+GitHub Actions `needs:` declarations form a DAG too.
+
+### Database migrations
+
+Each migration declares its parent (Rails, Django, Flyway,
+Prisma). The runner topo-sorts and applies pending migrations in
+order. A circular dependency in migrations is a configuration bug —
+the runner should reject it loudly.
+
+### Package resolution
+
+`npm install` builds a dependency graph and installs packages in
+topo order. Conflicts (e.g., A needs B@1, C needs B@2) are
+handled with nested installs or hoisting. The topo sort runs on
+the resolved tree.
+
+### Module loaders
+
+CommonJS and ES modules execute in topo order: dependencies first,
+then the importing module. The runtime walks the import graph,
+detects cycles (circular imports become `undefined` references on
+half-loaded modules), and executes leaves first.
+
+### Spreadsheets
+
+Excel recomputes cells in topo order of dependencies. Change `A1`,
+and every cell that references `A1` (directly or transitively) is
+recomputed in topo order. The "circular reference" warning is a
+cycle detection result.
+
+## Multiple valid orders
+
+A DAG usually has **many** valid topological orders. For:
+
+```
+A -> C
+B -> C
+C -> D
+```
+
+Both `[A, B, C, D]` and `[B, A, C, D]` are valid.
+
+For deterministic systems (build caches, CI), you want a **stable**
+order. Kahn's with a min-heap (instead of FIFO) gives
+lexicographically smallest. DFS with sorted neighbors gives a
+deterministic order based on iteration order.
+
+If your build cache key depends on order, pick a deterministic
+variant and document it.
+
+## Parallel execution
+
+When the goal is execution speed, the *order* isn't what matters —
+the *layers* are. A "modified Kahn's" gives you layers:
+
+```js
+function topoLayers(graph) {
+  const inDegree = new Map();
+  for (const node in graph) inDegree.set(node, 0);
+  for (const node in graph) {
+    for (const next of graph[node]) {
+      inDegree.set(next, (inDegree.get(next) ?? 0) + 1);
+    }
+  }
+
+  const layers = [];
+  let current = [...inDegree].filter(([_, d]) => d === 0).map(([n]) => n);
+
+  while (current.length) {
+    layers.push(current);
+    const next = [];
+    for (const node of current) {
+      for (const dep of graph[node]) {
+        inDegree.set(dep, inDegree.get(dep) - 1);
+        if (inDegree.get(dep) === 0) next.push(dep);
+      }
+    }
+    current = next;
+  }
+
+  return layers;
+}
+```
+
+Each layer can be executed in parallel — nothing in layer `k`
+depends on anything else in layer `k`. This is how Airflow, GitHub
+Actions, and `make -j` decide what to run concurrently.
+
+## Common pitfalls
+
+### Confusing edge direction
+
+"A depends on B" — does that mean an edge from A to B or B to A?
+Pick a convention and stick with it. Most graph libraries treat
+the edge direction as "this is required by that." Mismatched
+conventions produce reversed topo orders that mysteriously break
+builds.
+
+### Cycles in "shouldn't be cyclic" graphs
+
+The "cannot determine build order" error usually means someone
+imported a peer in a way that closed a cycle. Run cycle detection
+during build, and crash early with the cycle path.
+
+### Treating undirected graphs
+
+Topo sort only makes sense on **directed** graphs. An undirected
+graph has no notion of "earlier than" — you can't topo-sort it.
+
+### O(n^2) in-degree updates
+
+If your graph is dense (every node points to every other), the
+algorithms are O(V + E) = O(V^2). For sparse graphs (E close to V),
+they're effectively linear. Most dependency graphs are sparse.
+
+### Forgetting that "topo order" isn't unique
+
+Tests that assert "the topo order is `[A, B, C, D]`" will break
+when an unrelated change reorders neighbors. Test the *property*
+("dependencies come before dependents"), not the exact order.
+
+## The mental model
+
+Topological sort is **"linearize a partial order"**. Given a set of
+"must come before" rules, produce one valid sequence.
+
+Two practical rules:
+
+1. **Use Kahn's if you need cycle detection and streaming.** Use
+   DFS if you need cycle paths or already have a DFS in flight.
+2. **Sparse graphs are the norm.** Build systems, task DAGs,
+   migration trees — all sparse. Don't optimize for dense graphs.
+
+Whenever you see "do X before Y," "build the dependency graph,"
+"resolve in order," topo sort is in play. Often you don't write
+it; you just need to recognize when a circular dependency error
+means "my graph has a cycle."

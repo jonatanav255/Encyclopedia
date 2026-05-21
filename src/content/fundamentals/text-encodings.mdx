@@ -1,0 +1,233 @@
+export const level = 'junior';
+
+# Text encodings
+
+Strings on disk and on the wire are bytes. Strings in memory are
+*sometimes* characters and sometimes bytes-pretending-to-be-characters.
+The translation rules between bytes and characters are **encodings**,
+and getting them wrong silently corrupts data forever.
+
+## ASCII — the foundation
+
+**ASCII** is 7-bit: 128 characters (`0x00` - `0x7f`). Letters, digits,
+punctuation, control codes. That's it. No accents, no curly quotes,
+no anything-non-English. A single byte per character.
+
+```
+'A' = 0x41 = 65
+'a' = 0x61 = 97
+'0' = 0x30 = 48
+' ' = 0x20 = 32
+'\n' = 0x0a
+```
+
+The 8th bit was reserved. Different systems used it for different
+things in the 80s/90s (codepage chaos). One of those uses became
+"Latin-1."
+
+## Latin-1 / ISO-8859-1
+
+**Latin-1** is 8-bit: 256 characters. Same first 128 as ASCII, plus
+common Western European accented letters in the upper half (`é` =
+`0xe9`, `ü` = `0xfc`, etc.). One byte per character.
+
+The HTTP/1.1 spec defaulted text bodies to Latin-1 for years. A lot of
+old systems still pretend everything is Latin-1. It can't represent
+anything outside Western European — no Cyrillic, no Greek, no Arabic,
+no CJK, no emoji.
+
+## Unicode — the character set
+
+**Unicode** is the universal character set. Each character ("code
+point") has a unique number. Currently ~150,000 assigned, room for
+1,114,112 total (`U+0000` to `U+10FFFF`).
+
+```
+'A'   = U+0041
+'é'   = U+00E9
+'€'   = U+20AC
+'中'  = U+4E2D
+'😀'  = U+1F600
+```
+
+Unicode is **not an encoding** — it's a list of code points. To put
+code points into bytes, you need a Unicode encoding.
+
+## UTF-8 — the right answer
+
+**UTF-8** is variable-length: 1 to 4 bytes per code point.
+
+- ASCII characters (`U+0000` to `U+007F`) are 1 byte. Identical to
+  ASCII.
+- Most European/Cyrillic/Greek/Hebrew/Arabic: 2 bytes.
+- Most Asian scripts (CJK, Devanagari, ...): 3 bytes.
+- Emoji and rare scripts: 4 bytes.
+
+```
+'A'   U+0041   -> 41                   (1 byte)
+'é'   U+00E9   -> c3 a9                (2 bytes)
+'€'   U+20AC   -> e2 82 ac             (3 bytes)
+'😀'  U+1F600  -> f0 9f 98 80          (4 bytes)
+```
+
+The encoding is **self-synchronizing**: any byte tells you whether
+it's the start of a sequence, a continuation, or an ASCII character,
+just from its high bits. Lose your place in a stream, you can resync
+on the next valid start byte.
+
+UTF-8 is ASCII-compatible, compact for Western text, and the
+de-facto standard for the web, JSON, source code, and most modern
+file formats. **When in doubt, UTF-8.**
+
+## UTF-16 — JS, Java, Windows
+
+**UTF-16** uses 2 bytes for the basic plane (`U+0000` to `U+FFFF`)
+and 4 bytes (a "surrogate pair") for everything above. This is the
+internal string representation in JavaScript, Java, C#, and Windows
+APIs.
+
+```
+'A'    U+0041   -> 00 41             (2 bytes)
+'中'   U+4E2D   -> 4e 2d             (2 bytes)
+'😀'   U+1F600  -> d83d de00         (4 bytes, surrogate pair)
+```
+
+UTF-16 is **wider for ASCII** than UTF-8 (always 2+ bytes) and
+**not ASCII-compatible** (`0x41` alone is not "A" — it's the high
+byte of `U+0041` in UTF-16-LE, or you'd see `0x00 0x41` in UTF-16-BE).
+Don't write UTF-16 to disk if you can help it.
+
+## Code points vs code units vs bytes
+
+This is where it goes wrong. Three distinct concepts:
+
+- **Code point**: a Unicode character (U+1F600).
+- **Code unit**: the fixed-size piece an encoding uses. UTF-8: 1
+  byte. UTF-16: 2 bytes. UTF-32: 4 bytes.
+- **Byte**: 8 bits, what's actually in your file/buffer.
+
+In JS, `string.length` is **code units**, not characters:
+
+```js
+'A'.length;            // 1   — 1 code unit
+'é'.length;            // 1   — Single precomposed code point (NFC)
+                       //       fits in one UTF-16 code unit
+'é'.length;            // 2   — 'e' + combining acute accent (NFD)
+                       //       two code points, even though it renders as one glyph
+'😀'.length;           // 2   — One code point, but needs a surrogate pair in UTF-16
+```
+
+That last one is the famous gotcha. `'😀'[0]` is the high surrogate
+(`'\uD83D'`), which by itself isn't a valid character. To iterate by
+code points, use the iterator protocol:
+
+```js
+[...'😀'].length;                       // 1
+'😀'.codePointAt(0);                    // 128512 (0x1F600)
+String.fromCodePoint(0x1f600);          // '😀'
+Array.from('é').length;                 // 1 or 2 depending on normalization
+```
+
+And **byte length** is yet another thing:
+
+```js
+new TextEncoder().encode('😀').length;    // 4 (UTF-8 bytes)
+new TextEncoder().encode('é').length;     // 2 (UTF-8 bytes)
+new TextEncoder().encode('hi').length;    // 2 (UTF-8 bytes)
+```
+
+If you're enforcing a "max 280 characters" field, decide what you
+mean: code units (`.length`), code points (`[...s].length`), grapheme
+clusters (what users see, needs `Intl.Segmenter`), or bytes (UTF-8
+encoded).
+
+## Why `"é".length === 2` sometimes
+
+There are two ways to write "é" in Unicode:
+
+- **NFC (precomposed)**: `U+00E9` — one code point.
+- **NFD (decomposed)**: `U+0065` (`e`) + `U+0301` (combining acute
+  accent) — two code points.
+
+Both render identically. They're equal visually, but `===` in JS
+compares code points:
+
+```js
+'é' === 'é';            // false
+'é'.normalize() === 'é'.normalize();   // true
+```
+
+`String.prototype.normalize()` collapses to a canonical form (NFC
+by default). Always normalize before string comparison if your input
+might be NFD — macOS file paths historically used NFD, most other
+sources use NFC.
+
+## BOMs (byte order marks)
+
+A **BOM** is `U+FEFF` written at the start of a file to signal
+encoding and endianness.
+
+- UTF-8 BOM: `EF BB BF` — three bytes. Optional and **not
+  recommended**: many tools choke on it. JSON spec forbids it.
+  Shell scripts break (`#!/usr/bin/env node` after a BOM is no
+  longer a valid shebang).
+- UTF-16 BOM: `FE FF` (big-endian) or `FF FE` (little-endian).
+  Needed because UTF-16 has endianness.
+
+If you see weird invisible characters at the start of a file or a
+JSON parse error like "unexpected character at position 0", suspect
+a BOM. Strip with `sed -i '1s/^\xef\xbb\xbf//' file` or your
+editor's "Save without BOM."
+
+## ASCII can't hold "é"
+
+A common bug:
+
+```js
+// Some library that defaults to "ascii":
+buffer.toString('ascii');     // Strips high bits silently
+// "é" (0xc3 0xa9 in UTF-8) becomes "C)" or similar garbage
+```
+
+If you read a UTF-8 file as ASCII, anything non-ASCII becomes
+nonsense. If you read a UTF-8 file as Latin-1, multi-byte characters
+get split into separate Latin-1 characters (called "mojibake" —
+`é` becomes `Ã©`).
+
+The fix is always: **know your encoding, declare it, stick to UTF-8
+end to end.**
+
+## In Node and the browser
+
+```js
+// Encoding text to bytes:
+new TextEncoder().encode('hello');        // UTF-8, always
+
+// Decoding bytes to text:
+new TextDecoder('utf-8').decode(buf);
+new TextDecoder('latin1').decode(buf);    // For legacy data
+new TextDecoder('utf-16le').decode(buf);
+
+// Node Buffer:
+Buffer.from('hello', 'utf-8');
+Buffer.from(buf).toString('utf-8');
+```
+
+`TextEncoder` only does UTF-8. `TextDecoder` supports many encodings
+for reading legacy data. See `javascript/typed-arrays-and-binary.mdx`
+for the binary side.
+
+## The rules
+
+- **Default to UTF-8 everywhere.** Files, databases, APIs, source
+  code, terminals.
+- **Declare your encoding explicitly** in HTTP headers
+  (`Content-Type: text/plain; charset=utf-8`), HTML
+  (`<meta charset="utf-8">`), database column types
+  (`utf8mb4` in MySQL, never `utf8` which is 3-byte and excludes
+  emoji), and file open calls.
+- **Normalize before string comparison** if your input might be NFD.
+- **Use `Intl.Segmenter`** if you need real "user-visible character"
+  counts (grapheme clusters), not code units.
+- **Never use ASCII as a "compatible" encoding** for unknown data —
+  it silently destroys anything outside `0x00-0x7f`.

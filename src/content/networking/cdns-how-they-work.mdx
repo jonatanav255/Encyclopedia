@@ -1,0 +1,316 @@
+export const level = 'senior';
+
+# CDNs — how they work
+
+A CDN is a global cache that pretends to be your origin. Users hit
+the nearest edge POP; the edge serves cached responses; cache
+misses pull from origin once. The 10x latency improvement is the
+obvious win. The non-obvious one: knowing the cache key semantics
+is the difference between a 12% hit ratio and a 98% one. Most
+engineers treat the CDN as a black box and never close that gap.
+
+## Anycast — how the user finds the nearest POP
+
+You point your domain at the CDN's IP. That IP is **anycast** —
+advertised from every POP simultaneously via BGP. Internet routers
+forward packets toward the topologically nearest POP, which varies
+by user.
+
+A user in Tokyo connecting to `203.0.113.5` lands at the Tokyo
+POP. A user in São Paulo connecting to the same IP lands at the
+São Paulo POP. Both routed by BGP, no DNS magic required.
+
+DNS-based steering existed before anycast and still gets used too
+(CloudFront returns different IPs per region). Anycast is simpler:
+one IP, BGP does the work.
+
+The latency win: TCP+TLS handshake to the nearest POP (10-30ms)
+instead of to a distant origin (100-300ms). For a cold connection
+serving a small response, this alone is the whole performance story.
+
+## Origin pull vs origin push
+
+Two cache-fill models:
+
+- **Origin pull** (the default for almost every CDN). Edge gets
+  a request, doesn't have it cached, fetches from origin, caches,
+  serves. Lazy.
+- **Origin push** (or "upload to CDN"). You explicitly push assets
+  to the CDN ahead of time. Eager.
+
+Pull wins for almost everything: it auto-handles new assets, you
+don't manage a deploy pipeline to the CDN, the cache only holds
+what's hot.
+
+Push is useful when:
+
+- You're serving large media (video) and want to pre-position it
+  in regional POPs before launch.
+- You can't have an origin reachable from the CDN (firewall, air-
+  gapped origin).
+- You need guaranteed availability of specific assets even if
+  origin is down.
+
+Modern reality: 99% pull, with strategic push for hero content.
+
+## Cache key — the load-bearing detail
+
+When the edge looks something up, what's the key?
+
+The default for HTTP CDNs is typically:
+
+```
+(scheme, host, path, normalized-query-string)
+```
+
+That's it. Same path → same key, no matter who's asking.
+
+This is great for static assets (`/styles.css` is `/styles.css`).
+It's catastrophic if your URLs have user-specific data in the
+query string or if responses vary by request headers.
+
+### `Vary` header — incorporated into the key
+
+If your origin returns `Vary: Accept-Encoding`, the CDN stores
+separate cache entries per distinct `Accept-Encoding` value the
+client sent. A gzip client and a brotli client get different
+cached copies. Correct, necessary for any compressed asset.
+
+`Vary: User-Agent` is a footgun. There are millions of distinct
+User-Agent strings. You just sharded your cache by ~∞ keys. Hit
+ratio drops to single digits. Use a coarse-grained custom key
+(via the CDN's config: "device class") instead.
+
+`Vary: Cookie` is even worse — every distinct cookie value
+becomes a separate cache entry. Logged-in pages should usually be
+`Cache-Control: private` (or just uncacheable at the edge); don't
+try to cache them with `Vary: Cookie`.
+
+### Query string handling
+
+By default many CDNs include the entire normalized query string
+in the key. If your app does:
+
+```
+/product?id=42&utm_source=google&utm_campaign=spring
+/product?id=42&utm_source=facebook
+/product?id=42&utm_source=twitter
+```
+
+…that's three cache entries for the same content. Configure the
+CDN to ignore `utm_*` params (or whitelist only `id`). Most CDN
+configs have a "query string allowlist" feature for exactly this.
+
+### Custom cache keys
+
+Most major CDNs let you build a custom cache key from headers,
+cookies, or query params. Example: a B2B SaaS serving
+white-labeled assets per tenant:
+
+```
+key = (path, header:X-Tenant-ID)
+```
+
+Now tenant 1 and tenant 2 cache separately, and within each
+tenant the hit ratio is high. Default config would have either
+mixed responses (bug) or near-zero hit ratio (`Vary: X-Tenant-ID`).
+
+Spend an hour on cache key design when onboarding a CDN. It is
+the single highest-leverage thing you'll do.
+
+## TTL and cache-control
+
+Origin tells the CDN how long to cache via response headers:
+
+```
+Cache-Control: public, max-age=3600, s-maxage=86400
+```
+
+- `max-age` — what browsers should cache (1 hour).
+- `s-maxage` — what shared caches (CDNs) should cache (1 day).
+- `public` — caching by shared caches is allowed.
+- `private` — only the user's browser may cache; CDN should not.
+- `no-store` — don't cache anywhere.
+
+The CDN's own config can override origin headers (e.g., "cache
+everything for 1 hour regardless"). Be explicit; the defaults are
+sometimes surprising.
+
+## stale-while-revalidate — the edge superpower
+
+```
+Cache-Control: public, max-age=60, stale-while-revalidate=3600
+```
+
+For 60s, the response is fresh — serve straight from cache.
+
+For the next 3600s, it's stale — but the edge **serves it
+immediately** while fetching a fresh copy in the background. The
+user gets sub-millisecond response time; the cache is updated for
+the next request.
+
+This is how high-traffic origins survive content updates without
+thundering herd. A `Cache-Control: max-age=60` alone means every
+61-second-old request blocks waiting for origin. With SWR, the
+user sees the cached version and origin sees ~1 request per
+SWR window.
+
+**stale-if-error** is the companion: serve stale if origin is
+returning errors. Origin outage → users keep seeing yesterday's
+content instead of 502s.
+
+Both supported by Cloudflare, Fastly, CloudFront, Akamai. Use them.
+
+## Purges
+
+When you update content and need the CDN cache invalidated, you
+**purge**. Three flavors:
+
+- **Single URL purge**: invalidate one path. Cheap, fast.
+- **Surrogate keys / tags**: tag responses (e.g., `Surrogate-Key:
+  product-42 category-shoes`) and purge by tag (purge all
+  responses tagged `product-42`). Fastly pioneered this; others
+  followed.
+- **Wildcard / "purge everything"**: invalidate large swaths.
+  Slow, expensive, and triggers cache fill storms on origin. Use
+  rarely.
+
+Purge cost varies by provider; "purge everything" is metered
+explicitly on most platforms because of the origin pressure it
+creates.
+
+Workflow that scales: tag responses by what they depend on
+(product ID, category, user list). On origin write, purge the
+relevant tags. The CDN handles fan-out across POPs in seconds.
+
+## Cache statuses — what to log
+
+CDNs expose the cache decision per request:
+
+```
+X-Cache: HIT
+X-Cache: MISS
+X-Cache: REVALIDATED        (304 from origin, served stale-then-fresh)
+X-Cache: BYPASS             (config or headers prevented caching)
+X-Cache: REFRESH_HIT        (SWR stale-served, background refresh)
+```
+
+Names vary by vendor. Aggregate these in dashboards. **Hit ratio**
+(HIT / total) is your headline metric. Anything under 80% for
+static assets is a misconfiguration. Anything under 95% for
+hashed/versioned assets (`app.4a7c9.js`) is broken cache headers.
+
+## TLS termination at the edge
+
+The CDN holds the cert for your domain. TLS terminates at the
+edge POP. The leg from edge to origin is either:
+
+- A separate TLS connection (edge re-encrypts to origin). Standard
+  for any sane setup.
+- Plain HTTP (edge to origin over the public internet in clear
+  text). Bad; some legacy setups still do this.
+- An authenticated origin connection (Cloudflare Tunnels,
+  CloudFront origin access identity) so origin only accepts
+  CDN-originated traffic.
+
+For "origin certificate" management: most CDNs offer free certs
+for your domain (Let's Encrypt or their own CA). The leg between
+edge and origin can use a long-lived custom cert that only the CDN
+needs to trust.
+
+## Signed URLs and tokens
+
+For paid content (video, downloads), the CDN can require a signed
+URL or signed cookie:
+
+```
+https://cdn.example.com/private/file.mp4?Expires=1234567890&Signature=...
+```
+
+The signature proves the URL was issued by your origin (you sign
+with a shared secret). The CDN verifies signature + expiry before
+serving. Without it, the request 403s.
+
+Common in:
+
+- Video streaming (each chunk URL signed, short expiry).
+- Time-bounded downloads (purchase receipts, etc.).
+- Per-user content (signature ties to user ID + IP).
+
+You don't have to wake origin for every request; the CDN does the
+auth check at the edge.
+
+## WAF — the security layer
+
+Modern CDNs include a **Web Application Firewall** at the edge:
+
+- Rule sets for OWASP Top 10 (SQLi, XSS patterns).
+- Rate limiting per IP, per ASN, per request path.
+- Bot detection (challenge JS, CAPTCHA).
+- Geofencing (block by country).
+- DDoS absorption (the edge has more bandwidth than your origin
+  ever will).
+
+The edge is the right place for these — far from origin, no app-
+level state to consult, scales horizontally.
+
+Caveat: WAF rules are application-agnostic. False positives
+(legitimate requests blocked) are real. Run new rules in "log
+only" mode before "block."
+
+## Origin shields — second-level caching
+
+Without a shield, every edge POP that gets a miss goes to origin.
+A new asset → 100+ POPs hit origin nearly simultaneously
+(**thundering herd**).
+
+An **origin shield** is a single intermediate POP that all other
+POPs hit on miss. Origin sees one request, the shield caches, the
+other POPs cache from the shield. Reduces origin load by orders
+of magnitude during cache-fill events.
+
+CloudFront calls this Origin Shield; Cloudflare has Tiered
+Caching; Fastly has Origin Shielding. Enable it on any high-
+traffic property.
+
+## What origin should still do well
+
+The CDN is great at caching. Origin still owns:
+
+- **Generating cacheable responses with correct headers.** Garbage
+  in, garbage out — a missing `Cache-Control` means default
+  behavior, which may be "don't cache" or "cache forever," neither
+  of which is right.
+- **Serving cache misses fast.** The hit ratio is never 100%; the
+  misses still need to be quick. Origin perf matters.
+- **Handling purge invalidation correctly.** When tags change,
+  purge them.
+- **Authentication & application logic.** The CDN forwards or
+  bypasses for authenticated routes; origin handles them.
+
+Treating the CDN as "free magic" leads to bizarre bugs: stale
+private data served to wrong users (cache key misconfig), missing
+images after deploys (purge missing), or 504s from origin under
+load (no SWR + thundering herd).
+
+## The shape of a good CDN integration
+
+1. Static assets versioned in URL (`/app.4a7c9.js`), `Cache-Control:
+   public, max-age=31536000, immutable`. 99%+ hit ratio.
+2. HTML pages: `Cache-Control: public, max-age=60,
+   stale-while-revalidate=3600`. ~95% hit ratio, content updates
+   visible in ~1 minute.
+3. API responses: short TTL or `private, no-store`. Cache only what
+   makes sense per route.
+4. Tagged invalidation on origin writes. No more "wait 10 minutes
+   for the cache to expire."
+5. Custom cache keys excluding tracking params.
+6. WAF in log-only for a week, then block.
+7. Origin shield on.
+8. Cache status logged into your observability stack; hit ratio
+   tracked per route.
+
+Get this right and the CDN does 95% of the traffic for 5% of the
+origin cost. Get it wrong and you're paying for a global cache
+that's serving 12% from cache and 88% from origin, which is just
+extra latency.

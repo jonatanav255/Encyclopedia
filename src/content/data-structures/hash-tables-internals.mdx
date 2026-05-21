@@ -1,0 +1,232 @@
+export const level = 'mid';
+
+# Hash tables: internals
+
+`hash-tables-intuition.mdx` covered the mental model. This page is
+about what actually happens inside the box: how collisions are
+resolved, why load factor matters, what resize costs, and what V8's
+`Map` does specifically.
+
+## Collision resolution: chaining
+
+Each bucket is a small list of entries. On insert, append. On lookup,
+walk the list comparing keys.
+
+```js
+// Conceptual chaining table
+class HashMap {
+  constructor(capacity = 16) {
+    this.buckets = Array.from({ length: capacity }, () => []);
+    this.size = 0;
+  }
+  _bucket(key) {
+    return this.buckets[hash(key) % this.buckets.length];
+  }
+  set(key, value) {
+    const b = this._bucket(key);
+    for (const entry of b) {
+      if (entry[0] === key) { entry[1] = value; return; }
+    }
+    b.push([key, value]);
+    this.size++;
+    if (this.size / this.buckets.length > 0.75) this._resize();
+  }
+  get(key) {
+    for (const [k, v] of this._bucket(key)) if (k === key) return v;
+  }
+}
+```
+
+Strengths:
+
+- Simple. Easy to reason about.
+- Tolerates high load factor (>1 is okay, just slower).
+- Delete is straightforward — splice the entry from the chain.
+
+Weaknesses:
+
+- Each chain entry is a separate object — pointer chase, cache misses.
+- Per-entry overhead (the bucket array, the node objects).
+- Long chains degrade lookup to O(chain length).
+
+Java's `HashMap` uses chaining but **promotes a chain to a red-black
+tree once it has 8+ entries** to bound the worst case at O(log n).
+Most JS engines don't go that far.
+
+## Collision resolution: open addressing
+
+Store entries directly in the bucket array. On collision, probe to
+the next slot.
+
+```js
+// Linear probing
+function set(key, value) {
+  let i = hash(key) % buckets.length;
+  while (buckets[i] !== EMPTY && buckets[i].key !== key) {
+    i = (i + 1) % buckets.length;
+  }
+  buckets[i] = { key, value };
+}
+```
+
+Strengths:
+
+- Everything in one contiguous array — cache-friendly.
+- No per-entry allocation overhead.
+- Fewer total memory accesses for lookups.
+
+Weaknesses:
+
+- Requires lower load factor (~0.7-0.8 max) to stay fast.
+- Deletion needs tombstones (a special marker so probing doesn't
+  stop early), and tombstones accumulate, requiring rehashing.
+- Performance collapses as load factor approaches 1.
+
+Variants: **linear probing** (i+1, i+2, ...), **quadratic probing**
+(i+1, i+4, i+9, ...), **double hashing** (i + hash2(key)).
+
+In modern hardware, open addressing with linear probing usually wins
+on raw speed because of cache behavior — even though it's
+theoretically more vulnerable to clustering.
+
+## Load factor and resizing
+
+**Load factor** = entries / buckets. Once it crosses a threshold
+(0.75 for chaining, 0.7 for open addressing), the table doubles in
+size and **every entry is rehashed** into the new buckets — because
+`hash(key) % oldSize !== hash(key) % newSize`.
+
+This makes insert **amortized O(1)** with occasional O(n) spikes.
+
+```js
+// 1M inserts. 99.9999% are O(1).
+// ~20 of them resize and copy 2^k entries each.
+// Total work: O(n). Per insert: O(1) amortized.
+```
+
+For latency-sensitive systems, the spike is real. A resize from 4M
+to 8M entries can pause for tens of ms. Mitigations:
+
+- **Pre-size** the table if you know the entry count: `new Map()` and
+  insert vs. `new Map(arrayOfEntries)` — the latter sizes once.
+- **Incremental resize** (Go's map): rehash a few entries per
+  operation so no single insert spikes.
+- **Concurrent resize** (some databases): copy entries on a
+  background thread.
+
+V8 doesn't do incremental resize for `Map`. You will see GC/resize
+pauses on huge maps. For million-entry hot paths, profile.
+
+## Robin Hood hashing
+
+A variant of open addressing where probes "steal from the rich" —
+when inserting, if the current entry's probe distance is less than
+the incoming key's would-be distance, swap them.
+
+The effect: probe distances become uniform across all entries
+(low variance), so worst-case lookup stays close to average. This
+matters because lookup cost in open addressing is dominated by
+the *longest* probe sequence you might walk.
+
+```js
+// Simplified Robin Hood insert
+function insert(key, value) {
+  let i = hash(key) % n;
+  let dist = 0;
+  let entry = { key, value, dist };
+  while (true) {
+    if (buckets[i] === EMPTY) { buckets[i] = entry; return; }
+    if (buckets[i].dist < entry.dist) {
+      [buckets[i], entry] = [entry, buckets[i]];  // swap
+    }
+    i = (i + 1) % n;
+    entry.dist++;
+  }
+}
+```
+
+Robin Hood was used historically in some standard libraries (and
+still ships in libraries like Boost's `unordered_flat_map`). Rust's
+`HashMap` used Robin Hood until 1.36 (2019), when it moved to
+hashbrown / SwissTable. The pattern pays a small insert cost for
+much better tail latency on lookups.
+
+## SwissTable / hashbrown
+
+Google's SwissTable design (used by Abseil, Rust, and others):
+
+- Open addressing.
+- Each group of 16 slots has a 16-byte **control word** — one byte
+  per slot encoding "empty," "deleted," or the top 7 bits of the
+  hash.
+- Lookup uses SIMD (SSE2 / NEON) to scan 16 control bytes in one
+  instruction — a probe checks 16 candidates at a time.
+
+Result: extremely fast lookups, low memory overhead, scales well.
+JS engines don't expose this, but if you're writing hot-path
+hashing in Rust/C++, SwissTable is the baseline to beat.
+
+## What V8's `Map` actually does
+
+V8's `Map` and `Set` are **ordered hash tables** (insertion-order
+iteration is guaranteed by the spec). The implementation is roughly:
+
+- An entries array storing `[key, value, next-in-chain]` triples in
+  insertion order.
+- A hash-index array of bucket heads pointing into the entries
+  array.
+- Chaining via the `next` field — each bucket is a linked list of
+  entry indices.
+
+Key consequences:
+
+- Iteration is insertion-order, fast (sequential scan of entries
+  array).
+- Deletion marks an entry as hole; doesn't reclaim immediately.
+- A rebuild happens when too many holes accumulate (similar to
+  resize) — also amortized O(1) but with spikes.
+- Get/set are average O(1); worst case depends on key distribution
+  and V8's randomized hash seed.
+
+The takeaway: `Map` is fast and predictable for normal workloads. For
+multi-million-entry tables you'll see resize/rebuild pauses; profile
+before optimizing.
+
+## When to roll your own
+
+Almost never. `Map` is good. But there are reasons:
+
+- **Numeric keys, fixed capacity, performance-critical.** A
+  `Uint32Array` of length `1 << k` and a bitmask hash (no modulo)
+  can beat `Map` by 2-3× in tight loops.
+- **Integer-only key with sequential or near-sequential access.** A
+  plain array indexed by ID is unbeatable.
+- **You're targeting WebAssembly** and want a struct-of-arrays
+  layout for cache efficiency.
+
+Otherwise: `Map`.
+
+## Tradeoff summary
+
+| | Chaining | Linear probing | Robin Hood | SwissTable |
+|---|---|---|---|---|
+| Max load factor | 1+ | 0.7 | 0.9 | 0.875 |
+| Cache friendliness | Bad | Good | Good | Great |
+| Tail latency | Variable | High | Low | Low |
+| Deletion | Easy | Tombstones | Backshift | Tombstones |
+| Implementation complexity | Low | Low | Medium | High |
+
+For application code in a managed language: chaining is fine, the
+language gives it to you. For systems code or hot inner loops:
+SwissTable or Robin Hood.
+
+## The discipline
+
+- Understand the load factor. If you can pre-size, do.
+- Don't write your own hash table unless you've measured.
+- A bad hash function or bad keys turn O(1) into O(n). Watch for
+  composite keys that aren't canonicalized.
+- Deletion in open-addressing tables is subtle. Use the language's
+  built-in unless you've read the algorithm carefully.
+- `Map` resizes will cause occasional latency spikes at scale.
+  Profile, don't guess.

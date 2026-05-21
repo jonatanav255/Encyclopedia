@@ -1,0 +1,216 @@
+export const level = 'senior';
+
+# False sharing
+
+A multithreaded program adds another thread and gets **slower**.
+Every variable is per-thread, no locks anywhere, no shared mutable
+state — and somehow performance collapses. The usual culprit:
+**false sharing**. Two threads writing to two unrelated variables
+that happen to live on the **same cache line**, ping-ponging the
+line between their cores.
+
+This is one of the harder performance bugs to diagnose because the
+code looks correct and there's no logical sharing — only physical.
+
+## MESI in plain English
+
+Cache coherence protocols like **MESI** (Modified, Exclusive,
+Shared, Invalid) keep all cores' caches consistent with each
+other. Each cache line is in one of four states per core:
+
+- **M (Modified)** — this core has the only valid copy, and it's
+  dirty (different from RAM).
+- **E (Exclusive)** — this core has the only valid copy, clean.
+- **S (Shared)** — multiple cores have valid clean copies.
+- **I (Invalid)** — this core's copy is stale.
+
+The relevant transitions for false sharing:
+
+- Core A holds a line in **E** state. It writes. Line goes to **M**.
+- Core B then wants to write to a different variable in the **same
+  line**. Coherence protocol: A must give up its copy. Line goes
+  to **I** in A's cache, **M** in B's.
+- Core A now writes again — must invalidate B's copy. Line bounces
+  back to A as **M**.
+
+Each bounce costs **tens to hundreds of nanoseconds** of coherence
+traffic over the CPU's inter-core bus. In a tight loop where both
+cores are writing thousands of times per second, the whole inner
+loop slows to coherence-traffic speed instead of L1-cache speed.
+
+## The canonical example
+
+```js
+// Imagine threads of execution that share memory (workers + SharedArrayBuffer).
+// Two counters, adjacent in memory, each updated by one thread:
+
+const buf = new SharedArrayBuffer(8);
+const ints = new Int32Array(buf);   // ints[0] and ints[1] share a 64-byte cache line
+
+// Worker A in a hot loop:
+for (let i = 0; i < 1e8; i++) Atomics.add(ints, 0, 1);
+
+// Worker B in a hot loop:
+for (let i = 0; i < 1e8; i++) Atomics.add(ints, 1, 1);
+```
+
+Both threads use only their own counter. No logical sharing. But
+`ints[0]` and `ints[1]` sit 4 bytes apart in the same 64-byte cache
+line. Every increment by either thread invalidates the other's
+copy. Throughput tanks.
+
+Fix: separate the counters by at least a cache line (64 bytes):
+
+```js
+const buf = new SharedArrayBuffer(128);
+const ints = new Int32Array(buf);
+
+// Worker A uses ints[0]    (offset 0)
+// Worker B uses ints[16]   (offset 64 bytes)
+```
+
+Now each counter is on its own cache line. Each thread keeps its
+line in **E**/**M** state without coherence traffic. Throughput
+recovers, often by 10-100x.
+
+## The "I added threads, got slower" mystery
+
+```js
+// Pseudo-shape — applies to any language with shared memory.
+struct Counters {
+  atomic<long> a;   // thread 1 increments
+  atomic<long> b;   // thread 2 increments
+  atomic<long> c;   // thread 3 increments
+  atomic<long> d;   // thread 4 increments
+};
+// 4 longs * 8 bytes = 32 bytes — all on the same cache line.
+```
+
+One thread: 50M ops/sec. Two threads: 5M ops/sec each. Four
+threads: 1M ops/sec each. Adding more cores made it dramatically
+worse. The atomics are correct, the counters are independent — but
+they share a line.
+
+This is reported as "atomic operations don't scale" in microbenchmarks
+all the time. The atomic op itself is cheap; the cache-line bouncing
+is the cost.
+
+## The fix: padding
+
+Pad each counter to take a full cache line:
+
+```js
+struct PaddedCounter {
+  atomic<long> value;
+  char pad[64 - sizeof(atomic<long>)];   // pad up to 64 bytes
+};
+struct Counters {
+  PaddedCounter a;
+  PaddedCounter b;
+  PaddedCounter c;
+  PaddedCounter d;
+};
+```
+
+Wasteful in memory (each counter "costs" 64 bytes for 8 bytes of
+data), but each is on its own line. Coherence traffic drops to
+near zero.
+
+In modern C++ there's `std::hardware_destructive_interference_size`
+(usually 64). In Java, `@Contended` annotation marks fields to be
+padded by the JVM. In Rust, you use `repr(align(64))` or a wrapper
+type. In JS/Node with `SharedArrayBuffer`, manually space your
+indices.
+
+## Common patterns where false sharing bites
+
+- **Per-thread counters in an array**: `counters[tid]++` with
+  threads on adjacent indices.
+- **Concurrent queue head/tail pointers**: producer writes `tail`,
+  consumer writes `head`. Putting them in the same struct without
+  padding pings the line.
+- **Lock-free hash tables**: buckets per slot, threads concurrently
+  updating adjacent buckets.
+- **Statistics structures**: hit/miss/total counters in the same
+  struct, updated from different threads.
+- **NIC ring buffers / network state**: per-CPU stats that aren't
+  padded across cache lines.
+
+The Linux kernel has `____cacheline_aligned` and per-CPU data
+infrastructure precisely to dodge this everywhere it matters.
+
+## Detecting it in practice
+
+Symptoms:
+
+- **Atomic op throughput** doesn't scale with cores. Adding cores
+  decreases per-thread rate.
+- **`perf stat -e cache-misses,LLC-loads`** shows high LLC traffic
+  even though the working set should fit in L1.
+- **`perf c2c`** (cache-to-cache) on Linux directly reports false
+  sharing — it's exactly what the tool was built for. Shows the
+  cache line, the offending offsets, and the threads involved.
+- **Linear scaling with padding** confirms the diagnosis.
+
+For JS code, you don't have `perf c2c` access easily. The
+diagnostic is empirical: separate the contended addresses by 64+
+bytes and see if perf jumps.
+
+## Other coherence-cost patterns
+
+False sharing is the famous case. Related issues:
+
+- **True sharing** — multiple threads writing the same variable.
+  Same coherence bouncing, but at least it's intentional. Still
+  hurts; lock-free reads + per-thread aggregation often beats
+  shared writes.
+- **Producer-consumer ping-pong** — even with separate lines, if
+  consumer reads what producer just wrote, the line transitions
+  M (on producer) -> S (on consumer reads) -> ... per item.
+  Batching items per cache-line transition helps.
+- **Reader-writer contention** — many readers + occasional writes.
+  Each write forces all readers' copies to **I**, then they reload.
+
+## Pitfall: the compiler can't help
+
+The compiler doesn't know which fields will be touched by which
+threads. It packs the struct in the order you wrote it. To avoid
+false sharing, **you** must lay out the data — put per-thread
+fields in separate cache lines, group co-accessed fields together.
+
+This is the same logic as the SoA-vs-AoS layout decision in
+`fundamentals/cache-lines-and-locality.mdx`, with the added
+constraint of cross-thread access patterns.
+
+## In JavaScript
+
+`SharedArrayBuffer` + `Atomics` gives JS shared-memory threading.
+The cache-coherence rules apply the same way they do in C — V8's
+typed arrays sit on real memory backed by real cache lines.
+
+If you're building a high-throughput shared queue / counter / lock
+structure in Node worker threads, **lay out your indices so per-
+worker writes land on different 64-byte boundaries**. Don't write
+`view[workerId]` and call it a day — that's the textbook false-
+sharing setup.
+
+```js
+// Bad: adjacent indices, false sharing
+const stats = new BigInt64Array(sharedBuf);   // 16 workers, indices 0..15
+
+// Good: stride by cache-line
+const STRIDE = 8;   // 8 * 8 bytes = 64 bytes
+const stats = new BigInt64Array(sharedBuf);
+// worker i writes stats[i * STRIDE]
+```
+
+## The takeaway
+
+Cache lines are the unit of coherence, not bytes. Two unrelated
+variables on the same line behave like shared state under heavy
+multithreaded writes — the line ping-pongs between cores at
+inter-core-bus speed. Symptoms: atomics that don't scale, "added
+threads, got slower," high LLC traffic with no logical sharing.
+Cure: pad to 64 bytes, or arrange your indices to land on different
+lines. Once you've been bitten, you start eyeing adjacent shared
+variables suspiciously, which is the right instinct.

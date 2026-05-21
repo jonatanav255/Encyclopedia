@@ -1,0 +1,170 @@
+export const level = 'junior';
+
+# Two's complement
+
+How computers represent negative integers. There's exactly one
+representation in modern hardware, and it's the reason `-1` looks
+like `0xFFFFFFFF`, why signed overflow wraps to a negative number,
+and why an `INT` column dies at 2.1 billion rows.
+
+## The setup
+
+You have `N` bits. You want to represent both positive and negative
+integers. The naive option ("sign bit + magnitude") is bad: it has
+two zeros (`+0` and `-0`), and addition needs special cases.
+
+Two's complement solves both. The rules:
+
+- The high (leftmost) bit is the **sign bit**: 0 = non-negative, 1 =
+  negative.
+- To negate a value: **flip all bits, then add 1**.
+
+```
+ 4 (8-bit)    = 0000 0100
+flip          = 1111 1011
++1            = 1111 1100   -> -4
+```
+
+That's it. Addition, subtraction, and comparison all work with the
+**same hardware circuits** as unsigned arithmetic — that's the
+genius of the design.
+
+## Why `-1` is `0xFFFFFFFF`
+
+```
+ 0    = 0000 0000
+-1    = 1111 1111  (8-bit)   = 0xff
+-1    = 1111 1111 1111 1111 1111 1111 1111 1111  (32-bit) = 0xffffffff
+```
+
+It's just `0 - 1` with the carry borrowing from infinity. Every bit
+is on. In JS:
+
+```js
+(~0) >>> 0;        // 4294967295 = 0xffffffff
+(-1) >>> 0;        // 4294967295 — same bits, unsigned interpretation
+```
+
+## Signed vs unsigned ranges
+
+For `N` bits:
+
+| N | unsigned range | signed range |
+| --- | --- | --- |
+| 8 | `0` to `255` | `-128` to `127` |
+| 16 | `0` to `65535` | `-32768` to `32767` |
+| 32 | `0` to `~4.29B` | `~-2.15B` to `~2.15B` |
+| 64 | `0` to `~1.8e19` | `~-9.2e18` to `~9.2e18` |
+
+The signed range is **asymmetric** — there's one more negative value
+than positive. `-(-128)` in an 8-bit signed integer is `-128` again,
+because `+128` doesn't fit. That's a real bug source.
+
+## Overflow and wraparound
+
+Add 1 to the max signed value:
+
+```
+ 127 (8-bit) = 0111 1111
+ +1          = 1000 0000  = -128
+```
+
+Silent wraparound to the most negative number. In C this is
+**undefined behavior** (the compiler is allowed to assume it never
+happens, then optimize accordingly). In Java, Go, Rust (release mode),
+and most VMs, it wraps.
+
+In JS, regular arithmetic produces a float so it doesn't wrap. But
+bitwise ops force 32-bit signed:
+
+```js
+2147483647 | 0;    //  2147483647
+2147483648 | 0;    // -2147483648  — wrapped
+4294967296 | 0;    //  0           — past 32 bits, truncated
+```
+
+## The `id INT` problem
+
+A MySQL `INT` is signed 32-bit. Max value: **2,147,483,647** (~2.1B).
+Many production outages are some variation of "auto-increment
+primary key hit max". Reddit hit it. Slack hit it. YouTube famously
+upgraded their view counter to 64-bit when Gangnam Style approached
+the 32-bit limit in 2014.
+
+Fix: declare new ID columns as `BIGINT` (signed 64-bit, max ~9.2e18).
+The four extra bytes per row are nothing compared to the rewrite when
+you run out.
+
+```js
+-- Bad: dies at 2.1B rows
+CREATE TABLE events (id INT AUTO_INCREMENT PRIMARY KEY, ...);
+
+-- Good: dies in roughly the heat death of the universe
+CREATE TABLE events (id BIGINT AUTO_INCREMENT PRIMARY KEY, ...);
+```
+
+Same logic for Unix timestamps in seconds since 1970: a signed 32-bit
+counter overflows on **January 19, 2038** ("Y2K38"). Anything still
+using `time_t = int32` dies that day. Use 64-bit.
+
+## `>>` vs `>>>` in JS
+
+This is where two's complement becomes a JS gotcha.
+
+```js
+-8 >> 1;     // -4   — arithmetic shift, fills with sign bit (1)
+-8 >>> 1;    // 2147483644   — logical shift, fills with 0
+```
+
+`>>` (arithmetic right shift) **keeps the sign**: for a negative
+number, it shifts in 1s on the left. So `-8 >> 1 === -4` and
+`-1 >> 1 === -1` (still all ones).
+
+`>>>` (logical / unsigned right shift) shifts in **0s** regardless.
+Negative numbers turn into huge positive numbers because the sign bit
+becomes just another data bit.
+
+```js
+-1 >> 31;     // -1   — still all ones
+-1 >>> 31;    //  1   — just the top bit moved down
+-1 >>> 0;     //  4294967295  — common trick to read as unsigned
+```
+
+`(x >>> 0)` is the JS idiom for "interpret this 32-bit value as
+unsigned." Used a lot in hash and CRC code.
+
+## Sign extension
+
+When you copy an 8-bit signed value into a 32-bit register, the CPU
+**sign-extends** — replicates the sign bit into the upper bits, so
+the value stays the same:
+
+```
+ -1 (8-bit)   = 1111 1111
+ -1 (32-bit)  = 1111 1111 1111 1111 1111 1111 1111 1111
+```
+
+If you accidentally **zero-extend** a signed value (treat it as
+unsigned during the widening), you get a huge positive number instead.
+This is why `int8_t` to `int` and `uint8_t` to `int` widen differently
+in C — and a classic source of "why did my value jump to 255 when I
+expected -1" bugs.
+
+## Floats, briefly
+
+Floating point has its own sign representation (one bit, separate
+from magnitude — closer to sign-and-magnitude than two's complement),
+so it has `+0` and `-0`. See `fundamentals/floating-point.mdx` for
+that whole story.
+
+## The takeaway
+
+- Negative ints look like big unsigned ints with the high bit set.
+  This is by design, not a bug.
+- Signed `INT` columns die at 2.1B. Use `BIGINT`.
+- Wraparound is silent in most languages, UB in C/C++. Don't rely on
+  it without checking your language spec.
+- In JS, use `>>>` when you want the unsigned interpretation of a
+  bit-pattern; `>>` when you want arithmetic that preserves sign.
+- Time, IDs, hashes, money — anywhere a counter can grow, the size of
+  your integer is a production concern.

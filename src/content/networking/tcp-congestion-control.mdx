@@ -1,0 +1,283 @@
+export const level = 'senior';
+
+# TCP congestion control
+
+TCP doesn't blast packets as fast as you tell it to. It probes the
+network, infers capacity, and adjusts. The algorithm that does this
+is **congestion control**, and the choice of algorithm — CUBIC,
+BBR, Reno — explains why your transcontinental file copies are slow,
+why HTTP/2 underperforms on lossy wifi, and why p99 latency cliffs
+under load.
+
+## The two windows
+
+Every TCP sender tracks two limits on how much can be in flight:
+
+- **`rwnd`** — receiver's advertised window. Flow control. "I have
+  64KB of buffer left."
+- **`cwnd`** — sender's congestion window. Congestion control. "I
+  believe the network can carry N bytes in flight without loss."
+
+Bytes in flight = unacknowledged bytes. Sender sends up to
+`min(cwnd, rwnd)` bytes, then waits for ACKs to free room.
+
+Throughput is bounded by:
+
+```
+throughput ≤ window / RTT
+```
+
+A 64KB window on a 100ms RTT path caps you at 640KB/s ≈ 5 Mbps —
+regardless of how fat the pipe actually is. This is the **BDP**
+(bandwidth-delay product) problem; long-fat pipes need big windows.
+Linux scales `rwnd` up to ~6MB by default (`tcp_rmem`); `cwnd` is
+managed by the congestion algorithm.
+
+## Slow start — start small, double fast
+
+A new connection has no idea what the network can do. So it starts
+with a tiny `cwnd` (Linux: 10 segments ≈ 14KB) and **doubles every
+RTT**:
+
+```
+RTT 1:  cwnd = 10
+RTT 2:  cwnd = 20
+RTT 3:  cwnd = 40
+RTT 4:  cwnd = 80
+...
+```
+
+Exponential growth, until either a packet drops or `cwnd` reaches
+`ssthresh` (the slow-start threshold). Then it switches to:
+
+## Congestion avoidance — additive growth
+
+Add one segment per RTT. Linear, not exponential. Probe more
+gently for additional capacity. This is the "AI" in AIMD —
+**Additive Increase**.
+
+## Loss = "MD" — multiplicative decrease
+
+A packet loss is TCP's signal that the network is congested. The
+response: **halve `cwnd`** (or some variant, depending on the
+algorithm). "Multiplicative Decrease."
+
+```
+RTT 7:  cwnd = 80  → packet lost!
+RTT 8:  cwnd = 40, resume additive increase
+```
+
+This **AIMD** loop — slow climb up, sharp cut on loss — is the
+fundamental shape of classic TCP. The result, on a path with
+periodic loss, is the famous sawtooth `cwnd` graph.
+
+## Fast retransmit and fast recovery
+
+Originally, a sender waited for a retransmission timeout (RTO) to
+notice loss — slow, often hundreds of ms. **Fast retransmit**:
+three duplicate ACKs ("I got segment X, I got X, I got X" — the
+receiver acks the last in-order byte each time it gets an
+out-of-order segment) trigger immediate retransmission without
+waiting for the timer.
+
+**Fast recovery**: after the retransmit, instead of dropping `cwnd`
+to 1 and slow-starting, halve `cwnd` and continue in congestion
+avoidance. Recover quickly from single losses without throwing
+away everything you learned.
+
+These are in every modern TCP. They're why a single dropped packet
+no longer destroys throughput.
+
+## CUBIC — Linux default
+
+The classic AIMD response (cut in half on loss) is too conservative
+for long-fat networks. After a loss on a 1 Gbps cross-continent
+link, climbing back additively takes minutes.
+
+**CUBIC** uses a cubic function of time-since-last-loss. The window
+ramps up fast right after a loss, slows as it approaches the
+previous max, then ramps fast again past it. Optimized for
+high-bandwidth, high-RTT paths.
+
+Linux has used CUBIC by default since ~2.6.19 (2006). Every server
+you SSH into in 2026 is probably running CUBIC unless someone
+changed it.
+
+Check:
+
+```bash
+sysctl net.ipv4.tcp_congestion_control
+# net.ipv4.tcp_congestion_control = cubic
+```
+
+## BBR — bandwidth + RTT, not loss
+
+Google's **BBR** (Bottleneck Bandwidth and RTT, 2016) takes a
+different approach. Instead of treating loss as the only signal,
+BBR models the path's bandwidth and minimum RTT directly:
+
+- Send at the measured bandwidth.
+- Periodically probe higher to see if there's more capacity.
+- Keep `cwnd` matched to the BDP, not to "how much can I send
+  before losing a packet."
+
+Why this matters: many networks drop packets for reasons unrelated
+to congestion — wireless, noisy fiber, oversubscribed peering
+links. CUBIC interprets all loss as congestion and backs off
+hard. BBR ignores loss in its rate calculation and keeps sending
+near the path's true capacity.
+
+Results, in Google's measurements:
+
+- YouTube throughput up significantly on lossy paths.
+- Latency under load down dramatically (BBR doesn't fill router
+  queues to detect congestion; loss-based CUBIC does, which is why
+  the "bufferbloat" problem exists).
+- Transcontinental TCP (high BDP, sometimes-lossy) sees the
+  biggest wins.
+
+Switch to BBR:
+
+```bash
+sudo modprobe tcp_bbr
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+# persist in /etc/sysctl.conf
+```
+
+On Linux 4.9+, BBR is in the kernel. v2 and v3 have been in
+development; CUBIC is still the default in 2026 distros because
+BBR is more aggressive against CUBIC flows and the "fair sharing"
+tradeoffs are debated.
+
+For an outbound-heavy service to many remote clients (e.g., serving
+video, large API responses to mobile), BBR is usually a measurable
+win. Test before flipping in prod.
+
+## Loss rates — the cliff edge
+
+On a path with **`p`** loss probability and RTT **`R`**, classic
+TCP (Reno-like) throughput is roughly:
+
+```
+throughput ≈ MSS / (R × sqrt(p))
+```
+
+This is the Mathis equation. The `sqrt(p)` term is brutal:
+
+| Loss   | RTT 50ms        | RTT 200ms     |
+|--------|-----------------|---------------|
+| 0.01%  | ~240 Mbps       | ~60 Mbps      |
+| 0.1%   | ~75 Mbps        | ~19 Mbps      |
+| 1%     | ~24 Mbps        | ~6 Mbps       |
+| 5%     | ~11 Mbps        | ~2.7 Mbps     |
+| 30%    | ~4 Mbps         | ~1 Mbps       |
+
+(MSS ~1460 bytes, classic Reno. CUBIC does better but the shape
+holds.)
+
+A 1% loss rate, which feels low, cuts your effective throughput by
+**90%** on a high-RTT path. This is why "the internet feels slow"
+on wifi at the coffee shop isn't about bandwidth — it's about loss.
+
+## Why HTTP/2 over lossy paths can be *slower* than HTTP/1.1
+
+HTTP/2 multiplexes many streams over **one** TCP connection. One
+lost packet stalls the entire TCP receive buffer until the
+retransmit arrives — and *all* multiplexed streams are blocked
+behind it. **TCP head-of-line blocking.**
+
+HTTP/1.1 with 6 parallel connections (the browser default) spreads
+streams across 6 independent TCPs. A loss on one only stalls 1/6
+of the streams.
+
+On a clean LAN, HTTP/2's gains (multiplexing, header compression)
+win. On a lossy mobile network, HTTP/1.1 can outperform HTTP/2.
+This is the entire motivation for **HTTP/3 over QUIC** — see
+**QUIC under the hood**.
+
+## Bufferbloat — the latency-under-load cliff
+
+Modern routers, modems, and switches have deep buffers (megabytes).
+Loss-based TCP fills them until packets drop, then backs off. While
+the buffer is full, every packet through that link sits in the
+queue:
+
+```
+queue depth (bytes) / link rate (bytes/sec) = added latency (sec)
+```
+
+A 1MB buffer on a 1 Mbps uplink = 8 seconds of added latency.
+Saturated upload → web page loads time out → user blames "wifi."
+
+CUBIC causes bufferbloat by design (it probes by filling queues).
+BBR avoids it (rate-limits to the measured bandwidth, doesn't fill
+queues). **fq_codel** and **CAKE** are queueing disciplines on the
+router side that drop / mark packets to keep queues short — apply
+them on your router with `tc qdisc` if you care.
+
+## p99 cliffs on long-fat pipes
+
+A connection between continents — say, 200ms RTT, 1 Gbps capacity.
+BDP = 25 MB. To use the full bandwidth, the in-flight window must
+be 25 MB.
+
+- `rwnd` of 25 MB requires `tcp_rmem` to allow it. Default Linux
+  is fine.
+- `cwnd` of 25 MB requires no losses for many seconds of slow start
+  + ramp up. One packet drop during ramp resets you.
+- One lost ACK partway through extends p99 dramatically because
+  the resume takes RTTs.
+
+You'll see this as: median latency for small responses is fine
+(50ms RTT × 1 each). p99 for large responses is wildly bigger
+than p50, because the unlucky requests hit a loss and slow-start
+again.
+
+Mitigations:
+
+- **BBR.** Most effective single change.
+- **Tune `tcp_rmem` / `tcp_wmem` upward** if your platform hasn't
+  already.
+- **Initial `cwnd` bump.** Linux defaults to 10 segments; some
+  CDNs set 30+ for first-RTT bytes.
+- **Persistent connections + warm pools.** Keep the connection
+  warmed past slow-start.
+
+## ECN — explicit signals instead of inferred loss
+
+**Explicit Congestion Notification** lets routers mark packets when
+their queues fill, instead of dropping them. The sender treats the
+mark as "congested" and backs off — same effect, without the loss.
+
+ECN requires both endpoints and the path to support it. Linux
+supports it; many middleboxes still strip the bits. Negotiated per
+connection. Increasingly common in datacenter fabrics (DCTCP),
+slowly creeping into the public internet.
+
+```bash
+sysctl net.ipv4.tcp_ecn
+# 0=off, 1=both, 2=incoming-only (Linux default in many distros)
+```
+
+## What you actually do about all this
+
+For application code: very little. Use keep-alive, pool
+connections, prefer HTTP/2 or /3 to your CDN.
+
+For infrastructure:
+
+- **Switch outbound-heavy machines to BBR.** Measure first; it's
+  usually a win.
+- **Watch retransmit rate.** `ss -tin` per connection;
+  `netstat -s | grep -i retrans` overall. Rising retransmits =
+  network problem creeping in.
+- **Don't believe "the network is fine."** A 0.5% loss rate on a
+  cross-region link is invisible to monitoring but slashes
+  throughput. Measure between hosts, not just "is the ping
+  responding."
+
+The mental model: TCP gives you a moving estimate of how hard it
+can push. The algorithm choice (CUBIC vs BBR) and the path's loss
+character determine the answer. For most of what you write, that
+answer is "fast enough." When it isn't, knowing where the loop
+lives is the first step to making it faster.

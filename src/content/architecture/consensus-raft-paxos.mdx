@@ -1,0 +1,288 @@
+export const level = 'senior';
+
+# Consensus: Raft and Paxos
+
+Consensus is how a group of unreliable machines agree on a single
+value — the next log entry, the current leader, the latest config —
+in the face of network drops, crashes, and slow replicas. Every
+modern coordination system you've heard of (etcd, Consul, CockroachDB,
+TiKV, Kafka KRaft, FoundationDB's coordinators) runs Raft or a Paxos
+variant under the hood.
+
+You almost never implement consensus yourself. You do need to know
+what it gives you, what it doesn't, and where its sharp edges are
+when you build on top.
+
+## What problem consensus actually solves
+
+A group of N nodes wants to agree on a sequence of values such that:
+
+1. **Agreement**: no two non-faulty nodes ever decide on different
+   values for the same slot.
+2. **Validity**: the agreed value was proposed by some node.
+3. **Termination**: as long as a majority can talk to each other,
+   the group eventually decides.
+
+That's it. Consensus alone doesn't give you a database, a queue, or
+a lock service. It gives you a **replicated log** that all replicas
+agree on, in the same order. Everything else (state machines,
+linearizable reads, leases) is built on top.
+
+The FLP impossibility result says no deterministic consensus
+algorithm can guarantee termination in an asynchronous network with
+even one crash failure. Real systems sidestep this with timeouts and
+randomized backoff — they're correct (agreement + validity) always
+and live (termination) usually.
+
+## Raft, in one page
+
+Raft was designed (Diego Ongaro, 2014) to be understandable, after
+years of teams getting Paxos wrong. It decomposes consensus into
+three independent sub-problems: **leader election**, **log
+replication**, **safety**.
+
+### Three roles
+
+At any moment each node is one of:
+
+- **Follower** — passive. Accepts AppendEntries from the leader,
+  votes when asked.
+- **Candidate** — running for election after a timeout.
+- **Leader** — exactly one per term. Accepts client writes, replicates
+  log entries to followers.
+
+### Terms and elections
+
+Time is divided into **terms** (monotonically increasing integers).
+Each term has at most one leader.
+
+```
+Follower → (election timeout, no heartbeat) → Candidate
+Candidate → (votes from majority) → Leader
+Candidate → (heard from leader with higher term) → Follower
+Leader → (sees higher term in any RPC) → Follower
+```
+
+A follower that hears no heartbeat for ~150–300ms increments its
+term, votes for itself, and asks the rest for votes. Random timeouts
+prevent split votes from looping forever. A node grants its vote
+only if the candidate's log is **at least as up-to-date** as its own
+(safety property — see below).
+
+### Log replication
+
+The leader appends client commands to its log and sends
+**AppendEntries** RPCs to followers. An entry is **committed** once a
+majority (including the leader) has it durably. The leader then
+applies it to its state machine and tells followers to do the same
+on the next heartbeat.
+
+```
+client → leader: SET x=5
+leader: append to log @ index 7, term 4
+leader → followers: AppendEntries(prevIdx=6, prevTerm=4, entries=[(7, "SET x=5")])
+followers: append, ack
+leader (majority acked): commit index = 7, apply to SM, reply OK to client
+```
+
+### The safety invariant
+
+If a log entry is committed in term T, it must be present in every
+future leader's log. Raft enforces this by:
+
+- Only granting votes to candidates whose log is at least as
+  up-to-date (longer log or same length with same final term).
+- A new leader never overwrites or deletes log entries — it only
+  appends. It brings followers in line by overwriting **their**
+  divergent tail.
+
+This is what makes Raft "safe under all conditions, live when a
+majority can communicate."
+
+## What's the same in Paxos
+
+Paxos (Leslie Lamport, 1998) solves the same problem and predates
+Raft by 15+ years. Multi-Paxos (the practical variant — Basic Paxos
+is just one slot) and Raft are isomorphic in what they guarantee:
+
+- Both require a **majority quorum** for both proposes and decides
+  (a 5-node cluster tolerates 2 failures).
+- Both use a **monotonic term/ballot number** to detect stale
+  leaders.
+- Both elect a **stable leader** in steady state to batch decisions
+  efficiently (Multi-Paxos's "distinguished proposer").
+- Both achieve the same FLP-bound liveness — eventually decide if a
+  majority can communicate.
+
+What's different is presentation. Paxos describes two phases
+(`Prepare`/`Promise`, `Accept`/`Accepted`) that are powerful but
+notoriously hard to reason about correctly. Raft fuses leader
+election with log catch-up and bans gaps in the log — you lose some
+generality, you gain the ability to ship a correct implementation in
+a quarter rather than a decade.
+
+If you see "Paxos" in a 2026 codebase it's almost certainly
+Multi-Paxos with a stable leader, or a derivative like **EPaxos**
+(leaderless, commutative-command optimization) or **Flexible Paxos**
+(decouples leader-election quorum from commit quorum).
+
+## What Raft does NOT give you
+
+This is where people get hurt building on Raft.
+
+### Linearizable reads, by default
+
+A follower may have committed entries the leader hasn't told it
+about yet, or may be lagging entries the leader has committed.
+Reading from a follower is not linearizable. **Even reading from
+the leader is not linearizable** unless you do one of:
+
+- **Read index**: leader confirms it's still leader (heartbeat to a
+  quorum) before serving the read. Cheap, one round-trip.
+- **Leader lease**: leader holds a time-bounded lease (granted by
+  followers); within the lease it can serve reads without
+  contacting the quorum. Faster, requires clock-skew bounds.
+- **Quorum read**: read from a majority, take the entry with the
+  highest term/index. Most expensive, rarely used.
+
+etcd, CockroachDB, and TiKV all do leader-lease reads by default.
+If your "Raft store" library doesn't, you can stale-read after a
+network blip even when nothing seems wrong.
+
+### Performance under partition
+
+If the leader is partitioned from a follower minority, those
+followers can't make progress and the partitioned minority can't
+elect a new leader (no majority). Writes on the majority side keep
+going. Clients on the wrong side of the partition see timeouts
+until topology heals or they're routed away.
+
+This is correct CP behavior (see **cap-and-pacelc.mdx**) but it
+means a Raft cluster has a hard floor on availability — minority
+partitions are unavailable for writes, period.
+
+### Cross-shard transactions
+
+A Raft group agrees on one log. If your data is sharded into many
+Raft groups (CockroachDB style), cross-shard atomicity is a separate
+layer — typically 2PC over per-shard Raft commits. Raft doesn't
+solve distributed transactions; it gives you a building block.
+
+### Anything in fewer than 3 nodes
+
+Consensus needs a majority. A 2-node cluster tolerates zero
+failures (majority is 2, so any failure stalls). A 1-node "cluster"
+is just a single point of failure with extra steps. Run 3 or 5 — 5
+if you can afford it (tolerates 2 failures and one node can be down
+for maintenance without losing fault tolerance).
+
+## Where you actually meet Raft
+
+Every modern coordination system uses it:
+
+- **etcd** — Kubernetes' config store. Raft over gRPC. Watch
+  primitive built on top.
+- **Consul** — HashiCorp's service discovery + KV. Raft for the
+  server pool.
+- **CockroachDB**, **TiKV / TiDB**, **YugabyteDB** — per-range
+  Raft groups, sharded.
+- **Kafka (KRaft mode)** — replaced ZooKeeper in Kafka 4.0 (March
+  2025). The controller quorum is Raft.
+- **FoundationDB** — uses a custom variant for the coordinator role.
+- **MongoDB replica set elections** — Raft-derived since 3.2.
+
+ZooKeeper uses **ZAB**, not Raft — a leader-based total-order
+broadcast protocol that's essentially a different presentation of
+the same idea.
+
+## Building on Raft, practically
+
+When you reach for Raft, you almost always reach for **etcd** rather
+than implementing it. etcd gives you:
+
+```js
+// node-etcd or etcd3 client
+import { Etcd3 } from 'etcd3';
+const client = new Etcd3({ hosts: ['etcd-0:2379', 'etcd-1:2379', 'etcd-2:2379'] });
+
+// Atomic compare-and-swap via transaction
+await client.if('config/version', 'Value', '==', '7')
+            .then(client.put('config/version').value('8'))
+            .else(client.put('config/conflict').value('true'))
+            .commit();
+
+// Leader election via lease + key
+const lease = client.lease(10);   // 10s TTL
+await lease.put('leader/myservice').value('node-A');
+lease.on('lost', () => { /* I am no longer leader */ });
+```
+
+This is the right level of abstraction. You get a linearizable KV
+store, leases, watches, and CAS — all backed by Raft, all somebody
+else's problem to operate.
+
+<Callout type="info">
+For "is there exactly one of me running" use cases (leader-only
+cron, singleton consumer), etcd or ZooKeeper leases beat Redis
+locks on safety. Redis `SET NX EX` is fast but doesn't survive
+split-brain cleanly — see **data/distributed-ids-and-locks.mdx**
+for the Redlock debate.
+</Callout>
+
+## Common misuses
+
+### Treating a 2-node setup as HA
+
+Two nodes with Raft is strictly worse than one node. Any single
+failure halts the cluster (no majority). Use 3 or 5.
+
+### Sharing a single Raft group across all data
+
+A Raft group has throughput ceilings (~10–50k commits/sec depending
+on hardware and batching). For database-scale workloads, shard the
+data into many small Raft groups (the CockroachDB / TiKV model).
+
+### Reading from a "Raft replica" expecting freshness
+
+Replicas can lag. Either route reads to the leader (with read index
+or lease) or accept eventually-consistent semantics. Don't assume
+"it's Raft, it's consistent" without checking how reads are served.
+
+### Using consensus for high-frequency data
+
+A 5-node Raft group with cross-AZ replication has a write latency
+floor of ~5–20ms per commit. That's fine for config and metadata,
+ruinous for hot-path application writes. Per-write consensus belongs
+to the coordination plane, not the data plane.
+
+### Long GC pauses breaking leader leases
+
+A leader whose process pauses (full GC, swap, fork) past its lease
+expiry can serve reads after a new leader has been elected — classic
+split-brain. Tune leases longer than worst-case pause, or use
+fencing tokens at the next layer down.
+
+## The mental model
+
+Consensus produces a **replicated log that a majority agrees on, in
+order**. That log drives a state machine, and the state machine is
+your KV store, your config, your leader election, your lock service.
+
+For 2026 backend services:
+
+- **Don't implement Raft.** Use etcd, Consul, or the consensus layer
+  baked into your database.
+- **Use it for coordination, not data.** Leader election, config,
+  service discovery, distributed locks — not your hot-path writes.
+- **Run odd-sized clusters of 3 or 5.** Tolerates 1 or 2 failures
+  respectively.
+- **Understand how reads are served.** Linearizable reads need a
+  read-index, lease, or quorum read — they are not free.
+- **Trust the algorithm; mistrust the implementation.** Most
+  consensus bugs in the wild are in the surrounding code (snapshot
+  handling, membership changes, log compaction), not in the core
+  protocol.
+
+Consensus is one of the few areas where the academic theory and the
+production reality are tightly aligned — and one of the few where
+rolling your own is almost always wrong.

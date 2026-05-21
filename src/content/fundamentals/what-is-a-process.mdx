@@ -1,0 +1,159 @@
+export const level = 'junior';
+
+# What is a process
+
+A **process** is a running program. Not the executable on disk — the
+executable plus everything the OS gives it to run: a private address
+space, a set of open file descriptors, environment variables, current
+directory, credentials, signal handlers, scheduling state, and a
+unique **PID** (process ID).
+
+Stop a program and it's not a process anymore. Start it again and it
+gets a new PID, new address space, fresh FDs. The on-disk binary is
+the recipe; the process is the meal.
+
+## What's actually in a process
+
+Every process the kernel knows about has:
+
+- **PID** — unique integer identifier (recycled after exit).
+- **PPID** — parent process ID.
+- **UID / GID** — user and group it runs as.
+- **Address space** — virtual memory: code, heap, stack, mmap'd
+  files. Private. Other processes can't touch it without going
+  through the kernel.
+- **File descriptor table** — small integers (`0`, `1`, `2`, ...)
+  mapping to open files, sockets, pipes, devices.
+- **Working directory** — what `./file` resolves against.
+- **Environment** — `PATH`, `HOME`, etc.
+- **Signal mask and handlers** — what to do on `SIGTERM`, `SIGINT`,
+  etc.
+- **Resource limits** — `ulimit` settings.
+- **Threads** — at least one (the main thread). All threads share
+  the address space and FDs.
+
+## The process tree
+
+On Unix, every process has a parent. New processes are created by an
+existing process calling `fork()` (clone yourself), usually
+immediately followed by `exec()` (replace your program). This is the
+"fork-exec" pattern — see `fundamentals/copy-on-write-and-fork.mdx`.
+
+The root of the tree is **PID 1**, the init process. On modern Linux
+it's usually `systemd`; in containers it's whatever you set as your
+entrypoint. PID 1 has two special jobs:
+
+- **Reap zombies.** When a child exits, it stays in the process table
+  as a "zombie" until its parent calls `wait()` to collect its exit
+  code. If the immediate parent dies first, the orphaned child is
+  re-parented to PID 1, which is responsible for reaping it.
+- **Receive default signals.** Some signals (`SIGKILL`, `SIGSTOP`)
+  always work on PID 1; others are ignored unless PID 1 explicitly
+  handles them.
+
+This bites in Docker: if your container's PID 1 is a Node process
+that doesn't reap children or handle `SIGTERM`, you get zombies and
+unresponsive shutdowns. `docker run --init` (or `tini`) gives you a
+tiny init that does this correctly.
+
+## What `ps` and `top` show
+
+`ps aux` (every process, BSD-style flags):
+
+```bash
+USER  PID  %CPU  %MEM    VSZ    RSS  TTY  STAT  START  TIME  COMMAND
+root    1   0.0   0.1  21000   3200  ?    Ss   10:00   0:01  /sbin/init
+jen   523   2.1   0.5 712000  41200  ?    Sl   10:04   0:12  node server.js
+```
+
+What to read off it:
+
+- `VSZ` — **virtual** memory size. Huge and misleading. See
+  `fundamentals/virtual-memory.mdx`.
+- `RSS` — **resident** set size. Physical RAM the process actually
+  has mapped right now. The number that matters.
+- `STAT` — process state: `R` running, `S` sleeping, `D` uninterruptible
+  sleep (usually waiting on disk I/O — can't be killed), `Z` zombie,
+  `T` stopped.
+- `TTY` — terminal it's attached to. `?` = daemon, no terminal.
+
+`top` and `htop` are the live versions. `htop -t` shows the process
+tree, which is the best way to see what spawned what.
+
+## "Why 8 Node processes?"
+
+You start one `node server.js` and `ps` shows eight Node processes.
+Usually one of:
+
+- **You used `cluster`** or a process manager (`pm2`, `node --watch`,
+  containers behind nginx) that forks one worker per CPU core.
+- **Worker threads** — these are *threads inside one process*, not
+  separate processes. They share the address space. `ps` won't show
+  them as separate rows; `ps -L` or `htop -H` will show the threads.
+- **You're behind a load balancer that spawned N replicas.** Each
+  replica is a full Node process with its own heap.
+
+The reason for N=cores: a single Node process pins one CPU. To use
+the whole machine, you need multiple processes (or worker threads
+for CPU work). See `node/multithreaded-javascript.mdx` for the JS
+angle.
+
+## Processes vs threads, briefly
+
+| | Process | Thread |
+| --- | --- | --- |
+| Address space | Private | Shared with siblings |
+| FDs | Own table | Shared with siblings |
+| Creation cost | Higher (fork + page tables) | Lower (just a stack) |
+| Crash blast radius | One process | Whole process |
+| Communication | Pipes, sockets, shared memory | Just read shared variables (with locks) |
+
+Full comparison: `fundamentals/processes-vs-threads.mdx`.
+
+## What "killing" a process means
+
+When you `kill PID`, the kernel sends a **signal** to that process.
+Default is `SIGTERM` — "please clean up and exit." The process can
+catch it and run a handler (flush logs, close DB connections,
+finish in-flight requests).
+
+`kill -9 PID` sends `SIGKILL`, which can't be caught. The kernel
+just removes the process. No cleanup runs. Open files are closed
+(by the kernel), in-flight writes may not flush, locks held aren't
+released cleanly.
+
+Containers do this in stages: orchestrator sends `SIGTERM`, waits
+~10 seconds (`stopGracePeriodSeconds` in Kubernetes), then `SIGKILL`.
+If your app ignores `SIGTERM` it always gets the hammer. See
+`fundamentals/signals.mdx`.
+
+## Useful commands
+
+```bash
+ps aux                   # all processes, BSD style
+ps -ef                   # all processes, System V style
+ps -fp 1234              # one process by PID
+ps -ef --forest          # tree view
+pgrep -fa node           # find PIDs matching pattern
+pidof node               # PIDs of "node" command
+top                      # live, sorted by CPU
+htop                     # nicer top with tree view (htop -t)
+kill 1234                # SIGTERM
+kill -9 1234             # SIGKILL
+kill -HUP 1234           # SIGHUP, often "reload config"
+lsof -p 1234             # what files/sockets does this process have open
+strace -p 1234           # trace syscalls of a running process
+```
+
+## The mental shift
+
+A process is a sandbox the kernel hands your program: own memory, own
+FDs, own identity. It can only affect other processes by going
+through the kernel (signals, pipes, sockets, shared memory). That
+isolation is what makes Unix scale — a crashing process can't
+corrupt anything outside itself, the kernel will clean up its
+resources, and other processes keep running.
+
+Once you internalize "process = isolated execution environment with
+PID-1-as-cleanup-crew", a lot of operational behavior — Docker,
+zombies, OOM kills, signal handling — stops being mysterious.

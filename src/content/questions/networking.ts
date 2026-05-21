@@ -1,0 +1,98 @@
+import type { QuestionBank } from './types';
+
+export const bank: QuestionBank = {
+  topic: 'networking',
+  questions: [
+    // --- junior ---
+    {
+      level: 'junior',
+      question: 'When would you pick UDP over TCP?',
+      answer:
+        'TCP is the default — request/response, databases, anything you\'d be sued for losing. Pick UDP when **latency matters more than completeness**, or when you can\'t afford per-connection state.\n\nClassic UDP cases: **DNS** (one small query, one small response — TCP\'s handshake would double the cost), **real-time audio/video** (a 200ms-old voice packet is worse than a glitch), **metrics fan-out** like StatsD (drop one data point, not the system), and **QUIC/HTTP/3** itself (which then builds reliability back on top in userland).\n\nThe trap is "I\'ll just use UDP and add retries." You\'ve now invented a worse TCP. Either use TCP, or use a UDP protocol someone else has already spent a decade getting right (QUIC, WebRTC, RTP).',
+    },
+    {
+      level: 'junior',
+      question: 'Your dev server fails to start with `EADDRINUSE: address already in use :::3000`. How do you fix it?',
+      answer:
+        'In order of frequency:\n\n1. **Old process still running.** Most common after a crash or a stuck nodemon. Find and kill it:\n\n```bash\nlsof -i :3000\nkill -9 <pid>\n```\n\n2. **TIME_WAIT from a recent listener.** TCP reserves the 4-tuple for ~60s after close. Node\'s `net.createServer` sets `SO_REUSEADDR` by default, so this rarely bites you on the listener side — but on macOS it sometimes does.\n3. **Another service squatting on the port.** `lsof -i :3000` will name it. Postgres on 5432, Redis on 6379, Vite on 5173, etc.\n4. **Container forwarding to the host.** Docker mapped `:3000 → :3000` and something else on the host already owns it.\n\nFor "what\'s listening on what" in general, `ss -tlnp` (Linux) or `lsof -iTCP -sTCP:LISTEN -P -n` (everywhere) is the right tool.',
+    },
+    {
+      level: 'junior',
+      question: 'Why shouldn\'t a database server listen on `0.0.0.0`?',
+      answer:
+        '`0.0.0.0` means "every interface" — the socket accepts connections from anything that can route to the host. For a database, that\'s usually the public internet, and the moment Postgres or Redis is reachable from the outside, you\'re one credential leak (or default-password drive-by) from a breach.\n\nBind to `127.0.0.1` for "localhost only" or to a specific private IP (`10.0.0.5`) for "only this VPC subnet":\n\n```bash\nss -tlnp\nLISTEN ... 127.0.0.1:5432   # safe — loopback only\nLISTEN ... 0.0.0.0:6379      # dangerous — exposed to the world\n```\n\nIt\'s the cheapest possible firewall: the service isn\'t reachable from anywhere the kernel can\'t route to that address. Use it for anything that doesn\'t need to be public.',
+    },
+
+    // --- mid ---
+    {
+      level: 'mid',
+      question: 'Walk through the TCP three-way handshake. What state is each side in along the way?',
+      answer:
+        'Three packets, one round trip:\n\n```\nClient                                Server\n  │ ── SYN (seq=x) ─────────────────▶ │   LISTEN → SYN_RECEIVED\n  │ ◀── SYN-ACK (seq=y, ack=x+1) ─── │\n  │ ── ACK (ack=y+1) ───────────────▶ │   → ESTABLISHED\n```\n\n1. Client sends `SYN` with its starting sequence number.\n2. Server replies `SYN-ACK` with its own sequence number and acks the client\'s.\n3. Client acks the server\'s sequence and is now `ESTABLISHED`. Data often piggybacks on this final ACK.\n\nOn a 100ms-RTT link that\'s 100ms before a useful byte moves. Add TLS 1.3 (1 RTT) and it\'s 200ms; TLS 1.2 is 300ms. That\'s why keep-alive, connection pools, and 0-RTT resumption exist — they amortize the handshake across many requests instead of paying it per request.',
+    },
+    {
+      level: 'mid',
+      question: 'A backend service makes ~1000 outbound requests/sec to one internal API. It starts failing with `EADDRNOTAVAIL`. What\'s happening and how do you fix it?',
+      answer:
+        '**TIME_WAIT exhaustion on the client side.** Each closed outbound connection reserves its `(local-ip, local-port, dst-ip, dst-port)` 4-tuple for 60s on Linux. The ephemeral port range is ~28k, so the math is:\n\n```\n28000 ports / 60 seconds ≈ 466 conn/sec\n```\n\nAt 1000/sec to one upstream you\'ve run out of local ports for that destination. Connects fail with `EADDRNOTAVAIL`.\n\nFix order, cheapest first:\n\n1. **Turn on keep-alive / connection pooling.** This is almost always the right answer. `undici.Agent` keeps a pool of 10 connections per origin by default; tune up if needed. Now you\'re reusing one connection for many requests instead of churning one per request.\n2. `net.ipv4.tcp_tw_reuse = 1` lets the kernel reuse TIME_WAIT sockets for new outbound connections. Safe on modern Linux.\n3. Widen `net.ipv4.ip_local_port_range`.\n4. Multiple source IPs to multiply the 4-tuple space.\n\nThe server side rarely has this problem — it\'s not the active closer, and the client IPs vary so its 4-tuple space isn\'t constrained.',
+    },
+    {
+      level: 'mid',
+      question: 'A user reports their WebSocket "randomly disconnects" on cellular. What\'s the most likely cause?',
+      answer:
+        '**Carrier NAT timeout.** Cellular NATs are aggressive — they evict idle entries after **30-60 seconds** for both TCP and UDP (much shorter than home NAT\'s 2-4 hours). When the mapping expires, the next packet from the server arrives at the NAT, which has no entry → drops it. The client\'s socket still looks alive (no FIN received), but nothing flows.\n\nFix: **app-layer heartbeats**. Send a WebSocket ping every 20-30s — that keeps the NAT mapping warm and surfaces dead connections quickly. Most WebSocket libraries have a `pingInterval` option; turn it on for any mobile client.\n\nIf the user "puts their phone in their pocket and comes back to a broken connection," that\'s the smoking gun. Same story for long-lived UDP (game state, VoIP) — heartbeats every few seconds.',
+    },
+    {
+      level: 'mid',
+      question: 'You suspect packet loss between two of your services. How would you confirm it with `tcpdump`?',
+      answer:
+        'Run `tcpdump` on **both sides** at once, with a tight filter so you don\'t drown:\n\n```bash\n# on the frontend host\nsudo tcpdump -i any -nn -w fe.pcap \'host orders.internal and tcp port 443\'\n\n# on the orders host\nsudo tcpdump -i any -nn -w be.pcap \'host frontend.internal and tcp port 443\'\n```\n\nReproduce the failure, stop both, open the pcaps in Wireshark and "Follow TCP Stream" on a failing request. The pattern to look for:\n\n- **Frontend pcap**: SYN sent, SYN retransmits at ~1s, ~2s, ~4s, no SYN-ACK.\n- **Backend pcap**: the SYN never appears.\n\nWhichever side stops seeing the packets tells you where the loss starts — switch counters, MTU mismatch, conntrack overflow, asymmetric routing. The bug is no longer in either app.\n\nKey flags: `-i any` (Linux all interfaces), `-nn` (no DNS or port-name lookup), `-w file.pcap` to save for Wireshark. Always filter — `not port 22` keeps your SSH session out of the capture.',
+    },
+    {
+      level: 'mid',
+      question: 'Why can two clients behind home NAT not connect directly to each other, and how does WebRTC work around it?',
+      answer:
+        'NAT only creates a mapping when an **internal host sends outbound** — there\'s no entry to map inbound connections to. So unsolicited inbound packets hit the router and get dropped. Two NATed clients both wait forever for the other\'s SYN.\n\nWebRTC works around this with **hole punching** mediated by public servers:\n\n- **STUN** — Alice and Bob each ask a STUN server "what\'s my public IP+port?" The act of asking creates a NAT mapping. STUN tells each one what their mapping looks like from the outside.\n- **Signaling** — they exchange those mappings via a rendezvous server (your app\'s signaling channel).\n- **Both send simultaneously** to the other\'s public IP+port. Each NAT sees the outbound packet first and creates a return-path entry. When the other side\'s packet arrives, the entry exists and it gets through.\n- **TURN** — when hole punching fails (symmetric NATs, where mappings are per-destination), a TURN server relays the entire conversation. Costs bandwidth.\n- **ICE** — the algorithm that tries STUN candidates first and falls back to TURN.\n\n"Video call quality issues behind corporate VPNs" is usually symmetric NAT forcing a TURN relay.',
+    },
+
+    // --- senior ---
+    {
+      level: 'senior',
+      question: 'When would switching from CUBIC to BBR help, and what\'s the risk?',
+      answer:
+        '**CUBIC** is Linux\'s default and treats packet loss as the signal for congestion — back off hard when you see drops. That works on clean wired networks but performs badly anywhere loss happens for non-congestion reasons (wifi, cellular, oversubscribed peering, transcontinental fiber). The Mathis equation `throughput ≈ MSS / (RTT × sqrt(p))` means a **1% loss rate cuts throughput by ~90%** on a high-RTT path. CUBIC also causes **bufferbloat** — it probes by filling router queues, adding seconds of latency under load.\n\n**BBR** models the path\'s bandwidth and minimum RTT directly. It paces sends to the measured bandwidth instead of filling queues until packets drop. Wins concentrate on:\n\n- Outbound-heavy services (video, large API responses) serving lossy mobile clients.\n- Transcontinental TCP (high BDP).\n- Anywhere bufferbloat hurts p99 latency under load.\n\n```bash\nsudo sysctl -w net.ipv4.tcp_congestion_control=bbr\n```\n\nThe risk: **BBR is more aggressive against CUBIC flows** sharing the same bottleneck. In a mixed environment it can take more than its fair share, hurting other tenants. Measure before flipping in prod, and prefer to flip it on egress-heavy hosts rather than across the fleet.',
+    },
+    {
+      level: 'senior',
+      question: 'Why does HTTP/3 use QUIC instead of TCP? Name the actual technical wins.',
+      answer:
+        'TCP has four problems that can\'t be fixed in the kernel because middleboxes break when you try:\n\n1. **HOL blocking in multiplexed protocols.** HTTP/2 puts many streams on one TCP socket; one lost packet stalls all of them because TCP guarantees byte-order across the whole connection. QUIC streams are **independently ordered** — a loss on stream A doesn\'t stall B, C, D.\n2. **Handshake cost.** TCP + TLS 1.3 = 2 RTTs minimum. QUIC fuses transport and crypto into a **1-RTT handshake**, with **0-RTT** for returning clients (idempotent requests only — replayable).\n3. **No connection migration.** A TCP connection is the 4-tuple; change IP (wifi → cellular) and it dies. QUIC keys on a **connection ID**, so the same connection survives the network switch. Killer feature for mobile.\n4. **TCP options are frozen.** Middleboxes assume specific behaviors and drop packets with unknown options. QUIC runs over UDP with everything encrypted (including most headers), so middleboxes can\'t ossify it — the protocol can actually evolve.\n\nCost: QUIC lives in userland, not the kernel, so CPU per packet is higher and you lose decades of TCP offload tuning. Inside a datacenter LAN — near-zero loss, ~1ms RTT, fixed IPs — TCP+HTTP/2 is often faster than QUIC. Most setups run HTTP/3 from user → CDN edge, then HTTP/2 from edge → origin.',
+    },
+    {
+      level: 'senior',
+      question: 'Your CDN reports a 12% cache hit ratio on what should be cacheable content. Where do you look first?',
+      answer:
+        'Three suspects, roughly in this order:\n\n1. **Cache key is fragmented by query params.** The default key includes the full normalized query string. URLs like `/product?id=42&utm_source=google` create a separate cache entry per `utm_*` value. Configure the CDN to **ignore tracking params** or whitelist only the ones that actually affect the response (`id`).\n2. **`Vary` is sharding by a high-cardinality header.** `Vary: User-Agent` is the classic footgun — millions of distinct UA strings, near-zero hit ratio. `Vary: Cookie` is even worse. Replace with a coarse-grained custom key (the CDN\'s "device class" feature) or just drop the `Vary` and treat the route as `private`.\n3. **`Cache-Control` is wrong or missing.** No `Cache-Control` header → many CDNs fall back to a default that may be "don\'t cache." Or origin is sending `private`/`no-store` when it should be `public`. For static, versioned assets (`/app.4a7c9.js`) you want `Cache-Control: public, max-age=31536000, immutable`.\n\nLog the `X-Cache` header (`HIT`/`MISS`/`REVALIDATED`/`BYPASS`) into your observability stack and break down by route. The route with the surprisingly low hit ratio almost always points at one of the three.\n\nThe rule of thumb: **>95% hit ratio for hashed/versioned static assets, >80% for HTML with stale-while-revalidate, <100% for anything personalized.** A 12% number on cacheable content is a config bug, not "the CDN is slow."',
+    },
+    {
+      level: 'senior',
+      question: 'Walk through what an origin shield is and why a high-traffic site needs one.',
+      answer:
+        'Without a shield, every edge POP that gets a cache miss goes directly to origin. Push a new asset → 100+ POPs hit origin nearly simultaneously. Same thing on a cache invalidation. This **thundering herd** can saturate origin or trip rate limits, even though it\'s the same underlying request being made 100 times.\n\nAn **origin shield** is one intermediate POP that all other POPs go through on miss. Origin sees **one** request; the shield caches; the other 99 POPs cache from the shield. Origin RPS during a fill event drops by orders of magnitude.\n\nNaming by vendor:\n\n- CloudFront: **Origin Shield** (pick a region).\n- Cloudflare: **Tiered Caching** (Argo).\n- Fastly: **Origin Shielding** (set a shield POP).\n\nEnable it on any high-traffic property, especially if origin is single-region (cross-region pulls hurt more) or has hard rate limits. The win shows up dramatically during deploys, content updates, and tag purges — exactly the times you don\'t want origin to fall over.\n\nPair with `stale-while-revalidate` so the user-facing cache stays warm even while the shield refreshes in the background.',
+    },
+
+    // --- staff ---
+    {
+      level: 'staff',
+      question: 'Design the network stack for a service that needs to handle 50k concurrent WebSocket connections from mobile clients worldwide.',
+      answer:
+        '**Termination at the edge.** Anycast IP advertised from many POPs; clients land at the topologically nearest one (10-30ms handshake instead of 100-300ms). The edge POP holds the persistent WebSocket; the edge ↔ origin link is its own pool. Cloudflare, Fastly, AWS Global Accelerator all support this.\n\n**Heartbeats every 20-30s.** Carrier NATs evict idle entries in 30-60s; without app-level pings, half your mobile users will see phantom disconnects after putting their phone in their pocket. Disconnect detection: if 2 consecutive pongs are missed, tear down and reconnect.\n\n**Connection migration where you can.** HTTP/3 / QUIC connections survive IP changes (wifi → cellular) via connection ID. For WebSocket-over-TCP you can\'t — the user has to reconnect, so make reconnect cheap (session token in the first frame, no full re-auth).\n\n**Per-process connection budget.** 50k connections × 4-8KB of kernel + userland buffer ≈ 200-400MB per node before app state. Plan FD limits (`ulimit -n 200000`), tune `net.core.somaxconn` and the accept queue, raise `net.ipv4.tcp_max_syn_backlog`. Use multiple Node processes with `SO_REUSEPORT` so the kernel load-balances accepts across workers without an LB in front.\n\n**Backpressure and fan-out.** WebSocket sends are not free; one slow client mustn\'t block fan-out. Use per-connection send queues with a bounded depth — drop or kill the connection if it overflows. For broadcast, fan out via Redis Pub/Sub or a managed broker so each node only handles its own subset.\n\n**Observability.** Connections per node, message rate, p99 send latency, reconnect rate, disconnect reason histogram. Reconnect storms (a node restart causing 50k clients to reconnect at once) are real; build in jittered reconnect on the client.\n\n**Failure modes to test.** Rolling deploys (clients must reconnect to other nodes), AZ failure (anycast routes away from the dead POP), network blip (heartbeats catch it). Cellular flakiness is the steady state, not the exception.',
+    },
+    {
+      level: 'staff',
+      question: 'Your egress through an AWS NAT gateway is costing $40k/month. How would you cut it?',
+      answer:
+        'NAT gateway billing is **$0.045/GB processed** on top of regular egress. At $40k/mo you\'re pushing roughly 900TB through it — that\'s the lever to attack.\n\nMost expensive call typically: services that **should be talking to AWS endpoints over private networking but aren\'t**.\n\n1. **VPC endpoints (PrivateLink) for AWS services.** S3 and DynamoDB have **gateway endpoints — free**. Every other AWS service (Secrets Manager, SQS, Kinesis, ECR, STS) has interface endpoints — small per-hour cost but bypass NAT entirely. For S3 alone this is often half the savings.\n2. **Audit what\'s actually going through the NAT.** VPC Flow Logs → Athena. Group by destination IP/CIDR and protocol. Common offenders: container image pulls (use ECR with the VPC endpoint or pull-through cache), package installs in CI (proxy through a regional cache), telemetry exports to a third-party SaaS (use AWS Direct Connect or PrivateLink to the vendor if they support it).\n3. **Cross-AZ NAT chatter.** Each AZ should have its own NAT gateway; misconfigured route tables can route AZ-A pods through an AZ-B NAT, adding cross-AZ data charges on top of NAT charges. Cheap fix.\n4. **Compress and batch outbound payloads.** Telemetry agents that ship uncompressed JSON are the biggest unforced error — gzip cuts payload 70-90% on log-shaped data. Batch interval up from 1s to 10s where SLO allows.\n5. **Caching at the edge of your VPC.** A regional cache (Squid, Nginx proxy_cache, or a service like Sonatype Nexus for package mirrors) collapses N pod calls to 1 upstream call. Especially valuable for npm, PyPI, Docker pulls.\n6. **Reconsider chatty cross-region calls.** Cross-region traffic exits via NAT. If service A in `us-east-1` is calling service B in `us-west-2` constantly, regional read replicas or relocating the dependency may dominate.\n\nExpected outcome: a well-run audit usually cuts a $40k NAT bill by 60-80% in a quarter. The hardest part is the audit; the fixes are mechanical.',
+    },
+  ],
+};

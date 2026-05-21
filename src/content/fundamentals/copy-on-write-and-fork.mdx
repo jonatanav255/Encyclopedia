@@ -1,0 +1,223 @@
+export const level = 'senior';
+
+# Copy-on-write and `fork`
+
+`fork()` is famously cheap on Unix despite duplicating an entire
+process. The reason: **copy-on-write** (CoW). The kernel doesn't
+actually copy memory at fork time — it shares it, marked read-only,
+and only copies a page when one side writes to it.
+
+Understanding CoW explains the fork+exec idiom, why cluster workers
+in Node briefly show enormous RSS, and what makes Redis BGSAVE
+acceptable.
+
+## What `fork()` does, in detail
+
+`fork()` creates a new process that's a near-perfect copy of the
+caller. New PID, same code, same data, same heap, same FDs, same
+working directory. After the call, both parent and child return from
+`fork` — distinguished by the return value:
+
+- Parent: gets the child's PID.
+- Child: gets `0`.
+
+A naive implementation would memcpy the entire address space. For a
+500 MB Node process, that's hundreds of milliseconds of copy and a
+500 MB spike in RSS. Real `fork` does no such thing.
+
+## What actually happens
+
+The kernel:
+
+1. Creates a new PID + new process descriptor.
+2. **Duplicates the page table structure** (the metadata that maps
+   virtual to physical pages), not the underlying pages.
+3. Marks every shared page **read-only** in both parent's and
+   child's page tables.
+4. Duplicates the FD table (each FD now ref-counted, both processes
+   see the same open file).
+5. Both processes resume from the same instruction.
+
+Cost: roughly proportional to the **size of the page table**, not the
+size of the heap. For a few-GB process, that's a few MB of page
+table work — milliseconds at most.
+
+Crucially, both processes' pages now point at the **same physical
+RAM**. Any read works for free. Any write traps.
+
+## The first-write trap
+
+When either process writes to a CoW page:
+
+1. CPU sees the page is mapped read-only, raises a fault.
+2. Kernel handler recognizes "this is a CoW page."
+3. Allocates a new physical page, copies the original's content into it.
+4. Maps the new page (writable) into the **writer's** address space.
+5. The other side still sees the original page.
+6. Resume the write instruction.
+
+This is **transparent to user code** — your `*p = 5` just appears to
+work, but cost a fault and a page copy. Over time, as both
+processes mutate, more and more pages get unshared. Eventually each
+holds its own private copy of every page that's been written.
+
+For pages that nobody ever writes (most of your code segment,
+shared libraries, big read-only lookup tables loaded at startup),
+the sharing persists for the lifetime of both processes.
+
+## Why `fork` is cheap
+
+Three things make `fork` viable for spawning workers:
+
+- **No bulk copy at fork time.** Just page-table duplication.
+- **Code pages stay shared forever** — they're read-only by nature.
+- **Lookup-table-style data stays shared** — anything immutable
+  loaded at startup never CoW-copies.
+
+This is exactly the pattern Unicorn (Ruby), Gunicorn (Python),
+Node `cluster`, and Postgres rely on: load all your slow-to-load
+state in the master, then `fork` N workers. They start instantly,
+and the loaded state is shared until something writes to those
+pages.
+
+## The fork+exec idiom
+
+```js
+pid_t pid = fork();
+if (pid == 0) {
+  execve("/bin/ls", argv, envp);   // replace child's image
+  _exit(127);                       // only reached if exec fails
+}
+// parent continues
+waitpid(pid, &status, 0);
+```
+
+When you want to run an external command, you `fork` (cheap) and
+then `execve` (which discards the just-duplicated address space and
+loads a new program). Almost all the CoW pages get discarded
+unwritten — they were never going to be useful, the new program
+brings its own data.
+
+This is what every shell does for every command. Every `system()`
+call, every `child_process.spawn`, every `subprocess.Popen` — same
+pattern. The "wastefulness" of duplicating then discarding is
+mostly free because of CoW.
+
+For "fork only to immediately exec," there's also `vfork()` (the
+child shares the parent's memory until exec) and `posix_spawn` (no
+fork at all). Modern runtimes use `posix_spawn` when available
+because it sidesteps even the page-table duplication.
+
+## Why cluster workers can briefly show huge RSS
+
+You start a Node app with `cluster.fork()` and 4 workers. After
+boot, `ps` shows each worker with `RSS=400M` and the master at
+`RSS=350M`. Total looks like 1.95 GB. The machine has 2 GB. You
+panic.
+
+The trick: most of those pages are **shared CoW** copies of the
+master's data. Each worker's `RSS` includes shared pages, but they
+back the same physical frames. The actual unique physical memory in
+use is much less — maybe 600 MB total.
+
+To see real consumption, look at `/proc/PID/smaps` and sum up
+`Pss` (proportional set size) instead. `Pss` divides each shared
+page across its sharers. Sum the `Pss` of all your workers and the
+master and you get the actual physical footprint.
+
+```bash
+$ for pid in $(pgrep node); do
+    awk '/^Pss:/ {s+=$2} END {print s}' /proc/$pid/smaps
+  done
+```
+
+Over time, as workers mutate their heaps (V8 GCs, allocates,
+compacts), sharing erodes and `Pss` rises. The longer they run, the
+less the saving.
+
+## Redis BGSAVE — the textbook use
+
+Redis is in-memory. To take a snapshot to disk, it needs a
+**consistent point-in-time view** of the entire dataset while
+continuing to serve writes.
+
+The clever trick: **`fork()`**. The child gets a CoW view of the
+exact same data; the parent keeps serving. The child can leisurely
+walk the dataset and write it to disk, knowing the values won't
+change underneath it (its view is frozen). The parent's mutations
+trigger CoW copies — old page snapshots are preserved for the child;
+new pages are private to the parent.
+
+Cost: as the parent writes during the BGSAVE, more pages get
+unshared. In the worst case (write-heavy workload, the entire
+dataset changes during the BGSAVE), RSS doubles temporarily.
+In typical workloads, only a small fraction of pages CoW-copy.
+
+This is also why Redis configs warn about `vm.overcommit_memory`
+— under restrictive overcommit policies, the kernel might refuse
+the fork (worrying it can't back all the potentially-CoW pages),
+even though most of them will never actually be written.
+
+## Practical implications
+
+- **Loading shared state in a master before forking workers saves
+  memory** — but only as long as that state stays unwritten.
+  GC compaction in managed runtimes is the silent killer here: it
+  rewrites pages and unshares them.
+- **Forking a write-heavy process is expensive in the long run** —
+  the CoW savings erode quickly.
+- **`fork`-based snapshotting** (Redis, Postgres `pg_basebackup` in
+  some modes) is elegant but trades temporary RSS spikes for code
+  simplicity.
+- **Long-lived, mostly-read data (lookup tables, compiled regexes,
+  immutable caches) stay shared** indefinitely. Mutable per-request
+  state diverges fast.
+- **In containers with tight memory cgroups**, the CoW spike from
+  fork+exec or BGSAVE can OOM-kill the parent. Set `overcommit`
+  accordingly.
+
+## fork() in multithreaded processes
+
+Famously dangerous: `fork()` only duplicates the calling thread.
+All other threads vanish in the child. Any mutex they were holding
+is still locked in the child's view, with no thread to release it.
+Stuck process.
+
+Rule: after `fork` in a multithreaded program, the child should
+**only call async-signal-safe functions** (essentially: `execve` and
+exit) until it execs. Don't try to use libraries that might use
+mutexes — including the allocator.
+
+This is part of why "fork model" and "thread model" don't mix
+well. Python `multiprocessing` uses `spawn` by default on macOS now
+for exactly this reason (the old `fork` default caused subtle
+deadlocks).
+
+## In Node
+
+Node's `child_process.fork()` is **not** Unix `fork()` — it
+spawns a fresh Node process. `cluster.fork()` is the same. Both
+use `posix_spawn` / `execve` under the hood; no CoW sharing of the
+JS heap between master and workers.
+
+To share data across Node workers, you need:
+
+- `SharedArrayBuffer` between workers (same process, see
+  `node/worker-threads.mdx`).
+- IPC messages between forks (`worker.postMessage`,
+  `child.send`).
+- An external store (Redis, shared file).
+
+If you want CoW-based sharing in JS, you're looking at the
+underlying runtime's startup snapshots (V8 startup snapshot,
+Bun's compiled bundles) or native modules.
+
+## The mental model
+
+`fork` shares everything by default and copies on demand. Page
+tables get duplicated; physical pages stay shared until a write
+triggers an unshare. Most reads are free, first writes cost a
+copy. This is what makes Unix process spawning fast enough to be
+the default, what powers cluster workers and Redis snapshots, and
+what makes `RSS` numbers in `ps` an over-count of actual memory
+use.

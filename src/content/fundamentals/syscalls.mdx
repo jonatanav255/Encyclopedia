@@ -1,0 +1,181 @@
+export const level = 'mid';
+
+# System calls
+
+A **system call** (syscall) is the boundary between your program and
+the kernel. Your code can't read a file, open a socket, allocate
+memory from the OS, or talk to another process without going through
+one. They're the API of the operating system.
+
+## Ring 0 vs ring 3
+
+x86 CPUs have four "rings" of privilege; in practice only two get
+used:
+
+- **Ring 0** — kernel mode. Full hardware access: page tables, I/O
+  ports, interrupt vectors. The kernel runs here.
+- **Ring 3** — user mode. Restricted. Can't touch hardware directly,
+  can't read other processes' memory, can't disable interrupts.
+  Your code (and almost everything else) runs here.
+
+When user-mode code needs to do something only the kernel can
+(open a file, create a socket, fork), it must transfer control to
+ring 0. The mechanism is the **syscall instruction** (on x86-64,
+literally `syscall`; on older x86 it was the `int 0x80` trap).
+
+The CPU does this safely: it stops at a fixed kernel entry point
+(set up at boot), swaps to the kernel stack, and saves the user
+context. The kernel reads the syscall number, dispatches to the
+handler, validates arguments, does the work, and returns. The CPU
+flips back to ring 3.
+
+This boundary is the whole point of the user/kernel split: untrusted
+code can request services without ever holding the keys to the
+hardware.
+
+## What a syscall looks like
+
+You almost never invoke a syscall directly. You call a **libc**
+wrapper, which sets up the registers and runs `syscall`. On Linux
+x86-64:
+
+- Syscall number in `rax`.
+- Arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`.
+- Return value in `rax`. Negative values (`-4095` to `-1`) are
+  errno-style errors.
+
+The Node `fs.readFileSync('/etc/hostname')` chain:
+
+```
+JS  fs.readFileSync('/etc/hostname')
+->  libuv  uv_fs_read
+->  libc   read(fd, buf, len)
+->  syscall  rax=0, rdi=fd, rsi=buf, rdx=len
+->  kernel  sys_read -> VFS -> filesystem driver
+->  return bytes-read, copy data into your buffer
+```
+
+Every link is real and traceable.
+
+## Common syscalls you should recognize
+
+| Syscall | What it does |
+| --- | --- |
+| `read` / `write` | Read/write bytes from/to an FD. |
+| `open` / `openat` / `close` | Open and close files. |
+| `mmap` / `munmap` | Map memory regions (anon or file-backed). |
+| `brk` / `sbrk` | Grow the program's data segment (legacy heap). |
+| `fork` / `vfork` / `clone` | Create a new process (or thread, via `clone`). |
+| `execve` | Replace current process image with a new program. |
+| `wait4` / `waitpid` | Reap a child process. |
+| `kill` / `tgkill` | Send a signal to a process / thread. |
+| `socket` / `bind` / `listen` / `accept` / `connect` | TCP/UDP/unix sockets. |
+| `select` / `poll` / `epoll_wait` / `kqueue` | Wait on multiple FDs. |
+| `pipe` / `pipe2` | Create an in-memory pipe. |
+| `ioctl` | Catch-all "device-specific operation." |
+| `nanosleep` / `clock_gettime` | Time. |
+| `getpid` / `getuid` / `getgid` | Identity. |
+| `futex` | Mutex/condvar primitive. The base of pthread locks. |
+| `gettid` / `set_tid_address` | Threads. |
+
+Linux has ~400 syscalls now. You'll see a small handful repeatedly
+in any trace.
+
+## Why `strace` exists
+
+`strace` (and `ltrace` for libc, `dtrace`/`bpftrace` for richer
+tracing) attaches to a process and prints every syscall it makes,
+with arguments and return values:
+
+```bash
+$ strace -e trace=openat,read,write -p $(pidof node)
+openat(AT_FDCWD, "/etc/passwd", O_RDONLY|O_CLOEXEC) = 7
+read(7, "root:x:0:0:root:/root:/bin/bash\n"..., 4096) = 1842
+write(2, "loaded /etc/passwd\n", 19) = 19
+```
+
+When a program "hangs" or "doesn't work" and you don't have logs,
+`strace` is the first tool. It shows you exactly what the process
+is asking the kernel to do — and what the kernel is replying.
+
+Useful invocations:
+
+```bash
+strace -p PID                    # attach to running process
+strace -f -p PID                 # follow forked children
+strace -c -p PID                 # summary: which syscalls, time spent
+strace -e trace=network ./bin    # only network-related syscalls
+strace -tt -T ...                # timestamps + duration per call
+```
+
+A process stuck in `read()` from a socket forever? That's blocking
+I/O — the kernel is waiting on data. A process spamming `stat()` on
+a missing file? Misconfigured path. A process making 50,000 syscalls
+per second? You probably need to batch.
+
+`strace` itself adds significant overhead (every syscall takes a
+detour through ptrace), so don't use it on hot production traffic.
+`perf trace` or `bpftrace` are lower-impact alternatives.
+
+## Syscall cost
+
+A syscall is not free:
+
+- Context switch from user to kernel mode.
+- Save user registers, swap to kernel stack.
+- Dispatch + argument validation + actual work.
+- Restore user state, return.
+
+On modern x86-64 the **fixed overhead is roughly 100-500 ns** per
+syscall — without counting the actual work. For `getpid` (returns a
+cached value) that's the entire cost. For `read` from a file already
+in the page cache, the syscall overhead is comparable to the
+real work.
+
+This is why **batching matters**. `write`ing a thousand 1-byte
+chunks costs ~1000 syscalls; `write`ing one 1000-byte buffer costs
+1. Same data, 1000x fewer transitions.
+
+It's also why `io_uring` exists (Linux): submit many I/O ops and
+collect their results without a syscall per op. Same for
+**vectored I/O** (`readv`/`writev`) — one syscall, multiple buffers.
+
+## Syscall vs libc call
+
+Easy to confuse: `printf` is **not a syscall**. It's a C library
+function that eventually calls the `write` syscall (after formatting
+and buffering). `malloc` isn't a syscall either; it manages a heap
+that's grown via `brk` or `mmap`, which **are** syscalls.
+
+Knowing this helps you read traces correctly:
+
+- `strace` shows syscalls only — you won't see `printf` or `malloc`,
+  but you'll see the underlying `write` and `brk`/`mmap`.
+- `ltrace` shows libc calls — you see `printf` but not the kernel
+  side.
+- A profiler shows user-code time *and* kernel time (`perf top`
+  separates them with `[kernel]` brackets).
+
+## What runs in the kernel vs user
+
+In a typical web app:
+
+- Your code, runtime (Node, JVM, Go runtime), libraries — user.
+- TCP/IP stack, scheduler, FS drivers, network drivers, page cache —
+  kernel.
+- Syscalls bridge them.
+
+Some performance-critical paths try to **bypass the kernel**:
+DPDK (network), SPDK (storage), io_uring (batched async I/O). They
+all reduce or eliminate syscalls in the hot loop, because at
+millions of ops/sec, even 200 ns of syscall overhead per op caps
+your throughput.
+
+## The takeaway
+
+A syscall is the only way your code talks to the world. Each one is
+a controlled crossing into the kernel, costing ~100s of nanoseconds
+in pure overhead before any real work. `strace` shows them happening
+live and is your debugger of last resort when "the program just
+hangs." Batching syscalls (vectored I/O, `io_uring`, larger buffers)
+is one of the easier ways to scale throughput in the I/O hot path.

@@ -1,0 +1,201 @@
+export const level = 'mid';
+
+# CPU scheduling
+
+A modern machine has more runnable threads than CPU cores. The
+**scheduler** is the part of the kernel that decides which thread
+runs on which core, for how long, before being swapped out for
+another. Schedulers are why your `top` doesn't freeze when one
+process pegs the CPU, and why mixing CPU-bound and I/O-bound work
+on the same machine is full of surprises.
+
+## Preemptive vs cooperative
+
+Two models:
+
+- **Cooperative**: a running task keeps the CPU until it
+  voluntarily yields. Async runtimes (Node's event loop, Python
+  asyncio, single-threaded JS in general) and some toy/embedded
+  RTOSes work this way. Simple, but one badly-behaved task can hang
+  everything.
+- **Preemptive**: the kernel can yank the CPU away at any moment.
+  Driven by a timer interrupt. Linux, Windows, macOS, all modern OSes.
+
+Within preemptive scheduling there's still the **userspace**
+distinction:
+
+- Node's event-loop callbacks run cooperatively on the JS thread —
+  the OS can preempt the **process**, but inside one JS task,
+  callbacks run to completion. That's why blocking the event loop
+  blocks all other JS work in that process.
+- Go goroutines, Java virtual threads, Rust async tasks — all
+  cooperative *within* the runtime, preemptive *between* runtimes.
+  The runtime puts yield points at function calls, channel ops, GC
+  safepoints.
+
+## Time slices and the tick
+
+The kernel's tick (HZ) is the periodic timer interrupt that gives
+the scheduler a chance to act. Typically 100-1000 Hz on Linux
+(`CONFIG_HZ`). Modern Linux can also be **tickless** (NO_HZ) for
+idle / dedicated cores to save power and reduce jitter.
+
+The "time slice" a thread gets isn't a fixed number; it's computed
+from how many runnable threads exist and their priorities. Under
+Linux CFS (Completely Fair Scheduler):
+
+- Each thread gets a share of CPU proportional to its weight.
+- The scheduler tracks each thread's **virtual runtime** — how long
+  it's already had CPU, weighted by priority.
+- At each scheduling point, it picks the runnable thread with the
+  **lowest virtual runtime**.
+
+Result: under heavy load, every thread of equal priority gets
+roughly equal CPU share over time, sliced into chunks of a few ms
+each.
+
+## Linux CFS in one breath
+
+CFS replaced the older O(1) scheduler around 2007 and has been the
+Linux default since. The mental model:
+
+- Each runnable thread is a node in a **red-black tree** keyed by
+  virtual runtime.
+- Pick the leftmost (lowest vruntime) node. Run it for a slice
+  determined by total load. Update its vruntime. Reinsert.
+- Priority (`nice`) acts as a weight: lower nice = bigger weight =
+  vruntime accumulates more slowly = gets more CPU.
+
+It's fair across threads (not processes — a process with 10 threads
+gets 10x CPU vs one with 1 thread, all else equal). Cgroups change
+this — you can group threads and apply weight at the group level
+(`cpu.weight` in cgroup v2).
+
+In 2023 the kernel started shipping **EEVDF** (Earliest Eligible
+Virtual Deadline First) as the newer default. Conceptually similar
+to CFS but with explicit per-task latency targets. Same shape for
+purposes of "why didn't my thread get scheduled."
+
+## `nice` and priority
+
+`nice` is a per-process priority in the range -20 (highest) to +19
+(lowest). Default is 0.
+
+```bash
+nice -n 10 ./batch-job          # start at +10 (lower priority)
+renice -n 5 -p 1234              # change a running process
+```
+
+CFS weight is roughly `1024 * 1.25^(-nice)`. A nice=-5 process gets
+~3x more CPU than nice=0 under contention. Nice=10 gets ~1/3.
+
+For real-time priorities (which preempt regular tasks regardless of
+vruntime), use `chrt` / `SCHED_FIFO` / `SCHED_RR`. **You almost
+never want this** — RT-priority processes can starve the kernel
+itself if they spin without yielding. Reserved for audio,
+control systems, and tightly engineered low-latency code.
+
+## Why CPU-bound starves I/O on a busy core
+
+A CPU-bound thread (number-crunching, JSON-parsing big payloads, a
+busy-loop) is **always runnable**. The scheduler can preempt it, but
+when it picks back up it gets right back in line.
+
+An I/O-bound thread spends most of its time **blocked** (waiting on
+a socket, disk, etc.) — vruntime barely advances while sleeping. So
+when it wakes up, it has very low vruntime and gets scheduled
+immediately. This means **I/O-bound tasks typically get the CPU
+quickly** when they wake.
+
+But if all your cores are saturated with CPU-bound work, even a
+low-vruntime I/O task has to wait its turn after preemption. Tail
+latency on the I/O-bound work suffers: it wakes ready to do 200
+microseconds of work, then has to wait some scheduling slice (a
+few ms) before getting a core.
+
+The fixes:
+
+- **Dedicate cores**: `taskset -c 0-3 ./latency-sensitive-app` pins
+  to cores 0-3; `taskset -c 4-15 ./batch-job` keeps batch off them.
+- **CPU sets** (`cset`, cgroup v2 `cpuset`): isolate cores at the
+  cgroup level.
+- **Raise the I/O service's priority** (`nice -n -5`) or run the
+  batch job at `+10`.
+- **Don't co-locate** if it can be helped: latency-sensitive and
+  CPU-batch on different machines.
+
+## `taskset` and CPU affinity
+
+By default the scheduler can migrate a thread between cores. That's
+usually fine, but migration cost is **cold caches** — the thread's
+L1/L2 contents stay on the old core.
+
+`taskset` pins a process to specific cores:
+
+```bash
+taskset -c 0,1 ./mything           # only on cores 0 and 1
+taskset -pc 0-3 1234                # change pinning of running PID
+```
+
+For latency-sensitive servers (databases, low-latency trading) and
+NUMA-aware workloads, pinning matters. For typical web services,
+the scheduler does fine.
+
+`sched_setaffinity()` is the syscall behind it. You can also use
+`isolcpus=` kernel boot param to keep the scheduler from putting
+*anything* on certain cores, then run dedicated processes there
+with `taskset`.
+
+## Context switching cost
+
+Each scheduling decision saves the current thread's register state
+and restores the new one. Roughly **1-5 microseconds** of pure
+switching overhead on modern hardware, plus the implicit cost of
+**cold caches** (the new thread's data probably isn't in L1).
+
+A few thousand context switches per second per core is normal.
+Hundreds of thousands per second is a red flag — usually a
+synchronization problem (threads ping-ponging on a contended lock)
+or a tiny-message ping-pong pattern.
+
+`pidstat -w -p PID 1` shows voluntary vs involuntary switches per
+second:
+
+- **Voluntary** = thread blocked on something (usually I/O or a
+  lock).
+- **Involuntary** = scheduler preempted it (time slice ran out or a
+  higher-priority thread came in).
+
+A web server doing real work has a healthy voluntary switch rate
+(every blocking call). High involuntary switches mean CPU contention.
+
+## Threads, processes, and cores
+
+The scheduler's unit is the **thread**, not the process. A process
+with one thread gets one schedulable entity; a process with 8
+threads gets 8. They compete with all other threads in the system
+for CPU shares, by default with equal weight.
+
+This is why "more threads = faster" stops being true past the core
+count. If you have 8 cores and 16 threads doing CPU work, each
+thread gets roughly half the CPU time of a single-thread-per-core
+setup, plus extra context-switching overhead. For CPU-bound work,
+threads = cores is the sweet spot. For I/O-bound, you can have many
+more (they're blocked most of the time and don't consume CPU).
+
+## The takeaway
+
+- The kernel scheduler is preemptive. The runtime's scheduler (Node
+  event loop, Go runtime) on top of it is cooperative.
+- Under Linux CFS/EEVDF, equal-priority threads get roughly equal
+  CPU shares, sliced into ms-scale chunks.
+- CPU-bound threads will pile up at the scheduler; I/O-bound threads
+  get scheduled quickly when they wake but compete for cores under
+  load.
+- Pin or partition (taskset, cgroups) when latency matters.
+- Watch context-switch rate as a contention signal.
+
+If you understand "the scheduler picks the lowest-vruntime runnable
+thread, gives it a few ms, repeats" you have enough mental model to
+diagnose most "why is my service slow on this co-located host"
+problems.

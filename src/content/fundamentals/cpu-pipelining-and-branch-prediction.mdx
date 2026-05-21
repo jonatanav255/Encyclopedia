@@ -1,0 +1,243 @@
+export const level = 'staff';
+
+# CPU pipelining and branch prediction
+
+Modern CPUs don't execute instructions one at a time. They have a
+**pipeline** — instructions in different stages of execution
+overlap, like a factory assembly line. They also execute
+instructions **out of order**, **speculatively** down predicted
+branches, and **in parallel** across multiple execution units.
+
+This is why a `for` loop's "obvious" cost — N additions, each one
+cycle — is mostly fiction. The actual cost depends on whether the
+CPU can keep the pipeline full, and that depends heavily on your
+data and your branches.
+
+## The pipeline
+
+A simplified 5-stage RISC pipeline:
+
+1. **Fetch** — read the next instruction from memory.
+2. **Decode** — figure out what it does.
+3. **Execute** — do the ALU operation.
+4. **Memory** — load/store from cache.
+5. **Writeback** — write the result to a register.
+
+If each stage took one cycle and only one instruction were in
+flight at a time, each instruction would take 5 cycles. With
+pipelining, instructions overlap: while instruction 5 is being
+fetched, 4 is decoding, 3 executing, 2 in memory, 1 writing back.
+Throughput: one instruction per cycle, despite each instruction
+"taking" 5.
+
+Modern x86 / ARM CPUs have **15-20 stage pipelines** and can issue
+**4+ instructions per cycle** on multiple execution units. The
+factory has many parallel assembly lines, and each line is much
+longer than 5 stages.
+
+## Out-of-order execution
+
+The CPU doesn't strictly follow program order. It looks ahead in
+the instruction stream and dispatches instructions to free
+execution units as their inputs become ready.
+
+```js
+// Two independent operations:
+const a = x * y;
+const b = u + v;
+const c = w + 1;
+
+// The CPU can execute all three in parallel — they don't depend on each other.
+
+// But:
+const a = x * y;
+const b = a + 1;     // depends on a
+const c = b * 2;     // depends on b
+
+// These must be serialized.
+```
+
+Dependency chains are the enemy of parallelism. Independent
+operations are friend. Compiler and CPU together try to maximize
+the latter — instruction reordering, register renaming (giving
+each write a fresh physical register so reads/writes don't
+artificially serialize), and so on.
+
+## Branch prediction
+
+Pipelined CPUs can't wait for a branch to be evaluated before
+fetching the next instruction — the pipeline would stall for
+~15-20 cycles. They **predict** which way each branch will go and
+speculatively execute down that path. If correct: pipeline stays
+full, branch was effectively free. If wrong: the speculative work
+is discarded ("squashed") and the pipeline is reloaded from the
+correct path. That's a **branch misprediction**, costing ~15-20
+cycles.
+
+Modern predictors are sophisticated — they track the history of
+each branch site, identify patterns, even correlate across
+branches. **Predictable branches are ~100% accurate.** Random
+branches are ~50% accurate, paying ~10 cycles of misprediction on
+half of all branches.
+
+## The famous "sorted array is faster" example
+
+This is the StackOverflow demo recreated in JS:
+
+```js
+const N = 1_000_000;
+const data = new Int32Array(N);
+for (let i = 0; i < N; i++) data[i] = Math.floor(Math.random() * 256);
+
+// Optionally sort:
+// data.sort();
+
+let sum = 0;
+const start = performance.now();
+for (let r = 0; r < 100; r++) {
+  for (let i = 0; i < N; i++) {
+    if (data[i] >= 128) sum += data[i];
+  }
+}
+console.log(`time: ${(performance.now() - start).toFixed(1)}ms, sum=${sum}`);
+```
+
+Run twice — once without sorting, once with `data.sort()` first.
+
+Same data, same total work. **Sorted runs roughly 2-3x faster** in
+a JIT'd inner loop (and ~5-10x in lower-level languages where
+nothing else dominates).
+
+Why: the `if (data[i] >= 128)` branch.
+
+- **Unsorted**: each iteration is roughly 50/50 — the predictor
+  guesses wrong about half the time. Tens of millions of
+  mispredictions per run.
+- **Sorted**: the first ~half of the array is below 128 (branch
+  always false), the second half always true. The predictor
+  catches this within a handful of iterations. Near-zero
+  mispredictions for the rest.
+
+This is one of the cleanest demonstrations of branch prediction's
+real-world impact.
+
+The "branchless" version sidesteps the predictor entirely:
+
+```js
+sum += (data[i] >= 128) * data[i];   // multiplies by 0 or 1
+// or: sum += data[i] & ((data[i] - 128) >> 31);   // bit-twiddle
+```
+
+No branch -> nothing to mispredict. Runs at the same speed on both
+sorted and unsorted data, and beats the unsorted-branchy version
+significantly. JITs sometimes do this transformation automatically
+(`cmov` instructions), but not always.
+
+## What confuses the predictor
+
+- **Pseudo-random data-dependent branches.** Half of branches go
+  each way, the predictor can't see a pattern.
+- **Indirect branches with many targets** (`switch`/`vtable` calls
+  on a polymorphic object). Predictors handle 1-2 hot targets;
+  with 10+ branching targets per call site, prediction degrades.
+- **First few iterations after entering a function.** History
+  hasn't been built yet.
+- **Hot loops with unpredictable data.** Inner-loop branch is
+  exercised millions of times — even modest misprediction rates
+  add up.
+
+What helps the predictor:
+
+- **Stable patterns**: `if (i < n)`-style loop conditions are
+  always predicted correctly except at the loop exit.
+- **Sorted or grouped data**: turn a 50/50 branch into a
+  "false-for-the-first-half, true-for-the-second-half" pattern.
+- **Hoisting predictable conditions out of hot loops.**
+- **Branchless code** (arithmetic on booleans, `Math.max/min`,
+  bitmasks, conditional moves) — guaranteed no misprediction.
+
+## Other pipeline hazards
+
+Besides branch mispredictions, the pipeline stalls on:
+
+- **Data hazards** — instruction needs a value that's not yet
+  written back. Mitigated by forwarding (data piped directly from
+  one stage to another) and out-of-order execution.
+- **Cache misses** — load instruction's data is not in L1. The
+  load stalls the dependent chain for ~100 ns (~300 cycles)
+  waiting on DRAM. See `fundamentals/cache-lines-and-locality.mdx`.
+- **Resource conflicts** — too many of one kind of operation
+  (e.g., loads) in flight at once, exceeding the execution units
+  available.
+
+The CPU's ability to find independent work and execute it during
+a stall is what hides these latencies. Code that has long
+dependency chains exposes them.
+
+## Spectre and Meltdown
+
+Both are **side-channel attacks** that exploit speculative
+execution. The CPU speculatively executes down a predicted-but-
+ultimately-wrong path. The speculative instructions get squashed
+— but they leave traces in the cache (loaded lines, evicted
+lines).
+
+An attacker who can measure cache timings (e.g., via a high-
+resolution timer or by racing reloads of known-cold lines) can
+deduce what data the speculation touched. With careful gadget
+construction, this can be made to leak memory the attacker isn't
+supposed to read — bypassing privilege checks (Meltdown) or
+process boundaries (Spectre variants).
+
+Mitigations (microcode updates, kernel page-table isolation /
+KPTI, `lfence` instructions inserted by compilers, retpolines for
+indirect branches) cost varying amounts of CPU performance,
+generally **a few to ~30%** depending on workload. Modern CPUs
+have hardware mitigations that have brought the cost down.
+
+The architectural lesson: **microarchitectural state is part of
+your security boundary**. The CPU is allowed to speculate freely,
+but it must not leak speculation results through observable side
+effects (cache, branch predictor state). Modern CPUs spend
+significant silicon on "speculation cleanup" to make sure of this.
+
+This is also why browsers gate `SharedArrayBuffer` behind COOP/
+COEP headers (the high-resolution clock + shared memory is the
+attacker's measurement primitive) and removed precise timers from
+untrusted contexts.
+
+## What this means for code
+
+Most code doesn't need branch-prediction tuning. You're far more
+likely to bottleneck on cache misses, locks, GC, or network. But
+in hot inner loops:
+
+- **Avoid data-dependent branches** when you can compute the
+  result branchlessly.
+- **Sort or partition before branching** to make the branch
+  predictable.
+- **Use `Math.min`, `Math.max`, conditional moves, bitmasks**
+  instead of `if` for selection in hot paths.
+- **Watch for polymorphic call sites** (one `switch` over many
+  cases, or a virtual call against many concrete classes) in hot
+  loops. JITs and CPUs both handle 1-2 hot targets well; many
+  targets are death.
+- **Profile mispredictions** with `perf stat -e
+  branch-misses,branch-instructions` on Linux. Misprediction rate
+  above ~2-3% in a hot loop is worth investigating.
+
+## The takeaway
+
+The CPU runs many instructions in flight, speculatively, in
+parallel. It predicts branches with very high accuracy on
+predictable code and pays ~10-20 cycles when it's wrong. Hot
+loops where the branch outcome correlates with input data are
+where you see this — sorted vs unsorted data on the same code
+can show a 2-3x perf difference. Spectre and Meltdown are the
+security consequences of speculation leaking through
+microarchitectural state.
+
+For day-to-day code, "the compiler and CPU handle it" is mostly
+true. For the hot 5% of your codebase, knowing where the
+predictor wins and loses can be the difference between a
+millisecond and ten.

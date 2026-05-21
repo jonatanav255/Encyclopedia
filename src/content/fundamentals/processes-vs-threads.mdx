@@ -1,0 +1,205 @@
+export const level = 'mid';
+
+# Processes vs threads
+
+Two ways to get concurrency from a single program. Both run code in
+parallel; they differ in **what they share** and **what it costs**.
+
+## The core distinction
+
+| | Process | Thread |
+| --- | --- | --- |
+| Address space | Private | Shared with siblings in the same process |
+| File descriptors | Own table | Shared |
+| Heap | Own | Shared |
+| Stack | Own | Own (one per thread) |
+| Identity (PID, UID, GID) | Own | Inherited from process |
+| Default communication | IPC (pipes, sockets, shm) | Just read/write shared memory (with locks) |
+| Creation cost | Higher (~ms) | Lower (~10s of microseconds) |
+| Crash blast radius | One process | The whole process |
+
+Same hardware concurrency mechanism underneath (multiple OS threads,
+scheduled by the kernel) — but processes get isolation from each
+other for free, while threads in the same process get cheap memory
+sharing for free.
+
+## Creation
+
+### `fork` (Unix process creation)
+
+```js
+pid_t pid = fork();
+if (pid == 0) {
+  // child
+} else if (pid > 0) {
+  // parent, pid is child's PID
+} else {
+  // error
+}
+```
+
+`fork()` duplicates the calling process. New PID, copy of memory
+(via copy-on-write — see `fundamentals/copy-on-write-and-fork.mdx`),
+copy of FD table, same code. After `fork`, the child usually calls
+`execve()` to replace itself with a new program — the "fork-exec"
+idiom.
+
+Cost: roughly **microseconds to a few ms** depending on RSS. Page
+tables get duplicated (just the structure, not the actual pages —
+those are CoW).
+
+### `pthread_create` (POSIX thread creation)
+
+```js
+pthread_t tid;
+pthread_create(&tid, NULL, worker_func, arg);
+```
+
+Allocates a stack (default ~8 MB virtual, only pages touched are
+populated), creates a new schedulable entity in the same address
+space. **No page-table duplication**. Just a fresh stack and an
+entry in the thread list.
+
+Cost: typically **10s of microseconds**. An order of magnitude
+cheaper than `fork`.
+
+On Linux, both processes and threads go through the same `clone()`
+syscall under the hood with different flags. A "process" is just a
+clone with everything separated; a "thread" is a clone sharing
+memory + FDs + signal handlers + everything else with the parent.
+
+## Communication
+
+### Threads (cheap and dangerous)
+
+Threads see each other's memory directly. Communicating is "set a
+shared variable, other thread reads it." Cheap (just a memory
+write). Dangerous (races, torn reads, visibility bugs without
+proper synchronization).
+
+You need:
+
+- **Mutexes / locks** for mutual exclusion of critical sections.
+- **Atomics** for lock-free single-word updates.
+- **Memory barriers / acquire-release** for visibility ordering.
+- **Condition variables** for "wait until something changes."
+
+This is the whole topic of `fundamentals/locks-deadlocks.mdx`,
+`fundamentals/memory-barriers.mdx`, and `fundamentals/false-sharing.mdx`.
+
+### Processes (expensive but isolated)
+
+Separate address spaces, so they can't read each other's memory.
+Options:
+
+- **Pipes** — anonymous (between parent/child) or named (FIFO).
+- **Unix domain sockets** — like TCP but local and fast.
+- **Shared memory** (`shm_open`, `mmap` with `MAP_SHARED`) — share
+  a region explicitly, then synchronize like threads inside that
+  region.
+- **Message queues** (POSIX, SysV) — kernel-managed mailboxes.
+- **Signals** — sparse, async, low-bandwidth.
+- **Network sockets** — works locally, also across machines.
+
+IPC always crosses the user/kernel boundary (more or less). Higher
+overhead per message than shared-memory threading, but the isolation
+is the point.
+
+## When threads win
+
+- **Shared mutable state is central** to your work (e.g., an
+  in-memory cache served by many request handlers, a database
+  buffer pool, a graphics engine's scene graph).
+- **CPU-bound work** that can be split into parallel chunks
+  accessing the same data structures.
+- **Spawn/teardown frequency is high** — threads are cheaper to
+  create.
+- **Memory budget is tight** — N threads share one copy of the heap,
+  N processes have N copies.
+
+## When processes win
+
+- **Isolation is required**. A bug in one shouldn't take down the
+  others. (Browsers run each tab in its own process for this.)
+- **Different lifecycles** — restart one piece without disturbing the
+  rest. Postgres workers, nginx workers, systemd units.
+- **Different privilege levels** (drop privileges in workers; keep
+  them in the master).
+- **Memory-safe by construction** — no shared memory, no shared-state
+  bugs.
+- **You're in a language that has a "global lock"** that prevents
+  multi-core threading.
+
+## The GIL and friends
+
+Python (CPython, the standard implementation) has a **Global
+Interpreter Lock**: only one thread can execute Python bytecode at a
+time, regardless of how many cores you have. C extensions can
+release the GIL during long ops, but pure-Python CPU work is
+single-core no matter how many threads you spawn.
+
+Workarounds:
+
+- Use `multiprocessing` (processes) for CPU parallelism.
+- Use C extensions / NumPy / Cython that release the GIL for the
+  heavy lifting.
+- Use a GIL-less Python (Pyston, the experimental free-threaded
+  CPython landing as opt-in `3.13+`).
+
+Ruby (MRI) has the same issue, called the GVL. Node has it
+**worse** for CPU work: the JS engine itself is single-threaded per
+isolate — you don't even get "many threads, one runs at a time,"
+you get "one thread." Worker threads in Node are separate isolates
+with their own heaps; communication is by message passing or
+`SharedArrayBuffer`. See `node/multithreaded-javascript.mdx`.
+
+## The JVM, Go, Rust — full threading
+
+JVM threads, Go goroutines, and Rust threads can all use multiple
+cores in parallel without a GIL-equivalent. Go's runtime layers M:N
+scheduling on top — many goroutines multiplexed across a smaller
+pool of OS threads. Lightweight, cheap (KBs of stack each), millions
+per process.
+
+Java's Project Loom (Java 21+) introduced **virtual threads** doing
+the same thing — cheap thread-per-task instead of thread-pool
+gymnastics. Rust async runtimes (Tokio) are conceptually similar.
+
+This is why Go and modern Java are popular for high-concurrency
+backends: the thread model lets you write straight-line blocking
+code and still scale.
+
+## Practical rules
+
+- **Default to processes** if isolation matters more than
+  performance. Web frameworks (nginx, Postgres, Unicorn) win
+  reliability this way.
+- **Default to threads** when you need shared in-memory state.
+  Databases (in-process), game engines, graphics, scientific
+  computing.
+- **Use a runtime's lightweight concurrency** (goroutines, virtual
+  threads, async tasks) when you have lots of mostly-I/O work and
+  want straight-line code.
+- **In Node specifically**, processes (`cluster`, container
+  replicas) are the way to use multiple cores for HTTP work;
+  worker threads are for CPU-bound off-loading.
+
+## Failure modes
+
+| Symptom | Likely cause |
+| --- | --- |
+| Crash takes down everything | Threads — one bad pointer kills the process |
+| OOM kills one piece, others survive | Processes — each in own memory cgroup |
+| "Race condition" / "intermittent" | Threads — shared state, missing lock |
+| "Why does this take so much RAM at scale" | Processes — each is a full heap copy |
+| "Spawn is slow / GC isn't reclaiming children" | Processes — fork cost + zombie cleanup |
+| "Two parts deadlock" | Threads — lock-ordering bug |
+
+## The takeaway
+
+Threads share everything by default and cost less; processes share
+nothing by default and cost more. Pick based on **what you need
+isolated**. Most production systems use both: processes for
+isolation between major components or workers, threads within each
+process for parallelism. Knowing where the cost and the safety
+boundary live is what lets you make that choice deliberately.

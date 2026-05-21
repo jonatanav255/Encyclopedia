@@ -1,0 +1,162 @@
+export const level = 'mid';
+
+# Virtual memory
+
+Every process thinks it has the whole machine to itself. A 64-bit
+process sees a flat 2^48-byte address space (256 TB on x86-64, more
+on newer chips). It can ask for addresses anywhere in that range.
+None of those addresses are real RAM. They're **virtual addresses**,
+translated to physical ones on every access by the CPU's memory
+management unit (MMU).
+
+This is the abstraction that makes modern OSes work: process
+isolation, mmap'd files, copy-on-write fork, swap, shared libraries,
+and ASLR all fall out of it.
+
+## The translation
+
+The kernel maintains a **page table** per process: a tree-shaped
+data structure mapping virtual page numbers to physical frame
+numbers, page by page.
+
+A "page" is the unit of mapping. On x86-64 Linux, almost always
+**4 KB**. Huge pages (2 MB or 1 GB) exist for big workloads.
+
+On every memory access, the MMU:
+
+1. Splits the virtual address into "page number" + "offset within page."
+2. Walks the page table to find the physical frame for that page
+   number.
+3. Combines with the offset to get the physical address.
+
+The page table walk is slow (multiple memory accesses), so the CPU
+caches recent translations in the **TLB** (translation lookaside
+buffer) — typically a few hundred entries. A TLB hit is essentially
+free; a miss costs tens of cycles for the walk.
+
+## Page faults
+
+If a virtual address is mapped but the page **isn't currently in
+RAM** (swapped to disk, or never read in yet from an mmap'd file),
+the CPU traps. The kernel's page fault handler:
+
+1. Finds where the page actually lives (disk, swap, etc.).
+2. Reads it into a physical frame.
+3. Updates the page table.
+4. Resumes your instruction.
+
+Your code never knows — it just took longer.
+
+Types:
+
+- **Minor fault**: page is in RAM but not yet mapped into this
+  process (e.g., first access to a freshly-`mmap`ed region). Cheap
+  (microseconds).
+- **Major fault**: page must be read from disk/swap. Expensive
+  (milliseconds on disk, hundreds of microseconds on SSD).
+- **Invalid fault** (segfault): address isn't mapped to anything.
+  Kernel sends `SIGSEGV`, process usually dies.
+
+```bash
+$ ps -o pid,minflt,majflt,cmd -p $(pidof node)
+  PID    MINFLT  MAJFLT  CMD
+ 1234   1248301      12  node server.js
+```
+
+Major faults should be near zero on a healthy system. A growing
+`MAJFLT` means swapping — your working set doesn't fit in RAM.
+
+## Why `top` shows a huge VIRT
+
+Linux `top`/`ps` report three sizes:
+
+- **VIRT** — total virtual address space the process has reserved.
+  Includes everything mapped, even untouched pages and shared
+  libraries.
+- **RES (RSS)** — physical RAM actually in use by this process right
+  now.
+- **SHR** — portion of RES that's shared with other processes
+  (libc, mmap'd files, copy-on-write parent pages).
+
+A Node process with `VIRT=8.5G` and `RES=120M` is normal. The 8.5G
+is reserved virtual address ranges — V8's heap can grow into them,
+worker threads pre-mapped stacks, mmap'd JIT code regions. The 120M
+is what's actually backed by physical pages.
+
+`VIRT` is not "how much memory my process is using." `RSS` is closer,
+but it counts shared pages once per process — sum the `RSS` of all
+your workers and you'll double-count the shared libraries.
+
+For accurate accounting on Linux, look at `/proc/PID/smaps` or use
+`pmap -x PID`. The `Pss` (proportional set size) attribution divides
+shared pages by sharer count.
+
+## Memory mapping (`mmap`)
+
+`mmap` asks the kernel to map a region of virtual address space to
+either:
+
+- A **file** (file-backed): reads/writes go through the page cache.
+  See `fundamentals/mmap-and-page-cache.mdx`.
+- **Nothing** (anonymous): a fresh zero-filled region, used for
+  malloc heaps and large allocations.
+
+The crucial property: **mapping doesn't read anything from disk
+immediately**. The pages are marked "demand-paged" — the first
+access triggers a minor fault and lazy population. This is why
+`mmap`ing a 100 GB file takes microseconds: nothing has actually
+happened yet.
+
+`malloc` for large allocations (typically >128 KB in glibc) calls
+`mmap` under the hood with `MAP_ANONYMOUS`. Tiny allocations come
+from a heap arena that was itself mmap'd.
+
+## OOM kill
+
+When physical RAM runs out and the kernel can't free more (page
+cache evicted, swap exhausted), it invokes the **OOM killer**: a
+heuristic that picks a victim process and sends `SIGKILL`.
+
+The score is roughly: bigger memory footprint, lower nice value,
+lower OOM-adjust score = more likely victim. PID 1 and processes with
+`oom_score_adj=-1000` are immune. Database daemons usually set their
+own score to "don't kill me."
+
+In containers with a memory cgroup limit (`docker run
+--memory=512m`), exceeding the limit triggers an in-cgroup OOM kill
+*before* the host runs out. You'll see your process die with exit
+code 137 (= 128 + SIGKILL=9). The kernel logged the event:
+
+```bash
+$ dmesg | grep -i 'killed process'
+[12345.678] Out of memory: Killed process 1234 (node) total-vm:...
+```
+
+If you see "Killed" with no other warning, check `dmesg` or the
+container's events. Increase the limit or fix the leak — don't just
+restart and hope.
+
+## Why this matters operationally
+
+- **A process can map far more virtual memory than physical RAM
+  exists.** Don't panic about `VIRT`. Watch `RSS`.
+- **A growing RSS** with stable workload = leak. RSS that plateaus
+  near your container limit = you're going to be OOM-killed soon.
+- **Sudden latency spikes with major faults** = swapping. Disable
+  swap for latency-sensitive services or set `vm.swappiness=0`.
+- **OOM kill leaves no graceful-shutdown trail.** Connections drop,
+  in-flight requests die. Cap memory limits with headroom; don't
+  let `OOMKilled` be your monitoring signal.
+
+## The mental model
+
+Each process gets a private fiction of a flat, huge address space.
+The MMU and page tables turn that fiction into physical reality on
+every memory access. Pages can be unmapped, swapped, shared, or
+copy-on-write — all transparent to the running code. When the
+fiction can no longer be backed (out of physical RAM, hit the
+cgroup ceiling), the OOM killer ends the illusion abruptly.
+
+Knowing virtual vs physical, `RSS` vs `VIRT`, and what a page fault
+costs is the difference between guessing at OOM kills and actually
+debugging them.

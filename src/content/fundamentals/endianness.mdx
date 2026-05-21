@@ -1,0 +1,201 @@
+export const level = 'mid';
+
+# Endianness
+
+When a multi-byte integer (32-bit, 64-bit, whatever) is stored in
+memory or transmitted over a wire, the bytes have to go in **some**
+order. Endianness is the choice of which order.
+
+- **Big-endian (BE)**: most significant byte first. The "human" way
+  — same order you'd write the number on paper.
+- **Little-endian (LE)**: least significant byte first.
+
+The integer `0x12345678` in memory:
+
+```
+BE:  12 34 56 78
+LE:  78 56 34 12
+```
+
+Both store the same number. Read it back in the same order you wrote
+it and you'll get the right answer. Read it back in the **opposite**
+order and you'll get a wrong-but-valid number — and that's the
+entire bug class endianness produces.
+
+## Who uses what
+
+| Platform | Endianness |
+| --- | --- |
+| x86 / x86-64 (Intel, AMD) | Little-endian |
+| ARM (most configurations, including Apple Silicon, mobile, AWS Graviton) | Little-endian |
+| RISC-V (default) | Little-endian |
+| Network protocols (TCP/IP, UDP, etc.) | Big-endian ("network byte order") |
+| Java (JVM, internal) | Big-endian |
+| Most file formats (PNG, ZIP, ...) | Big-endian |
+| BMP, WAV, AVI | Little-endian |
+| Old PowerPC, SPARC, mainframes | Big-endian (some bi-endian) |
+
+So: your CPU is almost certainly little-endian. The network is
+big-endian. Java disagrees with the C world. PNG disagrees with BMP.
+**You will write a translation layer.**
+
+## Network byte order: `htons`, `htonl`, `ntohs`, `ntohl`
+
+POSIX defines these for the network direction:
+
+- `htons` — host-to-network short (16-bit)
+- `htonl` — host-to-network long (32-bit)
+- `ntohs` — network-to-host short
+- `ntohl` — network-to-host long
+
+On big-endian hosts they're no-ops. On little-endian hosts they
+swap bytes. Calling them is unconditional in C network code — it
+makes the code portable and is free if you're already on BE.
+
+When you write a TCP server in C, you build the listen address with
+`htons(port)`. Forget it and your server binds to a port with the
+bytes swapped (`port 80` becomes `port 20480`). The kernel doesn't
+care which is "right" — it just uses what you gave it.
+
+## In JavaScript: `DataView`
+
+JS's `DataView` gives you explicit control:
+
+```js
+const buf = new ArrayBuffer(4);
+const dv = new DataView(buf);
+
+dv.setUint32(0, 0x12345678, false);  // big-endian (default!)
+// bytes: 12 34 56 78
+
+dv.setUint32(0, 0x12345678, true);   // little-endian
+// bytes: 78 56 34 12
+```
+
+The third arg is `littleEndian`. **It defaults to `false`** (big-
+endian), the opposite of what your CPU does. This is intentional —
+`DataView` is meant for parsing wire formats and files, which are
+predominantly big-endian.
+
+Typed arrays (`Uint32Array`, `Float64Array`) use **native
+endianness** — almost always little-endian. Mixing them with
+network data without translation is a classic bug:
+
+```js
+const buf = new ArrayBuffer(4);
+const u32 = new Uint32Array(buf);
+const u8 = new Uint8Array(buf);
+
+u32[0] = 0x12345678;
+console.log([...u8].map(b => b.toString(16)));   // ['78', '56', '34', '12']
+//                                                  little-endian on x86/ARM!
+```
+
+If you're writing a JS server that speaks a binary protocol,
+**always use `DataView`**. Typed arrays for in-memory math; DataView
+for I/O.
+
+## In Node `Buffer`
+
+`Buffer` has explicit BE/LE methods, in pairs:
+
+```js
+const b = Buffer.alloc(4);
+b.writeUInt32BE(0x12345678, 0);   // 12 34 56 78
+b.writeUInt32LE(0x12345678, 0);   // 78 56 34 12
+
+b.readUInt32BE(0);                 // 0x12345678
+b.readUInt16BE(0);                 // 0x1234
+b.readBigUInt64BE(0);              // 64-bit
+```
+
+No "host" variant — you pick BE or LE explicitly every time. Better
+than the C `htonl` model because you can't accidentally forget.
+
+## Detecting endianness
+
+If you really need to know:
+
+```js
+const buf = new ArrayBuffer(2);
+new Uint16Array(buf)[0] = 0x0102;
+const isLE = new Uint8Array(buf)[0] === 0x02;
+console.log(isLE ? 'little-endian' : 'big-endian');
+```
+
+Write a known value through one view, read it byte-by-byte through
+another. The first byte tells you which end is least significant.
+
+You almost never need this in app code. `DataView` and `Buffer.*BE`
+APIs hide it.
+
+## Why x86 picked little-endian
+
+A few reasons commonly cited:
+
+- **Easy widening**: the address of an `int32` is the same as the
+  address of its low-byte `int8`. To narrow, just read fewer bytes
+  from the same address. Big-endian needs you to add an offset.
+- **Easier carry-on-add in slow hardware**: addition starts from the
+  least significant byte, which is at the lowest address.
+- **History**: DEC PDP-11 and Intel 8080 chose LE; everything Intel
+  shipped after stayed compatible.
+
+Architecturally there's no winner. The cost is purely the conversion
+when you cross domains.
+
+## Mixed-endian "middle-endian" formats
+
+A few formats are neither pure BE nor LE — they store words in one
+order, bytes within words in another. PDP-11 was famous for this.
+Some Wi-Fi and ARM-CPU configs have done it. You won't see this in
+modern day-to-day work; mention it only because the term comes up
+in protocol specs.
+
+## Why Java is big-endian
+
+The JVM spec mandates big-endian for `DataInputStream` and
+`DataOutputStream`. That's the network byte order, and Java was
+designed as a network-first language. Useful for protocol code —
+no manual conversion. Annoying for sharing binary data with C
+processes on the same x86 machine.
+
+## Floats
+
+Floats have endianness too. IEEE-754 binary64 is an 8-byte value;
+when stored or transmitted, the bytes go in some order. The same
+host endianness applies. `DataView.setFloat64(offset, value,
+littleEndian)` works the same way as for integers.
+
+```js
+const dv = new DataView(new ArrayBuffer(8));
+dv.setFloat64(0, 1.0, false);  // big-endian IEEE-754 1.0
+// bytes: 3f f0 00 00 00 00 00 00
+```
+
+## Practical rules
+
+- **In-memory math**: use typed arrays, don't think about
+  endianness. The CPU handles it.
+- **I/O (file, network, IPC across architectures)**: use
+  `DataView` (JS) or `Buffer.read*BE`/`Buffer.write*BE` (Node) and
+  pick an order explicitly.
+- **When parsing a third-party binary format**: look up the spec.
+  Don't assume.
+- **Use BOMs for text formats** (`FF FE` or `FE FF`) — they self-
+  describe the endianness of UTF-16/32. UTF-8 has no endianness, one
+  more reason it won.
+- **Test against fixtures**, not just round-tripping your own code.
+  A swap-on-both-sides bug round-trips cleanly and corrupts data
+  silently when interoperating.
+
+## The takeaway
+
+Endianness is purely a serialization concern. CPUs don't care among
+themselves — they're consistent with what they wrote. The bugs
+appear at the boundary: your LE machine reading a BE network
+packet, your Node process reading a Java-written file, your C array
+mmap'd into a Python process. Pick the order explicitly at every
+boundary. The cost of a byte swap is one instruction; the cost of
+"works on my machine" being silently wrong on customer hardware
+is much more.

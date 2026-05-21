@@ -1,0 +1,203 @@
+export const level = 'mid';
+
+# Stack vs heap
+
+Every thread has two memory regions for its data: a **stack** and a
+**heap**. They're distinguished by **lifetime semantics**, not by
+"what kind of data lives there." Understanding the difference is the
+prerequisite for understanding stack overflows, GC pauses, recursion
+limits, and most "why is this so slow" performance bugs.
+
+## The stack
+
+The call stack is a contiguous chunk of memory the thread uses for
+function calls. Each call pushes a **stack frame** containing:
+
+- Return address (where to jump back to when this function ends).
+- Saved register values from the caller.
+- Local variables and function arguments.
+- (Maybe) spill space for temporaries the compiler couldn't fit in
+  registers.
+
+The stack grows downward (in x86 / ARM / most architectures) — each
+call subtracts from the stack pointer (SP). Each return adds back to
+it. No bookkeeping, no free list — just bump the pointer.
+
+This is why the stack is **fast**:
+
+- Allocation = "subtract from SP." One instruction.
+- Deallocation = "add to SP." One instruction. Implicitly, by `ret`.
+- Allocation pattern is perfectly LIFO. No fragmentation.
+- The hot frames are always in L1 cache (you just used them).
+
+And why it's **small**:
+
+- Default per-thread stack is ~8 MB on Linux, ~1 MB on Windows,
+  ~512 KB on macOS thread.
+- Node's main thread: 984 KB by default. Worker threads: similar.
+- Configured at thread creation. Can be raised (`ulimit -s`,
+  `pthread_attr_setstacksize`, Node's `--stack-size`), but you're
+  trading off how many threads you can spawn.
+
+## The heap
+
+The heap is a managed region for data whose **lifetime exceeds the
+function that created it**. Anything you return a reference to,
+anything you put in a long-lived collection, anything the language
+boxes — heap.
+
+Heap allocation involves:
+
+- An **allocator** (malloc/jemalloc/V8's allocator/JVM's GC) finding a
+  free block big enough.
+- Bookkeeping (size headers, free-list entries, garbage collection
+  metadata).
+- Possibly a system call (`brk` or `mmap`) if the allocator is out
+  of pages.
+
+A heap allocation is typically **100s of cycles**. A stack
+allocation is **1**. That ratio matters at scale.
+
+Heap memory is freed either explicitly (`free` in C, `delete` in
+C++, `drop` in Rust) or by a garbage collector (JS, Java, Go,
+Python).
+
+## In a managed language
+
+JS, Java, Python, Go — the user never touches `malloc`. Every object
+lives on the heap. The "stack" is mostly used for primitive locals
+and stack frames; everything that's not a primitive number/bool is a
+reference into the heap.
+
+```js
+function f() {
+  const x = 42;             // small int — fits in a register / stack slot
+  const arr = [1, 2, 3];    // arr is a stack-local reference; the
+                            // array object itself is on the heap
+  return arr;               // reference escapes -> array survives
+}
+```
+
+The compiler/JIT can do **escape analysis** to keep an object on the
+stack if it never leaves the function (V8 does this for some cases,
+JVM/HotSpot is more aggressive). But the default mental model is:
+"reference types are on the heap."
+
+## Stack frames in detail
+
+A simplified frame layout:
+
+```
+high addresses
++-----------------+
+| caller's frame  |
++-----------------+  <- saved frame pointer (FP) or RBP
+| return address  |
++-----------------+
+| arg N           |
+| ...             |
+| arg 1           |
+| local var 1     |
+| local var 2     |
+| ...             |
++-----------------+  <- stack pointer (SP / RSP) (top of stack)
+low addresses
+```
+
+`call` pushes the return address and jumps. `ret` pops it and jumps
+back. The frame pointer is a stable reference for the debugger to
+walk the stack — `gdb backtrace`, V8's stack traces, all use this.
+
+## "Maximum call stack size exceeded"
+
+```js
+function recurse() { return recurse(); }
+recurse();           // RangeError: Maximum call stack size exceeded
+```
+
+Each call adds a frame. Run out of stack space, throw. In JS this
+becomes a catchable `RangeError`. In C/C++ it's an unrecoverable
+segfault (the stack page after the limit isn't mapped — you hit the
+**guard page** and the kernel sends `SIGSEGV`).
+
+Same root cause:
+
+- Unbounded recursion (missing base case).
+- Mutual recursion you didn't realize was mutual.
+- Recursion on data deeper than expected (a deeply nested JSON
+  blob, a long linked list).
+
+The fix is usually to **convert to iteration** (use a `while` loop
+and an explicit array-as-stack) or to **trampoline**:
+
+```js
+// Stack-overflow risk:
+function sum(arr, i = 0) {
+  if (i === arr.length) return 0;
+  return arr[i] + sum(arr, i + 1);   // not tail-recursive in V8
+}
+
+// Iterative:
+function sum(arr) {
+  let total = 0;
+  for (const x of arr) total += x;
+  return total;
+}
+```
+
+V8 (and most JS engines) don't do guaranteed tail-call optimization,
+despite the spec allowing it. A "recursive" function with no return
+back up the chain will still grow the stack.
+
+## Where managed-runtime objects sit
+
+In V8 (Node, Chrome), the JS heap is divided into:
+
+- **New (young) space** — small (a few MB), for fresh allocations.
+  Collected with a fast copying collector (scavenger). Most
+  allocations die here.
+- **Old (tenured) space** — for objects that survived a few young
+  GCs. Collected by mark-sweep / mark-compact, which is slower.
+- **Large object space** — for big allocations (>~512 KB), each in
+  its own page.
+- **Code space** — JIT-compiled machine code.
+
+A short-lived `{foo: 1}` typically lives entirely in young space and
+gets reclaimed in the next minor GC (~1 ms pause). A long-lived
+cache entry tenures into old space; collecting it costs a full major
+GC (~tens of ms).
+
+See `javascript/memory-and-gc.mdx` for the JS-specific GC tuning
+story.
+
+## Concurrency note
+
+**Each thread has its own stack.** All threads share the heap.
+That's why shared mutable state needs synchronization (locks,
+atomics) and why thread-local state can be stored cheaply on the
+stack with no contention.
+
+Goroutines (Go) and Java's Project Loom virtual threads have
+**resizable / segmented stacks** — they start small (KBs) and grow
+on demand, which is how you can have a million of them per process.
+Native OS threads can't do this cheaply (fixed-size stack at
+creation), which is why "spawn a thread per request" doesn't scale.
+
+## The practical rules
+
+- **Big locals don't belong on the stack.** A `char buf[1024 * 1024]`
+  local in C eats 1 MB of your 8 MB stack. Allocate on the heap.
+- **Avoid deep recursion on user input.** Parsers, tree walkers,
+  serializers — they all need bounded recursion or iteration.
+- **In managed languages, allocation pressure is GC pressure.**
+  Reuse objects in hot paths (pool, mutate in place, use typed
+  arrays) rather than `new`-ing per iteration.
+- **Stack overflow != heap exhaustion.** `Maximum call stack size`
+  is the stack. `Out of memory` is the heap. Different fix.
+
+## The takeaway
+
+Stack: small, fast, LIFO, per-thread. For function frames and short
+locals. Heap: large, slower, freeform, shared. For everything else.
+The cost asymmetry is so large that JITs spend significant effort
+proving things can stay on the stack — and you should too.

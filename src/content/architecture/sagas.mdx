@@ -1,0 +1,369 @@
+export const level = 'senior';
+
+# Sagas
+
+The de-facto pattern for "transactions" that span multiple services.
+A saga is a sequence of local transactions, each of which can be
+**compensated** if a later step fails. There's no global rollback —
+you write the inverse operations yourself and pray you got them
+right.
+
+Sagas exist because the alternative (distributed transactions with
+two-phase commit across services) doesn't work in practice. 2PC
+holds locks across networks, blocks on coordinator failure, and
+couples services to each other's availability. Sagas trade
+all-or-nothing atomicity for "all-or-undone-best-effort" with much
+better operational properties.
+
+<Callout type="info">
+**messaging-patterns.mdx** introduces choreography vs orchestration
+in two sentences. This page goes deep on the trade-offs, the
+non-obvious compensation problems, and where Temporal/Step Functions
+actually fit.
+</Callout>
+
+## The shape
+
+```
+T1 (charge card)
+  → T2 (reserve inventory)
+    → T3 (create shipment)
+
+If T3 fails:
+  → C2 (release inventory)
+    → C1 (refund card)
+```
+
+Each `Ti` is a local ACID transaction in one service. Each `Ci` is
+a separate local transaction that semantically undoes `Ti`. The
+saga succeeds if all `Ti` succeed, or all `Ci` for executed steps
+run on failure.
+
+Crucially: between `T2` and the failure of `T3`, other readers see
+an in-progress state ("inventory reserved, no shipment yet"). Sagas
+are **not** isolated. They are atomic only in the sense that the
+end state is either "fully forward" or "fully compensated."
+
+## Two flavors
+
+### Choreography
+
+No central coordinator. Each service listens for events, executes
+its local step, and emits the next event.
+
+```
+OrderService publishes "OrderPlaced"
+  PaymentService consumes, charges, publishes "PaymentSucceeded"
+    InventoryService consumes, reserves, publishes "InventoryReserved"
+      ShippingService consumes, ships, publishes "OrderShipped"
+```
+
+On failure, the failing service publishes a failure event, and
+upstream services listen for it and run their compensation:
+
+```
+ShippingService publishes "ShippingFailed"
+  InventoryService consumes, releases, publishes "InventoryReleased"
+    PaymentService consumes, refunds, publishes "PaymentRefunded"
+```
+
+**Pros**: no single point of coordination. Services don't know about
+each other directly — they just know events. Easy to add a new
+participant (subscribe to the relevant events).
+
+**Cons**: the workflow is **not written down anywhere**. To
+understand what happens after "OrderPlaced," you grep across N
+codebases for event subscribers. The DAG only exists in your head.
+Compensation paths multiply combinatorially as you add steps. New
+hires take weeks to learn the flow.
+
+Works well for 2–3 steps. Falls apart at 5+.
+
+### Orchestration
+
+A central **orchestrator** drives the flow. It calls each service
+(or publishes commands and listens for replies) and decides what to
+do based on the response.
+
+```
+Orchestrator.run("PlaceOrder", { userId, items }):
+  paymentId = await Payment.charge(userId, amount)
+  try {
+    reservation = await Inventory.reserve(items)
+    try {
+      shipmentId = await Shipping.create(reservation, address)
+      return { ok: true, shipmentId }
+    } catch {
+      await Inventory.release(reservation)
+      throw
+    }
+  } catch {
+    await Payment.refund(paymentId)
+    throw
+  }
+```
+
+**Pros**: the workflow is **explicit code**. You can read it,
+diagram it, test it. Adding a step is one file, not three. Retries,
+timeouts, and compensation are all in one place. The orchestrator
+has a persistent state machine — survives restarts mid-flow.
+
+**Cons**: the orchestrator is a coupling point. It knows the names
+and APIs of every participant. It's also a runtime dependency —
+when it's down, no new sagas start.
+
+For anything more than trivial, **prefer orchestration**. The
+"loose coupling" argument for choreography rarely pays off — your
+services were never loosely coupled in business terms, you just
+hid the coupling in event subscriptions.
+
+## Designing compensating actions
+
+This is the hard part. The naive view is "compensation = the
+inverse of the forward action." Reality is messier.
+
+### Compensable, idempotent, retriable
+
+A good compensation is:
+
+- **Semantically inverse** — restores the business invariant. (Not
+  necessarily bit-for-bit inverse.)
+- **Idempotent** — running it twice is the same as once. Compensation
+  may itself be retried.
+- **Always succeeds eventually** — if compensation can fail
+  permanently, your saga can get stuck "half-rolled-back."
+
+```js
+// GOOD compensation
+async function refund(paymentId) {
+  // Idempotent: if already refunded, return existing refund.
+  const existing = await db.refunds.findOne({ paymentId });
+  if (existing) return existing;
+  return await stripe.refunds.create({ payment_intent: paymentId });
+}
+```
+
+### What's NOT compensable
+
+Some actions in the real world have no inverse. The saga design has
+to account for this — either by putting non-compensable steps **last**,
+or by accepting that compensation is best-effort.
+
+Classic non-compensable actions:
+
+- **Sending an email or SMS.** You can send a follow-up "ignore
+  the previous email" but the original is in the user's inbox
+  forever.
+- **Charging a card on a network that doesn't support refunds**, or
+  pushing a payment via ACH that's already cleared.
+- **Calling an external API with side effects** you don't control
+  (third-party shipment booking, real-world physical actions).
+- **Releasing a unique identifier** that's already been shown to a
+  user (an order number, a reservation code).
+- **Anything observed by a human.** Once a user has seen the
+  confirmation page, "undoing" requires a separate
+  communication, not a silent rollback.
+
+The rule: **put non-compensable steps last**. Order: reserve
+inventory → charge card → send confirmation email. Not: send email
+→ charge card → reserve inventory. If inventory fails after the
+email, you've lied to the user.
+
+### "Apology semantics"
+
+For unavoidable cases (you charged the card but couldn't ship), the
+"compensation" is an apology workflow — credit the account, email a
+sorry note, log to a CS queue. This is real, legitimate compensation
+design. It's just not silent.
+
+## Saga state, persistence, and crashes
+
+A saga in flight is **state**. Steps have executed; compensations
+are queued; timers are armed. If the orchestrator process dies, that
+state has to survive.
+
+You have three options:
+
+1. **Persist the saga state to a DB yourself** — a `saga_instances`
+   table with `current_step`, `payload`, `compensations_to_run`.
+   Then a worker resumes incomplete sagas on startup. You'll
+   reinvent half of a workflow engine and get the recovery edge
+   cases wrong.
+2. **Use the outbox pattern** to make each "publish next command"
+   atomic with the step's local DB write. Combined with at-least-
+   once delivery and idempotent steps, this gives you durable
+   choreography without an orchestrator process. See
+   **replication-and-cdc.mdx** for the outbox shape.
+3. **Use a workflow engine** — Temporal, Cadence, AWS Step Functions,
+   Camunda Zeebe, Restate. They persist your function's execution
+   state automatically; you write what looks like plain async code.
+
+For anything non-trivial, option 3 wins.
+
+## Sagas vs the outbox pattern
+
+These are often confused. They solve different problems and compose.
+
+- **Outbox** ensures that "write to DB + publish event" is atomic.
+  It's a transactional messaging primitive. It does not coordinate
+  multiple services.
+- **Saga** coordinates a multi-step workflow across services with
+  compensation. It needs reliable messaging — often provided by
+  outbox.
+
+A choreographed saga is typically built on outbox: each service's
+step writes to its DB and inserts the next event into its outbox in
+the same transaction. The relay publishes. Failure paths are
+symmetric: write compensation outbox entry in the same transaction
+as the local rollback.
+
+An orchestrated saga can use outbox for "send command to next
+service" + "record what we did," or hand the durability problem to
+a workflow engine.
+
+## Where Temporal / Cadence / Step Functions fit
+
+Workflow engines change the deal. You write workflow code that
+**looks synchronous**:
+
+```js
+// Temporal TS SDK
+import * as wf from '@temporalio/workflow';
+import type * as activities from './activities';
+
+const { charge, refund, reserve, release, ship } =
+  wf.proxyActivities<typeof activities>({ startToCloseTimeout: '30s' });
+
+export async function placeOrder(input: OrderInput): Promise<OrderResult> {
+  const paymentId = await charge(input.userId, input.amount);
+  try {
+    const reservation = await reserve(input.items);
+    try {
+      const shipmentId = await ship(reservation, input.address);
+      return { ok: true, shipmentId };
+    } catch (err) {
+      await release(reservation);
+      throw err;
+    }
+  } catch (err) {
+    await refund(paymentId);
+    throw err;
+  }
+}
+```
+
+Under the hood, each `await` is durable. Temporal records every
+activity's input and result in its event history. If the worker
+crashes mid-saga, a new worker picks up, **replays** the workflow
+function deterministically against the recorded history, and resumes
+exactly where execution was — including in-flight timers and signals.
+
+You write the saga as ordinary code. You don't write a state machine.
+You don't write recovery logic. The engine handles retries, timeouts,
+versioning of workflow code, and the durability of the orchestrator
+itself.
+
+**Trade-offs**:
+
+- **Operational cost**: Temporal Cluster (or Temporal Cloud) is a
+  real dependency. Step Functions is managed but charges per state
+  transition.
+- **Determinism constraints**: workflow code can't use `Date.now()`,
+  `Math.random()`, or non-deterministic libraries directly — has to
+  go through the SDK's deterministic equivalents.
+- **Versioning**: changing workflow code while sagas are in flight
+  requires explicit versioning (`getVersion`) or careful patching.
+
+For 3+ step workflows with compensation, this is the right shape.
+For "do thing then do other thing," a plain orchestrator is fine.
+
+## Common pitfalls
+
+### Treating sagas as transactions
+
+They're not isolated. Other actors see intermediate states. If you
+need read-isolation across steps, sagas don't give it to you —
+either use a single DB transaction, or design for the intermediate
+states being visible (e.g., a `pending` order status).
+
+### Compensation that can fail permanently
+
+If `refund()` can hard-fail (the gateway is permanently down for
+that card), your saga is stuck. Design compensation to **always
+eventually succeed** — usually by enqueueing to a manual-intervention
+queue if the automated path fails N times.
+
+### Non-deterministic compensation
+
+```js
+// BAD: compensation depends on current state, not original action
+async function unreserveLatest(productId) {
+  const latest = await db.reservations.find({ productId }).sortBy('-createdAt').first();
+  await db.reservations.delete(latest.id);
+}
+
+// GOOD: compensation references the specific reservation
+async function release(reservationId) {
+  await db.reservations.updateOne({ id: reservationId }, { status: 'released' });
+}
+```
+
+The forward action returns an ID. The compensation takes that ID.
+Anything else races against concurrent sagas.
+
+### Sagas for things that should be one transaction
+
+If two steps live in the **same database**, that's a transaction,
+not a saga. Sagas exist because cross-service transactions don't
+work. Within a single service, prefer ACID.
+
+### Choreography at scale
+
+If your saga has 6+ steps and 4+ services, choreography becomes
+incomprehensible. Migrate to orchestration before it does. The
+"loose coupling" you thought you bought has been replaced by
+"completely opaque coupling distributed across the codebase."
+
+### Forgetting timeouts and idempotency keys
+
+Each step is a network call. It can hang. It can return success
+after you've already retried. Every step needs:
+
+- A timeout (orchestrator-side, not just network-level).
+- An idempotency key so the receiving service deduplicates retries.
+- A compensation path triggered on timeout (which is just another
+  failure).
+
+See **architecture/idempotency.mdx** for the receiving-side pattern.
+
+## The mental model
+
+A saga is **a sequence of local transactions plus a sequence of
+compensations**. Forward path or full reversal — never both, never
+partial. The hard part isn't the happy path; it's designing
+compensations that are idempotent, eventually-successful, and
+ordered so non-compensable steps come last.
+
+For 2026 backend services:
+
+- **Use sagas when** a workflow spans multiple services and you
+  need eventual atomicity.
+- **Use a single DB transaction when** the data lives in one
+  database. Don't invent a saga to feel modern.
+- **Prefer orchestration over choreography** beyond 2–3 steps. The
+  flow being explicit code is worth the central dependency.
+- **Reach for a workflow engine** (Temporal, Step Functions) when
+  you have non-trivial state, long-lived workflows, or human-in-
+  the-loop steps. The infra cost is real; the alternative is
+  reinventing it badly.
+- **Design compensations first**, not as an afterthought. If a step
+  has no real inverse, push it to the end or design an apology
+  workflow.
+- **Never assume a saga is atomic from outside.** Other readers see
+  intermediate states. Model them in your data.
+
+Sagas are the answer to "how do I do a transaction across
+microservices" only because the question is wrong. The right
+framing is "how do I design a workflow that's resilient to partial
+failure" — and for that, sagas, with compensation as a first-class
+concern, are the right tool.

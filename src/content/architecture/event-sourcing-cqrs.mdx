@@ -1,0 +1,381 @@
+export const level = 'senior';
+
+# Event sourcing and CQRS
+
+Event sourcing stores **what happened** instead of **what is**.
+Every change to state is an append-only event in a log. Current
+state is a fold over the log. CQRS (Command Query Responsibility
+Segregation) is the natural partner: the write model accepts
+commands and emits events, while one or more read models are
+**projections** built by replaying those events into shapes
+optimized for query.
+
+It's genuinely the right answer for a small set of domains — and
+cargo-culted into a much larger set where it costs 5x more to build
+and operate than a plain CRUD app. This page is mostly about being
+honest with yourself about which one you're in.
+
+<Callout type="info">
+**messaging-patterns.mdx** has a 6-line mention of event sourcing
+as one of several messaging shapes. This page is the deep dive on
+the data-modelling consequences — read both for context.
+</Callout>
+
+## The shape
+
+Instead of:
+
+```
+users table
+| id | name   | email           | status   |
+| 42 | Jonatan | j@example.com  | active   |
+```
+
+You store:
+
+```
+events table (append-only)
+| seq | aggregate_id | type           | payload                          | ts |
+| 1   | user-42      | UserRegistered | {name: "Jonatan", email: "..."}  | .. |
+| 2   | user-42      | EmailChanged   | {email: "new@example.com"}        | .. |
+| 3   | user-42      | UserActivated  | {}                                | .. |
+```
+
+Current state is `events.filter(e => e.aggregate_id === 'user-42').reduce(apply, {})`.
+
+```js
+function apply(state, event) {
+  switch (event.type) {
+    case 'UserRegistered':
+      return { id: event.aggregate_id, ...event.payload, status: 'pending' };
+    case 'EmailChanged':
+      return { ...state, email: event.payload.email };
+    case 'UserActivated':
+      return { ...state, status: 'active' };
+    default:
+      return state;
+  }
+}
+```
+
+The log is the source of truth. The current-state table, if it
+exists at all, is a cache.
+
+## What this buys you
+
+### A complete audit log, for free
+
+You don't *also* write to an audit table — the events **are** the
+audit. Every change has a timestamp, an actor, a reason. Compliance
+auditors love this. Domains where this matters: finance, healthcare,
+legal, insurance, government, anything regulated.
+
+### Time travel
+
+Re-running the fold up to time T gives you "what did the user look
+like on March 14th." Reproducing bug reports, building point-in-time
+reports, "show me account state as of the dispute date" — all
+trivial. With a normal CRUD app, you have history if and only if
+you remembered to add `created_at`/`updated_at`/audit tables, and
+even then you usually can't reconstruct the full row state.
+
+### Multiple read models from one log
+
+This is the CQRS half. The same event stream can build:
+
+- A normalized SQL projection for the dashboard.
+- A denormalized search index in Elasticsearch.
+- A pre-aggregated analytics table.
+- A graph projection in Neo4j.
+
+Each projection rebuilds by replaying the log. When you want a new
+view, you write a new projection and replay history into it — no
+backfill scripts, no "we don't have the data."
+
+### Natural fit for event-driven downstream
+
+External consumers can subscribe to the event stream directly.
+Internal services react to the same events you persisted. The
+boundary between "internal state change" and "outbound integration
+event" disappears (with some caveats — see the downsides).
+
+## The honest downsides
+
+This is where most adopters underestimate the cost.
+
+### Schema evolution is a permanent problem
+
+Your domain model changes. The events in your log don't. A
+`UserRegistered` event from 2022 may have fields, formats, or
+assumptions that don't match 2026's code. You need a strategy:
+
+- **Upcasters** — code that transforms old event shapes to new
+  before applying. Lives forever, runs on every replay.
+- **Weak schemas** — make all new fields optional, never remove
+  fields, never change semantics. Permanent additive-only discipline.
+- **Event versioning** — `UserRegisteredV2`, with a strategy for
+  in-place migration or parallel projections during transition.
+
+There is no version of this that's painless. Every new release
+asks "does this break replay?" and the answer changes with code,
+not with data.
+
+### Replay cost
+
+Rebuilding a projection means reading every event from the
+beginning. After 100M events, that's hours. Mitigations:
+
+- **Snapshots**: periodically materialize the folded state. Replay
+  starts from the latest snapshot. Snapshots themselves need
+  versioning when the apply function changes.
+- **Parallel replay**: shard by aggregate ID. Still bounded by I/O.
+- **Per-aggregate replay**: only replay events for a single entity
+  when you read it. Faster path, doesn't help bulk projections.
+
+Snapshots are essentially a complexity admission: pure event
+sourcing is too slow at scale; you cache.
+
+### GDPR / right-to-erasure
+
+Append-only logs and "delete all personal data on request" are in
+direct conflict. You can't just remove an event — that breaks the
+fold for everyone. Real strategies:
+
+- **Crypto-shredding**: encrypt PII at write time with a per-user
+  key. Delete the key on erasure request. Events remain, payloads
+  are now unrecoverable ciphertext. The most defensible approach.
+- **Tombstone events**: emit `UserErased`; downstream projections
+  null the PII fields. Original events still contain the PII.
+  Works for some interpretations of GDPR; auditors disagree.
+- **Hard deletes from the log**: violates "immutable log," requires
+  re-snapshotting every aggregate. Painful.
+
+If your data is subject to GDPR, CCPA, HIPAA, or similar — plan
+crypto-shredding **before** the first event lands in production.
+Retrofitting is brutal.
+
+### Read models lag
+
+Projections are eventually consistent with the write model. A
+command succeeds → the event is persisted → the projection updates
+**later**. The user issues a command and then reads the dashboard,
+the change isn't there yet.
+
+Mitigations are the same shapes as replication lag (see
+**replication-and-cdc.mdx**): read your own writes from the write
+model directly, or wait for the projection to catch up using a
+version/seq number. Both add complexity to clients.
+
+### The "exactly once" trap
+
+Events should be applied to each projection exactly once. In
+practice you get at-least-once delivery and need idempotent
+projection handlers — usually by tracking "last seq applied per
+projection." If you forget this, restarts double-apply events and
+your read models drift from the log.
+
+### Cognitive overhead
+
+Every engineer on the team needs to understand: events vs commands,
+aggregates and aggregate boundaries, projections, snapshots,
+upcasters, eventual consistency, versioning. The mental model isn't
+hard, but it's foreign. New hires take longer to be productive.
+
+### Operational footprint
+
+You're now running an event store (often Kafka or EventStoreDB) +
+a projection layer + a read store + possibly a snapshot store. A
+simple Postgres app does the same job with one piece of infra.
+
+## When event sourcing is right
+
+A short list. If your domain is on it, seriously consider event
+sourcing. If it's not, you're probably building complexity you
+won't recoup.
+
+- **Financial ledgers**. Double-entry accounting, transaction
+  history, dispute resolution. Events are the literal business
+  primitive. *This is the canonical case.*
+- **Audit-required workflows**. Healthcare records, legal case
+  management, regulatory filings. The audit log is the product.
+- **Collaborative editing**. CRDTs are conceptually event sourcing
+  with merge semantics. Figma, Google Docs.
+- **Trading systems**. Order book reconstruction, regulatory
+  replay.
+- **Complex multi-step business processes** where the **history**
+  is itself the entity (insurance claims, loan applications,
+  multi-month onboarding).
+
+For these, the costs are paid for by capabilities you couldn't get
+any other way.
+
+## When it's wrong
+
+Most CRUD apps. Specifically:
+
+- **Read-heavy lookups of current state** (user profile, product
+  catalog, settings pages). Plain DB is faster and simpler.
+- **Domains where history is "nice to have"** rather than load-
+  bearing. An `updated_at` + an audit table covers 95% of "we
+  might need to look back" with 10% of the complexity.
+- **Small teams**. The overhead lands on a few people; it kills
+  velocity.
+- **MVPs and pre-PMF products**. The data model will change weekly.
+  Event versioning churn at that stage is misery.
+- **CRUD admin interfaces** layered on top of event-sourced
+  domains. You will end up rebuilding CRUD against the read model
+  while complaining about the write side. Acknowledge that not
+  every aggregate needs to be event-sourced.
+
+<Callout type="warn">
+If your team is talking about "we're going event-sourced" as a
+foundational decision for a new product, push back. The right
+answer is almost always "some aggregates are event-sourced where
+the business demands it; the rest are CRUD." Mixed is fine. All-in
+on event sourcing for a generic SaaS is usually a 3-year regret.
+</Callout>
+
+## CQRS without event sourcing
+
+You can do CQRS — separate write and read models — without event
+sourcing the writes. The read model is rebuilt via CDC from the
+write database, not by replaying events.
+
+```
+clients → command API → Postgres (write model)
+                            ↓ (CDC via Debezium / logical replication)
+                        Elasticsearch  (read model: search)
+                        ClickHouse     (read model: analytics)
+                        Postgres view  (read model: dashboard)
+```
+
+This gets you the read-model multiplicity benefit (different stores
+for different access patterns) without committing to the event log
+as source of truth. Schema evolution stays normal. GDPR stays
+normal. Most of the operational benefits, much less of the cost.
+
+For most teams, **this is the CQRS you actually want**. Event-
+sourced writes are an additional, separate decision that should
+clear a higher bar. See **replication-and-cdc.mdx** for the CDC
+plumbing.
+
+## Aggregates — the unit of consistency
+
+In event-sourced systems, an **aggregate** is the boundary inside
+which you enforce invariants. A single command targets a single
+aggregate. Optimistic concurrency control is per-aggregate:
+
+```js
+// Write a new event with an expected version
+async function handle(command) {
+  const events = await store.load(command.aggregateId);
+  const state = events.reduce(apply, initialState);
+  const newEvents = decide(state, command);   // pure function, may throw
+  await store.append(command.aggregateId, newEvents, events.length);
+  // ^ append fails if another writer beat us — retry the command
+}
+```
+
+Cross-aggregate consistency requires a saga (see **sagas.mdx**).
+Choosing aggregate boundaries is the hardest modelling decision in
+event-sourced systems — too coarse and you serialize unrelated
+writes, too fine and every operation becomes a multi-aggregate
+saga.
+
+## The tooling landscape
+
+- **EventStoreDB** — purpose-built event store. Subscriptions,
+  projections engine, persistent subscribers. The reference
+  implementation.
+- **Kafka** — log per topic, infinite retention possible.
+  Pragmatic event store when you already run Kafka. Less aggregate-
+  friendly than EventStoreDB.
+- **Postgres + an `events` table** — fine for many use cases.
+  `(aggregate_id, version)` unique index gives you optimistic
+  concurrency. Logical replication to projections. Surprisingly
+  capable, much less infra.
+- **AxonIQ**, **Marten** (Postgres-based), **Eventuous** (.NET) —
+  framework-level support.
+- **Temporal** — sometimes pitched as event sourcing for workflows.
+  Adjacent but different problem (durable execution, not aggregate
+  state).
+
+For new event-sourced subsystems in 2026, the honest defaults are:
+EventStoreDB if you want the dedicated tooling, Postgres + an
+events table if you want to keep your ops surface small.
+
+## Common pitfalls
+
+### Treating events as commands
+
+Events describe **what happened, in the past**: `UserRegistered`,
+`PaymentCaptured`, `OrderShipped`. Past tense. Commands describe
+**what we want to happen**: `RegisterUser`, `CapturePayment`. If
+your events are named like commands (`RegisterUser` as an event),
+you'll confuse intent with fact and your projections will get
+weird.
+
+### Putting business logic in projections
+
+Projections should be **pure folds**. Decisions belong in the
+write model. A projection that calls APIs, sends emails, or
+emits side effects can't be safely rebuilt — replay will re-send
+emails.
+
+### Forgetting that events are an external contract
+
+The moment downstream services subscribe to your event stream, your
+event schemas are a **public API**. You can't refactor them freely.
+Treat them with the same versioning discipline as REST/gRPC.
+
+### Using "exactly-once" delivery as an excuse to skip idempotency
+
+Projection handlers must be idempotent regardless of broker
+guarantees. Track last applied seq per projection; skip events
+you've already applied.
+
+### Not budgeting for replay
+
+"We'll just replay" stops scaling at ~10M events without snapshots
+and parallelism. Plan snapshot and replay performance early; it's
+much harder to retrofit.
+
+### CRUD writes against an event-sourced model
+
+A "quick admin tool" that writes directly to the read store
+bypasses the event log and silently corrupts the system. Every
+write must go through the command path. Enforce at the DB layer
+(read store is read-only to the app, write store is write-only).
+
+## The mental model
+
+Event sourcing makes the **history** of state the source of truth.
+CQRS separates the model that accepts changes from the models that
+serve queries. They are independent decisions:
+
+- **CQRS without event sourcing** — split read and write models,
+  build projections from CDC. Cheap, often correct.
+- **Event sourcing without CQRS** — possible but odd; usually you
+  want projections to query effectively.
+- **Both together** — the full pattern. Powerful, expensive, right
+  for ~10% of systems.
+
+For 2026 backend services:
+
+- **Default to CRUD on Postgres.** Add an audit table if you need
+  history. You probably don't need event sourcing.
+- **Default to CQRS via CDC** when you have genuinely different
+  query shapes (search, analytics, geo). Plumb with Debezium /
+  logical replication, not by hand.
+- **Reach for event sourcing** when the domain is genuinely
+  event-shaped — finance, audit, collaboration, multi-step
+  workflows where history *is* the entity.
+- **Plan GDPR before the first event lands.** Crypto-shredding by
+  default is much easier than retrofitting.
+- **Snapshot from day one.** Pretend you don't need it now,
+  pretend you'll always need it later.
+
+Event sourcing is one of the few patterns where the textbooks are
+right about the benefits and quiet about the costs. Be honest about
+both, and most of your aggregates will stay plain CRUD — which is
+exactly where they belong.

@@ -1,0 +1,228 @@
+export const level = 'mid';
+
+# Signals
+
+Signals are Unix's lightweight async notification mechanism. The
+kernel (or another process) interrupts your process to say "something
+happened" — a user pressed Ctrl-C, a child exited, the OOM killer
+chose you, a write went to a broken pipe. Each signal has a number
+and a name (`SIGTERM` = 15, `SIGKILL` = 9).
+
+Signals are how everything from `kill` to Docker graceful shutdown
+to crash dumps gets propagated.
+
+## The signals that matter
+
+| Signal | Default | Catchable | Common use |
+| --- | --- | --- | --- |
+| `SIGTERM` (15) | terminate | yes | "Please exit cleanly." Default for `kill`, Docker, K8s. |
+| `SIGKILL` (9) | terminate | **no** | "Die now." Cannot be caught or ignored. |
+| `SIGINT` (2) | terminate | yes | Ctrl-C in terminal. |
+| `SIGHUP` (1) | terminate | yes | Terminal hung up. Often reused as "reload config." |
+| `SIGQUIT` (3) | core dump | yes | Ctrl-\ in terminal. |
+| `SIGPIPE` (13) | terminate | yes | Wrote to a closed pipe/socket. |
+| `SIGCHLD` (17) | ignore | yes | A child process exited. |
+| `SIGUSR1`, `SIGUSR2` | terminate | yes | App-defined. |
+| `SIGSEGV` (11) | core dump | yes | Invalid memory access. |
+| `SIGABRT` (6) | core dump | yes | `abort()` called, assertion failed. |
+| `SIGSTOP` (19) | stop | **no** | Pause execution. Cannot be caught. |
+| `SIGCONT` (18) | continue | yes | Resume after `SIGSTOP`. |
+| `SIGALRM` (14) | terminate | yes | `setitimer` / `alarm()` expired. |
+| `SIGWINCH` (28) | ignore | yes | Terminal window resized. |
+
+`SIGKILL` and `SIGSTOP` are the two you **cannot intercept**. The
+kernel does them to you, period.
+
+## Default actions
+
+If you don't install a handler, signals have a default disposition:
+
+- **Term** — process exits.
+- **Core** — process exits and writes a core dump (`SIGSEGV`,
+  `SIGABRT`, `SIGQUIT`).
+- **Ign** — signal is ignored entirely.
+- **Stop** — process is suspended.
+- **Cont** — resumes a stopped process.
+
+`SIGCHLD` defaults to **ignore**, which is why a process whose
+parent never reaps it becomes a zombie — the kernel keeps the
+zombie's exit code around in case the parent ever calls `wait()`.
+PID 1 is supposed to reap orphans (see
+`fundamentals/what-is-a-process.mdx`).
+
+## Sending signals
+
+```bash
+kill 1234              # SIGTERM (default)
+kill -TERM 1234        # SIGTERM explicit
+kill -9 1234           # SIGKILL
+kill -HUP 1234         # SIGHUP
+kill -USR1 1234        # custom
+
+killall node           # all processes named "node"
+pkill -f "node server" # match command line
+```
+
+From code:
+
+```js
+process.kill(1234, 'SIGTERM');
+process.kill(process.pid, 'SIGUSR1');
+```
+
+A "self-signal" to your own PID is a common pattern — used by
+languages without direct exit-after-cleanup support to trigger their
+own teardown.
+
+## Handling signals
+
+```js
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, draining...');
+  server.close();             // stop accepting new connections
+  await db.disconnect();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('Ctrl-C, bye');
+  process.exit(130);          // 128 + SIGINT (2)
+});
+```
+
+The convention for exit codes after a signal is `128 + signum`:
+killed by `SIGTERM` (15) gives exit 143; `SIGKILL` (9) gives 137;
+`SIGSEGV` (11) gives 139.
+
+## Async-signal-safe code
+
+When a signal handler runs, it interrupts whatever your code was
+doing — potentially mid-allocation, mid-lock-acquire, mid-write to
+stdio buffers. From inside a signal handler in C, you can only call
+a tiny list of **async-signal-safe** functions (`write`, `_exit`,
+`raise`, `kill`, a handful of others). `printf`, `malloc`, `pthread_mutex_lock`
+— not safe. Calling them risks deadlock (you might already hold
+the lock the handler is now trying to take) or corruption.
+
+In high-level runtimes (Node, Java, Go), the signal handler is
+trampoline'd by the runtime: the actual JS/Java/Go callback runs at
+a safe point in the loop, not inside the signal handler. You get to
+write `await db.disconnect()` and it works because the runtime is
+shielding you.
+
+The lesson sticks anyway: **keep signal handlers tiny.** Set a flag,
+schedule cleanup, return. Do the actual work elsewhere.
+
+## SIGPIPE — the silent killer
+
+Writing to a closed pipe or socket sends `SIGPIPE`. Default action:
+**terminate the process**. A common bug: your server writes to a
+client that hung up; `SIGPIPE` fires; your process dies silently.
+
+Most network code wants to **ignore SIGPIPE** and check `write()`'s
+return value (`EPIPE`) instead. Node ignores it by default for you.
+In C, you do:
+
+```js
+signal(SIGPIPE, SIG_IGN);
+```
+
+Or use `MSG_NOSIGNAL` on the `send()` call, or `SO_NOSIGPIPE` on
+the socket (macOS/BSD).
+
+## The Docker / Kubernetes shutdown pattern
+
+When `docker stop CONTAINER` runs (or K8s deletes a pod), the
+orchestrator:
+
+1. Sends **SIGTERM** to PID 1 in the container.
+2. Waits `--time=10` seconds (Docker default;
+   `terminationGracePeriodSeconds: 30` in K8s).
+3. Sends **SIGKILL** if PID 1 hasn't exited.
+
+For this to work, **your app must catch SIGTERM** and exit
+gracefully — stop accepting new requests, finish in-flight ones,
+flush logs, disconnect DBs. If you ignore SIGTERM, you always get
+the kill.
+
+If your container's PID 1 is a shell (`CMD ["sh", "-c", "node
+server.js"]`), the shell does **not** forward SIGTERM to its
+child by default. The child never sees it. Two fixes:
+
+- Use **exec form** in your Dockerfile: `CMD ["node", "server.js"]`.
+  No shell, Node is PID 1, signal goes straight to it.
+- Use `docker run --init` or `tini` as PID 1; it forwards signals
+  and reaps zombies.
+
+This is the single most common "my graceful shutdown doesn't work"
+bug in containerized apps.
+
+## `kill -9` is not graceful
+
+`SIGKILL` cannot be caught. Your app gets zero notice. Open
+connections drop, in-flight requests die, transactions might be
+half-applied. Use SIGKILL only as a last resort — when SIGTERM
+didn't work.
+
+If you find yourself reaching for SIGKILL routinely in deployment,
+fix the SIGTERM handler.
+
+## SIGCHLD and zombies
+
+When a child process exits, the kernel sends `SIGCHLD` to the
+parent. Until the parent calls `wait()` / `waitpid()`, the child's
+entry stays in the process table (a "zombie") so the parent can
+read its exit code.
+
+Long-running parents that spawn many children must reap them:
+
+```js
+const child = spawn('cmd', args);
+child.on('exit', (code) => {
+  // child is reaped automatically when this fires in Node
+});
+```
+
+Node and most modern runtimes handle this for you. In raw C, you
+either set `signal(SIGCHLD, SIG_IGN)` (kernel auto-reaps) or install
+a handler that loops `waitpid(-1, &status, WNOHANG)` until no more.
+
+## SIGHUP for "reload"
+
+Historically meant "the terminal hung up." Daemons reused it for
+"please reread your config file" — `kill -HUP nginx` makes nginx
+reload `nginx.conf` without dropping connections. This convention
+isn't required, but it's standard for long-running daemons (nginx,
+HAProxy, dnsmasq, sshd).
+
+## SIGUSR1 / SIGUSR2
+
+Reserved for app-defined meaning. Common uses:
+
+- Rotate log files (`SIGUSR1` in nginx).
+- Toggle a debug flag.
+- Trigger a heap dump or profiler start.
+
+Node's `--inspect` uses `SIGUSR1` to enable the debugger on a
+running process — `kill -SIGUSR1 PID` opens the inspector port.
+
+## Useful debugging
+
+```bash
+ps -p PID -o stat                       # process state ('S', 'D', 'Z'...)
+cat /proc/PID/status | grep -i sig      # blocked/ignored/caught signals
+strace -e trace=signal -p PID           # signals as they arrive
+```
+
+A zombie (`Z` state) means the parent hasn't reaped. An uninterruptible
+sleep (`D` state) can't even receive non-fatal signals — usually
+stuck in a kernel I/O call (NFS hang, broken disk).
+
+## The mental model
+
+Signals are the OS's interrupt-style API to your process. The
+kernel sends them when things happen; you can install handlers (or
+get default behaviors) for all but `SIGKILL` and `SIGSTOP`. Handlers
+must be tiny in raw C; high-level runtimes lift that constraint.
+Production correctness — graceful shutdown, log rotation, debugger
+hooks — all rides on getting signal handling right.

@@ -1,0 +1,205 @@
+export const level = 'mid';
+
+# Cache lines and locality
+
+CPU caches don't fetch individual bytes from RAM. They fetch in
+**cache lines** — fixed-size chunks, almost always **64 bytes** on
+x86 and ARM. Touch one byte; the CPU pulls all 64 into L1. Touch a
+byte from another line; another fetch. **The cost of an algorithm is
+how many cache lines it touches.**
+
+This is the single biggest source of "why is the textbook
+implementation 10x slower than the dumb one" surprises.
+
+## Locality: spatial and temporal
+
+The two principles caches exploit:
+
+- **Spatial locality** — if you accessed byte X, you're likely to
+  access X+1, X+2, ... soon. Caches preload by line.
+- **Temporal locality** — if you accessed X recently, you're likely
+  to access X again. Caches keep it around.
+
+A loop that walks an array forward gets perfect spatial locality.
+A loop that walks a hash table chasing pointers to random heap
+locations gets ~zero locality and pays a cache miss on every step.
+
+## Row-major vs column-major iteration
+
+```js
+// 2D array as flat row-major buffer:
+// element (row, col) at index row * cols + col
+
+const rows = 1024, cols = 1024;
+const a = new Float64Array(rows * cols);
+
+// Good — sequential memory access, fits cache lines:
+let sum = 0;
+for (let r = 0; r < rows; r++) {
+  for (let c = 0; c < cols; c++) {
+    sum += a[r * cols + c];
+  }
+}
+
+// Bad — strides of `cols * 8` bytes per inner step:
+for (let c = 0; c < cols; c++) {
+  for (let r = 0; r < rows; r++) {
+    sum += a[r * cols + c];
+  }
+}
+```
+
+Same operations, same data, same total work. The second is often
+**5-20x slower** for large matrices because every inner-loop access
+touches a different cache line. The line was prefetched for the
+*next* row's element at that column, but you never visit it before
+it gets evicted.
+
+For row-major storage (C, C++, NumPy default, JS typed arrays):
+**iterate rows in the outer loop**. For column-major (Fortran,
+MATLAB, R, some Julia code): the opposite.
+
+## Struct of arrays vs array of structs
+
+Layout choice that has enormous cache implications:
+
+```js
+// Array of Structs (AoS)
+const particles = [
+  { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, mass: 1, color: 'red' },
+  { x: 1, y: 0, z: 0, vx: 0, vy: 0, vz: 0, mass: 1, color: 'red' },
+  // ...
+];
+
+// Updating just positions:
+for (const p of particles) {
+  p.x += p.vx;
+  p.y += p.vy;
+  p.z += p.vz;
+}
+```
+
+Each `particles[i]` is a separate heap object. The pointers in the
+outer array might be reasonably close, but the actual `{x, y, z,
+vx, vy, vz, mass, color}` objects could be anywhere in the heap.
+Each iteration may touch multiple cache lines for one logical
+element, and brings in fields you don't need (`color`, `mass`).
+
+```js
+// Struct of Arrays (SoA)
+const xs = new Float64Array(N), ys = new Float64Array(N), zs = new Float64Array(N);
+const vxs = new Float64Array(N), vys = new Float64Array(N), vzs = new Float64Array(N);
+
+for (let i = 0; i < N; i++) {
+  xs[i] += vxs[i];
+  ys[i] += vys[i];
+  zs[i] += vzs[i];
+}
+```
+
+Each array is contiguous. The position update touches `xs`, `ys`,
+`zs`, `vxs`, `vys`, `vzs` — six tight streams the prefetcher loves.
+No `mass` or `color` cache pollution.
+
+SoA is the standard layout in ECS game engines (Unity DOTS,
+EnTT), numeric libraries (NumPy), and high-throughput data
+pipelines (Apache Arrow). When you see "10x speedup from rewriting
+to SoA," this is why.
+
+The trade-off: AoS is more ergonomic to write and pass around;
+SoA is uglier but cache-friendly. Reach for SoA when you have
+millions of records and a hot loop that touches only some of their
+fields.
+
+## Linked lists vs arrays
+
+A linked list has perfect insert/delete at any position (O(1) given
+the node), but iterating it is a cache nightmare: every `.next`
+chase is a potential cache miss to wherever the allocator happened
+to put the next node.
+
+For most "real" workloads:
+
+- Iterating a `Array<T>` (or `Vec<T>`, `ArrayList<T>`) of **10,000
+  items**: fits in L2 cache, runs in microseconds.
+- Iterating a linked list of **10,000 items** allocated over the
+  program's lifetime: 10,000 cache misses, runs in tens of
+  microseconds to milliseconds depending on where the nodes
+  ended up.
+
+This is why textbook "linked list O(1) prepend" can be **slower in
+practice** than `unshift` on an array (which is technically O(n)).
+The constants from cache behavior swamp the asymptotic difference.
+
+## The 64-byte rule
+
+Most modern CPUs use 64-byte cache lines. Things that follow from
+this:
+
+- **A struct of 8 doubles fits in one line.** A struct of 9 doesn't.
+- **An array of 16 ints (4 bytes each) is one line.** Iterate it in
+  one shot.
+- **Two `u32`s padded to a cache line each** wastes 56 bytes per
+  pair but avoids **false sharing** (see
+  `fundamentals/false-sharing.mdx`).
+- **Hot fields together** — pack the fields you touch on every
+  iteration into the first 64 bytes of your struct; put the cold
+  ones after.
+
+## The prefetcher
+
+Modern CPUs have **hardware prefetchers** that detect simple access
+patterns (sequential forward, sequential backward, constant stride)
+and start loading the next few cache lines speculatively. A
+sequential loop runs basically at memory-bandwidth speed because
+the prefetcher hides latency.
+
+What confuses the prefetcher:
+
+- Pointer chasing (no detectable stride — random heap addresses).
+- Indirect access (`a[b[i]]` — depends on a value the prefetcher
+  doesn't know).
+- Conditionally accessed memory in a branch the predictor can't
+  resolve.
+
+You don't program the prefetcher directly (in JS or most high-level
+languages). You **earn** it by making access patterns predictable.
+
+## How to spot the problem
+
+If a piece of code is "slower than it should be" and the asymptotic
+complexity looks fine, check:
+
+- **What's the working set size?** If it's bigger than L2, every
+  random access pays main-memory latency (~100 ns).
+- **Is the access pattern sequential or scattered?** A `perf` profile
+  showing high "L1-dcache-load-misses" confirms it.
+- **Are you using the right data structure?** A `Map` over 100k
+  small keys is much slower than a sorted `Array` you binary-search,
+  even though the `Map` is "O(1) lookup."
+- **Are unrelated fields cohabiting your hot loop's cache lines?**
+  Split the struct.
+
+In Node/V8 specifically: typed arrays (`Int32Array`, `Float64Array`)
+have predictable layout and aggressive JIT specialization. Regular
+arrays of objects are slower for numeric inner loops by a wide margin.
+
+## The practical rules
+
+- **Iterate in storage order.** Outer index varies slowest.
+- **Use typed arrays / SoA for numeric inner loops.**
+- **Group hot fields. Split cold fields out.**
+- **Prefer contiguous arrays to linked structures** unless you
+  measure a need for pointer-stable insertion.
+- **Stop sweating O() constants — measure cache behavior** when N
+  matters.
+
+## The takeaway
+
+Cache misses are the real performance currency. The CPU is happy to
+compute; what it hates is waiting on memory. Sequential, contiguous,
+predictable access patterns let the prefetcher and caches hide
+DRAM's 100 ns latency. Pointer-chasing, scattered, struct-heavy
+patterns expose it. Two correct algorithms with the same big-O can
+differ by an order of magnitude purely because one is cache-friendly
+and the other isn't.

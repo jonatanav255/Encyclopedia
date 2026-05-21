@@ -155,6 +155,38 @@ export const bank: QuestionBank = {
         '**URL-based** (`/v1/users`, `/v2/users`) is the most-recommended option for external APIs. Pros: explicit, browser-friendly, easy to route, easy to deprecate (return 410 Gone on old versions). Cons: smells un-RESTful purists ignore. Pin minor versions in changelogs, not URLs (`v1.4` stays `v1`).\n\n**Header-based** (`Accept: application/vnd.example.v2+json`) is cleaner architecturally but hostile to browsers/curl. Use for internal APIs.\n\n**Operational discipline**: support at least 2 major versions concurrently. Announce deprecations 6–12 months ahead with sunset dates. Track usage per version — don\'t kill a version with active consumers. Provide migration guides. For breaking changes within a version, add new fields (additive) and never remove or repurpose. Reach for a major version bump only when truly breaking.\n\n**For SDKs**: pin the API version in the SDK release. SDK v3 talks to API v2; users upgrade SDKs at their own pace.',
     },
 
+    // senior — CAP/PACELC
+    {
+      level: 'senior',
+      question: 'What does CAP actually say, and why do people misquote it?',
+      answer:
+        'CAP says: when a network **partition** happens, you must choose between **consistency** (all reads see the latest write) and **availability** (every request gets a non-error response). You do not "pick two of three" — partitions are not optional, they\'re a fact of distributed reality. You pick CP or AP for *the partition case*.\n\nThe usual misquote: "Postgres is CA" or "DynamoDB sacrifices consistency for availability." Postgres is CP (a partition between the primary and a sync replica blocks writes). DynamoDB tunably leans AP in the partition case but is also EL ("else, prefer latency over consistency") in the *non-partition* case — which CAP says nothing about.\n\n**PACELC** fixes this: if Partition then A or C; **Else** then L (latency) or C (consistency). Spanner is PC/EC (consistency always). Cassandra default is PA/EL. The Else half captures normal-day behavior, which is what users actually feel.',
+    },
+    {
+      level: 'senior',
+      question: 'Where do Postgres, DynamoDB, Cassandra, and Spanner sit in PACELC?',
+      answer:
+        '- **Postgres (single-leader sync replica)**: PC/EC. Partition between primary and the sync replica blocks the write (or you reconfigure to drop the replica). Non-partition: still consistent reads on the primary.\n- **DynamoDB (default)**: PA/EL. In a partition the replicas keep accepting writes; reads can be stale. Even with no partition, it favors low-latency eventual reads. Use `ConsistentRead: true` to get linearizable reads (you pay throughput and latency).\n- **Cassandra (quorum R+W>N)**: PA/EL by default; can be tuned toward consistency with QUORUM/ALL but never gets you linearizability.\n- **Spanner**: PC/EC, achieved with TrueTime — atomic-clock-bounded uncertainty + waiting out the bound to commit. The "C" is real linearizability, not "eventually consistent."\n\nMost engineers reach for "AP" assuming it means "I get faster writes." It actually means "the system would rather hand you a stale value than fail."',
+    },
+    {
+      level: 'senior',
+      question: 'What does Raft actually guarantee, and what does it not?',
+      answer:
+        'Raft guarantees that all nodes agree on the order of entries in a **replicated log**. Pick a quorum (majority of N), elect a leader, all writes go through the leader, replicated to followers, committed once a majority acks. After a partition heals, the minority side\'s uncommitted writes are discarded — there is exactly one log history.\n\n**What it gives you for free**: a single source of truth for any state you put in the log (config, leader election, distributed locks with fencing tokens).\n\n**What it does NOT give you**:\n- **Linearizable reads** without extra work. A stale leader still thinks it\'s the leader for a brief window after a partition. To get linearizable reads you either route reads through a Raft round-trip ("read index"), or use leader leases (assume no clock skew beyond a bound).\n- **Performance under partition**. Lose quorum, lose writes. A 3-node cluster with 2 unreachable is unavailable, period.\n- **Cross-cluster consistency**. Raft is one log. Two Raft clusters don\'t coordinate. For globally-distributed consistency you need Spanner-style TrueTime or 2-phase commit on top.\n\netcd, Consul, CockroachDB, TiKV, MongoDB (since 4.0) all use Raft (or a Paxos variant). They all hit these same limits.',
+    },
+    {
+      level: 'senior',
+      question: 'What is a saga and when does it beat 2PC?',
+      answer:
+        'A saga splits a "distributed transaction" into a sequence of local transactions, each in its own service. If step 3 fails, you run **compensating actions** for steps 1 and 2 to undo them.\n\n**Choreography**: each service emits an event after its step; the next service listens and acts. Loose coupling, but the workflow is implicit — no single place to see "what state is this saga in?".\n\n**Orchestration**: a coordinator service drives each step explicitly (Temporal, AWS Step Functions, Cadence). Easier to reason about, observe, retry. The orchestrator becomes a critical service.\n\nSagas beat 2PC because **2PC blocks on coordinator failure** — every participant holds its lock until the coordinator says commit or abort. If the coordinator dies in the prepare phase, you wedge every database involved. 2PC across services is a textbook anti-pattern.\n\n**The catch**: sagas are not actually atomic. Step 1 commits before step 2 even tries; clients can observe intermediate states. And some actions are not compensable — you can\'t un-send an email. You design for this: use "pending" states, send-after-commit, and accept that the saga is the *only* unit of consistency, not each step.',
+    },
+    {
+      level: 'senior',
+      question: 'When should you NOT use event sourcing?',
+      answer:
+        'Event sourcing is genuinely useful in maybe 10% of systems and cargo-culted into the other 90%. Reach for it when you actually need: full audit history as a product feature (banking, compliance), time-travel debugging, multiple read models from the same writes, or domain events that already model reality (e.g., financial ledgers).\n\n**Avoid it when**:\n- **The domain is CRUD.** Storing 50 `UserAddressUpdated` events instead of one current address adds complexity for no win.\n- **You need fast random reads of current state.** You\'ll need projections (snapshots + replay), which is just a regular database with extra steps.\n- **GDPR right-to-erasure matters.** Events are immutable by design; "delete this user\'s data" becomes a hard problem (you typically encrypt PII per-user and throw away the key — "crypto-shredding").\n- **Your team is small.** Schema evolution, event versioning, replay testing, and projection management need a real platform investment.\n- **You\'re using it as a message bus.** That\'s what Kafka is for. Event sourcing means events are *your database*, not just transport.\n\nThe most honest test: "If we lose the projection store tomorrow, can we replay events to rebuild it?" If yes, you\'re doing event sourcing. If no, you have a regular DB plus an event log — which is fine, but call it that.',
+    },
+
     // staff
     {
       level: 'staff',

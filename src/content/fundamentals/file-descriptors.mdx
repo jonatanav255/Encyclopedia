@@ -1,0 +1,177 @@
+export const level = 'junior';
+
+# File descriptors
+
+A **file descriptor** (FD) is a small non-negative integer the
+kernel gives you when you open something. That something can be a
+file, a socket, a pipe, a device, a timer, an event queue — Unix's
+"everything is a file" mantra means almost any I/O handle is an FD.
+
+The number is the handle. Read/write/close take it directly:
+
+```bash
+$ cat /proc/self/fd
+0  1  2  3
+```
+
+PID self has four FDs open right now: stdin, stdout, stderr, and the
+directory it's reading.
+
+## The standard three
+
+Every process starts with three pre-opened FDs:
+
+| FD | Name | Default |
+| --- | --- | --- |
+| 0 | `stdin` | terminal input |
+| 1 | `stdout` | terminal output |
+| 2 | `stderr` | terminal output (unbuffered) |
+
+Redirection in the shell is just swapping where those FDs point:
+
+```bash
+cmd > out.txt              # FD 1 -> out.txt
+cmd 2> err.txt             # FD 2 -> err.txt
+cmd > out.txt 2>&1         # FD 1 -> out.txt, then FD 2 -> same as FD 1
+cmd < in.txt               # FD 0 <- in.txt
+cmd | other                # FD 1 of cmd -> FD 0 of other (pipe)
+```
+
+`2>&1` is "make 2 a duplicate of 1." Order matters: `> out 2>&1`
+sends both to `out`; `2>&1 > out` sends stderr to the original
+stdout and stdout to `out`.
+
+## Where FDs come from
+
+Anything that opens a kernel resource hands you an FD:
+
+```bash
+open()         file or directory
+socket()       network socket (TCP, UDP, unix)
+pipe()         in-memory pipe (returns a pair: read end + write end)
+accept()       new socket from an incoming connection
+eventfd()      counter you can signal
+timerfd()      timer you can poll
+epoll_create() readiness set
+inotify_init() filesystem watch
+```
+
+A long-running server has FDs for: each listening socket, each
+accepted client, each open log file, each open database connection,
+each pipe to a child process, each `epoll` instance, each timer.
+
+```bash
+$ ls -l /proc/$(pidof node)/fd
+lrwx------ 1 jen jen 64 May 21 10:14 0 -> /dev/null
+lrwx------ 1 jen jen 64 May 21 10:14 1 -> 'pipe:[298411]'
+lrwx------ 1 jen jen 64 May 21 10:14 2 -> 'pipe:[298412]'
+lrwx------ 1 jen jen 64 May 21 10:14 3 -> 'socket:[298500]'
+lrwx------ 1 jen jen 64 May 21 10:14 4 -> /var/log/app.log
+...
+```
+
+`/proc/PID/fd/` is a directory of symlinks. One row per open thing.
+
+## The FD table is per-process
+
+Each process has its own table mapping FD numbers to underlying
+kernel objects. FD 3 in process A and FD 3 in process B are unrelated.
+
+After `fork()`, the child inherits a **copy** of the FD table. Both
+parent and child have FD 3 pointing at the same underlying object.
+Either can read/write/close it. Closing in one doesn't close it for
+the other — the kernel only frees the underlying object when **all**
+FDs referencing it are closed.
+
+This is exactly how a shell pipe works:
+
+```bash
+cmd1 | cmd2
+```
+
+The shell calls `pipe()` (gets two FDs), `fork()`s twice, and in
+each child `dup2()`s the right pipe end onto FD 0 or 1, then
+`exec()`s the command.
+
+## `ulimit -n` and "Too many open files"
+
+The kernel caps how many FDs one process can have open at once.
+Default on Linux is often **1024** for interactive shells. Servers
+need much more.
+
+```bash
+ulimit -n                # soft limit (what you actually get)
+ulimit -Hn               # hard limit (max you can raise to)
+ulimit -n 65536          # raise soft limit (must be <= hard)
+```
+
+`EMFILE: Too many open files` from your runtime means you hit the
+per-process limit. `ENFILE` means you hit the system-wide limit (much
+rarer).
+
+For a Node server, `1024` is laughably low. A modern web app routinely
+needs tens of thousands of FDs (one per concurrent connection, plus
+files, sockets to upstream services, etc.). Raise it in systemd unit
+files, Docker daemon config, or `/etc/security/limits.conf`.
+
+## FD leaks (a.k.a. "the wrong kind of memory leak")
+
+Most production "memory leak" reports in long-running services
+**aren't** leaking heap memory — they're leaking FDs. Sockets to a
+DB never closed. HTTP responses never `.end()`ed. File handles
+opened on every request and never released.
+
+Symptoms:
+
+- Service runs fine for hours/days, then dies with `EMFILE`.
+- `lsof -p PID | wc -l` grows monotonically over time.
+- Heap profile looks healthy. Kernel-side accounting doesn't.
+
+How to find them:
+
+```bash
+lsof -p $(pidof node)           # everything FD-like for this PID
+lsof -p $(pidof node) | wc -l   # count
+lsof -p $(pidof node) | awk '{print $5}' | sort | uniq -c | sort -rn
+```
+
+The third command groups by FD type — a pile of `IPv4` rows is
+sockets, `REG` is regular files. If one keeps growing, that's your
+leak source.
+
+Most common offenders in Node:
+
+- HTTP responses not ended on error paths (the socket stays open).
+- DB clients not pooled correctly — `new Client()` per request,
+  never `.end()`ed.
+- File streams opened without an error handler that closes them.
+- Outgoing `fetch`/`http.request` whose body is never consumed.
+
+The fix is **always**: pair every "open" with a guaranteed "close"
+(use `try/finally`, `using`, `defer`, or stream lifecycle events).
+
+## FDs and threads
+
+Within one process, **all threads share the same FD table**. A
+socket opened by thread A is visible (and usable) from thread B.
+This is unlike memory in some languages (Go goroutines, Node worker
+threads have separate JS heaps) but the FD table is process-scoped,
+not thread-scoped.
+
+## Special FDs to know
+
+| Path | What it is |
+| --- | --- |
+| `/dev/null` | Bit bucket. Reads return EOF, writes always succeed. |
+| `/dev/zero` | Reads return endless zero bytes. |
+| `/dev/urandom` | Random bytes (use this for crypto). |
+| `/dev/stdin`, `/dev/stdout`, `/dev/stderr` | Aliases for FDs 0/1/2. |
+| `/proc/PID/fd/N` | The thing FD N of PID points at. |
+
+## The mental model
+
+An FD is a small int the kernel hands you that means "the I/O thing
+you opened, ref-counted, owned by this process." Lose track of which
+FDs you opened and you leak them. Open too many at once and you hit
+`EMFILE`. Inherit them by `fork()` and your child can talk to them
+too. They're the foundation everything I/O-ish in Unix is built on.

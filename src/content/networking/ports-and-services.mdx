@@ -1,0 +1,215 @@
+export const level = 'junior';
+
+# Ports and services
+
+A port is a 16-bit number (0-65535) that lets one IP host run many
+services. Combined with the IP and protocol, it tells the kernel
+"this packet goes to that socket."
+
+## The 4-tuple — what actually identifies a connection
+
+A TCP connection is uniquely identified by:
+
+```
+(src-ip, src-port, dst-ip, dst-port)
+```
+
+That's it. Not just "port 443." Two different clients can both
+connect to your server's port 443 simultaneously because their
+`(src-ip, src-port)` differs.
+
+This is why one server can serve thousands of concurrent connections
+on a single listening port — each accepted connection gets a unique
+4-tuple. The server's socket on `:443` isn't "in use" by any one
+client; it's the accept point.
+
+For UDP, it's similar but there's no connection — the kernel
+demultiplexes incoming packets by the same 4-tuple to whichever
+socket is bound (or `recvfrom` sees them all if the socket isn't
+connected).
+
+## The three ranges
+
+IANA splits the port space:
+
+- **0-1023 — well-known / system ports.** Reserved by convention
+  for standard services. Binding to these on Linux/macOS requires
+  root (or `CAP_NET_BIND_SERVICE`).
+- **1024-49151 — registered ports.** Assigned to specific
+  applications by IANA. Most can be bound without root.
+- **49152-65535 — ephemeral / dynamic ports.** The kernel picks
+  from this range when a client opens an outbound connection. On
+  Linux, the actual range is `/proc/sys/net/ipv4/ip_local_port_range`,
+  often `32768 60999`.
+
+The split is convention, not enforcement. You can run a web server
+on port 31415; nothing breaks except other people's expectations.
+
+## Well-known ports a backend dev sees
+
+| Port    | Protocol | Service                          |
+|---------|----------|----------------------------------|
+| 22      | TCP      | SSH                              |
+| 25      | TCP      | SMTP (email submission/relay)    |
+| 53      | UDP/TCP  | DNS                              |
+| 80      | TCP      | HTTP                             |
+| 443     | TCP/UDP  | HTTPS (UDP for HTTP/3 / QUIC)    |
+| 587     | TCP      | SMTP submission (with auth)      |
+| 3000    | TCP      | Default for Node/dev servers     |
+| 5432    | TCP      | PostgreSQL                       |
+| 6379    | TCP      | Redis                            |
+| 8080    | TCP      | Alt HTTP (often Tomcat / proxies)|
+| 9092    | TCP      | Kafka brokers                    |
+| 27017   | TCP      | MongoDB                          |
+
+Knowing these on sight saves time when reading `netstat`/`ss`
+output or firewall rules. If port 6379 is open to the internet,
+your Redis is one drive-by scan from being mined for crypto.
+
+## Reading `ss` and `lsof -i`
+
+`ss` is the modern replacement for `netstat`.
+
+```bash
+ss -tlnp           # TCP, listening, numeric, with process
+ss -ulnp           # UDP, listening, numeric, with process
+ss -tnp            # All TCP connections (not just listening)
+ss -tn state established '( dport = :443 )'
+```
+
+Sample output:
+
+```
+State   Recv-Q   Send-Q   Local Address:Port    Peer Address:Port  Process
+LISTEN  0        511              0.0.0.0:3000         0.0.0.0:*  users:(("node",pid=1234,fd=20))
+LISTEN  0        128            127.0.0.1:5432         0.0.0.0:*  users:(("postgres",pid=987,fd=6))
+ESTAB   0        0           10.0.0.5:54123      52.84.10.12:443   users:(("node",pid=1234,fd=22))
+```
+
+`0.0.0.0:3000` means "listening on all interfaces, port 3000" —
+reachable from anywhere that can route to this host. `127.0.0.1:5432`
+means "localhost only" — much safer default for a database.
+
+`lsof -i` covers the same ground with a different syntax:
+
+```bash
+lsof -i :3000             # who's on port 3000
+lsof -i -P -n | grep LISTEN
+lsof -iTCP -sTCP:LISTEN -P -n
+```
+
+`-P` keeps ports numeric (no service-name lookup); `-n` keeps IPs
+numeric (no DNS). Both speed up the command and avoid surprises.
+
+## "Address already in use" — `EADDRINUSE`
+
+You restart your dev server and:
+
+```
+Error: listen EADDRINUSE: address already in use :::3000
+```
+
+Causes, in rough order of frequency:
+
+1. **Old process still running.** `lsof -i :3000` shows it. Kill it.
+2. **TIME_WAIT from a recent listener.** TCP keeps the 4-tuple
+   reserved for ~60s after close. Solution: `SO_REUSEADDR` on the
+   socket (Node does this by default for `net.createServer`).
+3. **A different service squatting on the port.** Pick another port
+   or stop the other service.
+4. **Your dev container forwards the port to the host, and
+   something on the host already has it.** Check with `lsof` on
+   the host.
+
+For TIME_WAIT specifically, see **TCP three-way handshake**.
+
+## Containers and ports below 1024
+
+A normal user inside a container can't bind to port 80 or 443:
+
+```bash
+docker run myapp
+# Error: bind: permission denied
+```
+
+The container's process runs as a non-root user (good practice).
+Linux requires either:
+
+- Run as root inside the container (bad: violates least-privilege).
+- Grant the capability: `--cap-add=NET_BIND_SERVICE` plus the
+  binary having that capability set.
+- Use `sysctl net.ipv4.ip_unprivileged_port_start=80` on the host
+  (lowers the threshold).
+- **The right answer**: run your service on a high port (3000,
+  8080) and let the ingress/load balancer / Kubernetes Service
+  expose 80/443 externally.
+
+In Kubernetes, your pod binds to `containerPort: 3000`; the
+Service maps `port: 80` to it. The kernel-level low-port restriction
+never matters inside the cluster.
+
+## Ephemeral port exhaustion
+
+Each outbound connection consumes an ephemeral port on the client.
+With ~28k ports in the default range and 60s TIME_WAIT after each
+close, a client making >450 new outbound connections per second to
+the same destination IP+port runs out.
+
+This shows up as `EADDRNOTAVAIL` on connect, or mysterious latency
+spikes. Fixes:
+
+- **Connection pooling / keep-alive** — reuse connections instead
+  of churning new ones (almost always the right answer).
+- Widen the range: `net.ipv4.ip_local_port_range = 1024 65535`.
+- Enable `net.ipv4.tcp_tw_reuse` (reuse TIME_WAIT sockets for new
+  outbound connections — Linux-safe, despite scary docs).
+
+This is a real outage mode for high-fanout services (lambdas
+hitting an upstream API, log shippers, scrape-heavy crawlers).
+
+## Binding to specific interfaces
+
+```bash
+ss -tlnp
+```
+
+```
+LISTEN ... 0.0.0.0:3000     # all IPv4 interfaces
+LISTEN ... [::]:3000        # all IPv6 interfaces
+LISTEN ... 127.0.0.1:5432   # loopback only
+LISTEN ... 10.0.0.5:8080    # only that specific interface
+```
+
+For internal-only services, bind to `127.0.0.1` (or a private
+network IP). It's the cheapest possible firewall: the service
+isn't reachable from anywhere the kernel can't route to that
+address.
+
+In Node:
+
+```js
+server.listen(8080);                  // 0.0.0.0 — public
+server.listen(8080, '127.0.0.1');     // localhost only
+```
+
+## SO_REUSEPORT — multiple processes, one port
+
+A newer kernel feature. Multiple processes can bind to the same
+`(addr, port)` with `SO_REUSEPORT`; the kernel load-balances
+incoming connections across them.
+
+Node's cluster module uses this on Linux. It's how a 4-worker Node
+service can have all 4 workers listening on `:3000` without a
+front-end load balancer doing the dispatching.
+
+## When to care
+
+- Reading deployment configs and firewall rules.
+- Diagnosing `EADDRINUSE`, `EADDRNOTAVAIL`, "connection refused."
+- Picking ports for new services (high enough to avoid root, low
+  enough to be memorable).
+- Securing databases — never expose 5432/6379/27017 to `0.0.0.0`
+  on a public host without auth and a firewall.
+
+Ports are mundane infrastructure. Knowing them well means the
+weird stuff stays in the application layer, where you can debug it.

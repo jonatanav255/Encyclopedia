@@ -1,0 +1,278 @@
+export const level = 'mid';
+
+# tcpdump and Wireshark
+
+When your app logs say "the request succeeded" and the upstream
+swears it never arrived, the truth is on the wire. `tcpdump`
+captures it; Wireshark reads it back with a UI. This is the single
+production-debugging skill that separates "the network is broken,
+not my problem" from a fix in 20 minutes.
+
+## tcpdump — the basics
+
+```bash
+sudo tcpdump -i any -n
+```
+
+- `-i any` — listen on all interfaces (Linux). On macOS, name one:
+  `-i en0`, or use `-i pktap` for all.
+- `-n` — no DNS resolution. Faster, and avoids tcpdump itself
+  triggering DNS queries you don't want to see in the capture.
+
+Without filters, you'll drown. Add a BPF filter.
+
+## BPF filters — the language
+
+The expression after the options is a Berkeley Packet Filter.
+Common forms:
+
+```bash
+sudo tcpdump -i any -n 'host 10.0.0.5'                # to or from that host
+sudo tcpdump -i any -n 'src 10.0.0.5'                 # only from
+sudo tcpdump -i any -n 'dst 10.0.0.5'                 # only to
+sudo tcpdump -i any -n 'port 443'                     # either direction
+sudo tcpdump -i any -n 'tcp port 443'                 # TCP only
+sudo tcpdump -i any -n 'udp port 53'                  # DNS
+sudo tcpdump -i any -n 'host 10.0.0.5 and port 443'
+sudo tcpdump -i any -n 'net 10.0.0.0/24'              # whole subnet
+sudo tcpdump -i any -n 'not port 22'                  # exclude SSH (so you don't capture your own session)
+```
+
+Compound:
+
+```bash
+sudo tcpdump -i any -n '(host api.example.com or host db.internal) and tcp port 443'
+```
+
+The filter runs in the kernel — much faster than capturing
+everything and grep'ing.
+
+## Useful flags, in production order
+
+```bash
+sudo tcpdump -i any -nn -tttt -s 0 -w cap.pcap 'tcp port 443'
+```
+
+- `-nn` — no DNS, no port-name lookup (just `:443`, not `:https`).
+- `-tttt` — full timestamps with date.
+- `-s 0` — capture full packets (default snaplen is enough on
+  modern tcpdump, but explicit is safe).
+- `-w cap.pcap` — write to file instead of stdout. Open later in
+  Wireshark.
+- `-c 1000` — stop after N packets (so you don't fill the disk).
+
+To watch live AND save:
+
+```bash
+sudo tcpdump -i any -nn -w cap.pcap -U -l 'tcp port 443' | tee /dev/null
+```
+
+`-U` flushes the file buffer after each packet so a parallel
+`tcpdump -r cap.pcap` sees data as it arrives.
+
+## Reading packets inline
+
+```bash
+sudo tcpdump -i any -nn -A 'tcp port 80'
+```
+
+`-A` prints payloads as ASCII. Useful for plaintext HTTP. For
+binary protocols, swap to:
+
+```bash
+sudo tcpdump -i any -nn -X 'tcp port 6379'
+```
+
+`-X` shows hex + ASCII side by side. Reading Redis or Memcached
+traffic this way is fast.
+
+For HTTPS, you'll see the TLS handshake (`ClientHello`,
+`ServerHello`, certs) and then encrypted data. To actually see
+plaintext you need the TLS keys; for app debugging, terminate TLS
+at a proxy you control and capture between proxy and origin.
+
+## Sample output — what each line means
+
+```
+14:22:01.342157 IP 10.0.0.5.54123 > 10.0.0.10.443: Flags [S], seq 12345, win 65535, length 0
+14:22:01.342889 IP 10.0.0.10.443 > 10.0.0.5.54123: Flags [S.], seq 67890, ack 12346, win 64240, length 0
+14:22:01.342901 IP 10.0.0.5.54123 > 10.0.0.10.443: Flags [.], ack 1, win 65535, length 0
+14:22:01.343102 IP 10.0.0.5.54123 > 10.0.0.10.443: Flags [P.], seq 1:518, ack 1, length 517
+14:22:01.343543 IP 10.0.0.10.443 > 10.0.0.5.54123: Flags [P.], seq 1:1460, ack 518, length 1459
+```
+
+- Timestamp.
+- `IP src.port > dst.port`.
+- Flags: `S` = SYN, `.` = ACK, `P` = PUSH, `F` = FIN, `R` = RST.
+- `seq` / `ack` — sequence and acknowledgement numbers.
+- `win` — receiver window (flow control).
+- `length` — payload bytes.
+
+The first three lines above are the three-way handshake. Line 4 is
+the client's first data send (probably the TLS ClientHello at 517
+bytes).
+
+## Common patterns to recognize
+
+### Connection refused
+
+```
+IP client.54123 > server.443: Flags [S], ...
+IP server.443 > client.54123: Flags [R.], seq 0, ack 1, ...
+```
+
+`R` (RST) immediately. Server actively rejected — no listener on
+that port, or firewall doing an explicit reset.
+
+### Connection timeout (server unreachable)
+
+```
+IP client.54123 > server.443: Flags [S], ...
+IP client.54123 > server.443: Flags [S], ...        (retransmit ~1s later)
+IP client.54123 > server.443: Flags [S], ...        (retransmit ~2s later)
+```
+
+SYN retransmits with no reply. Server isn't seeing the SYN, or its
+reply isn't getting back. Network path issue or firewall dropping.
+
+### Asymmetric routing
+
+You see the SYN leave; the SYN-ACK appears on a different
+interface. Common in multi-NIC hosts and BGP-multihomed clouds.
+Connection establishes, but state-tracking firewalls (conntrack)
+mark the reverse path as invalid and drop application data.
+
+### TLS handshake failure
+
+```
+... Flags [P.], length 517    (ClientHello)
+... Flags [P.], length 7      (alert)
+... Flags [F.], ...
+```
+
+A tiny payload (often 7 bytes) right after the ClientHello is a
+TLS alert — version mismatch, cipher mismatch, SNI mismatch. Wire-
+shark decodes the exact alert.
+
+### Application slow path
+
+Three-way handshake takes 1ms. TLS takes 50ms. Server's first byte
+arrives 800ms later. The handshake is fine; the app is slow.
+You've just narrowed the problem from "the network" to "the app
+process."
+
+## When to reach for tcpdump vs strace vs app logs
+
+- **App logs** — first stop. Tells you the app's view.
+- **strace** (`strace -p PID -e network`) — what syscalls the app
+  is making. Tells you if the app is even trying to send, or
+  blocked in `recv`. Linux-only; on macOS use `dtruss`.
+- **tcpdump** — what's on the wire. The neutral ground.
+- **conntrack** (`conntrack -L`) — what the Linux kernel firewall
+  thinks of each flow.
+
+Workflow:
+
+1. App logs say "timeout."
+2. strace shows `connect()` returning successfully, then `recv()`
+   blocked.
+3. tcpdump shows the handshake completing but no application
+   data ever leaving the other side.
+4. Conclusion: it's the upstream, not your network or your app.
+   Page their on-call.
+
+Without tcpdump, step 3 is a guess. With it, you know.
+
+## Wireshark — when you need the UI
+
+`tcpdump -w cap.pcap` and open in Wireshark. The big wins:
+
+- **Follow stream**: right-click a packet → "Follow TCP Stream."
+  Reassembles a TCP conversation and shows the bytes in order.
+  Reading an HTTP/1.1 request becomes trivial.
+- **TLS decryption**: with `SSLKEYLOGFILE` set in the client (works
+  with Chrome, Firefox, curl, Node via env), Wireshark decrypts
+  HTTPS and HTTP/2 on the fly. Indispensable for HTTPS debugging.
+- **Expert info**: warnings on retransmissions, duplicate ACKs,
+  out-of-order packets, zero windows. Often you spot the bug just
+  by scanning these.
+- **Statistics → Conversations**: top talkers, byte counts. Find
+  the noisy flow.
+- **IO graphs**: throughput over time. Visualize stalls.
+
+For one-off "why did this connection break," Wireshark beats
+tcpdump's text output by an order of magnitude.
+
+## Capturing inside containers
+
+You can't `tcpdump` from outside the container's network namespace
+and see its traffic by default. Options:
+
+```bash
+# Run tcpdump inside the container
+docker exec -it mycontainer tcpdump -i eth0 -w /tmp/cap.pcap
+```
+
+Or, on the host, capture on the container's veth interface:
+
+```bash
+# Find the container's PID, enter its netns
+PID=$(docker inspect -f '{{.State.Pid}}' mycontainer)
+sudo nsenter -t $PID -n tcpdump -i eth0 -w /tmp/cap.pcap
+```
+
+For Kubernetes, `kubectl debug` or sidecar a `nicolaka/netshoot`
+container into the pod.
+
+## Capturing on the loopback interface
+
+```bash
+sudo tcpdump -i lo -nn 'port 5432'
+```
+
+`-i any` covers loopback on Linux. On macOS, `lo0` is separate.
+Loopback traffic uses 65k-byte segments (no MTU), so byte counts
+look enormous. Don't be alarmed.
+
+## Common mistakes
+
+- **Forgetting to filter.** A busy box can produce gigabytes of
+  pcap in minutes. Filter aggressively.
+- **Capturing your own SSH.** `not port 22` saves you from a
+  feedback loop of capture traffic causing more capture traffic.
+- **Truncated payloads.** Old defaults of `-s 96` cut packets
+  short. Modern tcpdump uses 262144; if you see "[|http]" in
+  output, increase `-s`.
+- **Permissions.** tcpdump needs root or `CAP_NET_RAW`. In Docker,
+  the container needs `--cap-add=NET_RAW`.
+- **Not noting time alignment.** When correlating with app logs,
+  verify clocks. NTP drift between systems makes pcap timestamps
+  lie by seconds.
+
+## A realistic debug session
+
+Symptom: random 5% of POST `/api/orders` requests timing out from
+the web frontend to the orders service.
+
+```bash
+# On the frontend host, capture outbound to orders service
+sudo tcpdump -i any -nn -w fe.pcap 'host orders.internal and tcp port 443'
+
+# On the orders host, capture inbound from frontend
+sudo tcpdump -i any -nn -w be.pcap 'host frontend.internal and tcp port 443'
+```
+
+Reproduce, stop both. In Wireshark:
+
+- Open `fe.pcap`: requests visible, SYN sent, ACK received, POST
+  body sent. No response within 30s.
+- Open `be.pcap`: most requests visible. The failing ones — no
+  SYN ever arrived. The frontend sent them; the backend never
+  saw them.
+
+Conclusion: packet loss between the two hosts. Now check the
+network — switch counters, MTU mismatch, conntrack table
+overflow. The bug is no longer in either app.
+
+This is the workflow. tcpdump on both sides, compare. Whichever
+side stops seeing the packets tells you where the problem starts.

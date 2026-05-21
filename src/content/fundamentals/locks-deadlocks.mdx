@@ -1,0 +1,324 @@
+export const level = 'senior';
+
+# Locks and deadlocks
+
+When multiple threads (or processes, or async tasks) touch the
+same mutable state, **something** must serialize them. Locks are
+the most common primitive. They're also the source of the most
+classic concurrency failure mode: **deadlock**, where threads
+wait for each other forever and the program freezes.
+
+## The lock zoo
+
+Different primitives, different trade-offs:
+
+### Mutex (mutual exclusion lock)
+
+Owned by one thread at a time. Anyone else who calls `lock()`
+blocks until the owner `unlock()`s. The bread-and-butter primitive.
+
+```js
+await mutex.lock();
+try {
+  // critical section
+} finally {
+  mutex.unlock();
+}
+```
+
+Variants:
+
+- **Recursive (reentrant) mutex**: same thread can `lock()`
+  multiple times, must `unlock()` the same number of times. Useful
+  but a code smell — usually means your locking layers don't know
+  about each other.
+- **Try-lock**: `tryLock()` returns immediately with success/fail
+  instead of blocking. For "if not contended, do it; otherwise
+  defer."
+- **Timed lock**: `tryLock(timeoutMs)` blocks up to a limit. Lets
+  you detect deadlock-ish situations and recover.
+
+### Semaphore
+
+A counter. `acquire()` decrements; if it would go negative, blocks.
+`release()` increments and wakes a waiter.
+
+```js
+const sem = new Semaphore(10);          // max 10 concurrent
+await sem.acquire();
+try { ...slow op... } finally { sem.release(); }
+```
+
+A semaphore initialized to 1 is essentially a mutex (without
+ownership semantics). Use semaphores when you want to **cap
+concurrency** (e.g., "no more than 10 in-flight requests to this
+upstream") rather than enforce exclusivity.
+
+### RWLock (reader-writer / shared-exclusive)
+
+Many readers OK simultaneously; writers exclusive. Use when reads
+vastly outnumber writes and the critical section is non-trivial.
+
+```js
+await rw.acquireRead();    // shared
+await rw.acquireWrite();   // exclusive
+```
+
+Trade-off: writer starvation if readers stream in constantly.
+Most implementations give writers some priority to avoid this.
+
+### Spinlock
+
+Instead of blocking when contended, **busy-loop** until the lock is
+free. CPU-intensive, but avoids the overhead of putting the thread
+to sleep and rescheduling.
+
+```js
+while (atomic_compare_exchange(&lock, 0, 1) != 0) { /* spin */ }
+// critical section
+lock = 0;
+```
+
+Right choice when:
+
+- Critical section is **extremely short** (a few instructions).
+- The kernel-level mutex's wake/sleep overhead dominates.
+- You have dedicated cores (won't waste a core spinning while
+  others wait).
+
+Wrong choice when:
+
+- Critical section can be slow (you'll burn CPU for the lock holder
+  to finish).
+- Only one CPU (the spinner can never make progress if the holder
+  isn't scheduled).
+
+Kernels use spinlocks heavily for short internal critical sections.
+Userspace mostly uses adaptive mutexes (spin briefly, then block).
+
+### Condition variable
+
+"Wait until some predicate becomes true." Used with a mutex.
+
+```js
+mutex.lock();
+while (!queue.hasItems()) {
+  await cv.wait(mutex);   // releases mutex, sleeps, reacquires on wake
+}
+const item = queue.pop();
+mutex.unlock();
+
+// Producer:
+mutex.lock();
+queue.push(x);
+cv.signal();   // or cv.broadcast()
+mutex.unlock();
+```
+
+Note the `while (!predicate)` loop, **not** `if`. Condition
+variables can wake spuriously, and another waiter might race ahead
+of you. Re-check after every wake.
+
+### Atomic operations
+
+For single-word updates, atomics skip locks entirely:
+
+```js
+Atomics.add(view, 0, 1);                       // atomic increment
+Atomics.compareExchange(view, 0, expected, next);  // CAS
+```
+
+Faster than a mutex for trivial updates. Limited in scope —
+nothing larger than a word can be made atomic without help.
+Lock-free data structures (queues, hash maps) build entirely on
+CAS, and they're hard to write correctly. See
+`fundamentals/memory-barriers.mdx` for the visibility story.
+
+## Coffman's four conditions
+
+A deadlock occurs only when **all four** of these hold
+simultaneously:
+
+1. **Mutual exclusion** — a resource is held by one thread at a
+   time. (Locks. Files opened exclusively. Connections from a fixed
+   pool.)
+2. **Hold and wait** — a thread holding one resource is waiting to
+   acquire another.
+3. **No preemption** — resources can only be released voluntarily by
+   the thread that holds them. (You can't yank a lock from a
+   thread.)
+4. **Circular wait** — there's a cycle in the "who waits for whom"
+   graph.
+
+Eliminate any one and deadlock becomes impossible. The fixes
+target different conditions.
+
+## The classic deadlock
+
+Two threads, two locks, opposite acquisition order:
+
+```js
+// Thread A:
+await lockX.lock();
+await lockY.lock();   // Thread A holds X, wants Y
+// ...
+
+// Thread B:
+await lockY.lock();
+await lockX.lock();   // Thread B holds Y, wants X
+// ...
+```
+
+A holds X waiting for Y. B holds Y waiting for X. Neither will
+release. Forever. Diagnostic: stack traces show both threads
+inside the second `lock()` call, the holder/waiter graph shows
+the cycle.
+
+## Lock ordering — the remedy
+
+Establish a **total order on locks** and always acquire in that
+order. Define the order globally (alphabetical by lock name, or
+by depth in your domain hierarchy, or just an arbitrary `lock_id`
+field). Enforce in code review or tooling.
+
+```js
+// Both threads:
+const [first, second] = [lockX, lockY].sort(byId);
+await first.lock();
+await second.lock();
+// ...
+```
+
+With a consistent order, no cycle can form — the "wait-for" graph
+is necessarily acyclic. This is the standard solution and the
+single most useful design discipline for multithreaded code.
+
+When a global order is impractical (e.g., you've got per-object
+locks and any pair might be touched), use **`tryLock` with
+backoff**:
+
+```js
+await lockA.lock();
+while (!lockB.tryLock()) {
+  lockA.unlock();
+  // sleep a bit, retry from the top
+  await sleep(jitter());
+  await lockA.lock();
+}
+```
+
+You may not deadlock, but you can livelock if all threads keep
+backing off at the same time. Random jitter helps.
+
+## Livelock
+
+Threads aren't blocked — they're actively running — but make no
+progress. Two threads each politely step aside for the other and
+keep stepping in the same direction. Common with naive `tryLock +
+back off + retry immediately` patterns.
+
+Same flavor: **two retrying clients exponential-backing-off
+in sync**, both retry at exactly the same instant forever. Solution
+is the same — random jitter.
+
+## Starvation
+
+A thread keeps trying to acquire a lock but is repeatedly beaten
+by others. Common with naive RWLock implementations (writer
+starves if readers stream in nonstop). Solution: writer priority,
+queued / FIFO locks (each waiter gets the lock in arrival order).
+
+## Priority inversion
+
+A high-priority thread blocked on a lock held by a low-priority
+thread, while a medium-priority CPU-bound thread runs ahead of
+the low-priority holder. The low-priority holder never gets
+scheduled, so it never releases the lock, so the high-priority
+thread waits forever.
+
+The Mars Pathfinder mission famously hit this in 1997. The
+classic fix is **priority inheritance**: while a higher-priority
+thread is waiting, the holder's priority is temporarily boosted
+to match. Most modern real-time kernels and pthread implementations
+support this; turn it on with `PTHREAD_PRIO_INHERIT`.
+
+## Dining philosophers
+
+Five philosophers sit around a table. Between each pair is a
+single fork. To eat, a philosopher needs both forks (left and
+right). If all five simultaneously pick up their left fork,
+deadlock — every one of them is waiting for the right fork held
+by their neighbor.
+
+The textbook model of "many threads, many resources, naive
+acquisition order causes cycles." Solutions:
+
+- **Lock ordering** — number the forks, always pick the lower-
+  numbered first. Breaks circular wait.
+- **Asymmetric protocol** — even-indexed philosophers pick left
+  first, odd pick right first. Breaks circular wait.
+- **Resource hierarchy** — one waiter (semaphore counted to 4)
+  prevents all five from holding one fork at once.
+- **Try-pick** — pick left, try-pick right, drop left and retry if
+  failed. Avoids deadlock but introduces livelock risk without
+  jitter.
+
+Worth running through once mentally; the patterns recur in real
+code constantly.
+
+## Practical debugging
+
+Symptoms of deadlock in production:
+
+- Two or more threads "stuck" — no CPU, no progress.
+- A thread dump (jstack, `pstack`, `node --inspect`) shows them in
+  `lock()`/`futex()`/`mutex_lock()` system calls.
+- The blocked threads' "what they're waiting on" cross-references —
+  Thread 1 waiting on lock owned by Thread 2 waiting on lock
+  owned by Thread 1.
+
+Tools:
+
+- **Java**: `jstack PID` shows "Found one Java-level deadlock"
+  blocks. Best deadlock-detection of any mainstream platform.
+- **Go**: the runtime detects deadlocks where all goroutines are
+  blocked and crashes (`fatal error: all goroutines are asleep -
+  deadlock!`). Doesn't catch partial deadlocks (some goroutines
+  stuck, others working).
+- **C/C++**: `helgrind` (valgrind) and `tsan` (thread sanitizer)
+  detect lock-ordering violations dynamically.
+- **Linux generally**: `gdb`, then `info threads` and
+  `thread apply all bt`. Trace each thread's wait target manually.
+
+## Locks in async / single-threaded contexts
+
+Single-threaded JS doesn't have classical races, but you can still
+deadlock async tasks: two promises each `await`ing each other,
+producer-consumer queues with no termination signal, mutex
+libraries (`async-mutex`) used in cyclic patterns.
+
+The lock-ordering discipline still applies. Lock-free designs
+(use atomic compare-and-swap on a shared structure) and immutable
+data structures sidestep the whole class.
+
+## The rules
+
+- **Acquire locks in a consistent order.** This single rule prevents
+  most deadlocks.
+- **Hold locks for the shortest possible time.** Long critical
+  sections give other threads more opportunities to contend or
+  deadlock.
+- **Don't call out from inside a lock** to code that might acquire
+  other locks you can't reason about (especially: don't call
+  user-provided callbacks while holding a lock).
+- **Prefer simpler primitives.** Mutex > RWLock > condvar > lock-
+  free. Each step up the complexity ladder is more bugs per LOC.
+- **Use timeouts** on production locks where possible — better to
+  fail a request than to deadlock the service.
+- **Test for races.** Add jitter. Use ThreadSanitizer. Run under
+  contention. Most deadlocks don't reproduce without stress.
+
+The deepest fix is usually structural: redesign so the shared
+mutable state isn't shared (per-thread copies, message passing,
+immutable snapshots). Locks are a tool of last resort, not a first
+choice.

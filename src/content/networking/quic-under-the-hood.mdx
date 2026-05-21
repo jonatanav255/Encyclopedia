@@ -1,0 +1,271 @@
+export const level = 'senior';
+
+# QUIC under the hood
+
+HTTP/3 runs on **QUIC**, not TCP. The reasons are technical and
+specific: TCP head-of-line blocking, kernel ossification, slow
+handshakes, no migration. QUIC fixes all four — at the cost of
+running in userland, on UDP, with TLS 1.3 fused into the transport.
+
+This is the transport view; for the app-layer shape see **HTTP
+Versions**.
+
+## Why not just keep TCP?
+
+TCP has problems you can't fix in the kernel because middleboxes
+on the path break when you try.
+
+- **HOL blocking in multiplexed protocols.** HTTP/2 puts many
+  streams on one TCP socket. One lost packet stalls all of them.
+- **Handshake cost.** TCP + TLS 1.3 = 2 RTTs minimum on a cold
+  connection.
+- **Connection migration is impossible.** A TCP connection is
+  identified by the 4-tuple; change your IP (wifi → cellular) and
+  the connection is gone.
+- **TCP options are frozen.** Adding a new option (TCP Fast Open,
+  Multipath TCP) means convincing every middlebox, NAT, and
+  intrusion detector in the world not to drop unknown options.
+  Most do. Deployment is glacial.
+
+Google noticed this around 2012, started building QUIC, deployed
+it across Google services, fed the results to the IETF, and
+RFC 9000 standardized it in 2021. HTTP/3 (RFC 9114, 2022) defined
+how HTTP runs over it.
+
+## The transport layer cake
+
+```
+HTTP/3
+QPACK
+QUIC streams
+QUIC packets       (encrypted, with TLS 1.3 keys)
+UDP
+IP
+```
+
+Compare to HTTP/2:
+
+```
+HTTP/2 frames
+TLS 1.3            (encrypted)
+TCP
+IP
+```
+
+QUIC swallows everything from "reliable ordered delivery" up to
+"TLS-encrypted streams" into one protocol. The kernel just sees
+UDP packets.
+
+## Streams without HOL blocking
+
+A QUIC connection contains many **streams**, each an ordered byte
+sequence. Critically, the streams are **independently ordered** at
+the transport layer.
+
+If packet for stream A is lost, streams B, C, D keep flowing.
+Only A blocks until the retransmit arrives. In HTTP/2-over-TCP,
+the loss of one packet stalls the entire socket because TCP
+guarantees ordering across all bytes.
+
+Each stream has its own flow control window (per-stream and
+per-connection). The receiver can backpressure one slow consumer
+without blocking the others.
+
+For HTTP/3, each request/response pair is one stream. A slow image
+load doesn't stall a JS bundle download on the same connection.
+
+## Handshake — 1-RTT (and 0-RTT)
+
+QUIC bakes TLS 1.3 into itself. The handshake combines transport
+setup and crypto key exchange in a single 1-RTT exchange:
+
+```
+Client                                            Server
+  │ ── Initial (ClientHello, transport params) ──▶ │
+  │ ◀── Initial (ServerHello, transport params) ── │
+  │ ◀── Handshake (cert, finished) ────────────────│
+  │ ── Handshake (finished) ──────────────────────▶│
+  │ ── 1-RTT data (the actual HTTP request) ─────▶ │
+  │ ◀── 1-RTT data (the response) ─────────────────│
+```
+
+Total: 1 RTT before the request goes out. Compare to TCP + TLS 1.3
+which is 2 RTTs.
+
+### 0-RTT resumption
+
+A returning client (one that has a recent session ticket) can send
+data in its very first packet:
+
+```
+Client                                Server
+  │ ── Initial + early data (GET /) ──▶ │
+  │ ◀── ServerHello + response ────────│
+```
+
+Zero round trips to first byte. Combined with QUIC's connection
+migration, the second visit to a site can be nearly instantaneous.
+
+**The catch: replay attacks.** A network observer who captured the
+0-RTT packet can replay it later. If the request was a `POST` to
+`/transfer-money`, that's catastrophic.
+
+The rule: only use 0-RTT for **idempotent, safe** operations.
+HTTP/3 implementations restrict 0-RTT to safe methods (GET, HEAD)
+by default. Servers can refuse 0-RTT, forcing a 1-RTT request.
+
+Browser behavior in 2026 is conservative: 0-RTT for the initial
+GET / on a returning visit, falling back to 1-RTT for everything
+else. The performance win is real for cold-second-visit; the
+risks are real for misuse.
+
+## Connection migration — survives network changes
+
+A QUIC connection is identified by a **connection ID**, not by
+the 4-tuple. When the client's IP changes (wifi to cellular, VPN
+toggle, NAT rebinding), the client just sends the next packet from
+the new IP with the same connection ID. The server sees a new
+source IP, recognizes the connection ID, validates with a path
+challenge, and keeps going.
+
+For a video call, a download, or a long-lived API session, the
+user doesn't notice the network switch. With TCP, they would — the
+old connection breaks, the app reconnects, and any in-flight state
+is lost.
+
+This is the killer feature for mobile. It's also why CDNs and load
+balancers had to change: a 4-tuple-keyed forwarding decision no
+longer works. They route by connection ID instead.
+
+## Packet number, not sequence number
+
+TCP retransmits use the same sequence number as the original
+packet. This means the receiver can't tell "is this the original
+or the retransmit" — which breaks RTT measurement on
+retransmitted packets (the **RTT ambiguity** problem) and limits
+the precision of congestion control.
+
+QUIC packets each have a unique, monotonically increasing **packet
+number**. The retransmit gets a new number. RTT is always
+unambiguous. Loss detection is more precise. Congestion algorithms
+(BBR, CUBIC adapted for QUIC) get cleaner signals.
+
+## Encrypted by default — including headers
+
+In TCP+TLS, the TCP headers are plaintext. Middleboxes can read
+(and meddle with) sequence numbers, ECN bits, window sizes, etc.
+This is what made TCP innovation impossible — middleboxes assumed
+specific behaviors and broke connections that deviated.
+
+In QUIC, almost everything is encrypted:
+
+- **Long header packets** (handshake): partially encrypted; some
+  bits visible.
+- **Short header packets** (post-handshake): the only thing visible
+  to middleboxes is the connection ID and a few bits. Even the
+  packet number is encrypted (with **header protection**).
+
+The deliberate effect: middleboxes can't ossify QUIC the way they
+ossified TCP. The protocol can evolve.
+
+Consequence: you can't `tcpdump` and read QUIC traffic without
+the keys. For debugging, browsers and `curl --http3` support
+`SSLKEYLOGFILE`; Wireshark decrypts.
+
+## Userland implementations
+
+QUIC lives in the application, not the kernel. Implications:
+
+- **No kernel deployment cycle.** Roll out a new QUIC version with
+  a server update.
+- **Each implementation tunes its own congestion control, pacing,
+  loss detection.** Performance varies more than TCP.
+- **CPU cost is higher.** Per-packet encryption, packet number
+  handling, congestion accounting — all in userland, often per
+  packet. Kernel TCP benefits from years of inlining and offload.
+
+Major implementations: **quiche** (Cloudflare), **msquic**
+(Microsoft), **quic-go**, **lsquic** (Lightspeed/Akamai),
+**ngtcp2** (used by curl, nginx). Google's original implementation
+is now mostly merged into Chromium.
+
+**UDP offload** (UDP GSO/GRO, segmentation offload) and
+**kernel-bypass** stacks (DPDK, AF_XDP) close some of the CPU gap.
+Servers handling huge QUIC fleets often use these.
+
+## Why HTTP/3 doesn't help inside the datacenter
+
+QUIC's wins concentrate on lossy, high-RTT, mobile networks:
+
+- HOL blocking matters most when loss > 0.1%.
+- Connection migration matters when clients change networks.
+- 0-RTT helps for cold-second-visits.
+
+A datacenter LAN has near-zero loss, ~1ms RTT, fixed addresses.
+HTTP/2 over TCP is as fast as HTTP/3 (often faster, because TCP
+is kernel-offloaded and QUIC isn't). The cost of QUIC's CPU
+overhead exceeds its benefit.
+
+Most enterprises run HTTP/3 from the user → CDN edge, then HTTP/2
+or even HTTP/1.1 from CDN → origin. This matches where each
+protocol earns its keep.
+
+## Server Name Indication, but encrypted
+
+In TLS over TCP, the **SNI** (which hostname the client wants) is
+plaintext in the ClientHello. Observers can see "this user is
+visiting `politicaldissident.example`."
+
+QUIC's initial packets are encrypted with keys derived from the
+connection ID and a known salt — so they're not cleartext, but
+they're trivially decryptable by anyone who knows the spec. SNI is
+effectively visible.
+
+**Encrypted Client Hello (ECH)** encrypts SNI under the CDN's
+public key. The CDN can decrypt; observers can't. ECH is in
+deployment as of 2026 — Cloudflare and a few major CDNs support
+it; browsers behind various feature flags. The interaction with
+QUIC is the same as with TCP+TLS, just on a different transport.
+
+## Connection ID rotation — privacy
+
+A naive QUIC implementation reuses the same connection ID forever.
+That's a tracking ID — an observer can follow a user across IP
+changes (which was supposed to be a privacy win).
+
+QUIC supports **connection ID rotation**: the server hands out
+multiple connection IDs; the client rotates which it uses,
+especially after migrating. Done well, this preserves the
+migration benefit without enabling tracking.
+
+Implementation quality varies. Browsers do this; some custom
+clients don't bother.
+
+## Practical adoption in 2026
+
+- **~30% of HTTPS traffic** to top sites is HTTP/3 (Cloudflare,
+  Google, Facebook serving large shares of it).
+- **Browsers**: Chrome, Firefox, Safari all support HTTP/3 by
+  default.
+- **Servers**: nginx (with the upstream QUIC patches merged
+  recently), Caddy (built-in), HAProxy, LiteSpeed, Cloudflare's
+  edge.
+- **Node**: no first-class HTTP/3 in core. Use a proxy or a
+  third-party library. For 99% of Node services, terminate /3 at
+  the CDN; your origin speaks /1.1 or /2 over TCP.
+
+## When QUIC is the wrong answer
+
+- **Strict middlebox environments** that block UDP. Some
+  enterprise firewalls, hotel wifi, etc. Browsers detect this and
+  fall back to HTTP/2 over TCP automatically.
+- **Low-latency LAN.** QUIC's CPU overhead beats its on-wire
+  savings.
+- **Workloads with huge unstreamed unicast** (file transfers,
+  batch jobs). TCP with BBR and large buffers is fine.
+
+For everything that touches a mobile client over the public
+internet, QUIC is the future. Knowing why — HOL blocking, fast
+handshake, migration — is the senior-engineer understanding that
+turns "we should upgrade to HTTP/3" from a buzzword into a
+decision.

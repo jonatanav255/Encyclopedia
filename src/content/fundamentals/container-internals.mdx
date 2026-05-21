@@ -1,0 +1,272 @@
+export const level = 'senior';
+
+# Container internals
+
+A container is not a kernel feature. It's a process, started with
+specific arguments and constrained by several unrelated kernel
+mechanisms layered on top. Docker is one ergonomic frontend over
+those mechanisms; there are others (podman, containerd, CRI-O,
+LXC). Understanding what's underneath separates "Docker works
+mysteriously" from "I can debug this without Docker."
+
+For the CLI / image / Dockerfile view, see `devops/docker.mdx`.
+This page is the **internals** view.
+
+## What a container actually is
+
+A container is a process started with:
+
+- New **namespaces** (pid, mount, net, uts, ipc, user, cgroup) —
+  isolated view of OS resources.
+- A **new root filesystem** (pivoted to the image's unpacked
+  rootfs) — isolated filesystem view.
+- A **cgroup** with resource limits — bounded CPU, memory, I/O.
+- A **seccomp filter** — restricted set of syscalls allowed.
+- A reduced set of **Linux capabilities** — finer-grained subdivision
+  of "root" privileges.
+- Optionally **AppArmor / SELinux** profile — mandatory access
+  control layer.
+
+That's it. There's no "container" object in the kernel. There's a
+process tree, with the above constraints applied. `ps aux` on the
+host sees them as regular processes with weird namespaces.
+
+```bash
+$ ps -ef | grep nginx       # host view
+root  1234   1233  0 10:00  ?  00:00:01 nginx: master process
+www-data 1245 1234 0 10:00 ?  00:00:00 nginx: worker process
+```
+
+These are the same processes that appear as PID 1 and PID N inside
+the container.
+
+## OCI Runtime spec
+
+The **Open Container Initiative** defines two specs:
+
+- **Image spec** — what a container image is on disk: layered tar
+  archives, manifests, config blob.
+- **Runtime spec** — what a container looks like at runtime: a
+  bundle (rootfs + `config.json`) and operations to create/start/
+  kill/delete a container.
+
+`config.json` is the deliverable. It declares: the command to run,
+which namespaces to create, what cgroups to apply, what
+filesystem mounts, what capabilities to drop, what seccomp profile,
+which user to run as. A reference runtime (runc) reads this and
+makes it real.
+
+Anyone implementing the OCI runtime spec can run OCI images.
+Docker is not load-bearing — `podman`, `crun`, `youki` all do the
+same job.
+
+## The container stack
+
+```
++-------------------------------------------+
+|  CLI / API: docker, ctr, crictl, podman   |
++-------------------------------------------+
+|  High-level runtime: containerd, CRI-O    |
+|  - image pulling, lifecycle               |
+|  - network plugins (CNI)                  |
+|  - storage drivers (overlayfs, ...)       |
++-------------------------------------------+
+|  Low-level runtime: runc, crun, youki     |
+|  - reads OCI config.json                  |
+|  - calls clone/unshare/mount/exec         |
++-------------------------------------------+
+|  Kernel: namespaces, cgroups, seccomp,    |
+|  capabilities, overlayfs, ...             |
++-------------------------------------------+
+```
+
+`docker run` -> Docker daemon -> containerd -> runc -> kernel.
+Kubernetes goes `kubelet -> CRI (containerd or CRI-O) -> runc ->
+kernel`. The high-level runtime handles pulling images, networking,
+storage; the low-level runtime is the thin shim that actually calls
+`clone(CLONE_NEWPID | CLONE_NEWNS | ...)`.
+
+You can run runc directly with a hand-written `config.json`. It's
+educational and reveals there's no Docker magic — just kernel
+calls.
+
+## What `runc` does, briefly
+
+Given a bundle (rootfs directory + config.json):
+
+1. **`clone()`** with all the namespace flags to start a new process
+   in fresh namespaces.
+2. In the child, **set up the new rootfs**: bind-mount the host
+   rootfs, do `pivot_root` so the container's rootfs becomes `/`.
+3. **Mount** `/proc`, `/sys`, `/dev` with safe defaults appropriate
+   for a container (e.g., a tmpfs `/dev` with only the standard
+   device nodes).
+4. **Set up the network namespace**: bring up `lo`; the higher-level
+   runtime (CRI-O / containerd) handles `veth` pairs, bridges,
+   IP allocation via CNI.
+5. **Configure the cgroup**: write the container's PID to
+   `cgroup.procs`, apply `memory.max`, `cpu.max`, etc.
+6. **Drop capabilities**: `prctl(PR_CAPBSET_DROP, ...)` for each cap
+   not in the allowed list.
+7. **Apply seccomp filter**: `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`.
+8. **Apply AppArmor / SELinux label** if configured.
+9. **`setresuid` / `setresgid`** to the configured user.
+10. **`execve` the entrypoint**.
+
+After exec, the entrypoint runs as PID 1 in the new namespace, with
+all the constraints in place. From its perspective, it's just a
+program. From the host's perspective, it's a process pinned into
+namespaces and cgroups it can't escape.
+
+## PID 1 inside the container
+
+The entrypoint becomes PID 1. PID 1 has special obligations:
+
+- **Reap zombie children.** When any process descendant exits, if
+  its immediate parent has already died, it's re-parented to PID 1.
+  PID 1 must call `wait()` or the entry stays in the process table
+  as a zombie.
+- **Receive signals correctly.** Most signals are ignored by PID 1
+  unless explicitly handled. `SIGTERM` requires a handler to do
+  graceful shutdown.
+
+If your container's entrypoint is your application directly (Node,
+Java, Python), it probably doesn't know it's PID 1 and doesn't
+reap zombies. Symptoms:
+
+- Long-running container accumulates `<defunct>` processes in
+  `ps`.
+- `docker stop` times out and falls back to SIGKILL because the app
+  doesn't handle SIGTERM.
+
+The fix: use a tiny init process as PID 1, which reaps zombies and
+forwards signals.
+
+```bash
+# In your Dockerfile, either use tini explicitly...
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]
+
+# ...or use Docker's built-in init at run time:
+docker run --init ...
+```
+
+Or in Kubernetes: `shareProcessNamespace: true` and an explicit init
+container — though `--init`-style is usually simpler.
+
+## seccomp
+
+Seccomp filters which syscalls the process can make. Docker's
+default profile blocks ~50 of the ~400 Linux syscalls — the ones
+that are dangerous (mounting filesystems, loading kernel modules,
+raw network access, debugging other processes via ptrace).
+
+You can write custom profiles. `docker run --security-opt
+seccomp=my-profile.json`. Disabling seccomp entirely
+(`--security-opt seccomp=unconfined`) is a security regression;
+some sandboxing tools require it though.
+
+## Capabilities
+
+Linux split "root" into **38+ capabilities** (CAP_NET_BIND_SERVICE,
+CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_DAC_OVERRIDE, ...). A process
+can hold a subset.
+
+By default, containers get a small subset of capabilities (no
+CAP_SYS_ADMIN, no CAP_NET_ADMIN). You can add specific ones with
+`--cap-add` or drop with `--cap-drop`. The principle: grant the
+narrowest set the workload actually needs.
+
+`--privileged` grants all capabilities (and disables seccomp,
+gives access to all devices). It's effectively "this container is
+root on the host." Avoid unless you really need it; for build
+processes etc., look for narrower flags first.
+
+## rootfs and overlayfs
+
+The container's filesystem is a **stack of read-only image layers
+plus one read-write layer on top**, presented as a single tree via
+**overlayfs**.
+
+```
++---------------------------------+
+| writable layer (container's CoW) |
++---------------------------------+
+| layer N (image's last RUN)        |
++---------------------------------+
+| layer N-1                         |
++---------------------------------+
+| ...                               |
++---------------------------------+
+| base layer (e.g., alpine:3)       |
++---------------------------------+
+```
+
+Reads hit the topmost layer that has the file. Writes copy the file
+up to the writable layer (CoW). Deletes leave a "whiteout" marker
+in the writable layer hiding the lower copy.
+
+This is why image layers are useful — the same base layer is shared
+on disk across many containers. It's also why writing to large
+files inside a container can be slow (whole-file CoW the first time
+you touch it).
+
+For real persistent data, use volumes — bind mounts of host
+directories or named volumes managed by the runtime. Don't write
+to the container filesystem in production.
+
+## Image building: just a series of layers
+
+`docker build` of a Dockerfile runs each instruction in a temporary
+container, then snapshots the rootfs as a new layer. `FROM`,
+`RUN`, `COPY`, `ADD` create layers. `CMD`, `ENV`, `ENTRYPOINT`,
+`USER`, `WORKDIR` only modify metadata in the image config.
+
+Each layer is content-addressed (sha256 of its tar contents).
+Layers don't need to be rebuilt if their inputs haven't changed.
+This is the **build cache** — order your Dockerfile to put rarely-
+changing layers first (install deps, then copy code).
+
+## What the container can't escape from
+
+A correctly-configured container can't:
+
+- See or signal host processes (pid namespace).
+- Mount host filesystems (mount namespace + dropped CAP_SYS_ADMIN).
+- Bind to privileged host ports without CAP_NET_BIND_SERVICE.
+- Use raw sockets without CAP_NET_RAW.
+- Load kernel modules.
+- Make arbitrary syscalls (seccomp blocks dangerous ones).
+- Exceed memory or CPU limits (cgroups).
+
+What can escape:
+
+- Anything with `--privileged`.
+- Containers with the host PID/network/mount namespace shared
+  (`--pid=host`, `--network=host`, `-v /:/host`).
+- Bugs in the runtime (rare but they happen — runc has had several
+  CVEs over the years).
+- Kernel exploits affecting all containers on the host (containers
+  share one kernel — the strongest isolation argument for VMs over
+  containers in multi-tenant environments).
+
+## The mental model
+
+A container is a process, plus:
+
+- Namespaces for what it can see.
+- cgroups for what it can use.
+- seccomp / capabilities / LSMs for what it can do.
+- A pivoted rootfs for what filesystem it sees.
+- A high-level runtime stitching this together from an OCI image.
+
+There's no container kernel object. "Stopping a container" is
+"killing PID 1 in the container's pid namespace." "Mounting a
+volume" is "bind-mounting a host directory into the container's
+mount namespace at container-creation time." Everything has a
+corresponding kernel mechanism. When something doesn't work, the
+question is: which mechanism is misconfigured?
+
+See `fundamentals/cgroups-and-namespaces.mdx` for the namespace
+and cgroup layers in detail, and `devops/docker.mdx` for the CLI
+and image-authoring view.

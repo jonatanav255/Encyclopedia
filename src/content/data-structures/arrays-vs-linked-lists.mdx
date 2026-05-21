@@ -1,0 +1,189 @@
+export const level = 'junior';
+
+# Arrays vs linked lists
+
+The textbook story: arrays are O(1) to index but O(n) to insert; linked
+lists are O(1) to insert but O(n) to index. That's true on paper and
+wrong in practice. On a modern CPU, arrays usually win even at the
+things linked lists are "good at." Cache locality eats Big-O for
+breakfast.
+
+## What they actually are
+
+An **array** is a contiguous block of memory. Element `i` lives at
+`base + i * size`. A single multiplication and one memory read.
+
+A **linked list** is a chain of nodes, each holding a value and a
+pointer to the next node. To find element `i` you follow `i` pointers,
+each one a fresh memory load from a (likely) different cache line.
+
+```js
+// Array: one allocation, elements packed together
+const arr = [1, 2, 3, 4, 5];
+
+// Linked list: 5 separate node objects, each with a `next` reference
+class Node {
+  constructor(value) {
+    this.value = value;
+    this.next = null;
+  }
+}
+```
+
+JS arrays aren't always true contiguous arrays (engines use packed,
+holey, double, and dictionary modes), but for dense small-integer or
+small-object arrays V8 will use a contiguous backing store. Close
+enough.
+
+## The cache locality argument
+
+CPUs don't fetch one byte at a time. They fetch a **cache line** —
+typically 64 bytes. When you read `arr[0]`, you get `arr[0]` through
+roughly `arr[7]` (for 8-byte values) for free.
+
+A linked list node's `next` pointer points somewhere arbitrary. Each
+hop is a potential cache miss — 100-300 cycles of waiting on RAM. By
+the time you've followed 20 pointers, an array scan has already read
+hundreds of elements.
+
+Rough numbers on a modern desktop CPU:
+
+- L1 hit: ~1ns
+- L2 hit: ~4ns
+- L3 hit: ~12ns
+- Main memory: ~100ns
+
+A 100x speedup hides inside that table. Arrays exploit it. Linked
+lists fight it.
+
+## The insertion myth
+
+"Linked list insert is O(1)" assumes **you already have the node**.
+You don't. You usually have to find it first, which is O(n). So the
+real cost of "insert at position k" is:
+
+- Array: O(k) to shift elements after k. Cache-friendly memmove.
+- Linked list: O(k) to walk to position k. Cache-hostile pointer chase.
+
+Both are O(n) in the worst case, but the array's O(n) is faster because
+of locality and because `memmove` is one of the most optimized
+operations in any standard library.
+
+The linked list only beats the array when you **already hold a
+reference to the node** and just need to splice. That happens less
+often than the textbook suggests.
+
+## Append is fast on both — usually
+
+```js
+const arr = [];
+for (let i = 0; i < 1_000_000; i++) arr.push(i);
+```
+
+`push` is **amortized O(1)**. The array's backing store doubles when
+full, so most pushes are O(1) and the occasional resize averages out.
+
+Linked list `append-to-tail` is O(1) if you keep a tail pointer, O(n)
+if you don't. Singly-linked lists often only keep a head, in which
+case append walks the whole list. Doubly-linked lists almost always
+keep both.
+
+## Indexing
+
+Arrays: `arr[i]` is one address calculation and one read. O(1).
+
+Linked lists: `list.at(i)` follows `i` pointers. O(n). No amount of
+clever engineering changes that.
+
+If you index by integer position frequently, you don't want a linked
+list.
+
+## Splice in the middle
+
+```js
+// Array: shift everything after the insertion point
+arr.splice(1000, 0, 'new');   // O(n) — shifts ~n-1000 elements
+
+// Linked list: rewire two pointers
+//   if you have the node:
+node.next = new Node('new');
+//   if you don't, you walked to find it: O(n) either way
+```
+
+The linked list wins only when you have direct references to the
+splice points — e.g., you're maintaining a custom data structure that
+holds nodes (LRU cache, intrusive list in a kernel).
+
+## When linked lists actually win
+
+- **You hold node references and splice frequently.** LRU caches use
+  a doubly-linked list precisely for this — `move-to-front` is O(1)
+  when you already have the node from a hash table lookup.
+- **You need stable references that survive growth.** Pushing to a JS
+  array doesn't invalidate references (objects are heap-allocated),
+  but in lower-level languages, growing a vector can move everything.
+- **You're implementing a queue with a deque-like API** and want
+  guaranteed O(1) at both ends without amortization spikes.
+- **Persistent data structures** (functional languages) — sharing
+  tails between versions.
+
+Most application code doesn't hit any of these.
+
+## When arrays win (almost always)
+
+- **Iteration.** Cache-friendly, vectorizable, branch-predictable.
+- **Indexing.** O(1) and one memory load.
+- **Sorting.** Mergesort and quicksort want random access.
+- **Bulk operations.** `map`, `filter`, `reduce`, `splice` are all
+  faster on contiguous memory.
+- **Memory overhead.** No `next`/`prev` pointers — just the values.
+
+## JS-specific notes
+
+- `arr.shift()` and `arr.unshift()` are **O(n)** — they shift every
+  element. If you need a real FIFO queue, either use two stacks or
+  reach for a deque library. Don't use an array.
+- `arr.push()` and `arr.pop()` are amortized O(1).
+- Sparse arrays (holes) trigger slower paths in V8. `new Array(1000)`
+  is holey; `[].push(...)` in a loop stays packed.
+- Mixing types deopts the backing store (a packed-int array becomes a
+  packed-double or generic array). For hot loops, keep arrays
+  monomorphic.
+
+## A minimal singly-linked list
+
+If you need one (rare), it's not much code:
+
+```js
+class List {
+  constructor() {
+    this.head = null;
+    this.size = 0;
+  }
+  prepend(value) {
+    this.head = { value, next: this.head };
+    this.size++;
+  }
+  *[Symbol.iterator]() {
+    let n = this.head;
+    while (n) {
+      yield n.value;
+      n = n.next;
+    }
+  }
+}
+```
+
+That's the whole thing. Use it when you specifically need
+prepend-and-iterate semantics. Otherwise use an array.
+
+## The discipline
+
+- Default to arrays. Always. Even when Big-O suggests otherwise.
+- Reach for a linked list when you have a specific reason: intrusive
+  splicing, LRU-style move-to-front, persistent structures.
+- Don't write your own queue with `shift` — it's O(n) per dequeue.
+- Don't trust micro-benchmarks that ignore cache effects. Run on
+  realistic data sizes.
+- Big-O is a ceiling, not a prediction. Constants and locality
+  decide.

@@ -1,0 +1,250 @@
+export const level = 'senior';
+
+# cgroups and namespaces
+
+Linux containers aren't a single kernel feature. They're a pile of
+unrelated isolation mechanisms — **namespaces** for what a process
+can *see*, **cgroups** for what it can *use* — assembled by
+container runtimes (runc, containerd, Docker) into the thing you
+call "a container." Understanding the two layers separately is the
+difference between "containers are magic" and "I can debug this."
+
+## Namespaces — what you can see
+
+A namespace virtualizes some kernel resource: processes, mounts,
+network interfaces, etc. Inside one namespace, processes see only
+the resources in that namespace, not the host's full set.
+
+Linux has eight namespace types:
+
+| Namespace | What it isolates |
+| --- | --- |
+| **`pid`** | Process IDs. Inside, `ps` shows only this namespace's processes. PID 1 in the container is some other PID outside. |
+| **`mount` (`mnt`)** | The filesystem tree. Mounts in the namespace don't appear on the host. |
+| **`net`** | Network stack: interfaces, routing tables, iptables, sockets. |
+| **`user`** | UID/GID mappings. UID 0 in the container can be UID 100000 on the host. |
+| **`uts`** | Hostname and domainname. |
+| **`ipc`** | SysV IPC, POSIX message queues, shared memory. |
+| **`cgroup`** | Hides the host cgroup hierarchy (each namespace sees its own root). |
+| **`time`** | System time (boottime, monotonic). Newer, less commonly used. |
+
+Each process has a set of namespace memberships. `unshare(2)` /
+`clone(2)` create new namespaces. `setns(2)` joins an existing one.
+
+```bash
+$ ls -l /proc/$$/ns
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 cgroup -> 'cgroup:[4026531835]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 ipc    -> 'ipc:[4026531839]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 mnt    -> 'mnt:[4026531840]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 net    -> 'net:[4026531992]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 pid    -> 'pid:[4026531836]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 user   -> 'user:[4026531837]'
+lrwxrwxrwx 1 jen jen 0 May 21 10:14 uts    -> 'uts:[4026531838]'
+```
+
+Each link points at the namespace's inode. Two processes in the
+same namespace share the inode. `nsenter -t PID -a` enters a
+process's full set of namespaces — useful for debugging
+containers from the host.
+
+### `pid` namespace specifics
+
+Inside a pid namespace, your container's entrypoint becomes **PID 1**
+in that namespace, even though it's some random PID (say 12345) on
+the host. Both views are real — `ps` from inside vs `ps` from outside
+shows different numbers.
+
+PID 1 has the usual responsibilities (reap zombies, default
+signals — see `fundamentals/what-is-a-process.mdx`). If your
+container's entrypoint can't do those, use `--init` or `tini`.
+
+### `mount` namespace and rootfs
+
+The container's filesystem is just a mount namespace where the root
+(`/`) is bind-mounted to a different directory on the host (the
+container's "rootfs" — the unpacked image). Plus a few standard
+mounts (`/proc`, `/sys`, `/dev`) set up by the runtime.
+
+You can do this manually with `unshare --mount`, `pivot_root`, and
+some bind-mounts. That's literally what runc does, plus the other
+namespaces.
+
+### `net` namespace
+
+A new network namespace starts with **no interfaces except a down
+`lo`**. To give the container network access, the runtime
+typically:
+
+1. Creates a `veth` pair: two virtual ethernet interfaces wired
+   together.
+2. Moves one end into the container's net namespace.
+3. Bridges the host end to a bridge (e.g., `docker0`).
+4. Configures NAT (iptables/nftables) for outbound traffic.
+
+`docker run --network host` skips the new namespace — the container
+shares the host's network. Faster, less isolated.
+
+### `user` namespace and rootless containers
+
+The killer feature for security. Inside a user namespace, your
+process can be UID 0 (root). On the host, that maps to some
+unprivileged UID (say 100000). The container thinks it's root, but
+can't actually do anything outside its sandbox that requires real
+root.
+
+This is what makes **rootless containers** possible (Podman default,
+Docker rootless mode). The whole container stack runs as a normal
+user. A breakout still lands you as an unprivileged user.
+
+## cgroups — what you can use
+
+cgroups (**control groups**) limit and account resource usage —
+CPU, memory, I/O, network — for a group of processes. Independent
+of namespaces. You can apply cgroup limits to host processes
+without making them containers, or run a container without any
+limits.
+
+### cgroup v2 (the modern one)
+
+All controllers in one unified hierarchy under `/sys/fs/cgroup`:
+
+```bash
+$ ls /sys/fs/cgroup
+cgroup.controllers  cpu.max     memory.max    io.max
+cgroup.procs        cpu.weight  memory.high   ...
+```
+
+To put a process in a cgroup, write its PID to `cgroup.procs`:
+
+```bash
+mkdir /sys/fs/cgroup/mygroup
+echo 1234 > /sys/fs/cgroup/mygroup/cgroup.procs
+echo '512M' > /sys/fs/cgroup/mygroup/memory.max
+```
+
+Now PID 1234 (and its descendants, by default) live in `mygroup`
+with a 512 MB memory limit.
+
+### Common controllers
+
+**`memory`**:
+
+- `memory.max` — hard limit. Exceeding it triggers an in-cgroup
+  OOM kill (exit code 137).
+- `memory.high` — soft limit. Above it, processes get throttled
+  (slowed down) but not killed.
+- `memory.current` — current usage.
+
+**`cpu`**:
+
+- `cpu.max` — bandwidth limit: "X microseconds of CPU per Y
+  microseconds of wall clock." `100000 100000` is 1 full core.
+  `200000 100000` is 2 cores.
+- `cpu.weight` — proportional share under contention (default
+  100). Like `nice` for cgroups.
+
+**`io`**:
+
+- `io.max` — bandwidth + IOPS caps per block device.
+- `io.weight` — proportional share.
+
+**`pids`**:
+
+- `pids.max` — cap the number of tasks in the cgroup. Prevents
+  fork-bombs.
+
+### What `--memory=512m` actually does
+
+```bash
+docker run --memory=512m myimage
+```
+
+Container runtime creates a cgroup, writes `memory.max=512M` to it,
+puts the container's processes in the cgroup. Done. The kernel
+enforces it. Exceed 512 MB and one of your container processes
+gets SIGKILL'd by the in-cgroup OOM killer (which is a different
+beast from the system-wide OOM killer).
+
+Same for `--cpus=2.5`:
+
+```bash
+echo "250000 100000" > /sys/fs/cgroup/.../cpu.max
+```
+
+Allow 250 ms of CPU per 100 ms wall clock = 2.5 cores' worth.
+
+## Why `nproc` inside a container returns the host count
+
+`nproc` (and `os.cpus().length` in Node, `Runtime.availableProcessors()`
+in Java, etc.) reads from `/proc/cpuinfo` or `sched_getaffinity`.
+
+Neither of those is namespaced. They show the **host's CPU count**,
+not your cgroup's `cpu.max` limit. A container with `--cpus=2` on a
+64-core host will see 64.
+
+Real-world consequences:
+
+- Node's `cluster` spawns `os.cpus().length` workers — 64 on a
+  64-core host, even though only 2 cores are usable.
+- Java pre-Java 10 ignored container CPU limits and sized its
+  thread pools to the host's count. Modern JVMs (`+UseContainerSupport`,
+  enabled by default in Java 10+) detect cgroup limits and
+  honor them.
+- Go's `GOMAXPROCS` defaults to `runtime.NumCPU()` — same issue.
+  Use `automaxprocs` to read cgroup limits.
+
+The fixes are runtime-specific: read `/sys/fs/cgroup/cpu.max` (v2)
+or `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` (v1) yourself, and divide
+workers by what's actually allowed.
+
+## Putting it together: a container is...
+
+When you `docker run`, the runtime essentially does:
+
+1. **Unpack the image** into a rootfs directory.
+2. **Create new namespaces**: pid, mount, net, uts, ipc, user.
+3. **Set up the new rootfs** in the mount namespace via
+   `pivot_root`.
+4. **Mount `/proc`, `/sys`, `/dev`** appropriately for the
+   container.
+5. **Configure the network namespace** (veth pair, bridge, NAT, or
+   host-network).
+6. **Create the cgroup** and apply resource limits.
+7. **Apply seccomp filter, capabilities, AppArmor/SELinux profile**
+   (further hardening).
+8. **`execve` the entrypoint** as PID 1 in the new namespace.
+
+No single feature. Stack of orthogonal mechanisms. See
+`fundamentals/container-internals.mdx` for the OCI runtime view.
+
+## Debugging containers from the host
+
+```bash
+nsenter -t PID -a               # enter all namespaces of PID
+nsenter -t PID -n ip a           # show container's interfaces from host
+crictl exec -it CONTAINER sh     # newer containerd-native way
+docker exec -it CONTAINER sh     # the usual
+cat /sys/fs/cgroup/<PATH>/memory.current   # actual memory usage
+ps -eo pid,cgroup,cmd            # which cgroup is each process in
+systemd-cgls                      # tree of cgroups + their processes
+```
+
+You can change cgroup limits on a running container without
+restarting (`docker update --memory=1g CONTAINER`) — just rewrites
+the cgroup file.
+
+## The takeaway
+
+Two orthogonal mechanisms:
+
+- **Namespaces** = "what you can see." Per-process isolation of
+  filesystem, processes, network, users.
+- **cgroups** = "what you can use." Per-group accounting and
+  limiting of CPU, memory, I/O.
+
+Containers compose both. Knowing which mechanism owns which
+behavior — "why does my container see 64 cores" (namespaces don't
+hide them, cgroups don't lie about them either; the runtime
+doesn't translate), "why did my container die at exit 137" (memory
+cgroup OOM), "why can't I see the host's processes from inside"
+(pid namespace) — is most of container debugging.

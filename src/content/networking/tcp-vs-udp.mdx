@@ -1,0 +1,160 @@
+export const level = 'junior';
+
+# TCP vs UDP
+
+Two transport protocols sit on top of IP. Everything else — HTTP,
+DNS, gRPC, WebRTC, your database driver — picks one. TCP is the
+default "I want a connection, please don't lose anything." UDP is
+"send this packet, I'll figure out the rest."
+
+## TCP — connection-oriented byte stream
+
+What you get:
+
+- **Reliability** — lost packets are retransmitted.
+- **Ordering** — bytes arrive in the order you wrote them.
+- **Flow control** — the sender slows down if the receiver is full.
+- **Congestion control** — slows down if the network is full.
+- **A connection** — explicit setup (three-way handshake) and
+  teardown (FIN dance).
+
+What it costs:
+
+- **Setup latency** — at least 1 RTT before you can send data
+  (3 RTTs if you add TLS 1.2; 2 RTTs with TLS 1.3).
+- **Head-of-line blocking** — one lost packet stalls everything
+  behind it on that connection, even unrelated streams.
+- **Per-connection state** on every router/NAT in the path.
+
+TCP is a **byte stream**, not a message stream. If you `write("hello")`
+twice, the receiver might see `"hellohello"` in one read or split
+across two. Framing is the application's job. See
+**`node:net` and `node:dgram`** for the Node-side details.
+
+## UDP — connectionless datagrams
+
+What you get:
+
+- **Speed** — no handshake. First packet carries data.
+- **Message boundaries** — one `send` is one packet. The receiver
+  reads exactly that, or nothing.
+- **Stateless on the wire** — no per-connection table entries.
+- **Multicast / broadcast** — one packet to many receivers.
+
+What you don't get:
+
+- No reliability. Packet lost? Gone.
+- No ordering. Packets can arrive out of order or duplicated.
+- No flow control. You can blast a slow receiver until it drops you.
+- No congestion control. If everyone does this, the network melts
+  (which is why every serious UDP protocol implements its own).
+
+UDP is "IP with ports" plus a 16-bit checksum. That's it.
+
+## When to pick TCP
+
+- **HTTP / HTTPS / gRPC** — request/response, needs ordering, the
+  load matters.
+- **Database connections** — Postgres, MySQL, Redis, MongoDB. Long-
+  lived, ordered, can't tolerate silent drops.
+- **Payments, messaging, anything you'd be sued for losing** — the
+  retransmit logic is free and battle-tested.
+- **SSH, SMTP, IMAP** — interactive sessions, persistent state.
+
+Default to TCP. The protocol you use (HTTP, the DB driver) already
+made the choice; you're just confirming it.
+
+## When to pick UDP
+
+- **DNS** — single small query, single small response, retry at the
+  app layer is cheap. TCP handshake would double the cost.
+- **QUIC / HTTP/3** — runs on UDP precisely because TCP's HOL
+  blocking is the bottleneck. Builds its own reliability on top.
+- **Real-time audio / video (VoIP, WebRTC, game traffic)** — losing
+  a packet is fine; *retransmitting* a 200ms-old voice packet is
+  worse than just skipping it. You'd rather have a glitch than a
+  delay.
+- **Syslog, StatsD, metrics fan-out** — fire-and-forget. If a metric
+  packet drops, you lose one data point, not the system.
+- **NTP** — tiny exchanges; reliability isn't worth the overhead.
+- **Service discovery (mDNS, SSDP)** — multicast, only UDP can do
+  it.
+
+The pattern: UDP wins when **latency matters more than completeness**
+or when you can't afford per-connection state.
+
+## The handshake cost (why UDP keeps winning)
+
+A fresh TCP+TLS connection to a server 100ms away:
+
+```
+0ms    SYN          ─▶
+50ms                 ◀─ SYN-ACK
+100ms  ACK + ClientHello ─▶
+150ms                ◀─ ServerHello, Finished
+200ms  Finished + GET /  ─▶
+250ms                ◀─ 200 OK
+```
+
+250ms before the first byte of response. Repeat for every fresh
+connection. This is why keep-alive, connection pools, and 0-RTT
+resumption exist — they amortize the handshake across many
+requests.
+
+UDP-based protocols (QUIC, DNS) skip the multi-RTT setup entirely.
+First packet does work.
+
+## "But UDP is unreliable" — what that means in practice
+
+On a healthy LAN, UDP packet loss is near zero. On the public
+internet, 0.1-1% is typical; on bad cellular or wifi, 5%+. UDP
+itself doesn't care; the protocol on top must.
+
+QUIC, RTP, custom protocols — they all implement acks and
+retransmits. The difference from TCP: they can decide *which*
+packets to retransmit, when to give up, and whether to keep going
+on a parallel stream. The kernel's TCP can't make those choices.
+
+## "Address already in use" applies to both
+
+A TCP server binds to `(addr, port)`. A UDP server binds to
+`(addr, port)`. Same `EADDRINUSE` error, different protocols.
+`ss -tlnp` lists TCP listeners; `ss -ulnp` lists UDP listeners.
+
+A single port number can be used by both TCP and UDP independently
+(e.g., DNS uses both: UDP for normal queries, TCP for responses too
+big for UDP). They don't conflict.
+
+## Common confusion
+
+### "TCP is more secure"
+
+No. TCP and UDP are both unencrypted. TLS sits on top of TCP; QUIC
+bakes TLS 1.3 into itself. Encryption is orthogonal to transport
+choice.
+
+### "UDP is faster"
+
+Per-packet, UDP has less header overhead (8 bytes vs 20+) and no
+handshake. But "faster" is meaningless without context — TCP with
+keep-alive on a warm connection beats UDP-from-scratch for many
+workloads. UDP's win is **first-packet latency** and **no HOL
+blocking**.
+
+### "WebSocket uses UDP"
+
+No. WebSocket runs over TCP. WebRTC's data channels can use UDP
+(via SCTP-over-DTLS). Different protocols, often confused.
+
+### "I'll just use UDP and add retries"
+
+You've now invented a worse TCP. The reason QUIC took 10 years and
+involves the entire Google stack is that doing reliable transport
+*well* over UDP is hard. For request/response, use TCP. For things
+TCP genuinely can't do, use QUIC.
+
+## How to choose, in one sentence
+
+If you can tolerate "this byte arrived 200ms late" but not "this
+byte never arrived," use TCP. If you can tolerate "this byte never
+arrived" but not "200ms late," use UDP. Most things are the first.

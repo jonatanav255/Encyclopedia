@@ -1,0 +1,148 @@
+export const level = 'junior';
+
+# Memory hierarchy
+
+CPUs are fast. Memory is slow. To hide that gap, machines have a
+**hierarchy**: tiny, fast caches close to the cores; bigger, slower
+storage further out. The numbers span ten orders of magnitude — from
+sub-nanosecond register access to seconds of cross-continent network
+round-trips. Internalizing the rough shape of those numbers is one of
+the highest-leverage things a junior engineer can do.
+
+## The hierarchy, top to bottom
+
+| Level | Typical size | Access time | Bandwidth |
+| --- | --- | --- | --- |
+| Register | ~256 bytes per core | under 1 ns | trillions / sec |
+| L1 cache (per core) | 32-64 KB | ~1 ns | very high |
+| L2 cache (per core) | 256 KB - 2 MB | ~3-10 ns | high |
+| L3 cache (shared) | 8-64 MB | ~10-30 ns | high |
+| DRAM (main memory) | 16-512 GB | ~80-100 ns | ~30-80 GB/s |
+| NVMe SSD | 1-8 TB | ~10-100 microseconds | ~3-12 GB/s |
+| SATA SSD | 1-8 TB | ~100 microseconds | ~500 MB/s |
+| Spinning disk | 4-20 TB | ~5-10 ms | ~100-200 MB/s |
+| Same-region network | -- | ~0.5-2 ms RTT | -- |
+| Cross-continent network | -- | ~80-200 ms RTT | -- |
+
+Notice the gaps: L1 to DRAM is ~100x. DRAM to NVMe is ~1000x. NVMe to
+disk is ~100x. DRAM to a same-region network call is ~10,000x. A
+cross-continent call is ~100x slower again.
+
+## Jeff Dean's latency numbers (updated for 2026)
+
+The famous "latency numbers every programmer should know" list,
+rounded for the current decade:
+
+```
+L1 cache reference                                     1 ns
+Branch mispredict                                      3 ns
+L2 cache reference                                     4 ns
+Mutex lock/unlock (uncontended)                       15 ns
+Main memory reference                                100 ns
+Compress 1 KB with snappy                          2,000 ns   ~2 us
+Send 1 KB over 10 Gbps network                       100 ns
+Read 1 MB sequentially from memory                10,000 ns   10 us
+SSD random read (NVMe)                            20,000 ns   20 us
+Read 1 MB sequentially from SSD                  200,000 ns   200 us
+Round trip within same datacenter                500,000 ns   500 us
+Read 1 MB sequentially from spinning disk      5,000,000 ns   5 ms
+Disk seek (spinning)                          10,000,000 ns   10 ms
+Send packet US -> Europe -> US               150,000,000 ns   150 ms
+```
+
+Numbers shift each hardware generation but the **ratios** barely
+change. Memorize the ratios, not the digits.
+
+## What this implies in practice
+
+### Cache misses are expensive
+
+A cache miss costs ~100 ns on average. A pipelined CPU at 3 GHz
+executes ~300 instructions in that time. A data structure that
+chases pointers (linked list, hash table with linear probing into
+cold buckets, deeply nested object graph) can run **30-100x slower**
+than the same data laid out contiguously. See
+`fundamentals/cache-lines-and-locality.mdx`.
+
+### Sequential beats random by 1000x on disk
+
+Reading a 1 MB file in one go is ~200 microseconds on NVMe. Doing
+50 random 20 KB reads of that same megabyte is ~1 millisecond.
+Databases stake everything on this fact: B-trees pack keys
+together, log-structured stores write sequentially, indexes exist
+to turn random lookups into sequential range scans.
+
+### Network is the slowest thing in your stack
+
+Your service handler at p99 might run in 5 ms of CPU. One database
+query to a same-region replica adds 0.5-2 ms of round-trip latency.
+A call to another service adds another. Three sequential calls and
+you've spent half your latency budget on network. **Batch and
+parallelize cross-service calls.**
+
+A single cross-continent round-trip (~150 ms) costs more than your
+entire request budget. Don't put a database in a different region
+from your application server.
+
+### Memory access patterns matter more than algorithmic constants
+
+For small N, an O(n²) loop over a contiguous array often beats an
+O(n log n) algorithm on a linked list. The constants the textbook
+ignored are 50-100x cache penalties.
+
+## The rough mental model
+
+If a 1-second CPU operation were the reference:
+
+| Operation | Scaled time |
+| --- | --- |
+| L1 reference | 1 second |
+| L2 reference | 4 seconds |
+| Main memory | 1.5 minutes |
+| NVMe random read | 5.5 hours |
+| Same-datacenter RTT | 6 days |
+| Disk seek | 4 months |
+| US to Europe RTT | 5 years |
+
+This is why "just add a database call" or "just fan out 50 service
+calls" or "just load it from S3" each have wildly different cost
+profiles, even though they all "feel like a function call" in code.
+
+## Bandwidth vs latency
+
+Both matter, but they trade off differently:
+
+- **Latency** is "how long until I see the first byte." Hidden by
+  pipelining and prefetching. Killed by sequential dependencies
+  (each step waits for the last).
+- **Bandwidth** is "how many bytes per second once data is flowing."
+  Hidden by overlap; killed by tiny request sizes (per-call overhead
+  dominates).
+
+For SSD: tiny 4 KB reads max out at maybe 100k IOPS. Sequential 1 MB
+reads max out at ~3 GB/s. Same hardware, 10x throughput, just by
+batching.
+
+For network: a 1500-byte packet has ~40 bytes of TCP/IP headers — 3%
+overhead. A 60-byte packet has 40 bytes of header — 67% overhead.
+
+## What you should be able to estimate
+
+Without measuring:
+
+- "Is this a single-millisecond operation or a 100-ms operation?"
+- "Is this in cache or going to RAM?"
+- "Is this on the same machine, datacenter, region, or planet?"
+- "Is this one round-trip or N?"
+
+Get those right by an order of magnitude and you'll catch architectural
+problems before you write the code.
+
+## The takeaway
+
+Memory is a pyramid. Each level down is roughly 10x to 1000x slower
+than the one above it. The hot path of fast software lives in L1/L2;
+correct software keeps the slow stuff (disk, network) off the
+critical path. When something's surprisingly slow, the first question
+is almost always: **where in this pyramid is the data actually
+coming from?**
