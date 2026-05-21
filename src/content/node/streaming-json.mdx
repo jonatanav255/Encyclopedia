@@ -1,0 +1,258 @@
+export const level = 'senior';
+
+# Streaming JSON
+
+`JSON.parse` is fast, but it's all-or-nothing: the input must be
+buffered entirely in memory, and the output is one big object you
+own forever. For a 2 GB analytics dump, a paginated API export,
+or a long-running data pipeline, that's the wrong shape — you OOM,
+or you sit idle while gigabytes load, then GC churns on the
+resulting object graph.
+
+Streaming JSON lets you process the document as it arrives.
+
+## When you need it
+
+| Input size | Approach |
+| --- | --- |
+| < 1 MB | `JSON.parse` of the buffered body. No exceptions. |
+| 1 MB – 50 MB | `JSON.parse` is fine; watch memory if many in flight. |
+| 50 MB – 500 MB | Borderline. Streaming if response time matters. |
+| > 500 MB | Streaming, always. |
+| Unbounded / open stream | Streaming, always. |
+
+Also stream when you're proxying — you can forward the records you
+care about without ever holding the whole payload.
+
+## NDJSON / JSON Lines first
+
+The simplest "streaming JSON" format is not really streaming —
+it's one JSON value per line:
+
+```
+{"id":1,"name":"a"}
+{"id":2,"name":"b"}
+{"id":3,"name":"c"}
+```
+
+Parsing this is trivial: split on `\n`, `JSON.parse` each line:
+
+```js
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
+
+const rl = createInterface({ input: createReadStream('events.ndjson') });
+for await (const line of rl) {
+  if (!line.trim()) continue;
+  const record = JSON.parse(line);
+  await handle(record);
+}
+```
+
+No partial-line worries — `readline` handles the boundary. Memory
+stays flat regardless of file size.
+
+**Use NDJSON over a single big array whenever you control the
+format.** It's:
+
+- Streamable without a special parser.
+- Appendable (open file in append mode, write a line, done).
+- Recoverable — a corrupt line costs you one record, not the file.
+- Diffable, greppable, tail-able.
+
+Most modern data tools (BigQuery, Snowflake, Loki, Vector, Logstash)
+ingest NDJSON natively.
+
+## Streaming a single huge JSON document
+
+When you're stuck with a single giant `[{...}, {...}, ...]` array
+(third-party export, vendor API), you need a real streaming parser:
+
+```js
+import { parser } from 'stream-json';
+import { streamArray } from 'stream-json/streamers/StreamArray.js';
+import { createReadStream } from 'node:fs';
+
+const pipeline = createReadStream('big.json')
+  .pipe(parser())
+  .pipe(streamArray());
+
+for await (const { value } of pipeline) {
+  await handle(value);   // one element at a time
+}
+```
+
+`stream-json` tokenizes the byte stream and yields complete values
+at boundaries you choose (array elements, object values, named
+keys). Memory stays bounded — you never hold more than one record
+plus a small parser state.
+
+Alternatives:
+
+- **`JSONStream`** (older, callback-style, still maintained) —
+  `JSONStream.parse('rows.*')` to pull records from a nested path.
+- **`oboe.js`** — promises a "you can start using the data before
+  it's all loaded" UX; mostly used in browsers.
+- **`clarinet`** — low-level SAX-style JSON parser; build your own
+  collector. Most of the streaming-JSON ecosystem is built on this.
+
+## fetch() + stream-json
+
+A streaming consumer for a remote endpoint:
+
+```js
+import { parser } from 'stream-json';
+import { streamArray } from 'stream-json/streamers/StreamArray.js';
+import { Readable } from 'node:stream';
+
+const res = await fetch('https://api.example.com/events');
+if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+const nodeStream = Readable.fromWeb(res.body);
+
+const pipeline = nodeStream
+  .pipe(parser())
+  .pipe(streamArray());
+
+for await (const { value: event } of pipeline) {
+  await process(event);
+}
+```
+
+`Readable.fromWeb` bridges from the web `ReadableStream` returned by
+`fetch` into a Node stream. After that, the pipeline is the same.
+
+If memory pressure or backpressure matters, use `pipeline()` from
+`node:stream/promises` and ensure your consumer awaits — see
+`backpressure-and-highwatermark.mdx`.
+
+## Streaming output: ndjson
+
+For an Express endpoint that exports millions of rows:
+
+```js
+import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
+
+app.get('/export.ndjson', async (req, res) => {
+  res.setHeader('Content-Type', 'application/x-ndjson');
+
+  const stringify = new Transform({
+    objectMode: true,
+    transform(row, _, cb) { cb(null, JSON.stringify(row) + '\n'); },
+  });
+
+  await pipeline(
+    db.query('SELECT * FROM events').stream(),  // node-postgres stream
+    stringify,
+    res
+  );
+});
+```
+
+The DB driver streams rows, we stringify each, and pipe to the
+response. Memory stays flat at one row's worth — even for a 50M-row
+export. The client can `curl ... | jq` over the live stream and
+process it as it arrives.
+
+## Streaming a JSON array as output
+
+Sometimes the client really wants a JSON array (legacy consumers,
+JSON parsers without NDJSON support). You can still stream — just
+write the brackets and commas yourself:
+
+```js
+app.get('/export.json', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.write('[');
+  let first = true;
+  for await (const row of db.query('...').stream()) {
+    if (!first) res.write(',');
+    res.write(JSON.stringify(row));
+    first = false;
+  }
+  res.write(']');
+  res.end();
+});
+```
+
+The output is one valid JSON array, but you never held more than one
+row in memory. The client uses regular `JSON.parse` on the buffered
+response (with the size caveats above). Streaming costs nothing on
+the producer side; the consumer chooses whether to stream-parse.
+
+## Backpressure
+
+A streaming pipeline only saves memory if **each stage actually
+waits for the next stage to consume**. Without backpressure, a fast
+producer fills the pipeline's buffer until you OOM.
+
+For `for await` loops, awaiting work inside the loop creates natural
+backpressure — the iterator pauses while you're processing:
+
+```js
+for await (const record of parsed) {
+  await db.insert(record);    // pauses the iterator until done
+}
+```
+
+For pure pipelines, `stream.pipeline` and `pipeline()` propagate
+backpressure automatically. See
+`backpressure-and-highwatermark.mdx` for the underlying model.
+
+## Schema validation in streams
+
+Streaming gives you records one at a time, which is also when you
+should validate them:
+
+```js
+import { z } from 'zod';
+
+const Event = z.object({ id: z.string(), ts: z.number() });
+
+for await (const { value } of pipeline) {
+  const result = Event.safeParse(value);
+  if (!result.success) {
+    metrics.invalidRecords.inc();
+    continue;
+  }
+  await handle(result.data);
+}
+```
+
+Per-record validation is cheap; full-document validation isn't
+possible without buffering. This is one of the real wins of
+streaming — you can drop bad records and keep going instead of
+failing the whole import.
+
+## When NOT to stream
+
+- **Small payloads.** Setup cost (parser, pipeline) dwarfs the work.
+- **Random-access needs.** You need the 5,000th element. Streaming
+  is sequential; buffer or use a real database.
+- **You need the whole result before doing anything.** If your
+  consumer can't act on partial data, streaming saves no wall-clock
+  time — only memory.
+- **Tiny servers with huge available RAM.** If your data is 100 MB
+  and your container has 8 GB, `JSON.parse` is simpler. Streaming
+  is for when memory is the constraint.
+
+## Common mistakes
+
+- **Calling `JSON.parse` on the whole body without a size limit.**
+  A 2 GB response OOMs your process. Always cap inbound JSON
+  (`express.json({ limit: '...' })`, `undici` body limits).
+- **Stream-parsing but holding every result in an array.** You've
+  recreated the memory problem. Process records as they arrive
+  (database insert, kafka publish, file append) — don't accumulate.
+- **Forgetting `Readable.fromWeb`.** Web `ReadableStream` and Node
+  `Readable` don't pipe to each other directly. Bridge first.
+- **Streaming + non-async iteration.** `for (const x of stream)`
+  doesn't work; streams are async iterables. Use `for await`.
+- **Not handling parse errors mid-stream.** A single malformed
+  record can crash the parser. Wrap in try/catch or use a parser
+  with `lenient: true` mode if available.
+- **Streaming back-of-house to the client over a single request.**
+  Long-running HTTP responses are fragile — proxies time out,
+  clients disconnect. For multi-minute exports, consider a job +
+  signed download URL instead.

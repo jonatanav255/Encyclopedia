@@ -300,5 +300,139 @@ export const bank: QuestionBank = {
       answer:
         '**Goal**: identical concurrent requests should hit the API once. Subsequent identical requests within a short window (~50-500ms) reuse the in-flight or recently-resolved promise.\n\n**Implementation sketch**:\n\n```js\nconst inflight = new Map();\nconst recent = new LRUCache({ max: 500, ttl: 200 });\n\nasync function fetchDedup(url, options) {\n  const key = `${url}::${JSON.stringify(options)}`;\n  if (recent.has(key)) return recent.get(key);\n  if (inflight.has(key)) return inflight.get(key);\n  const promise = fetch(url, options).then(r => r.json());\n  inflight.set(key, promise);\n  try {\n    const result = await promise;\n    recent.set(key, result);\n    return result;\n  } finally {\n    inflight.delete(key);\n  }\n}\n```\n\n**Key decisions**:\n- **Cache key**: URL + serialized options. Order-stable serialization required (sort object keys).\n- **In-flight Map**: deduplicates concurrent requests during a fetch.\n- **Recent LRU**: deduplicates near-instant repeated calls (debounces "click button twice").\n- **TTL ~200ms**: balances "feels instant when repeated" vs "shows fresh data on user retry."\n\n**For mutations**: dedupe by `Idempotency-Key` header from the caller, not by URL — POST `/charges` should not silently return a cached result.\n\n**Failed requests** shouldn\'t be cached (retry might succeed). Honor `AbortSignal` to cancel both the request and clear the in-flight entry.\n\n**Comparable libraries**: TanStack Query implements this internally; SWR\'s deduper does the same. For a custom SDK, this 20-line version is enough.',
     },
+
+    // --- classes-deep ---
+    {
+      level: 'junior',
+      question: 'What does `class` give you that a plain function constructor does not?',
+      answer:
+        'Three things. (1) The body runs in strict mode automatically. (2) Methods are non-enumerable (`for...in` skips them), unlike `function.prototype.method = ...`. (3) The class can\'t be called without `new` — `Foo()` throws, `new Foo()` works. Everything else is essentially sugar over prototypes.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s the difference between `#private` fields and a `_underscore` convention?',
+      answer:
+        '`#private` is enforced by the language: `obj.#x` outside the declaring class is a `SyntaxError`, not `undefined`. The field doesn\'t exist as a property name, so `Object.keys`, `Reflect.ownKeys`, and `JSON.stringify` all skip it. Subclasses can\'t access parent private fields either. `_underscore` is purely a hint — anything can read or overwrite it. Use `#` when you actually need invariants protected.',
+    },
+    {
+      level: 'mid',
+      question: 'Why does this print `undefined` instead of `\'c\'`? `class P { constructor(){ this.tag() } tag(){} } class C extends P { kind = \'c\'; tag(){ console.log(this.kind) } } new C()`',
+      answer:
+        'Subclass field declarations run **after** the parent constructor body. The parent\'s `constructor` calls `this.tag()`, which dispatches to the child override, which reads `this.kind` — but `kind` hasn\'t been declared yet because the child\'s field init hasn\'t run. Same trap as calling virtual methods from a constructor in Java/C#. Fix: don\'t call overridable methods from a constructor, or initialize the field in the parent.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s `new.target` and when would you use it?',
+      answer:
+        'Inside a constructor (or function called with `new`), `new.target` is the constructor that was invoked with `new` — `undefined` if no `new`. Useful for: (1) **abstract classes** — `if (new.target === Base) throw new Error(\'abstract\')` blocks direct instantiation but allows subclasses; (2) **factory detection** — branch on whether a function was called as a constructor; (3) **dispatch** — `new.target.name` gives the runtime class name without `this.constructor.name` round-tripping.',
+    },
+
+    // --- symbols ---
+    {
+      level: 'mid',
+      question: 'What\'s the difference between `Symbol(\'x\')` and `Symbol.for(\'x\')`?',
+      answer:
+        '`Symbol(\'x\')` creates a brand-new symbol that\'s unique to that call — two `Symbol(\'x\')` are not equal. `Symbol.for(\'x\')` looks up (or creates) a symbol in a global registry, keyed by the string — so two `Symbol.for(\'x\')` calls return the same value, including across realms (workers, iframes, vm contexts). Use `Symbol.for` for protocol identifiers that need to mean the same thing everywhere; use plain `Symbol` for "I want a value nobody else can collide with."',
+    },
+    {
+      level: 'senior',
+      question: 'How do you make `for...of` work on a custom class?',
+      answer:
+        'Implement `[Symbol.iterator]()` returning an iterator (an object with a `next()` method that returns `{ value, done }`). The easiest path is to make it a generator method: `*[Symbol.iterator]() { yield 1; yield 2; }`. Once implemented, the class also works with spread (`[...obj]`), destructuring (`const [a, b] = obj`), `Array.from(obj)`, and any built-in that consumes iterables (`Map`, `Set`, `Promise.all`).',
+    },
+    {
+      level: 'senior',
+      question: 'Are symbol-keyed properties truly private?',
+      answer:
+        'No. They\'re hidden from `Object.keys`, `for...in`, and `JSON.stringify`, but `Object.getOwnPropertySymbols(obj)` returns them, and `Reflect.ownKeys(obj)` includes them. They\'re *unenumerable by accident* but visible to deliberate inspection. For real privacy, use `#private` class fields. Use symbols when you want to avoid name collisions and skip serialization, not when you need invariants protected.',
+    },
+
+    // --- maps & sets ---
+    {
+      level: 'junior',
+      question: 'When should you use a `Map` instead of a plain object?',
+      answer:
+        'When keys aren\'t strings (objects, numbers, functions); when keys come from untrusted input (prototype pollution risk with `__proto__` and friends); when you read `.size` often; when you iterate frequently (Maps are optimized for it). Plain objects are still right for fixed structs with known keys (`{ host, port }`) and when you need JSON serialization.',
+    },
+    {
+      level: 'mid',
+      question: 'Why does `map[key] = value` not work the way you might expect?',
+      answer:
+        'It sets a regular property on the Map *object*, not an entry in the map\'s key-value store. The lookup uses `===` against a string property name, so an object key won\'t round-trip. Always use `map.set(key, value)` and `map.get(key)`. Same for Set — use `.add` / `.has`, not bracket access.',
+    },
+    {
+      level: 'mid',
+      question: 'How do you group an array by a derived key in modern JavaScript?',
+      answer:
+        '`Object.groupBy(items, (item) => key(item))` (ES2024) returns a plain object keyed by the result. `Map.groupBy(items, fn)` returns a Map — better when keys aren\'t strings or you need guaranteed iteration order. Both shipped broadly in 2024 across V8, JavaScriptCore, and SpiderMonkey. Pre-2024 code used `reduce`, which still works.',
+    },
+
+    // --- typed arrays & binary ---
+    {
+      level: 'mid',
+      question: 'Why use a `Uint8Array` instead of a regular `Array` for byte data?',
+      answer:
+        'A regular `Array` holds *any* value and uses boxed numbers — each element is a full JS value with overhead. `Uint8Array` is a fixed-size view over an `ArrayBuffer` of raw bytes; each element is exactly one byte. Vastly less memory, JIT-optimized for math, interops with `crypto`, `fetch`, `fs`, WebAssembly, and Buffer (in Node). For anything binary — hashes, image data, protocol frames — typed arrays are the right tool.',
+    },
+    {
+      level: 'senior',
+      question: 'What\'s the difference between `Uint8Array.prototype.slice` and `subarray`?',
+      answer:
+        '`slice(begin, end)` copies the bytes into a new `ArrayBuffer` — independent of the parent. `subarray(begin, end)` creates a new view over the *same* underlying buffer — O(1), no copy, and mutations through one view are visible through the other. Use `subarray` in streaming/parsing pipelines where you want zero-copy windows; use `slice` when you need a buffer the parent can drop independently.',
+    },
+    {
+      level: 'senior',
+      question: 'When would you use `SharedArrayBuffer` over a regular `ArrayBuffer`?',
+      answer:
+        'When threads (Web Workers, Node `worker_threads`) need to read/write the same memory without `postMessage` copies. A regular `ArrayBuffer` is single-owner — sending it copies (or transfers and detaches). `SharedArrayBuffer` is genuinely shared, and concurrent access needs `Atomics` for correctness (atomic ops, `wait`/`notify` for blocking). Browser usage requires COOP/COEP headers (cross-origin isolation, post-Spectre lockdown). Node has no such requirement.',
+    },
+
+    // --- json deep ---
+    {
+      level: 'junior',
+      question: 'What happens when `JSON.stringify` encounters `undefined`, a function, or a symbol?',
+      answer:
+        'In an **object value position**, the key is silently omitted: `JSON.stringify({a: undefined}) === \'{}\'`. In an **array slot**, the value becomes `null` to preserve length: `JSON.stringify([undefined]) === \'[null]\'`. BigInt is the exception — it throws `TypeError`. The drop-vs-null asymmetry is a common source of bugs when round-tripping data.',
+    },
+    {
+      level: 'mid',
+      question: 'You serialize an object with `JSON.stringify` and a Date round-trips as a string. Why?',
+      answer:
+        '`Date.prototype.toJSON()` returns an ISO string, and `JSON.stringify` calls `toJSON()` if present. On the way back, `JSON.parse` has no symmetric hook — it always returns plain primitives, plain objects, plain arrays. To rehydrate Dates, pass a `reviver`: `JSON.parse(s, (k, v) => k === \'createdAt\' ? new Date(v) : v)`. Same pattern for BigInts, Maps, or any custom type — you have to bring revival yourself.',
+    },
+    {
+      level: 'senior',
+      question: 'Why is `JSON.stringify(obj)` a bad way to deep-clone?',
+      answer:
+        'It silently drops `undefined`, functions, and symbol-keyed properties; loses class prototypes (instances become plain objects); throws on cycles; throws on BigInt; turns Dates into strings, Maps/Sets into `{}` and `[]`; and turns `NaN`/`Infinity` into `null`. Use `structuredClone(obj)` instead — built-in, handles cycles, preserves Date/Map/Set/RegExp/TypedArray. The one thing `structuredClone` doesn\'t clone is functions, but neither does JSON.',
+    },
+
+    // --- tagged templates ---
+    {
+      level: 'mid',
+      question: 'What\'s the point of tagged template literals?',
+      answer:
+        'They separate the **static template** (from your source) from the **dynamic interpolations** (potentially untrusted). A tag function receives the strings array and values separately, so it can escape, validate, or transform interpolations while leaving the static template alone. That separation is the basis of every safe-HTML (`lit-html`), safe-SQL (`postgres.js`), GraphQL (`gql`), and CSS-in-JS (`styled`) library. Plain template literals can\'t express this trust boundary.',
+    },
+    {
+      level: 'senior',
+      question: 'Why can libraries like `gql` and `styled-components` cache parsed output by the strings array?',
+      answer:
+        'The strings array passed to a tagged template is **interned** — the same call site always passes the same array (reference-equal). So a library can use `strings === lastStrings` as a cache check: parse the GraphQL query (or CSS) once, look it up by identity afterward. No hashing needed. This is why `styled.div\`...\`` is cheap to evaluate on every render and why `gql\`...\`` parses each query exactly once per module load.',
+    },
+
+    // --- rendering patterns / streaming JSON (cross-topic) ---
+    {
+      level: 'senior',
+      question: 'When does SSR beat SSG, and when is it the wrong choice?',
+      answer:
+        '**SSR wins** when content varies per request (logged-in user data, geo-targeted pricing) — you can\'t pre-build a page that depends on the visitor. **SSG wins** when content is shared across visitors and changes infrequently (docs, marketing, blog) — a CDN serves the file in single-digit ms with zero per-request cost. Default to SSG; reach for SSR only when per-request data is essential. ISR (hybrid) covers the middle: mostly static, occasionally revalidated.',
+    },
+    {
+      level: 'senior',
+      question: 'You\'re streaming a 2 GB JSON array from a third-party API. How do you process it without OOMing?',
+      answer:
+        'Don\'t `await res.json()` — it buffers the whole body before parsing. Stream the response body through a JSON parser like `stream-json`: `Readable.fromWeb(res.body).pipe(parser()).pipe(streamArray())`, then `for await` over the records. Process each record (insert to DB, push to Kafka, write to file) inside the loop — don\'t accumulate into an array, or you\'ve recreated the memory problem. Memory stays flat at one record. If you control the producer, push them toward NDJSON instead — line-delimited JSON is streamable with `readline` and no parser library.',
+    },
   ],
 };

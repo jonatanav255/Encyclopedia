@@ -1,0 +1,247 @@
+export const level = 'mid';
+
+# Maps, Sets, and choosing the right collection
+
+JS has four built-in collections you should reach for before
+hand-rolling: `Map`, `Set`, `WeakMap`, `WeakSet`. Most code still
+uses `{}` and `[]` for everything, which is fine until it isn't.
+This page is about when to upgrade.
+
+## When `{}` is the wrong tool
+
+```js
+const counts = {};
+counts.apple = 1;
+counts.__proto__;   // not undefined — inherited
+counts.constructor; // not undefined either
+```
+
+Plain objects inherit from `Object.prototype`, so any prototype name
+is a fake "hit." That breaks `if (counts[key])` checks for arbitrary
+user input. Three real fixes:
+
+```js
+const a = Object.create(null);   // no prototype chain
+const b = new Map();             // separate key space entirely
+const c = { __proto__: null };   // shorthand for `Object.create(null)`
+```
+
+`Map` is usually right. The prototype-pollution avoidance is a side
+benefit; the main reasons are below.
+
+## `Map` vs `{}` — what `Map` gives you
+
+```js
+const m = new Map();
+m.set('apple', 1);
+m.set(42, 'answer');      // any key type
+m.set({}, 'object key');
+
+m.get('apple');           // 1
+m.has(42);                // true
+m.size;                   // 3
+m.delete('apple');
+```
+
+Differences that matter:
+
+| | `Map` | `{}` |
+| --- | --- | --- |
+| Key types | any value | strings + symbols only |
+| Iteration | insertion order, guaranteed | insertion order for string keys, integer-like keys first |
+| Size | `.size` | `Object.keys(o).length` |
+| Iteration speed | optimized for it | not designed for it |
+| Prototype collision | none | `__proto__`, `constructor`, etc. |
+| JSON | doesn't serialize | does |
+| Memory overhead | a bit more | less |
+
+The "integer-like keys first" footgun: `{ 2: 'a', 1: 'b', foo: 'c' }`
+iterates `1, 2, foo`. JS engines pull numeric-looking string keys to
+the front. `Map` doesn't.
+
+### When `Map` clearly wins
+
+- **Keys aren't strings** (objects, numbers, functions).
+- **Keys come from user input** (untrusted strings → prototype
+  pollution risk).
+- **You read `.size` a lot.**
+- **You iterate often** — `Map` is iteration-optimized.
+- **You add/remove frequently** — engines deopt objects that mutate
+  shape often (see `hidden-classes-perf.mdx`).
+
+### When `{}` is fine
+
+- **Fixed, known-at-write-time keys** (`{ host, port, scheme }`).
+- **You need JSON serialization.**
+- **You'd never call it a "collection"** — it's a struct/record.
+
+## `Set` vs `Array.includes`
+
+```js
+const seen = new Set();
+seen.add('a');
+seen.has('a');            // O(1) average
+```
+
+For membership checks at scale, `Set.has` is O(1) and `Array.includes`
+is O(n). The break-even is surprisingly high — for ~5-10 items,
+arrays often win because the linear scan is cache-friendly and the
+Set has overhead. For 100+ items or repeated checks, `Set` pulls
+ahead clearly.
+
+Other `Set` wins:
+
+- **Dedup** in one line: `[...new Set(arr)]`.
+- **Set operations** (ES2025, available in all major engines since mid-2024):
+  `a.union(b)`, `a.intersection(b)`, `a.difference(b)`,
+  `a.symmetricDifference(b)`, `a.isSubsetOf(b)`, `a.isSupersetOf(b)`,
+  `a.isDisjointFrom(b)`. These take any iterable, not just sets.
+
+```js
+const a = new Set([1, 2, 3]);
+const b = new Set([2, 3, 4]);
+a.intersection(b);        // Set { 2, 3 }
+a.union(b);               // Set { 1, 2, 3, 4 }
+a.difference(b);          // Set { 1 }
+```
+
+## Key identity matters
+
+`Map` and `Set` use **SameValueZero** for key equality — like `===`
+but `NaN` equals `NaN`, and `+0 === -0`. For object keys, identity
+is reference equality:
+
+```js
+const m = new Map();
+m.set({ id: 1 }, 'a');
+m.get({ id: 1 });         // undefined — different object
+```
+
+There's no built-in deep-equality keying. If you need "same content
+= same key," either canonicalize the key first (JSON, hash, tuple
+string) or use a library.
+
+## Iteration shapes
+
+All four collections iterate. `Map` yields `[key, value]` pairs:
+
+```js
+for (const [k, v] of map) {}
+for (const k of map.keys()) {}
+for (const v of map.values()) {}
+
+// Convert to array
+[...map];                 // [[k, v], ...]
+[...map.entries()];       // same
+Object.fromEntries(map);  // { ... } — string keys only
+```
+
+Plain objects don't iterate directly (no `Symbol.iterator`). Use:
+
+```js
+for (const [k, v] of Object.entries(obj)) {}
+for (const k of Object.keys(obj)) {}
+```
+
+## `Object.groupBy` and `Map.groupBy` (ES2024)
+
+A built-in for the most common "group these into buckets" operation:
+
+```js
+const users = [
+  { name: 'a', role: 'admin' },
+  { name: 'b', role: 'user' },
+  { name: 'c', role: 'admin' },
+];
+
+Object.groupBy(users, (u) => u.role);
+// { admin: [{name:'a',...}, {name:'c',...}], user: [{name:'b',...}] }
+
+Map.groupBy(users, (u) => u.role);
+// Map(2) { 'admin' => [...], 'user' => [...] }
+```
+
+`Map.groupBy` is preferable when keys aren't strings, when you want
+guaranteed iteration order, or when you need `.size`.
+
+Pre-2024 code used `reduce` for this:
+
+```js
+users.reduce((acc, u) => {
+  (acc[u.role] ??= []).push(u);
+  return acc;
+}, {});
+```
+
+Both are fine; the built-in is shorter and skips the prototype
+collision risk.
+
+## Converting between shapes
+
+```js
+// Object → Map
+const m = new Map(Object.entries(obj));
+
+// Map → Object (string keys only)
+const o = Object.fromEntries(m);
+
+// Array of pairs ↔ Map
+new Map([['a', 1], ['b', 2]]);
+[...m];
+
+// Array → Set, dedup
+[...new Set(arr)];
+
+// Set → Array
+[...set];
+
+// Two arrays → Map
+new Map(keys.map((k, i) => [k, values[i]]));
+```
+
+## Composite keys
+
+JS has no native tuple type (Records & Tuples was withdrawn — see
+`immutability-patterns.mdx`). For composite keys, two options:
+
+```js
+// 1. Stringify (works when components stringify cleanly)
+const key = `${userId}|${date}`;
+map.set(key, value);
+
+// 2. Nested Map (no stringification, but deeper code)
+const m = new Map();
+const inner = m.get(userId) ?? new Map();
+inner.set(date, value);
+m.set(userId, inner);
+```
+
+Stringification is faster and simpler when components are scalars
+with no separator collisions. Nested maps are better when components
+are objects or when you need to enumerate "all entries for userId X."
+
+## The forgotten collections
+
+- **`Object.create(null)`** — a plain "dictionary object" with no
+  prototype. Lighter than a Map, JSON-serializable, no prototype
+  pollution. Best when you want object syntax but trustworthy keys.
+- **`Array` as a queue** — `arr.push()` + `arr.shift()` is O(n) on
+  shift. For real FIFO at scale, use a deque library or two-stack
+  trick.
+- **Typed arrays** for fixed-size numeric data — see
+  `typed-arrays-and-binary.mdx`.
+
+## Common mistakes
+
+- **Using `{}` as a map of user-input keys.** Prototype names
+  (`__proto__`, `constructor`, `toString`) collide. Use `Map` or
+  `Object.create(null)`.
+- **`map[key]` instead of `map.get(key)`.** That sets a property on
+  the Map object, not an entry. The lookup uses `===` against the
+  property string and silently no-ops on objects.
+- **Treating `Set.has` as always faster than `Array.includes`.** For
+  tiny arrays, the linear scan often wins.
+- **Iterating a Set or Map after mutating it.** Spec-defined behavior
+  for deletions during iteration, but easy to write subtle bugs.
+- **Expecting `JSON.stringify` to serialize a `Map`.** It returns
+  `'{}'`. Convert to object or array of pairs first.

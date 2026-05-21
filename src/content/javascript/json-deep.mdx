@@ -1,0 +1,264 @@
+export const level = 'mid';
+
+# JSON, in depth
+
+`JSON.parse` and `JSON.stringify` are two of the most-used functions
+in the language. They also have ten years of accumulated surprise
+behavior that bites when you stop treating them as opaque.
+
+## `JSON.stringify` — what gets dropped silently
+
+Several JS values have no JSON representation and stringify drops
+them with no warning:
+
+```js
+JSON.stringify({
+  a: undefined,
+  b: () => 1,
+  c: Symbol('x'),
+});
+// '{}'  — all three keys silently removed
+```
+
+In arrays, those same values become `null` instead of being dropped:
+
+```js
+JSON.stringify([1, undefined, () => 1, 2]);
+// '[1,null,null,2]'  — preserves length
+```
+
+The "drop in objects, null in arrays" rule keeps array indices
+stable. Knowing it explicitly is the difference between debugging
+in 30 seconds and 30 minutes.
+
+## Values that throw
+
+```js
+JSON.stringify(1n);              // TypeError: Do not know how to serialize a BigInt
+
+const obj = {};
+obj.self = obj;
+JSON.stringify(obj);             // TypeError: Converting circular structure to JSON
+```
+
+Add `toJSON` to BigInt (carefully — see below) or stringify the
+value yourself. For cycles, either restructure your data, use the
+`replacer` to substitute references, or use `structured-clone.mdx`
+helpers (which handle cycles).
+
+## `toJSON` — the per-value escape hatch
+
+If a value has a `toJSON` method, `JSON.stringify` calls it and
+serializes the return value instead:
+
+```js
+class Money {
+  constructor(amount, currency) { this.amount = amount; this.currency = currency; }
+  toJSON() { return `${this.amount} ${this.currency}`; }
+}
+
+JSON.stringify({ price: new Money(10, 'USD') });
+// '{"price":"10 USD"}'
+```
+
+Built-ins already use this. `Date.prototype.toJSON()` returns an ISO
+string — which is why `JSON.stringify(new Date())` works but
+`JSON.parse` of that result gives you a string, not a Date.
+There's no reverse hook in `JSON.parse`; revival is your job (see
+`reviver` below).
+
+Adding `BigInt.prototype.toJSON = function () { return this.toString(); }`
+will make `JSON.stringify` accept BigInts but produces *strings* on
+the other side, not BigInts. Decide your protocol before patching
+built-ins.
+
+## `replacer` — transform during serialize
+
+Second argument to `stringify`. Either a function or a list of
+allowed keys:
+
+### As a function
+
+```js
+JSON.stringify(user, (key, value) => {
+  if (key === 'password' || key === 'token') return undefined;
+  return value;
+});
+// password/token removed
+```
+
+The function runs for **every** key — including the initial empty
+key for the root value. `value` has already been `toJSON`-ified.
+Return `undefined` to drop a key (or null in arrays).
+
+A common gotcha: the replacer receives the value *after* `toJSON`
+transformation. If you're trying to inspect the raw object, you
+need `this`:
+
+```js
+function replacer(key, value) {
+  // `this` is the parent object — value is post-toJSON
+  return value;
+}
+```
+
+### As an allowlist
+
+```js
+JSON.stringify(user, ['id', 'name']);
+// '{"id":42,"name":"jon"}'  — only these keys, others gone
+```
+
+Recursively applied. Use it for output shaping when you can't change
+the source.
+
+## `space` — pretty printing
+
+```js
+JSON.stringify(obj, null, 2);    // 2-space indent
+JSON.stringify(obj, null, '\t'); // tab indent
+JSON.stringify(obj);              // compact, default
+```
+
+In production, never pretty-print API responses by default — wire
+size matters and most clients don't care. Pretty-print in dev/log
+output.
+
+## `JSON.parse` — what you actually get back
+
+`JSON.parse` returns plain objects, arrays, strings, numbers, true,
+false, and null. **Always plain.** No prototypes, no classes, no
+Dates, no Maps, no BigInts. If your wire format produced `"2026-01-01"`,
+you get a string; if it produced `42`, you get a `number` (even if
+it should have been a `BigInt`).
+
+### Number precision
+
+JS numbers are IEEE-754 doubles. Integers up to `Number.MAX_SAFE_INTEGER`
+(2⁵³ − 1) round-trip cleanly through JSON; bigger ones lose
+precision:
+
+```js
+JSON.parse('9007199254740993');  // 9007199254740992 — last digit lost
+```
+
+For database IDs, timestamps, financial amounts — anything possibly
+above 2⁵³ — encode as strings on the wire. The Twitter/X API made
+this exact mistake with snowflake IDs and had to add `id_str`
+alongside `id`.
+
+### `__proto__` in the payload
+
+`JSON.parse` itself defines `__proto__` as a plain own property — it
+goes through `[[DefineOwnProperty]]`, not assignment, so it doesn't
+pollute the prototype chain. The risk is **downstream**: if you
+`Object.assign(target, parsed)` or recursively merge the parsed
+value, the assignment goes through `__proto__`'s setter and *can*
+re-pollute. Use a `reviver` to strip dangerous keys (`__proto__`,
+`constructor`, `prototype`) for untrusted input, or merge with a
+helper that ignores them.
+
+## `reviver` — transform during parse
+
+Second argument to `parse`. Runs bottom-up — children first, then
+parent, then the empty-key root:
+
+```js
+const data = JSON.parse(json, (key, value) => {
+  if (key === 'createdAt') return new Date(value);
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  return value;
+});
+```
+
+Returning `undefined` deletes the key entirely:
+
+```js
+JSON.parse('{"a":1,"password":"x"}', (k, v) => k === 'password' ? undefined : v);
+// { a: 1 }
+```
+
+Use revivers for date revival, BigInt revival of stringified IDs,
+prototype pollution defense, and dropping fields you don't trust.
+
+## Key ordering
+
+`JSON.stringify` preserves insertion order for string keys (with the
+same "integer-like keys first" rule as objects — see
+`maps-sets-and-collections.mdx`). For canonical JSON (e.g. for
+signing), you need to enforce a stable key order yourself:
+
+```js
+function canonical(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort()
+      .map(k => JSON.stringify(k) + ':' + canonical(value[k]))
+      .join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+```
+
+This isn't full RFC 8785 canonicalization — that also pins number
+formatting, escapes, etc. — but it's enough for "the same logical
+object always hashes to the same bytes" inside one runtime.
+
+## NDJSON / JSON Lines
+
+For large datasets, line-delimited JSON beats one giant array:
+
+```
+{"id":1,"name":"a"}
+{"id":2,"name":"b"}
+{"id":3,"name":"c"}
+```
+
+- Streamable — parser can yield records as they arrive.
+- Appendable — append a line, no need to rewrite a closing `]`.
+- Recoverable — a corrupted line costs you one record, not the file.
+
+`JSON.parse` on the whole file fails (it's not valid JSON). Split
+on `\n` and parse each line. See `node/streaming-json.mdx`.
+
+## Safe-JSON for untrusted input
+
+When the source is hostile:
+
+- **Cap input size** before parsing. A 2 GB JSON file can OOM your
+  process; cap at whatever your real API allows (1 MB?). For HTTP,
+  `express.json({ limit: '1mb' })` handles this.
+- **Use a reviver** to drop dangerous keys (`__proto__`, `constructor`,
+  `prototype`).
+- **Validate the shape after parsing** (Zod, AJV, hand-rolled
+  checks). `JSON.parse` validates *syntax*, not semantics. A
+  successful parse is not a successful contract check.
+
+## Performance notes
+
+- `JSON.parse` is C++, native, and very fast. Don't reinvent it.
+- `JSON.stringify` with a `replacer` is much slower than without —
+  the function call per key adds up. For hot paths, build the
+  object you want serialized and call `stringify` without a
+  replacer.
+- For very large objects, the *string concatenation* in stringify is
+  the bottleneck, not the traversal. Streaming serializers exist
+  (`fast-json-stringify`, schema-driven) and can be 2-5× faster
+  when you have a fixed schema.
+
+## Common mistakes
+
+- **`JSON.stringify(obj)` to clone.** Loses `Date`, `undefined`,
+  functions, symbols, and any class instance. Use `structuredClone`
+  for actual deep cloning.
+- **Comparing two objects via stringify.** Key order matters; nested
+  objects with the same content but different insertion order
+  compare unequal. Use a deep-equality helper.
+- **Trusting that round-tripping preserves types.** `Date` → string,
+  `BigInt` throws, `undefined` disappears, `NaN`/`Infinity` become
+  `null`. Plan the protocol.
+- **Returning the receiver in a replacer.** A replacer returning
+  `this` (or the parent object) recursively goes forever. Return
+  the value you want.
+- **No max body size on a public JSON endpoint.** One request can
+  OOM your service.

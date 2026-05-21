@@ -1,0 +1,257 @@
+export const level = 'senior';
+
+# Typed arrays and binary data
+
+When JS needs to hold raw bytes — image data, network protocol
+frames, hashes, compressed blobs, shared memory — `Array` is the
+wrong shape. Every element would be a boxed number, the memory
+layout would be opaque, and there'd be no way to view the same bytes
+as floats and as integers. Typed arrays solve all three.
+
+## `ArrayBuffer` is the bytes
+
+An `ArrayBuffer` is a contiguous, fixed-size block of raw bytes. You
+can't read or write it directly — you need a *view*:
+
+```js
+const buf = new ArrayBuffer(16);   // 16 bytes
+buf.byteLength;                     // 16
+buf[0];                             // undefined — no direct access
+```
+
+Views interpret the bytes as a typed sequence:
+
+```js
+const u8 = new Uint8Array(buf);    // 16 elements, each 1 byte
+const u32 = new Uint32Array(buf);  // 4 elements, each 4 bytes
+const f64 = new Float64Array(buf); // 2 elements, each 8 bytes
+```
+
+All three views point at the **same memory**. Writing through `u32`
+changes what `u8` reads. This aliasing is the point: a 32-bit write
+is one CPU instruction; the same effect via four 8-bit writes is
+four. It also lets you parse a packed binary format by overlaying
+different views.
+
+## The typed array family
+
+| View | Element size | Range |
+| --- | --- | --- |
+| `Int8Array` / `Uint8Array` | 1 byte | -128..127 / 0..255 |
+| `Uint8ClampedArray` | 1 byte | 0..255, saturating on overflow |
+| `Int16Array` / `Uint16Array` | 2 bytes | ±32k / 0..65k |
+| `Int32Array` / `Uint32Array` | 4 bytes | ±2³¹ / 0..2³²-1 |
+| `Float32Array` / `Float64Array` | 4 / 8 bytes | IEEE-754 |
+| `BigInt64Array` / `BigUint64Array` | 8 bytes | full 64-bit ints |
+
+`Uint8ClampedArray` is for canvas image data — values clamp to 0..255
+on assignment instead of wrapping, so `pixels[i] = 300` writes 255
+(not 44 from `300 & 0xff`).
+
+## `DataView` — when alignment and endianness matter
+
+Typed arrays are aligned (a `Uint32Array` starts at a 4-byte boundary)
+and use **native endianness** (almost always little-endian on
+servers). For network protocols and file formats, which are usually
+big-endian and unaligned, use `DataView`:
+
+```js
+const buf = new ArrayBuffer(8);
+const dv = new DataView(buf);
+
+dv.setUint32(0, 0x01020304, false);  // big-endian (network byte order)
+dv.setUint32(4, 0x05060708, true);   // little-endian
+
+dv.getUint16(2, false);              // reads bytes 2-3, big-endian
+```
+
+The boolean is `littleEndian` — default `false` (big-endian).
+`DataView` accepts any offset, no alignment requirement.
+
+Use `DataView` for parsing/emitting any wire format you didn't
+invent. Use typed arrays directly for in-memory math where you
+control both ends.
+
+## `Uint8Array` and `Buffer` (in Node)
+
+Node's `Buffer` is a `Uint8Array` subclass with extra methods
+(`toString('utf-8')`, `write`, `readUInt32BE`, slice-with-copy
+semantics, pooled allocation). Everywhere it shows up, a plain
+`Uint8Array` would also satisfy the type — and increasingly
+Node's APIs accept either:
+
+```js
+// All accept Buffer or Uint8Array:
+fs.writeFileSync('out.bin', new Uint8Array([1, 2, 3]));
+crypto.createHash('sha256').update(u8).digest();
+```
+
+In new code, prefer `Uint8Array` where you don't need Buffer-specific
+methods. It's the cross-runtime standard (browsers, Deno, Bun, Node).
+`Buffer` is fine in Node-only code where you want the conveniences.
+
+### Converting
+
+```js
+// String → Uint8Array
+new TextEncoder().encode('hello');         // Uint8Array([104, 101, ...])
+
+// Uint8Array → String
+new TextDecoder('utf-8').decode(u8);
+
+// Uint8Array → hex
+[...u8].map((b) => b.toString(16).padStart(2, '0')).join('');
+// or in Node 22+:
+Buffer.from(u8).toString('hex');
+
+// Uint8Array → base64 (Node)
+Buffer.from(u8).toString('base64');
+// In browsers (or runtime-neutral):
+btoa(String.fromCharCode(...u8));   // ASCII-safe range only
+
+// Uint8Array.prototype.toBase64() / .fromBase64() / .toHex() / .fromHex()
+```
+
+The native `Uint8Array.prototype.toBase64`/`toHex` methods shipped in
+all browsers during 2025 and in Node 25 (LTS arrives with Node 26 in
+late 2026). Until your runtime baseline allows them, the shims above
+work everywhere.
+
+## `TextEncoder` / `TextDecoder`
+
+The right way to go between strings and bytes:
+
+```js
+const enc = new TextEncoder();              // always UTF-8
+const dec = new TextDecoder('utf-8');       // many encodings
+
+enc.encode('héllo');                        // Uint8Array, UTF-8 bytes
+dec.decode(u8);                             // string back
+```
+
+`TextDecoder` handles partial codepoints with `{ stream: true }` —
+essential when decoding chunks from a stream:
+
+```js
+const dec = new TextDecoder('utf-8');
+let text = '';
+for await (const chunk of stream) {
+  text += dec.decode(chunk, { stream: true });
+}
+text += dec.decode();   // flush
+```
+
+Without `{ stream: true }`, a chunk boundary that splits a multi-byte
+character produces a replacement character (`U+FFFD`).
+
+## Slicing: copy vs view
+
+```js
+const u8 = new Uint8Array([1, 2, 3, 4, 5]);
+
+u8.slice(1, 3);            // [2, 3] — new buffer, copied
+u8.subarray(1, 3);          // [2, 3] — same buffer, view
+```
+
+`subarray` is O(1) — it just makes a new view header pointing into
+the same `ArrayBuffer`. Modify the parent and the child sees the
+change. `slice` copies. For parsing pipelines that don't need to
+hold the parent buffer, `subarray` saves allocations.
+
+## `SharedArrayBuffer` and `Atomics`
+
+For sharing memory between threads (Worker, Node `worker_threads`),
+you need `SharedArrayBuffer` instead of `ArrayBuffer`:
+
+```js
+const shared = new SharedArrayBuffer(1024);
+const view = new Int32Array(shared);
+
+// In main thread
+worker.postMessage(shared);   // transferred by reference, not copy
+
+// Concurrent writes need Atomics for correctness
+Atomics.add(view, 0, 1);                    // atomic increment
+Atomics.compareExchange(view, 0, 0, 1);     // CAS
+Atomics.wait(view, 0, 0);                   // block until view[0] !== 0
+Atomics.notify(view, 0, 1);                 // wake one waiter
+```
+
+This is real multithreaded code. Tearing, races, and visibility bugs
+are all in scope. `Atomics.wait` only works on `Int32Array` /
+`BigInt64Array` over a `SharedArrayBuffer`, and only off the main
+browser thread (workers OK, page main thread not).
+
+In Node `worker_threads`, only worker threads can call `Atomics.wait`;
+the main thread throws `TypeError`, same as the browser main thread.
+From the main thread, use `Atomics.waitAsync` (returns a Promise) or
+delegate the blocking wait to a worker. See `node/worker-threads.mdx`
+and `node/multithreaded-javascript.mdx`.
+
+**Browsers require COOP/COEP headers** to enable `SharedArrayBuffer`
+(post-Spectre lockdown). If `crossOriginIsolated === false`, the
+constructor exists but the buffer can't be transferred to workers.
+
+## Transferable objects
+
+Posting a regular `ArrayBuffer` to a worker structured-clones it
+(copy). Posting it as a *transferable* hands ownership over without
+copying:
+
+```js
+const buf = new ArrayBuffer(10_000_000);
+worker.postMessage(buf, [buf]);     // second arg: transferables
+buf.byteLength;                      // 0 — sender lost it
+```
+
+After transfer, the sender's view of the buffer is detached. Reading
+or writing through any view throws `TypeError: detached ArrayBuffer`.
+
+For a multi-MB payload, the perf difference between copy and transfer
+is enormous (zero-copy vs full memcpy + structured-clone overhead).
+This is the standard pattern for offloading image processing,
+parsing, and ML inference to workers.
+
+## When you reach for binary in normal code
+
+Beyond explicit binary protocols and workers:
+
+- **Hashing** — `crypto.subtle.digest` / Node `crypto.createHash`
+  produce/accept `Uint8Array`.
+- **`fetch` body** — `await res.arrayBuffer()` or `res.body` (a
+  stream of `Uint8Array`).
+- **`File` / `Blob`** — `.arrayBuffer()` / `.stream()`.
+- **WebAssembly** — `WebAssembly.instantiate(buffer)` takes the wasm
+  bytes as an `ArrayBuffer`. Linear memory exposed as a
+  `Uint8Array` view into the instance's memory.
+- **Image data** — `canvas.getContext('2d').getImageData(...)` returns
+  a `Uint8ClampedArray` (RGBA).
+
+## Performance notes
+
+- **Allocations are not free.** Pool / reuse buffers in hot paths
+  rather than `new Uint8Array(n)` per iteration.
+- **Use typed-array math, not `Array`**, for any numeric work past a
+  few hundred elements. The JIT specializes typed arrays aggressively
+  and skips boxing.
+- **Endianness wrong = silent corruption.** A `DataView.getUint32`
+  with the wrong endianness returns a real number, just the wrong
+  one. Test against known-good fixtures.
+
+## Common mistakes
+
+- **Indexing a `Uint8Array` past its length doesn't throw.** It
+  returns `undefined`, just like a regular array — but writes are
+  silently dropped. Bounds-check yourself in protocol code.
+- **Confusing element index and byte offset.** `u32[1]` is bytes 4-7;
+  `dv.getUint32(1)` is bytes 1-4. Mixing these is a classic parsing
+  bug.
+- **Forgetting endianness.** Most file/network formats are
+  big-endian; CPUs are little-endian. `DataView` default is
+  big-endian; typed arrays use native. They disagree.
+- **Detached buffer after transfer.** Once you `postMessage` with
+  transfer, the original handle is dead. Don't keep references to
+  views into a transferred buffer.
+- **Using `Buffer.from(str)` without an encoding** — defaults to
+  UTF-8, fine for text, *wrong* if `str` is supposed to be hex or
+  base64. Always pass the encoding explicitly.

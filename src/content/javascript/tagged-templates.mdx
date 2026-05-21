@@ -1,0 +1,245 @@
+export const level = 'mid';
+
+# Tagged templates
+
+A template literal prefixed with a function name calls that function
+with the static string parts and the interpolated values separated.
+That separation is what makes tagged templates useful — the static
+parts are *trusted* (they came from your source code), the
+interpolations are *untrusted* (they could be anything). Every safe
+SQL/HTML/shell builder you've seen in modern JS is built on this.
+
+## The shape of a tag
+
+```js
+function tag(strings, ...values) {
+  console.log(strings);   // ['Hello ', '! You are ', ' years old.']
+  console.log(values);    // ['jon', 30]
+}
+
+const name = 'jon';
+const age = 30;
+tag`Hello ${name}! You are ${age} years old.`;
+```
+
+`strings` is an array of the static pieces between interpolations.
+`strings.length === values.length + 1` always — there's a string
+before, between, and after every interpolation.
+
+`strings` is also a real array, but it has a `.raw` property:
+
+```js
+function tag(strings) {
+  console.log(strings[0]);       // 'a\nb' (escape processed)
+  console.log(strings.raw[0]);   // 'a\\nb' (raw source)
+}
+tag`a\nb`;
+```
+
+`raw` is what `String.raw` exposes — the source text of the string
+without escape processing.
+
+## `String.raw` — the built-in tag
+
+```js
+String.raw`C:\Users\${name}\file`;
+// 'C:\Users\jon\file'  — backslashes preserved
+```
+
+A built-in tag that returns the concatenation with values
+interpolated, but using `strings.raw` so escapes don't run. Useful
+for Windows paths in tests, regex source, anywhere you want the
+literal characters.
+
+## The trusted/untrusted split
+
+This is the whole point. The static template — the part between the
+backticks but outside `${}` — came from your code; it's safe. The
+interpolations came from variables; they might be hostile. A tag
+function can apply different rules to each.
+
+### Safe HTML
+
+```js
+function html(strings, ...values) {
+  let out = strings[0];
+  for (let i = 0; i < values.length; i++) {
+    out += escape(values[i]) + strings[i + 1];
+  }
+  return out;
+}
+
+function escape(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const name = '<script>alert(1)</script>';
+html`<div>Hello ${name}</div>`;
+// '<div>Hello &lt;script&gt;alert(1)&lt;/script&gt;</div>'
+```
+
+The template's `<div>` stays raw because it's *yours*; the
+interpolation escapes because it's *theirs*. This is what
+`lit-html`, `htm`, `solid-js`'s `html\`...\`` template do under the
+hood.
+
+### Safe SQL
+
+```js
+function sql(strings, ...values) {
+  const text = strings.reduce(
+    (acc, s, i) => acc + s + (i < values.length ? `$${i + 1}` : ''),
+    ''
+  );
+  return { text, values };
+}
+
+const id = req.params.id;
+const q = sql`SELECT * FROM users WHERE id = ${id} AND deleted = false`;
+// { text: 'SELECT * FROM users WHERE id = $1 AND deleted = false', values: [id] }
+
+await pg.query(q);
+```
+
+The interpolations never enter the query text. They become parameter
+placeholders and the driver binds them safely. This is exactly how
+`postgres.js` and `Slonik` work.
+
+For multiple statements with array interpolation, real libraries get
+fancy with helper tags like `sql.identifier(...)` for table names
+and `sql.array(...)` for value lists.
+
+## GraphQL `gql` and `styled` — same trick
+
+```js
+const QUERY = gql`
+  query GetUser($id: ID!) {
+    user(id: $id) { name }
+  }
+`;
+```
+
+The `gql` tag parses the template at module-evaluation time, caches
+the AST, and returns a document node. Same with `styled.div` —
+parses CSS once, generates a class name, returns a component.
+
+The performance angle: tagged template *strings arrays are interned*.
+Calling the same tagged template literal twice passes the **same
+strings array** both times (`===` equal), so caches can use it as a
+key cheaply:
+
+```js
+let lastStrings;
+function trackIdentity(strings) {
+  console.log(strings === lastStrings);
+  lastStrings = strings;
+}
+
+for (let i = 0; i < 3; i++) trackIdentity`hello ${i}`;
+// false, true, true
+```
+
+This identity guarantee is why `gql` and `styled` can cache parsed
+output by the strings array without computing a hash.
+
+## A shell-escape tag
+
+```js
+function sh(strings, ...values) {
+  return strings.reduce(
+    (acc, s, i) => acc + s + (i < values.length ? shellEscape(values[i]) : ''),
+    ''
+  );
+}
+
+function shellEscape(v) {
+  return `'${String(v).replace(/'/g, `'\\''`)}'`;
+}
+
+const filename = "robert'); DROP TABLE";
+sh`ls ${filename}`;
+// "ls 'robert'\\''); DROP TABLE'"
+```
+
+Same pattern as HTML and SQL — context-aware escape on the
+interpolations, leave the template alone.
+
+## Where tagged templates beat string concatenation
+
+| | `\`a ${x} b\`` | `tag\`a ${x} b\`` |
+| --- | --- | --- |
+| Just builds a string | yes | no — tag controls output |
+| Escapes interpolations | no | yes (if tag does) |
+| Sees raw template separately | no | yes |
+| Strings array is interned | n/a | yes — cache-friendly |
+| Can return non-string | no | yes (DOM, AST, query object) |
+
+A plain template literal is a string builder. A tagged template
+is a **mini-DSL**. The tag function decides what the syntax means.
+
+## Anti-patterns
+
+### Don't tag for cosmetics
+
+```js
+// pointless
+function format(strings, ...vals) {
+  return strings.reduce((a, s, i) => a + s + (vals[i] ?? ''), '');
+}
+const msg = format`Hello ${name}`;
+```
+
+A plain `\`Hello ${name}\`` already does this. Tag only when you
+need the strings/values split.
+
+### Don't lose raw context
+
+```js
+// loses the static/dynamic distinction
+function unsafe(strings, ...vals) {
+  return strings.join('?') + vals.join('?');
+}
+```
+
+Concatenating strings and values into one bag throws away the entire
+point of the API.
+
+### Don't put untrusted content in the template position
+
+```js
+const userInput = req.body.template;
+sql`${userInput}`;             // safe — userInput is interpolated
+sql\`${userInput} ${id}\`;     // can't do this — template is static
+```
+
+You can't make the template itself dynamic from a tag's caller —
+that's a feature, not a limitation. If you find yourself wanting
+dynamic templates, you're building a query builder, not using
+tagged templates.
+
+## Niche but cool
+
+- **Internationalization tags.** `i18n\`Hello, ${name}\`` can look
+  up the strings array's join (`'Hello, ' + '!'`) as a translation
+  key and substitute values into the localized form.
+- **DSL transpilers.** Babel/SWC plugins can statically analyze
+  tagged template calls (because the static parts are in source) and
+  transform them at build time — e.g., `gql` queries pre-validated
+  against a schema.
+- **Test snapshots / fixtures.** A tag that interns parsed JSON
+  fixtures once per template literal.
+
+## Common mistakes
+
+- **Forgetting `strings.length === values.length + 1`.** Off-by-one
+  when concatenating manually. Use `strings.reduce`.
+- **Calling the tag function directly with the wrong shape.** Tags
+  are normal functions; you can call `tag(['a ', ' b'], 1)`, but the
+  argument must be array-like with a `.raw` property if any
+  consumer cares.
+- **Using a tag where a plain template would do.** Adds indirection
+  for no gain.
+- **Not escaping in your safe-html / safe-sql tag.** A tag with the
+  right *shape* but no escaping is a security hole that looks safe.

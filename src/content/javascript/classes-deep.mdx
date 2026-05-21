@@ -1,0 +1,297 @@
+export const level = 'mid';
+
+# Classes, in depth
+
+`class` looks like sugar over the prototype machinery in
+`prototypes.mdx`, and 80% of the time it is. The other 20% is where
+bugs live — private fields, static, `super`, the `new` requirement,
+and the fact that a class body runs in strict mode whether you asked
+or not.
+
+## What `class` actually does
+
+```js
+class Account {
+  constructor(balance) { this.balance = balance; }
+  deposit(n) { this.balance += n; }
+}
+```
+
+is roughly:
+
+```js
+function Account(balance) {
+  if (!new.target) throw new TypeError("Class constructor Account cannot be invoked without 'new'");
+  this.balance = balance;
+}
+Object.defineProperty(Account.prototype, 'deposit', {
+  value: function deposit(n) { this.balance += n; },
+  writable: true, configurable: true, enumerable: false,  // 👈 not enumerable
+});
+```
+
+Two non-obvious differences from a hand-rolled constructor:
+
+- **Must be called with `new`.** `Account(100)` throws.
+- **Methods are non-enumerable.** `for...in` skips them. With a
+  function-based constructor, methods on `.prototype` are enumerable
+  by default.
+- **Class body runs in strict mode.** No `this` defaulting to the
+  global object, no silent assignment failures, no octal literals.
+
+## Static members
+
+`static` lives on the class itself, not on instances:
+
+```js
+class Money {
+  static parse(s) { return new Money(Number(s.replace('$', ''))); }
+  constructor(amount) { this.amount = amount; }
+}
+
+Money.parse('$42');     // Money { amount: 42 }
+new Money(42).parse;    // undefined — instances don't have it
+```
+
+Static methods see other statics via `this`:
+
+```js
+class API {
+  static base = 'https://api.example.com';
+  static url(path) { return `${this.base}${path}`; }
+}
+
+API.url('/users');  // 'https://api.example.com/users'
+```
+
+Subclasses inherit statics:
+
+```js
+class V2API extends API {}
+V2API.url('/users');  // still works — `this` is V2API
+```
+
+### Static initialization blocks
+
+For setup that needs more than one expression:
+
+```js
+class Config {
+  static defaults;
+  static {
+    const raw = readFileSync('./config.json', 'utf-8');
+    this.defaults = JSON.parse(raw);
+  }
+}
+```
+
+Runs once when the class is defined. Useful for derived static
+state, registering with a registry, or anything that needs
+multiple statements.
+
+## Private fields (`#`)
+
+Hard privacy — not a naming convention, an actual access restriction:
+
+```js
+class Account {
+  #balance = 0;
+  deposit(n) { this.#balance += n; }
+  get balance() { return this.#balance; }
+}
+
+const a = new Account();
+a.#balance;        // SyntaxError — not a parsing error you can catch
+a['#balance'];     // undefined — the field isn't a string property
+```
+
+Real differences from a `_balance` convention:
+
+- The field doesn't exist as a property name. Reflection (`Object.keys`,
+  `Reflect.ownKeys`, `JSON.stringify`) skips it.
+- Subclasses **can't** access parent private fields. `#` is per-class,
+  not per-prototype-chain.
+- A `#field` reference is a syntax error outside any class declaring
+  it — you literally can't write the code.
+
+Private methods and static private also work:
+
+```js
+class Token {
+  static #secret = process.env.JWT_SECRET;
+  static sign(payload) { return this.#hash(payload + this.#secret); }
+  static #hash(s) { /* ... */ }
+}
+```
+
+### Brand checks via `#`
+
+A class-only way to ask "is this one of mine?":
+
+```js
+class Money {
+  #brand;
+  static isMoney(v) {
+    try { v.#brand; return true; }
+    catch { return false; }
+  }
+}
+```
+
+Accessing `#brand` on a non-`Money` throws — the `try/catch` turns
+that into a `false`. Useful when `instanceof` lies (e.g. across
+realms / iframes).
+
+## `extends` and `super`
+
+```js
+class Animal {
+  constructor(name) { this.name = name; }
+  speak() { return `${this.name} makes a sound`; }
+}
+
+class Dog extends Animal {
+  constructor(name) {
+    super(name);           // must call before using `this`
+    this.kind = 'dog';
+  }
+  speak() {
+    return super.speak() + ' (bark)';
+  }
+}
+```
+
+Things to know:
+
+- **`super()` must run before `this` is touched.** Reading or
+  assigning `this` before `super()` throws `ReferenceError`. The
+  parent's constructor is what materializes `this`.
+- **`super.method()` is statically bound at definition time** — it
+  always refers to the prototype above the class where the method is
+  defined, not the runtime parent. Renaming the parent at runtime
+  doesn't affect `super`.
+- **`extends null`** parses, but a normal `super()` call throws
+  `TypeError`. The class is only usable if its constructor explicitly
+  `return`s an object. Mostly a curio; not a casual "primordial-free
+  base class" trick.
+
+## Getters, setters, and computed members
+
+```js
+class Temperature {
+  #celsius;
+  constructor(c) { this.#celsius = c; }
+  get fahrenheit() { return this.#celsius * 9 / 5 + 32; }
+  set fahrenheit(f) { this.#celsius = (f - 32) * 5 / 9; }
+}
+
+const t = new Temperature(20);
+t.fahrenheit;       // 68
+t.fahrenheit = 100; // sets celsius to 37.78
+```
+
+Computed member names with `[...]`:
+
+```js
+const KEY = Symbol('id');
+class Entity {
+  [KEY] = crypto.randomUUID();
+  static [Symbol.hasInstance](v) { return typeof v === 'object' && KEY in v; }
+}
+```
+
+## `new.target`
+
+Inside a constructor, `new.target` is the constructor that was called
+with `new`. `undefined` if called without `new`. Subclass-aware:
+
+```js
+class Base {
+  constructor() {
+    if (new.target === Base) throw new Error('abstract');
+  }
+}
+class Concrete extends Base {}
+new Concrete();   // ok — new.target is Concrete
+new Base();       // throws
+```
+
+The cleanest way to express "this class is abstract" without a flag.
+
+## Field declarations vs constructor assignment
+
+```js
+class A {
+  x = 0;                    // field declaration
+  constructor() { this.y = 0; }  // constructor assignment
+}
+```
+
+Two real differences:
+
+- **Order.** Field declarations run *first* in the constructor, then
+  any explicit constructor body. So `this.x` is already `0` when
+  your `constructor` runs.
+- **Subclass init order.** Parent fields, parent constructor body,
+  child fields, child constructor body. Surprising if a parent
+  constructor calls a method the child overrides — the override sees
+  child fields as `undefined` because they haven't been declared yet.
+
+```js
+class P { constructor() { this.tag(); } tag() {} }
+class C extends P { kind = 'c'; tag() { console.log(this.kind); } }
+new C();   // logs undefined, not 'c'
+```
+
+Same trap as Java/C# constructors calling virtual methods. Avoid
+calling overridable methods from a constructor.
+
+## Mixins
+
+JS has single inheritance. For multiple sources of behavior, use a
+function that returns a class:
+
+```js
+const Serializable = (Base) => class extends Base {
+  toJSON() { return { ...this, _type: this.constructor.name }; }
+};
+
+const Comparable = (Base) => class extends Base {
+  equals(other) { return JSON.stringify(this) === JSON.stringify(other); }
+};
+
+class User extends Serializable(Comparable(Object)) {
+  constructor(name) { super(); this.name = name; }
+}
+```
+
+Less elegant than traits in other languages, but it works and the
+mental model stays "linear prototype chain."
+
+## When NOT to use `class`
+
+- **Pure data shapes.** Object literals + functions are clearer.
+- **One-shot factory output.** A closure returning an object is often
+  smaller and has actually-private state without `#` syntax overhead.
+- **You don't need polymorphism.** Inheritance for code reuse alone
+  is usually worse than composition.
+
+Use `class` when there's real polymorphism (multiple implementations
+of the same interface), shared instance methods you'd otherwise
+duplicate, or interop with code that expects `instanceof`.
+
+## Common mistakes
+
+- **Forgetting `new`.** Throws now (thanks to `new.target`), but the
+  error message confuses people new to the syntax.
+- **Reading `this` before `super()`.** ReferenceError. The parent
+  has to initialize first.
+- **Arrow methods as class fields.** `method = () => {...}` puts a
+  per-instance closure on each object instead of one shared
+  prototype method. Convenient for callback `this`-binding,
+  expensive at scale.
+- **Treating `#private` as a hint.** It's enforced. Trying to read
+  `obj.#x` on the wrong class is a `TypeError`, not `undefined`.
+- **Subclassing built-ins for behavior.** Subclass `Array` and you
+  hit `Symbol.species` issues; many static methods return base-class
+  instances. Composition is safer.

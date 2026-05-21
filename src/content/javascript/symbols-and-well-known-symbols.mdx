@@ -1,0 +1,282 @@
+export const level = 'senior';
+
+# Symbols and well-known symbols
+
+`Symbol` is a primitive type whose only purpose is to be **unique**.
+Every call to `Symbol()` produces a value that's not equal to any
+other value in the runtime. That uniqueness powers two things: a
+weak form of privacy on objects, and a protocol system that lets
+the language's syntax hook into your objects via *well-known*
+symbols.
+
+## Creating symbols
+
+```js
+const a = Symbol();
+const b = Symbol();
+a === b;                  // false — always
+
+const c = Symbol('debug');
+String(c);                // "Symbol(debug)"
+c.description;            // "debug"
+```
+
+The optional description is for debugging only. It does not affect
+identity — two `Symbol('debug')`s are still distinct.
+
+## `Symbol()` vs `Symbol.for()`
+
+`Symbol()` makes a brand-new value. `Symbol.for(key)` looks up (or
+creates) a symbol in a global registry, keyed by string:
+
+```js
+const s1 = Symbol.for('app.id');
+const s2 = Symbol.for('app.id');
+s1 === s2;                // true — same registry entry
+
+Symbol.keyFor(s1);        // 'app.id'
+Symbol.keyFor(Symbol());  // undefined — not in registry
+```
+
+The registry is **cross-realm** — `Symbol.for('x')` in a worker, an
+iframe, or a `vm.Script` returns the same symbol as in the main
+realm. Use it when you need a symbol that means the same thing
+everywhere; use plain `Symbol()` when you specifically want a value
+that can't collide.
+
+## Symbols as property keys
+
+Symbols make properties that don't collide and don't show up in
+normal enumeration:
+
+```js
+const ID = Symbol('id');
+const user = { name: 'jon', [ID]: 42 };
+
+user[ID];                 // 42
+Object.keys(user);        // ['name']
+JSON.stringify(user);     // '{"name":"jon"}'
+Object.getOwnPropertySymbols(user);  // [Symbol(id)]
+Reflect.ownKeys(user);    // ['name', Symbol(id)]
+```
+
+This is **weak privacy**, not real privacy. Any code that has the
+symbol can read the value; `getOwnPropertySymbols` exposes it for
+inspection. Use `#private` class fields for actual privacy. Use
+symbol keys when you want to:
+
+- Attach metadata to objects you don't own without colliding with
+  their properties.
+- Hide implementation details from casual iteration / spreading /
+  `JSON.stringify`.
+- Define protocol methods (see below).
+
+## The well-known symbols
+
+These are predefined symbols (`Symbol.iterator`, `Symbol.asyncIterator`,
+etc.) that the language *itself* looks up on your objects when
+specific syntax runs. Implementing them lets your custom types plug
+into language features.
+
+### `Symbol.iterator` — `for...of` and spread
+
+```js
+class Range {
+  constructor(from, to) { this.from = from; this.to = to; }
+  *[Symbol.iterator]() {
+    for (let i = this.from; i <= this.to; i++) yield i;
+  }
+}
+
+const r = new Range(1, 3);
+[...r];                   // [1, 2, 3]
+for (const n of r) {}     // works
+Array.from(r);            // [1, 2, 3]
+```
+
+Every iterable protocol — `for...of`, spread, destructuring, `Array.from`,
+`Map`/`Set` constructors, `Promise.all` — calls `[Symbol.iterator]()`
+to get an iterator. See `iterators-generators.mdx`.
+
+### `Symbol.asyncIterator` — `for await...of`
+
+Same shape, for async iteration. See `async-iteration.mdx`.
+
+### `Symbol.toPrimitive` — implicit conversions
+
+Controls what your object becomes when coerced:
+
+```js
+class Temperature {
+  constructor(c) { this.c = c; }
+  [Symbol.toPrimitive](hint) {
+    if (hint === 'number') return this.c;
+    if (hint === 'string') return `${this.c}°C`;
+    return `${this.c}°C`;   // 'default' — used by `+` etc.
+  }
+}
+
+const t = new Temperature(20);
++t;                       // 20 (hint = 'number')
+`${t}`;                   // '20°C' (hint = 'string')
+t + '';                   // '20°C' (hint = 'default')
+```
+
+Without this, JS falls back to `valueOf()` then `toString()`. Use
+`Symbol.toPrimitive` when you want one method to handle all three
+contexts with explicit branching.
+
+### `Symbol.toStringTag` — what `Object.prototype.toString` says
+
+```js
+class Money {
+  get [Symbol.toStringTag]() { return 'Money'; }
+}
+
+Object.prototype.toString.call(new Money());  // '[object Money]'
+```
+
+Useful for debugger output and for the `Object.prototype.toString.call(x)`
+idiom that distinguishes built-in types when `typeof` is too coarse.
+Built-ins already set this (`'Map'`, `'Promise'`, etc.).
+
+### `Symbol.hasInstance` — custom `instanceof`
+
+```js
+class Even {
+  static [Symbol.hasInstance](v) { return typeof v === 'number' && v % 2 === 0; }
+}
+
+4 instanceof Even;        // true
+5 instanceof Even;        // false
+```
+
+Lets `instanceof` mean something other than prototype-chain checking.
+Common in libraries that want `instanceof` to work across realms,
+or for value-class checks.
+
+### `Symbol.species` — what subclass-aware methods return
+
+When `Array.prototype.map` makes a new array, what class does it
+construct? By default, `this.constructor[Symbol.species]`, which
+defaults to `this.constructor`:
+
+```js
+class MyArray extends Array {
+  static get [Symbol.species]() { return Array; }
+}
+
+new MyArray(1, 2, 3).map((x) => x * 2);  // Array, not MyArray
+```
+
+Set `[Symbol.species]` to a plain `Array` if you want derived methods
+on your subclass to *not* preserve your type. The default — preserve
+the subclass — is usually what surprises people negatively (you
+extend `Array`, then `.filter()` returns your subclass, and now your
+subclass's constructor gets called with different args than it
+expects).
+
+### `Symbol.isConcatSpreadable` — control `Array.concat` flattening
+
+```js
+const arr = [1, 2];
+const arrayLike = { 0: 'a', 1: 'b', length: 2, [Symbol.isConcatSpreadable]: true };
+arr.concat(arrayLike);    // [1, 2, 'a', 'b']
+```
+
+Or set it to `false` on a real array to *prevent* flattening. Niche
+but real — some libraries use it for "list of lists" semantics.
+
+### `Symbol.unscopables` — `with` statement opt-outs
+
+```js
+Array.prototype[Symbol.unscopables];
+// { at: true, copyWithin: true, entries: true, ... }
+```
+
+A `with` block won't introduce these names as bindings. Exists so
+that adding new array methods (like `at`) doesn't break existing
+code using `with(arr) { ... }`. You almost certainly don't need to
+care unless you write `with`, which you shouldn't.
+
+### Others
+
+`Symbol.match`, `Symbol.replace`, `Symbol.search`, `Symbol.split` —
+hook into the corresponding `String.prototype` method when called
+with your object. `Symbol.dispose` controls `using` declarations
+(the sync explicit resource management proposal reached Stage 4 in
+2025); `Symbol.asyncDispose` for `await using` is still finalizing.
+`Symbol.metadata` — used by the decorators proposal.
+
+## Symbol patterns worth knowing
+
+### Type-tag union without strings
+
+```js
+const NORTH = Symbol('north'), SOUTH = Symbol('south');
+function move(dir) {
+  if (dir === NORTH) {}
+  else if (dir === SOUTH) {}
+}
+```
+
+Equivalent to a string enum, but a typo of `Symbol('north')` doesn't
+collide with `NORTH` — you'd get a different symbol. Less useful in
+TypeScript (string literal types catch typos at compile time); more
+useful in plain JS.
+
+### Hiding metadata on third-party objects
+
+```js
+const META = Symbol('@my-lib/metadata');
+
+function tag(obj, info) { obj[META] = info; }
+function read(obj) { return obj[META]; }
+```
+
+Your `META` is unique to this module. Other libraries can't
+accidentally clobber it, and it doesn't appear in `Object.keys` /
+`JSON.stringify` on the host object.
+
+### Cross-realm protocol agreement
+
+```js
+const PROTO = Symbol.for('app.serialize');
+
+class Money {
+  [PROTO]() { return { type: 'money', amount: this.amount }; }
+}
+
+function serialize(v) {
+  return typeof v[PROTO] === 'function' ? v[PROTO]() : v;
+}
+```
+
+Now any module — in any realm — that does `Symbol.for('app.serialize')`
+gets the same symbol and can implement the protocol. Same idea as
+`Symbol.iterator` but for your own protocols.
+
+## What symbols are not
+
+- **Not GC roots.** A symbol used as a key is itself garbage if
+  nothing else references it (but `Symbol.for(...)` entries are kept
+  alive by the registry forever).
+- **Not serializable.** `JSON.stringify` skips symbol-keyed
+  properties, returns `undefined` (not a string) for a top-level
+  symbol value, and writes `null` for symbol values inside an array.
+  No throw — just silent loss.
+- **Not coercible to string implicitly.** `'' + sym` throws
+  `TypeError`. Use `String(sym)` if you really want the description.
+- **Not private.** Anyone with `Object.getOwnPropertySymbols` can
+  see them.
+
+## Common mistakes
+
+- **Comparing symbols by description.** Different `Symbol('x')`s are
+  not equal even if they share a description.
+- **Confusing `Symbol.for` and `Symbol()`.** Use `Symbol.for` when
+  you want cross-realm identity, plain `Symbol()` otherwise.
+- **Treating symbol-keyed props as private.** They're hidden from
+  iteration, not from `Reflect.ownKeys` or `getOwnPropertySymbols`.
+- **Forgetting `JSON.stringify` skips them.** If you stash important
+  state on a symbol key, it won't serialize. Add `toJSON`.
