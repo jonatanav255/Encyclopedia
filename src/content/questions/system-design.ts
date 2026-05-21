@@ -478,5 +478,56 @@ export const bank: QuestionBank = {
       answer:
         '- **Expand-contract schema pattern**: add new columns first; deploy code that writes both; backfill; deploy code that reads new; deploy code that writes only new; finally remove old columns. Each step is independently rollbackable.\n- **Dual-write phase**: writes go to both old and new schemas. Reads can switch independently. Verifies data parity before cutover.\n- **Shadow traffic** to validate the new system\'s behavior against real traffic before cutover.\n- **CDC for backfill**: stream changes from old to new while initial dump is loading.\n- **Per-tenant migration** for multi-tenant systems — migrate one tenant at a time, observe, rollback if needed.\n- **Continuous data validation**: comparison job running through migration confirming new = old.\n- **Slow rollout of read paths**: 1% → 10% → 50% → 100% with metric gates.\n\nBig-bang migrations fail. Incremental migrations succeed.',
     },
+
+    // --- references-grounded ---
+
+    {
+      level: 'senior',
+      question: 'Per the Spanner paper, what does "commit-wait" achieve and what does it cost?',
+      answer:
+        'Commit-wait gives Spanner **external consistency** (strict serializability) at global scale despite imperfect clocks.\n\nAt commit time the coordinator picks `commit_ts = TT.now().latest` (the upper bound of the TrueTime interval), then **waits** until `TT.now().earliest > commit_ts` before releasing the commit. After the wait, every observer\'s "now" is provably after the commit timestamp.\n\nCost: the commit takes ~5–10 ms longer (in the original 2012 paper; sub-1 ms p99 by 2023 per Google\'s reports). Spanner\'s latency floor *is* the TrueTime uncertainty bound. Better clocks ⇒ faster transactions.\n\nThis is why TrueTime needs GPS antennas + atomic clocks — software-only NTP\'s ~10–100 ms uncertainty would make the wait latency prohibitive.',
+    },
+    {
+      level: 'senior',
+      question: 'What did the AWS S3 us-east-1 outage of February 2017 teach about blast radius?',
+      answer:
+        'Three lessons from the AWS post-event summary:\n\n1. **An engineer\'s typo took down more servers than intended.** The debugging command removed capacity from two subsystems instead of one. Mitigation: input validation + capacity floors on operational tools.\n2. **Subsystems hadn\'t been restarted in years.** When forced to cold-start, they took hours to recover because of slow metadata rebuilds. Mitigation: regularly exercise cold-start paths.\n3. **The AWS status dashboard ran on S3.** The dashboard couldn\'t report S3\'s outage *because* of S3\'s outage. Mitigation: blast-radius isolation — control-plane and status systems must not depend on the data plane they monitor.\n\nThe meta-lesson: blast radius is what your software can produce on the worst day, not what your customers usually do.',
+    },
+    {
+      level: 'senior',
+      question: 'In Raft, why is the leader-election timeout randomized?',
+      answer:
+        'Per Ongaro & Ousterhout (2014): each follower waits a randomized timeout (typically 150–300 ms) before starting a new election when it stops hearing from the leader.\n\nIf timeouts were deterministic, every follower would time out simultaneously, all become candidates at once, split the vote N ways, and need another election. Randomization spreads the timeouts so that one candidate usually starts first, gathers votes, and wins before others time out.\n\nThe paper shows that even with poorly-chosen ranges (e.g., 12–24 ms on a fast network), Raft converges quickly. The point isn\'t the specific range — it\'s that the protocol relies on time + randomness to break symmetry, not on a coordinator.',
+    },
+    {
+      level: 'staff',
+      question: 'The Tail at Scale (Dean & Barroso, 2013) proposes hedged and tied requests. What\'s the difference?',
+      answer:
+        '**Hedged request**: send the same query to two (or more) replicas immediately. Take the first response. Cancel the loser. Effective but doubles backend load.\n\n**Tied request**: send to replica A first. If A doesn\'t respond within X ms (a small threshold, often around p50), *also* send to replica B. Whichever finishes first wins; cancel the other. Costs much less backend load than hedging because the second request only fires for slow cases.\n\nThe paper reports that tied requests reduce p99 latency by ~40% with only ~2% extra load, because the tail of slow requests is small.\n\nUse hedged when you must minimize p99 and can afford the load. Use tied when load matters and you only want to chase the tail.',
+    },
+    {
+      level: 'senior',
+      question: 'What does Stripe\'s "idempotency" post recommend for safe retries, and why does it matter?',
+      answer:
+        'Brandur Leach\'s 2017 post defines the canonical pattern:\n\n1. **Client generates an idempotency key** (UUID) per logical operation and sends it with the request.\n2. **Server records** `(idempotency_key → outcome)` in a database with a TTL.\n3. **On retry**, server looks up the key — if the previous attempt succeeded, return the cached result; if it\'s still in-flight, return 409 or block; if it failed deterministically, return the same failure.\n4. **The key is scoped per-customer per-endpoint** to avoid cross-tenant collisions.\n\nWhy it matters: without this, a network timeout on a "create payment" request means the client doesn\'t know whether to retry. With it, retries are safe — the worst case is one extra DB lookup instead of a double-charge. The pattern shows up in Stripe, Square, AWS\'s service APIs, and every webhooks design that needs to claim "at least once delivery without duplicates."',
+    },
+    {
+      level: 'senior',
+      question: 'What happened in the GitHub MySQL split-brain incident of October 2018?',
+      answer:
+        'Per the GitHub post-incident analysis:\n\n- A network partition split the Atlantic between East and West coast MySQL clusters.\n- Both sides briefly accepted writes — for 43 seconds — believing themselves to be the primary.\n- Orchestrator (their leader-election service) eventually picked a single primary, but reconciling the diverged writes required 24 hours of careful manual work.\n- Real customer-visible impact: 24h+ of degraded service while engineers diff\'d the two write streams and merged them.\n\nLessons:\n\n1. **Even with leader election, split-brain windows exist** during the time the election takes to detect and resolve a partition.\n2. **Fencing tokens / semi-sync replication** can shrink but not eliminate this window.\n3. **A 43-second window of dual-writes produced 24 hours of recovery.** The asymmetry between failure duration and recovery cost is the actual operational risk.',
+    },
+    {
+      level: 'staff',
+      question: 'What did the Cloudflare "Byzantine failure in the real world" post teach about fault models?',
+      answer:
+        'Lianza & Snook (2020) describe a real Byzantine failure in production:\n\n- A network switch silently corrupted ~1-in-10⁷ etcd packets in a *specific* way (flipping certain bits).\n- etcd\'s Raft tolerates **crash faults** — nodes that stop — but not **Byzantine faults** — nodes (or networks) that produce arbitrary corrupted messages that pass protocol-level checks.\n- The fault model assumption broke: the protocol assumed messages are either delivered intact or not at all. Reality delivered some messages with corrupted contents that still parsed as valid Raft messages.\n- Mitigation: application-layer checksums on top of TLS, because TLS alone didn\'t catch the specific corruption.\n\nThe takeaway: most distributed-systems algorithms assume crash-fault model. Real-world hardware sometimes produces Byzantine-shaped faults. Assume your fault model and reality may disagree, and add detection (application checksums, audit comparisons) for the assumptions you can\'t verify.',
+    },
+    {
+      level: 'staff',
+      question: 'Why does the Dynamo paper use vector clocks, and what problem do they solve that timestamps don\'t?',
+      answer:
+        'Per DeCandia et al. (2007):\n\nDynamo is leaderless and eventually consistent. Two replicas can accept concurrent writes to the same key. When the writes meet, the system must determine: did one write happen-before the other (in which case the later one wins) or are they truly concurrent (in which case both must be kept as siblings for application-level conflict resolution)?\n\nWall-clock timestamps can\'t distinguish "concurrent" from "ordered" — they\'re subject to clock skew and don\'t capture causality. Two writes with timestamps 100ms apart might be causally independent; two writes with the same timestamp might have a causal relationship.\n\n**Vector clocks** attach a per-node counter to each write. A write A causally precedes B if every component of A\'s vector is ≤ B\'s. They are *concurrent* if neither dominates. This gives Dynamo a sound way to detect "real conflict" vs "stale write" without requiring synchronized clocks.\n\nCost: storage overhead per object, and the vector can grow over time (Dynamo prunes it with heuristics). But it solves a correctness problem that timestamps alone can\'t.',
+    },
   ],
 };

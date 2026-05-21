@@ -15,6 +15,7 @@ import { Steps, Step } from './components/mdx/Steps';
 import { Diagram, DBox, DArrow } from './components/mdx/Diagram';
 import { Cheatsheet } from './components/mdx/Cheatsheet';
 import { Term } from './components/mdx/Term';
+import { Reference } from './components/mdx/Reference';
 import { MiddlewarePipeline } from './components/demos/MiddlewarePipeline';
 import { RouteMatcher } from './components/demos/RouteMatcher';
 import { EventLoop } from './components/demos/EventLoop';
@@ -30,6 +31,7 @@ const mdxComponents = {
   DArrow,
   Cheatsheet,
   Term,
+  Reference,
   MiddlewarePipeline,
   RouteMatcher,
   EventLoop,
