@@ -1,0 +1,393 @@
+export const level = 'senior';
+
+# Load balancing strategies
+
+When you have multiple instances of a service, a load balancer
+spreads requests across them. The strategy it uses materially
+affects latency, fairness, and resilience under load.
+
+This page covers the algorithms, their trade-offs, and when each is
+right.
+
+## Round robin
+
+```
+request 1 → instance A
+request 2 → instance B
+request 3 → instance C
+request 4 → instance A
+```
+
+Sequential distribution. Simple. Assumes all instances are equally
+capable and all requests cost the same.
+
+**Pros**: trivial to implement, even distribution under uniform
+workload.
+**Cons**: ignores instance health, ignores request cost variance.
+A slow request to one instance backs up traffic behind it.
+
+The default in nginx (`upstream`), HAProxy, every cloud LB. Fine
+for stateless services with uniform request times.
+
+## Weighted round robin
+
+```
+A weight 3, B weight 1
+A, A, A, B, A, A, A, B, ...
+```
+
+When instances have different capacities (e.g., during gradual
+rollout: 90% to the stable version, 10% to canary), weights bias
+distribution.
+
+Used heavily for:
+
+- **Canary deployments**: 1% canary, 99% stable.
+- **Heterogeneous fleets**: bigger instances get more traffic.
+
+Static weights, so changes require config updates. Modern systems
+use dynamic weights based on health (next sections).
+
+## Least connections
+
+```
+[A: 5 active] [B: 2 active] [C: 8 active]  →  send to B
+```
+
+Routes to the instance with the fewest active connections.
+
+**Better for** workloads with variable request times. A 10-second
+request to A reduces A's selection until it finishes — naturally
+shifts load to faster instances.
+
+HAProxy: `balance leastconn`. nginx: `least_conn`.
+
+**Limitation**: connections aren't requests. For HTTP/2 (one
+connection handles many requests), least-connections doesn't see
+the real load. Use least-requests or response-time-based for H2.
+
+## Least response time / EWMA
+
+```
+[A: avg latency 50ms] [B: avg latency 30ms] [C: avg latency 80ms]
+                       ↑ send here
+```
+
+Tracks recent average response time per instance (exponentially
+weighted moving average — EWMA). Routes to the fastest.
+
+Adapts to changing instance performance. If A starts thrashing,
+load shifts to B and C automatically.
+
+Used in Envoy, Linkerd, Finagle. The right choice for
+microservices with variable instance performance.
+
+## Power of two choices
+
+A surprisingly good algorithm:
+
+```
+1. Pick 2 instances at random.
+2. Send to the one with fewer active connections (or lower latency).
+```
+
+Sounds too simple. But: by sampling 2 of N, you avoid the
+worst case (one instance overloaded) with near-zero coordination
+overhead.
+
+Mathematically, P2C achieves nearly-optimal balance at a fraction
+of the cost of "always pick the best" (which requires global state).
+
+Used in Linkerd, Envoy. The default for many service meshes.
+
+## Consistent hashing
+
+```
+hash(request_key) % N  → instance index
+```
+
+Maps requests to instances by hashing some key (user ID, session
+ID, cache key). The same key always routes to the same instance.
+
+**Use cases**:
+
+- **Sticky sessions**: user X's requests always hit instance 7
+  (where their session is in memory).
+- **Caching**: cache key X always goes to the same node (so it's
+  cached there).
+- **Sharded services**: tenant X always routes to the shard that
+  owns their data.
+
+**Plain hash mod N** has a problem: when instance count changes
+(scaling, failover), most keys remap. Cache hit rate drops to
+near-zero briefly.
+
+**Consistent hashing** (Karger et al.) places instances on a ring;
+each key hashes to its position; it goes to the next instance
+clockwise. Adding/removing an instance only remaps ~1/N keys.
+
+**Rendezvous hashing (HRW)** is a similar but simpler scheme. Most
+modern stacks use one of these.
+
+Used in: Redis Cluster, Cassandra, CDNs (mapping requests to edge
+servers).
+
+## IP hash / source-based
+
+```
+hash(client_ip) % N → instance
+```
+
+The same client always hits the same instance. Used for sticky
+sessions without consistent hashing.
+
+**Cons**: doesn't handle changing client IPs (mobile, proxies, NAT).
+Modern apps prefer cookie-based stickiness or server-side session
+storage.
+
+## Active health checks
+
+Smart LBs don't just balance — they **skip unhealthy instances**.
+Two patterns:
+
+### Passive (failure-based)
+
+- Track per-instance failure rate.
+- Mark instance unhealthy after N consecutive failures.
+- Recheck after a cooldown.
+
+nginx open-source supports this (`max_fails`, `fail_timeout`).
+Simple but slow to detect issues — a sick instance keeps getting
+some traffic until it fails N times.
+
+### Active (probe-based)
+
+- LB periodically calls `/healthz` on each instance.
+- Marks unhealthy if probe fails.
+- Routes around unhealthy.
+
+HAProxy: `option httpchk GET /healthz`. Envoy, Linkerd, all cloud
+LBs do this natively.
+
+**Preferred for production**: active checks detect issues in seconds,
+not after failed user requests.
+
+### Outlier detection
+
+Envoy and Istio support **automatic ejection** of instances that
+deviate from the rest:
+
+- Instance returns 5xx at a much higher rate than peers → eject for
+  a cooldown.
+- Instance is 5× slower than peers → eject.
+
+Recovers automatically if the instance comes back to baseline. The
+modern complement to active health checks.
+
+## Sticky sessions
+
+Routing the same user's requests to the same instance:
+
+```
+User → cookie SERVERID=B → routed to instance B
+```
+
+**When needed**:
+
+- In-memory sessions (you haven't moved to Redis yet).
+- WebSocket connections (must stay on the same instance for the
+  duration).
+- Session-state-heavy apps where moving between instances is
+  expensive.
+
+**When not needed**:
+
+- Stateless services. Don't use sticky sessions — they reduce
+  failover quality.
+
+**How to implement**:
+
+- **Cookie-based**: the LB sets a cookie naming the instance.
+  Subsequent requests with the cookie go there.
+- **IP hash**: hash the client IP. Sticky but breaks for changing
+  IPs.
+- **Consistent hashing on session ID**.
+
+Modern apps move state to Redis / DB and skip sticky sessions
+entirely — better failover, even distribution, no special LB
+config.
+
+## Connection draining
+
+When taking an instance out of rotation (deploy, scale-down):
+
+1. **Mark unhealthy** (fail the readiness probe).
+2. **Wait** for the LB to stop sending new connections (one health-
+   check interval).
+3. **Let in-flight requests finish**.
+4. **Force-close** after a timeout.
+
+Without draining: in-flight requests get killed mid-response, users
+see errors.
+
+Kubernetes does this automatically with `terminationGracePeriodSeconds`
++ proper readiness probe response. See **Graceful shutdown deep**.
+
+## Geographic load balancing
+
+For globally distributed apps:
+
+### DNS-based
+
+- The DNS resolver returns different IPs based on the client's
+  location.
+- Limitation: DNS caching means changes take minutes to propagate.
+
+### Anycast
+
+- One IP advertised from many locations via BGP. Routers
+  automatically deliver packets to the nearest advertiser.
+- Cloudflare, Fastly, AWS Global Accelerator use this.
+- Failover is automatic at the network layer (seconds, not
+  minutes).
+
+### Cloud-managed
+
+- AWS Route 53 with health checks does latency-based or geolocation-
+  based routing.
+- Cloud Run, Cloud Functions handle geo-routing automatically.
+
+For most apps: cloud LB + multi-region origins. The cloud handles
+the complexity.
+
+## Layer 4 vs Layer 7
+
+**Layer 4** (TCP/UDP): the LB only sees IPs, ports, connection state.
+Fast, simple. Used for non-HTTP protocols, raw TCP services.
+
+**Layer 7** (HTTP): the LB parses the protocol — can route by
+URL, headers, method, body. More feature-rich, slightly slower.
+
+Modern LBs (Envoy, ALB, nginx) operate at L7 for HTTP traffic.
+L4 LBs (HAProxy in TCP mode, AWS NLB) for raw TCP / WebSocket.
+
+## When the LB is the bottleneck
+
+Single LB has a throughput ceiling. At scale:
+
+- **Multiple LBs in parallel**, fronted by anycast DNS.
+- **DSR (Direct Server Return)**: LB sees the inbound, but the
+  server sends responses directly to the client. Cuts return-path
+  traffic through the LB.
+- **eBPF-based LBs** (Cilium): kernel-level packet steering, much
+  higher throughput than userspace LBs.
+
+For most apps, one cloud LB is plenty. Top-tier (CDN providers,
+hyperscalers) need the fancy patterns.
+
+## Service mesh load balancing
+
+In service meshes (Istio, Linkerd):
+
+- **Per-pod proxy** (Envoy sidecar) handles all outbound traffic.
+- LB decisions are made at the source (the calling pod), not at a
+  central LB.
+- Algorithms: P2C, least-request, consistent hashing.
+
+**Pros**: client-side LB sees real-time health, can do circuit
+breaking, retries, outlier detection per call.
+**Cons**: extra resource cost per pod, complexity.
+
+For complex microservice architectures, the mesh's smart LB pays
+off. For monoliths or small service counts, a central LB is
+simpler.
+
+## Common pitfalls
+
+### Round robin in heterogeneous workloads
+
+Long requests pile up on whichever instance got them. Use
+least-connections or response-time-based.
+
+### Sticky sessions hiding instability
+
+If your app needs sticky sessions to work, you have a state-on-
+instance problem. Fix the underlying issue (move state to
+Redis/DB); don't paper over with stickiness.
+
+### Forgetting to test failover
+
+LB removes a sick instance, but does the app handle in-flight
+requests correctly? Test by killing an instance under load.
+
+### Health check that's too generous
+
+```
+healthcheck: GET /healthz  →  returns 200 even if DB is down
+```
+
+Health check should fail when the instance can't serve real
+traffic. Include DB connectivity, downstream dependency status in
+the check.
+
+But not too aggressive — if your healthcheck queries the DB on
+every check, you've added load. Cache the result for a few seconds.
+
+### LB-to-Node keep-alive mismatch
+
+Covered in **HTTP server internals**: nginx idle timeout vs Node
+`keepAliveTimeout` mismatch causes intermittent 502s. Node must
+hold the connection longer than the proxy.
+
+### Ignoring slow requests
+
+A few 30-second requests on an instance starve the rest. Either:
+
+- Set a per-request timeout at the LB.
+- Use the application's circuit breaker to bound time.
+- Switch to least-response-time LB strategy.
+
+## Choosing a strategy
+
+**Quick guide**:
+
+| Workload | Strategy |
+| --- | --- |
+| Stateless, uniform requests | Round robin |
+| Stateless, varying request times | Least connections or response time |
+| Heterogeneous instance sizes | Weighted round robin |
+| Cache locality matters | Consistent hashing |
+| Sticky sessions (avoid if possible) | Cookie-based |
+| Service mesh microservices | P2C or least request |
+| Many instances, want fairness | Power of two |
+| Multi-region | Anycast or geo-DNS |
+
+For most apps: start with round-robin + active health checks.
+Move to least-connections / response time when you see uneven
+load. Consistent hashing only when cache locality or sharding
+demands it.
+
+## The mental model
+
+A load balancer is **a function from incoming request → instance**.
+The function's shape determines fairness, latency, and resilience.
+
+Modern LBs combine:
+
+- **Distribution algorithm** (round-robin, least-conn, P2C, etc.).
+- **Health awareness** (active checks + outlier detection).
+- **Connection-level controls** (draining, keep-alive).
+- **Geographic routing** (multi-region).
+
+For 2026 production:
+
+- **Cloud LB** (ALB, Cloud Run, Vercel) handles the common case.
+- **Self-managed**: HAProxy or nginx for VMs; Envoy for service
+  meshes.
+- **Geographic**: anycast (Cloudflare, Fastly) or cloud-managed
+  global LB.
+
+The right strategy depends on your traffic shape, instance
+heterogeneity, and operational maturity. Most teams over-engineer
+the LB and under-engineer the app's resilience to LB decisions
+(draining, retries, graceful shutdown). Get those right first.

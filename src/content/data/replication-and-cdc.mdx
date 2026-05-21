@@ -1,0 +1,366 @@
+export const level = 'senior';
+
+# Replication and change data capture
+
+Databases at scale don't run on one server. Replication makes
+multiple copies, change data capture (CDC) streams changes to
+downstream systems. Both are mature, both have classic gotchas.
+
+This page covers what you need to know about replication in
+Postgres / MySQL + the CDC patterns built on top.
+
+## Why replicate
+
+- **Read scaling**: offload reads to replicas; primary handles
+  writes.
+- **High availability**: failover to a replica if the primary
+  dies.
+- **Geographic distribution**: replicas in regions close to users.
+- **Backup / analytics**: replicas as the source for batch jobs
+  without hitting the primary.
+
+You usually need all of these. Replication design is the
+foundation.
+
+## Replication topologies
+
+### Single-leader (primary + replicas)
+
+```
+clients
+  ↓ (writes + sync reads)
+[primary] → [replica 1]
+         → [replica 2]
+         → [replica 3]
+```
+
+One primary accepts writes. Replicas receive the change stream
+asynchronously. Reads from any replica.
+
+The 90% case. Postgres, MySQL, MongoDB, all the SaaS managed DBs
+default to this.
+
+**Pros**: simple, no conflict resolution, ACID on the primary.
+**Cons**: write throughput limited by the primary. Replication lag
+means reads from replicas can be stale.
+
+### Multi-leader
+
+Multiple primaries accept writes; replicate to each other.
+
+Use cases: multi-region active-active (writes go to the nearest
+region's primary), offline-capable apps (each device is a primary).
+
+**Pros**: write availability per region.
+**Cons**: **conflicts**. What if two regions update the same row at
+the same time? CRDTs, last-write-wins, or app-level merge logic.
+Most teams underestimate conflict-resolution complexity.
+
+For most apps, single-leader is right. Multi-leader pays off only
+at genuinely multi-region scale with conflict-tolerant data.
+
+### Leaderless (Dynamo-style)
+
+Cassandra, DynamoDB, Riak. No single primary. Clients write to N
+nodes, read from a quorum. Eventual consistency.
+
+For services that need huge write throughput + horizontal scaling
++ accept eventual consistency. Most Node services use single-leader
+relational DBs; leaderless is a specialized choice.
+
+## Postgres replication
+
+Two modes:
+
+### Streaming replication (physical)
+
+The primary ships its **write-ahead log** (WAL) to replicas. Replicas
+apply the WAL byte-by-byte — same data, same B-tree structure.
+
+```
+# postgresql.conf on primary
+wal_level = replica
+max_wal_senders = 10
+```
+
+```
+# pg_hba.conf
+host replication replicator 10.0.0.0/8 md5
+```
+
+The primary keeps a WAL "slot" per replica so unsent WAL isn't
+recycled.
+
+**Pros**: simple, fast, identical replica.
+**Cons**: replica must run the same Postgres version. Can't
+selectively replicate tables. Cross-version migrations require
+logical.
+
+### Logical replication
+
+Sends **row-level changes** decoded from the WAL. Replicas apply
+changes via INSERT/UPDATE/DELETE.
+
+```sql
+-- on primary
+CREATE PUBLICATION mypub FOR TABLE users, orders;
+
+-- on replica
+CREATE SUBSCRIPTION mysub
+  CONNECTION 'host=primary user=replicator dbname=app'
+  PUBLICATION mypub;
+```
+
+**Pros**:
+
+- Cross-version replication (PG 14 → PG 16).
+- Selective replication (only some tables).
+- Different schema on each side (with care).
+- Foundation for CDC.
+
+**Cons**: heavier (decode + apply), no DDL replication, large-row
+quirks.
+
+For application-level replication (read replicas), streaming is the
+default. For migrations and CDC, logical.
+
+## Replication lag
+
+The replica is always slightly behind. Lag depends on:
+
+- WAL volume on primary (write rate).
+- Network bandwidth.
+- Replica's ability to apply (CPU, I/O).
+
+Measure on the replica:
+
+```sql
+SELECT now() - pg_last_xact_replay_timestamp() AS lag;
+```
+
+Production target: < 1 second p99. Bigger lag → reads from replicas
+return stale data.
+
+When lag spikes:
+
+- Long-running query on the replica blocking WAL replay → reduce
+  query load or set `hot_standby_feedback`.
+- Network issues → check bandwidth and TCP.
+- Primary write spike → scale primary or distribute load.
+
+## Reading from replicas — consistency models
+
+### Read-after-write inconsistency
+
+User writes a comment, then reads the page — replica hasn't caught
+up, comment doesn't appear. Frustrating.
+
+Mitigations:
+
+- **Read your own writes from primary**: after a user writes, send
+  their reads to the primary for a few seconds. Sticky to user, not
+  global.
+- **Wait-for-replication**: write to primary, get the WAL position,
+  wait for replica to catch up before reading. Adds latency.
+- **Causally consistent reads**: track per-user "newest write"
+  timestamp; route to primary if replica < this timestamp.
+
+For most apps, "read your own writes from primary for N seconds
+after write" is enough.
+
+### Monotonic reads
+
+Two reads might return: first sees new data, second sees old (if
+they hit different replicas at different lag positions).
+
+Mitigation: sticky session to one replica.
+
+### Cross-session consistency
+
+User A writes. User B reads — sees old data. Most apps tolerate this
+for non-critical reads. For "shopping cart total," route through the
+primary.
+
+## Failover
+
+When the primary dies:
+
+1. **Detect**: heartbeat / Patroni / pg_auto_failover.
+2. **Promote**: a replica becomes the new primary.
+3. **Redirect**: app config (DNS, service mesh, pgbouncer) points to
+   the new primary.
+4. **Old primary recovers**: re-joins as a replica from the new
+   primary.
+
+Managed DBs (RDS, Cloud SQL, Aurora) handle this automatically with
+~30 second failover time. Self-managed setups need Patroni + etcd
+or a similar coordinator.
+
+**Watch for split-brain**: if the network partitions, both old and
+new primary might accept writes. Use a coordination service (etcd,
+Consul) to fence the old primary before promotion.
+
+## Change Data Capture (CDC)
+
+CDC = capture row changes from the database and stream them to
+downstream systems (search index, analytics warehouse, cache,
+event bus).
+
+The naïve approach: poll the DB for changes (`SELECT * WHERE
+updated_at > last_seen`). Problems:
+
+- Misses deletes.
+- Long-polling intervals = stale downstream.
+- Heavy queries on the primary.
+
+**The right approach: tail the WAL.**
+
+### Debezium
+
+The canonical CDC tool. Reads Postgres's logical replication slot
+(or MySQL binlog, MongoDB oplog) and publishes change events to
+Kafka.
+
+```
+[Postgres] → [Debezium connector] → [Kafka topic: users.updates]
+                                   → [Consumer 1: search index]
+                                   → [Consumer 2: cache invalidate]
+                                   → [Consumer 3: analytics warehouse]
+```
+
+Each row change becomes a Kafka message: `{ op: 'u', before: {...},
+after: {...}, ts: ... }`. Consumers process at their own pace.
+
+**Pros**: low latency (sub-second), captures every change, replayable
+(rewind the Kafka offset), no impact on primary's query load.
+**Cons**: operational complexity (Kafka, Debezium, schema registry).
+
+### Outbox pattern (simpler alternative)
+
+For "write to DB + send event" atomically (without Debezium):
+
+```js
+await db.transaction(async (tx) => {
+  await tx.users.update({ id, ...changes });
+  await tx.outbox.insert({ type: 'user.updated', payload: changes });
+});
+
+// Separate worker tails outbox table and publishes to broker
+```
+
+DB write + outbox write are atomic. Worker reads from outbox, marks
+processed. At-least-once delivery to consumers.
+
+Pros: no extra infra (just a table). Cons: extra writes; worker has
+to keep up.
+
+Use outbox if you don't want Debezium ops; CDC if you have many
+downstream consumers and need low-latency replay.
+
+## When to use a read replica vs caching
+
+**Read replicas**:
+- Real-time data (cache might be stale).
+- Read-heavy workloads where the primary is bottlenecked.
+- Geographic latency (replica in user's region).
+
+**Caching (Redis)**:
+- Hot keys that change rarely (user profiles, settings).
+- Computed results expensive to derive (aggregations).
+- Lookup tables.
+
+Most production stacks use both: replicas for tail reads, Redis for
+hot keys. See **caching strategies** for the cache layer.
+
+## Common pitfalls
+
+### Trusting "synchronous replication" too much
+
+Postgres supports synchronous replication (via `synchronous_commit`
++ `synchronous_standby_names` GUCs) — primary waits for at least
+one replica to confirm before acknowledging the write. Sounds safe.
+Reality:
+
+- The primary blocks if the replica is slow. Replica goes down →
+  writes hang.
+- If you have 1 replica configured as sync and it crashes, you
+  effectively have no writes until it recovers or you reconfigure.
+- Most users want **`synchronous_commit = remote_write`** (replica
+  has received but not yet applied) for performance.
+
+Asynchronous replication is the default for a reason.
+
+### Schema changes on the primary breaking the replica
+
+```sql
+-- primary
+ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+```
+
+On streaming replicas, the schema change replicates automatically.
+On logical replication, **schema changes don't replicate** — you
+must apply them on both sides manually.
+
+For logical-replication-based migrations, deploy schema first to
+replicas, then to primary, then to consumers.
+
+### Long-running queries on replicas
+
+Postgres replicas need to apply the WAL. If a long-running query
+blocks the replay (locks held by the query conflict with the WAL
+apply), lag grows.
+
+`hot_standby_feedback = on` tells the primary "this replica has
+old transactions; don't vacuum rows that would conflict." Reduces
+replay conflicts at the cost of bloat on the primary. Use for
+reporting replicas; skip for HA-only replicas.
+
+### Forgetting failover testing
+
+Failover that "should work" doesn't, in real outages. Test it:
+
+- Kill the primary in staging weekly.
+- Time the failover.
+- Verify app reconnects automatically.
+- Verify no lost writes.
+
+Chaos engineering at the DB level. Worth the investment.
+
+### CDC consumer lag amplifies under load
+
+A slow consumer falls behind; Kafka retention may roll past their
+offset; data loss. Monitor lag per consumer; alert when it exceeds
+N minutes.
+
+### Replica drift
+
+In rare cases (corruption, missed WAL), a streaming replica's data
+diverges from the primary. `pg_dirtyread` and consistency checks can
+detect. Rebuilding the replica (`pg_basebackup`) is the fix.
+
+## The mental model
+
+Replication is **a stream of changes from primary to replicas**.
+Reads can hit any replica (with lag tolerance); writes only the
+primary. Failover promotes a replica when the primary dies.
+
+CDC layers on top: same change stream, but consumed by downstream
+systems (Kafka + Debezium, or outbox + worker).
+
+For 2026 Node services:
+
+- **Default to managed Postgres** (RDS, Cloud SQL, Supabase, Neon)
+  with at least one replica.
+- **Route reads to replicas** for non-critical paths; primary for
+  read-your-writes.
+- **CDC via Debezium** if you have > 2 downstream consumers
+  needing real-time DB events.
+- **Outbox pattern** if you have one downstream consumer or want
+  simpler ops.
+- **Monitor lag** as a first-class SLI.
+- **Test failover** quarterly minimum.
+
+The discipline is operational, not coding: replication is mostly
+config + monitoring. The wins (HA, read scale, geo, real-time
+analytics) are substantial. The cost (lag awareness, failover
+runbooks, occasional incidents) is acceptable.

@@ -1,0 +1,452 @@
+export const level = 'staff';
+
+# Multithreaded JavaScript
+
+JavaScript was designed single-threaded. The web platform and Node
+have added genuine parallelism via **workers** (Web Workers in
+browsers, `worker_threads` in Node) and **shared memory** (via
+`SharedArrayBuffer` and `Atomics`). Used together, you can write
+real multithreaded JS — with all the synchronization concerns
+real threads bring.
+
+For most app code, you don't need this. For CPU-bound work, parallel
+data processing, or low-latency coordination between workers, it's
+essential.
+
+## The mental model
+
+- **Workers** run JS in **separate V8 isolates** (each has its own
+  heap, microtask queue, global scope).
+- **Communication** is by message passing (structured-cloned) or
+  **shared memory** (via `SharedArrayBuffer`).
+- **Synchronization** of shared memory uses **`Atomics`** —
+  atomic operations + condition-variable primitives.
+
+This is real multithreading. Race conditions, deadlocks, memory
+visibility — all the classic concurrency hazards apply.
+
+## When to reach for it
+
+- **CPU-bound work that would block the event loop**: image
+  resizing without a native binding, parsing a 500MB JSON, ML
+  inference, cryptographic hashing at high concurrency, large CSV
+  transforms.
+- **Parallel data processing** where each worker handles a chunk
+  independently (embarrassingly parallel workloads).
+- **Producer-consumer pipelines** where workers exchange data via
+  shared buffers at high throughput.
+
+**Don't use it for**:
+
+- I/O (the main event loop already doesn't block on I/O).
+- Tiny tasks (worker startup is ~30ms; message-passing overhead
+  matters).
+- Anything where a worker pool isn't already useful (`piscina`
+  handles the typical case).
+
+## `worker_threads` basics
+
+```js
+// main.js
+import { Worker } from 'node:worker_threads';
+
+const worker = new Worker('./worker.js', {
+  workerData: { iterations: 1_000_000 },
+});
+
+worker.on('message', (result) => console.log(result));
+worker.on('error', (err) => console.error(err));
+worker.on('exit', (code) => console.log('exited', code));
+
+worker.postMessage({ type: 'start' });
+```
+
+```js
+// worker.js
+import { parentPort, workerData } from 'node:worker_threads';
+
+parentPort.on('message', (msg) => {
+  if (msg.type === 'start') {
+    const result = compute(workerData.iterations);
+    parentPort.postMessage(result);
+  }
+});
+
+function compute(n) {
+  // CPU-bound work
+}
+```
+
+Each worker has its own event loop. Run truly in parallel with the
+main thread.
+
+**Cost**: ~30MB+ per worker (V8 isolate has its own heap), tens of
+ms to spawn. Pool them with **`piscina`** for recurring tasks.
+
+## Worker pools with `piscina`
+
+```js
+import Piscina from 'piscina';
+
+const pool = new Piscina({
+  filename: './worker.js',
+  minThreads: 4,
+  maxThreads: 8,
+});
+
+const results = await Promise.all(
+  inputs.map(input => pool.run(input))
+);
+```
+
+`piscina` queues tasks, distributes to worker threads, handles
+errors and crashes. Battle-tested. The default choice for "I want
+CPU parallelism in a Node service."
+
+## `SharedArrayBuffer` — actually-shared memory
+
+By default, `postMessage` **copies** data (structured clone).
+`SharedArrayBuffer` is the exception — the underlying bytes are
+**shared between threads**, no copy.
+
+```js
+// main.js
+const shared = new SharedArrayBuffer(1024);
+const view = new Int32Array(shared);
+view[0] = 42;
+
+worker.postMessage({ shared });
+```
+
+```js
+// worker.js
+parentPort.on('message', ({ shared }) => {
+  const view = new Int32Array(shared);
+  console.log(view[0]);   // 42 — same memory
+  view[1] = 99;            // visible to main
+});
+```
+
+Two threads share the same bytes. Reads and writes are visible to
+both — eventually. Without `Atomics`, you have no guarantees about
+**when** or in **what order**.
+
+## Transferables (move ownership)
+
+For large `ArrayBuffer` you want to *move* (not share or copy):
+
+```js
+const buf = new ArrayBuffer(10_000_000);   // 10MB
+worker.postMessage({ buf }, [buf]);   // second arg: transfer list
+// `buf` is now detached on the main side; usable on the worker
+```
+
+After transfer, the source loses access (`buf.byteLength === 0`).
+The receiver owns it.
+
+Use for: passing big data to a worker for processing without
+copying.
+
+## `Atomics` — synchronization primitives
+
+When threads share memory, you need atomic operations.
+
+### Atomic reads/writes
+
+```js
+const view = new Int32Array(new SharedArrayBuffer(4));
+
+Atomics.store(view, 0, 42);          // atomic write
+const value = Atomics.load(view, 0);  // atomic read
+Atomics.add(view, 0, 1);             // atomic increment
+Atomics.compareExchange(view, 0, 42, 100);   // CAS
+```
+
+These guarantee:
+
+- **Atomicity**: the operation completes as one unit.
+- **Visibility**: subsequent atomic reads on any thread see the
+  result.
+
+Non-atomic ops (`view[0] = 42`, `view[0]++`) have no such
+guarantees. Race conditions follow.
+
+### `Atomics.wait` / `Atomics.notify`
+
+Condition-variable-like primitives:
+
+```js
+// Worker A: wait until view[0] changes
+Atomics.wait(view, 0, expectedValue);   // blocks
+console.log('woke up, new value:', view[0]);
+```
+
+```js
+// Worker B: change view[0] and notify
+Atomics.store(view, 0, newValue);
+Atomics.notify(view, 0, 1);   // wake up 1 waiter
+```
+
+This is **blocking** — the calling thread sleeps. Lets you build:
+
+- Mutexes (lock/unlock).
+- Condition variables.
+- Semaphores.
+- Barriers (wait until all workers reach a sync point).
+
+**Can't be used on the main thread of a browser** (would block the UI).
+Can be used on the main thread of Node — but rarely useful there
+(the main loop is the one place you don't want to block).
+
+## Building a mutex
+
+```js
+class Mutex {
+  static UNLOCKED = 0;
+  static LOCKED = 1;
+
+  constructor(buffer, offset = 0) {
+    this.view = new Int32Array(buffer, offset, 1);
+  }
+
+  lock() {
+    while (true) {
+      // Try to acquire: if 0, set to 1 atomically
+      const prev = Atomics.compareExchange(this.view, 0, Mutex.UNLOCKED, Mutex.LOCKED);
+      if (prev === Mutex.UNLOCKED) return;   // got the lock
+      // Spin-wait — or use Atomics.wait for proper sleep
+      Atomics.wait(this.view, 0, Mutex.LOCKED);
+    }
+  }
+
+  unlock() {
+    Atomics.store(this.view, 0, Mutex.UNLOCKED);
+    Atomics.notify(this.view, 0, 1);
+  }
+}
+```
+
+A classic mutex implementation. Workers fight for the lock; one
+wins, others block on `Atomics.wait` until the holder calls
+`unlock`.
+
+In practice, you rarely build this yourself — libraries like
+`@thi.ng/sync` provide tested versions. But knowing how it works
+demystifies "what's happening under the hood."
+
+## Patterns
+
+### Thread pool (covered above)
+
+The most common. Workers wait for jobs; pool dispatches.
+
+### Streaming data via shared ring buffer
+
+For high-throughput producer-consumer:
+
+```js
+// Shared ring buffer in SharedArrayBuffer
+// Producer writes; consumers read; Atomics coordinates head/tail pointers
+```
+
+Hardcore. Used in audio processing, real-time graphics. For most
+work, message passing via `postMessage` is simpler.
+
+### Actor model
+
+Each worker is an "actor" with its own state; communicate only by
+messages. No shared memory, no synchronization headaches.
+
+```js
+class Actor {
+  constructor(workerFile) {
+    this.worker = new Worker(workerFile);
+    this.pending = new Map();
+    this.id = 0;
+    this.worker.on('message', (msg) => {
+      const resolver = this.pending.get(msg.id);
+      this.pending.delete(msg.id);
+      resolver(msg.result);
+    });
+  }
+
+  send(type, payload) {
+    return new Promise((resolve) => {
+      const id = ++this.id;
+      this.pending.set(id, resolve);
+      this.worker.postMessage({ id, type, payload });
+    });
+  }
+}
+```
+
+Like Erlang in Node. No shared state means no races. The trade-off
+is message-passing overhead — fine for "tasks per second" workloads,
+not for "tight inner loop."
+
+### Pipeline
+
+```
+Producer → Worker A → Worker B → Worker C → Consumer
+```
+
+Each stage processes; passes results downstream via `MessagePort` or
+`SharedArrayBuffer`. Parallelism if stages can run concurrently on
+different data items.
+
+## Browser context (Web Workers)
+
+The browser story is similar:
+
+- **Dedicated Workers** — one parent, one worker.
+- **Shared Workers** — multiple browser tabs share one worker.
+- **Service Workers** — proxy network requests; not a parallelism
+  primitive, despite the name.
+
+Same `SharedArrayBuffer` + `Atomics` mechanics. With one important
+caveat:
+
+### Cross-origin isolation
+
+`SharedArrayBuffer` is **restricted in browsers** due to Spectre
+(speculative-execution attacks could leak data via shared memory
+timing). Sites must opt in to "cross-origin isolation" via:
+
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Embedder-Policy: require-corp`
+
+Without these headers, `SharedArrayBuffer` constructors throw.
+
+Node has no such restriction — no other origins to worry about.
+
+## WebAssembly + threads
+
+WASM can use shared memory and pthreads. Useful for:
+
+- Porting C/C++ libraries that use pthreads (Emscripten compiles
+  them).
+- Performance-critical inner loops where WASM is faster than JS.
+- ML inference, image processing, codecs.
+
+`AssemblyScript` and `Rust + wasm-bindgen` are common toolchains.
+Pair WASM with `worker_threads` for "compute heavy stuff in C/Rust,
+orchestrate from JS."
+
+## When it goes wrong
+
+### Race conditions
+
+```js
+// Thread A
+const n = view[0];
+view[0] = n + 1;
+
+// Thread B
+const n = view[0];
+view[0] = n + 1;
+```
+
+Both read 5, both write 6. Lost increment. Use `Atomics.add`.
+
+### Deadlocks
+
+Two workers each hold one lock and wait for the other. Classic. Avoid
+by acquiring locks in a consistent order or using lock-free
+algorithms.
+
+### Memory visibility
+
+```js
+// Thread A
+view[0] = 42;
+view[1] = 1;   // "signal that 0 is ready"
+
+// Thread B
+if (view[1] === 1) {
+  console.log(view[0]);   // might still be 0!
+}
+```
+
+Without atomic operations, the compiler/CPU may reorder writes.
+Thread B might see `view[1] === 1` but `view[0] === 0`. Use
+`Atomics.store` for the signal write to establish a happens-before
+relationship.
+
+### Forgetting to `Atomics.notify`
+
+```js
+this.view[0] = newValue;   // wakes nobody
+```
+
+Even with `Atomics.store`, waiters on `Atomics.wait` won't wake
+until you call `Atomics.notify`. Pair `store` + `notify` for
+signaling.
+
+## Benchmarking matters
+
+```js
+const start = performance.now();
+// work
+const elapsed = performance.now() - start;
+```
+
+Threads don't make things faster automatically. Below ~1ms per
+task, message-passing overhead dominates. Measure single-threaded
+first; then thread; compare.
+
+Common results: threads win for tasks > 5ms each, lose for tasks <
+1ms each, mixed in between.
+
+## Common pitfalls
+
+### Treating workers as cheap
+
+Spawning a worker for every request is 30ms+ of overhead.
+**Pool them.**
+
+### Forgetting message-passing serialization cost
+
+```js
+worker.postMessage(hugeObject);   // structured clone — slow for big trees
+```
+
+Either: transfer ownership of `ArrayBuffer` (zero-copy), use
+`SharedArrayBuffer`, or process the data in smaller chunks.
+
+### Sharing complex objects
+
+Only `SharedArrayBuffer` shares memory. Plain JS objects, Maps,
+Sets, class instances — all copied. If you wanted shared state, use
+shared bytes + a serialization scheme on top.
+
+### Concurrency bugs without testing
+
+Threading bugs are notoriously hard to find — they manifest only
+under specific timing. Unit tests rarely catch them. Stress tests
+with random delays, fuzzing, and explicit interleaving help.
+
+### Browser security headers
+
+If a browser library uses `SharedArrayBuffer` and your site isn't
+cross-origin-isolated, the library fails silently. Test in isolation.
+
+## The mental model
+
+Multithreaded JavaScript is **real threading**: separate V8
+isolates, shared memory via `SharedArrayBuffer`, synchronization
+via `Atomics`. The hard parts of multithreaded programming
+(races, deadlocks, memory ordering) apply.
+
+For 2026 Node:
+
+- **Default for CPU work**: `worker_threads` + `piscina`. Message-
+  passing, no shared memory needed.
+- **Shared memory**: only when message-passing overhead dominates
+  (high-throughput producer-consumer, tight pipelines).
+- **WebAssembly**: when JS is too slow for the inner loop.
+
+Most engineers will never write `Atomics.compareExchange` directly.
+Knowing it exists explains *how* libraries like `piscina` or
+audio-processing workers achieve performance. For library authors,
+it's essential. For app code, message-passing is almost always the
+right level.
