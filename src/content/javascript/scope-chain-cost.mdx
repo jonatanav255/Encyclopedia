@@ -1,0 +1,261 @@
+export const level = 'mid';
+
+# Scope-chain cost and lookup tables
+
+Identifier resolution in JavaScript isn't free. When you reference
+a name, the engine walks outward from the current scope until it
+finds a matching binding — local → enclosing function → module →
+global. Most of the time, V8's optimizer collapses this to a direct
+memory access. Sometimes it can't, and you pay per-access.
+
+This page is about the cases where the cost is real and how to
+shape your code to avoid them.
+
+## The fast path
+
+V8 builds a scope analysis at parse time and pre-resolves every
+identifier reference to a specific binding. At runtime:
+
+- **Local variables** — a slot in the current call frame. Direct
+  access; one of the cheapest operations the engine does.
+- **Captured variables in a closure** — a slot in a heap-allocated
+  context object referenced by the closure. Slightly slower than
+  local but still O(1).
+- **Module-level bindings** — module record lookup, similar to
+  closure capture.
+- **Global object properties** — property lookup on the global
+  object, which can be a megamorphic hot spot.
+
+The slow path appears when the optimizer **can't pre-resolve** an
+identifier — typically because some code in scope could redefine
+or shadow it dynamically.
+
+## What kills optimization
+
+Three constructs poison scope analysis:
+
+### `with`
+
+```js
+with (obj) {
+  console.log(x);   // could be obj.x, could be outer x — unknowable
+}
+```
+
+`with` introduces dynamic name resolution. The engine has to look
+up every identifier on `obj` first and fall back to outer scope on
+miss. Strict mode bans `with` entirely — primarily because it defeats
+static scope analysis (with performance and readability as downstream
+consequences). Don't use `with`.
+
+### Direct `eval`
+
+```js
+function f(x) {
+  eval('var y = 1');    // can introduce bindings into f's scope
+  return x + y;
+}
+```
+
+When the engine sees an unqualified `eval(...)` call, it can't know
+what bindings the string creates. The function's scope is treated
+as dynamic — every *identifier resolution* in `f` goes through the
+dynamic-scope slow path, even for names unrelated to the eval.
+(Property access on already-loaded receivers isn't slowed down; it's
+identifier lookup that suffers.)
+
+**Indirect eval** — `(0, eval)(s)` or `globalThis.eval(s)` — runs in
+global scope and doesn't taint the calling function. Use the indirect
+form if you must `eval` at all.
+
+### `arguments` in non-strict mode
+
+In sloppy mode, `arguments[i]` and the named parameter `arg[i]`
+alias each other: assigning to one changes the other. The optimizer
+has to keep `arguments` in sync with the parameters. Strict mode
+removes the alias and lets the engine treat `arguments` as a normal
+array-like, which is much cheaper.
+
+All modern JS files (ESM, modules, class bodies) are strict by
+default, so this rarely bites unless you're maintaining old code.
+
+## Local-caching repeated lookups
+
+Reading a property in a tight loop walks the prototype chain
+(unless V8's inline cache hits). For hot paths, cache to a local:
+
+```js
+// Slower in tight loops — repeated chain walks
+for (let i = 0; i < items.length; i++) {
+  total += items[i].price * tax.rate;
+}
+
+// Faster — chain walked once
+const rate = tax.rate;
+const len = items.length;
+for (let i = 0; i < len; i++) {
+  total += items[i].price * rate;
+}
+```
+
+How much faster depends on:
+
+- **How often the loop runs.** Hundreds of millions → measurable.
+  Dozens → noise.
+- **Whether the engine's IC can specialize the access.** Stable
+  hidden classes → V8 already inlines. See `hidden-classes-perf.mdx`.
+- **What the lookup walks through.** Own property → cheap. Chain
+  walk through 5 prototype levels → costly.
+
+For most app code this is premature. For inner loops in parsers,
+serializers, image processing, and game engines, it can show up in
+a profile.
+
+## Lookup tables instead of `if`/`switch` chains
+
+A long `if`/`else if` or `switch` with many branches walks the
+branches in order. Linear in worst case:
+
+```js
+function colorFor(status) {
+  if (status === 'pending') return '#888';
+  if (status === 'running') return '#36f';
+  if (status === 'success') return '#3c3';
+  if (status === 'failed')  return '#c33';
+  if (status === 'cancelled') return '#aaa';
+  // ... 10 more
+  return '#000';
+}
+```
+
+Replace with an object lookup:
+
+```js
+const COLORS = {
+  pending: '#888',
+  running: '#36f',
+  success: '#3c3',
+  failed:  '#c33',
+  cancelled: '#aaa',
+  // ...
+};
+
+function colorFor(status) {
+  return COLORS[status] ?? '#000';
+}
+```
+
+The lookup is hash-table O(1) regardless of how many cases exist.
+Beyond perf, the table version:
+
+- Is shorter and clearer for "map enum to value" cases.
+- Makes the cases data, so they can be merged, filtered, or
+  generated.
+- Removes the "did I forget a `return`?" risk that bites long
+  if-chains.
+
+`Map` works the same way if your keys aren't strings. For very small
+case counts (~5 or fewer) the `if` chain is fine and often clearer.
+
+For "dispatch on enum to a *function*", same pattern:
+
+```js
+const HANDLERS = {
+  pending:  handlePending,
+  running:  handleRunning,
+  success:  handleSuccess,
+  failed:   handleFailed,
+};
+
+(HANDLERS[status] ?? handleUnknown)(payload);
+```
+
+## Module-scope vs function-scope for hot constants
+
+```js
+function processRow(row) {
+  const TAX_RATE = 0.08;     // recreated every call
+  return row.price * (1 + TAX_RATE);
+}
+```
+
+vs:
+
+```js
+const TAX_RATE = 0.08;       // hoisted once at module load
+
+function processRow(row) {
+  return row.price * (1 + TAX_RATE);
+}
+```
+
+The optimizer almost always hoists primitive constants regardless,
+so for a simple number this doesn't matter. It does matter for
+**objects, arrays, and regexes** declared inside a function:
+
+```js
+function isEmail(s) {
+  const RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;   // allocated every call
+  return RE.test(s);
+}
+```
+
+Each call allocates a new `RegExp`. Move it to module scope:
+
+```js
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isEmail(s) {
+  return EMAIL_RE.test(s);
+}
+```
+
+Same applies to lookup tables, option objects, and any
+non-primitive literal in a hot path.
+
+## Avoiding repeated property access in chains
+
+```js
+// Slower — three lookups, each chain walk
+obj.config.theme.primary;
+obj.config.theme.secondary;
+obj.config.theme.background;
+
+// Faster — one walk, three local reads
+const t = obj.config.theme;
+t.primary;
+t.secondary;
+t.background;
+```
+
+Same principle. Same caveat about how much it matters.
+
+## When to ignore all of this
+
+Modern V8 is aggressive about inlining and inline-caching property
+access on stable hidden classes. For 95% of code, the engine is
+ahead of you. Optimize when:
+
+- A profiler shows the access in a hot frame.
+- You've already eliminated algorithmic waste (the O(n²) loop, the
+  redundant fetch, the unneeded JSON parse).
+- You can measure the improvement.
+
+Otherwise, readability wins. `obj.config.theme.primary` reads more
+clearly than `t.primary` if `t` is short-lived.
+
+## Common mistakes
+
+- **Caching to a local when the property is volatile.** If
+  `tax.rate` could change mid-loop, caching to a local snapshots
+  the old value. Cache only what's known to be invariant for the
+  loop's lifetime.
+- **Premature lookup tables.** A 3-case switch as a table is just
+  ceremony. The table wins around 5+ cases.
+- **Mistaking inline caching for "no cost."** ICs help, but they
+  can deopt under shape churn. Keep object shapes stable in hot
+  paths.
+- **Using `eval`/`with` to "make code shorter."** You pay for it
+  with the optimizer turned off. Worth it almost never.
+- **Optimizing the wrong thing.** A 5% speedup on 0.1% of runtime
+  is nothing. Profile first.

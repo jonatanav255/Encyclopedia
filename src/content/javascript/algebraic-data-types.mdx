@@ -1,0 +1,256 @@
+export const level = 'senior';
+
+# Algebraic data types in JavaScript
+
+`Maybe`, `Either`, `Result`, `IO`, `Task` — the wrapper types from
+ML/Haskell that show up in JS libraries (`fp-ts`, `Effect`, `purify-ts`)
+and increasingly in plain JS codebases. None of them are part of the
+language. All of them are 30 lines of code each. The interesting
+question isn't *how* to build them — it's *when* the discipline pays
+off in a language that already has `try/catch`, `?.`, and `null`.
+
+## Why ADTs at all
+
+A function that "returns a `User` or throws" has two return channels,
+and only one is visible in its type:
+
+```js
+function findUser(id) {        // signature: returns User
+  if (!cache.has(id)) throw new NotFound();
+  return cache.get(id);
+}
+```
+
+Callers learn about the error channel by reading the body, the
+docs, or a stack trace at runtime. Move the error into the return
+value and both channels become visible at the call site:
+
+```js
+function findUser(id) {        // signature: returns Result<User, NotFound>
+  if (!cache.has(id)) return Err(new NotFound());
+  return Ok(cache.get(id));
+}
+
+const r = findUser(id);
+if (r.ok) use(r.value);
+else handle(r.error);
+```
+
+That's it. That's the whole idea. Everything else — `map`, `chain`,
+`Maybe`, `IO`, etc. — is composition machinery built on top.
+
+## `Maybe` — "a value or nothing"
+
+```js
+const Just  = (value) => ({ tag: 'Just', value });
+const Nothing = { tag: 'Nothing' };
+
+const map = (f) => (m) => m.tag === 'Just' ? Just(f(m.value)) : m;
+const chain = (f) => (m) => m.tag === 'Just' ? f(m.value) : m;
+const unwrap = (def) => (m) => m.tag === 'Just' ? m.value : def;
+```
+
+Use:
+
+```js
+const upperName = chain((u) => u.name ? Just(u.name.toUpperCase()) : Nothing);
+const result = upperName(Just({ name: 'jon' }));   // Just('JON')
+const missing = upperName(Just({}));                // Nothing
+```
+
+The 2020-era language addition that eats most of `Maybe`'s use cases
+is **optional chaining** (`?.`) plus **nullish coalescing** (`??`):
+
+```js
+const result = user?.name?.toUpperCase() ?? 'unknown';
+```
+
+So when does `Maybe` still earn its keep?
+
+- **Long pipelines where each step can fail.** `?.` short-circuits
+  one chain; `Maybe` composes across arbitrary functions, not just
+  property access.
+- **You want the *absence* to be a first-class value** — e.g., to
+  combine with other Maybes (`liftA2(add)(Just(1))(Nothing) === Nothing`)
+  rather than scatter `if` checks.
+- **Distinguishing "missing" from "null-on-purpose"** — `Maybe`
+  carries the distinction; `?.` collapses them.
+
+For most app code, `?.` + `??` is enough. `Maybe` shines in libraries
+and pipelines.
+
+## `Result` / `Either` — "value or error"
+
+Two names for the same shape. `Either<L, R>` is symmetric;
+`Result<T, E>` reads better when one side is conceptually the error.
+
+```js
+const Ok  = (value) => ({ ok: true,  value });
+const Err = (error) => ({ ok: false, error });
+
+const map = (f) => (r) => r.ok ? Ok(f(r.value)) : r;
+const mapErr = (f) => (r) => r.ok ? r : Err(f(r.error));
+const chain = (f) => (r) => r.ok ? f(r.value) : r;
+```
+
+Pipeline:
+
+```js
+const parse = (s) => {
+  try { return Ok(JSON.parse(s)); }
+  catch (e) { return Err(e); }
+};
+
+const validate = (obj) =>
+  typeof obj.id === 'string' ? Ok(obj) : Err(new Error('bad id'));
+
+const result = chain(validate)(parse(input));
+```
+
+vs. `try/catch`:
+
+```js
+try {
+  const obj = JSON.parse(input);
+  if (typeof obj.id !== 'string') throw new Error('bad id');
+  use(obj);
+} catch (e) {
+  handle(e);
+}
+```
+
+The `try/catch` version is shorter and most teams will (rightly) pick
+it. The `Result` version wins when:
+
+- **Errors are *expected* control flow, not exceptions.** Validation
+  failures, not-found lookups, parse errors — things that happen
+  routinely. Reserve exceptions for genuinely unexpected state.
+- **You want the type system to track which errors are possible.**
+  In TypeScript, `Result<T, ParseError | ValidationError>` is
+  enforced; `throws` is not.
+- **You're composing many fallible operations** and `try`-wrapping
+  each one gets noisy.
+- **You're crossing a boundary that shouldn't propagate exceptions**
+  — e.g., returning from a worker, an event handler, or a serverless
+  function.
+
+## `IO` and `Task` — "an effect, deferred"
+
+`IO` wraps a thunk that performs a side effect:
+
+```js
+const IO = (run) => ({ run, map: (f) => IO(() => f(run())) });
+
+const readFile = (p) => IO(() => require('fs').readFileSync(p, 'utf-8'));
+const upper = readFile('a.txt').map((s) => s.toUpperCase());
+
+// nothing has run yet
+upper.run();   // now it runs
+```
+
+`Task` is `IO` for async — a `Promise`-returning thunk:
+
+```js
+const Task = (run) => ({
+  run,
+  map: (f) => Task(async () => f(await run())),
+  chain: (f) => Task(async () => f(await run()).run()),
+});
+```
+
+This sounds like `Promise`. The difference: `Promise` runs **eagerly**
+the moment you construct it. `Task` runs only when you call `.run()`.
+That lazy-vs-eager split matters for:
+
+- **Retries.** Re-running the same `Task` re-runs the effect. Re-running
+  a `Promise` does nothing — you get the cached resolution.
+- **Composition.** Building a pipeline of `Task`s doesn't execute
+  anything; you choose when (and whether) to execute the whole.
+- **Cancellation.** A `Task` you haven't run is trivially cancelled
+  by not running it.
+
+For most code, eager `Promise`s are what you want. `Task` matters in
+libraries that need referential transparency or composable retries
+(see `node/http-client-undici.mdx` for the practical version).
+
+## The "monad" word
+
+If a wrapper has `of(x)` (lift a value in), `map(f)` (transform the
+inside), and `chain(f)` (transform and re-flatten — `f` itself returns
+the wrapper), it's a monad. That's it. The name does no work the
+type doesn't already do.
+
+`Maybe`, `Result`, `IO`, `Task`, `Array`, and `Promise` are all
+monads in the colloquial sense. `Promise.then` is `chain` (it
+flattens nested promises). `Array.flatMap` is `chain`. The named
+concept is mostly useful when you write code that's generic over
+*any* monad — which JS, without higher-kinded types, can't do cleanly
+anyway.
+
+## Validation: `Either` vs `Validation`
+
+Standard `Either`/`Result` short-circuits — the first error stops
+the pipeline. For form validation you usually want **all** errors
+collected:
+
+```js
+const Valid = (value) => ({ ok: true, value });
+const Invalid = (errors) => ({ ok: false, errors });
+
+const ap = (vf, va) => {
+  if (vf.ok && va.ok) return Valid(vf.value(va.value));
+  if (!vf.ok && !va.ok) return Invalid([...vf.errors, ...va.errors]);
+  return vf.ok ? va : vf;
+};
+```
+
+`Validation` and `Either` look identical but compose differently —
+the choice depends on whether you want fail-fast or fail-collect.
+Zod, Yup, and similar libraries pick this trade-off for you.
+
+## Practical adoption
+
+You almost never want to roll your own ADTs in production. Either:
+
+- **Use the language features.** `?.`, `??`, `try/catch`, plain
+  `{ok, value}` literals.
+- **Adopt a library.** `Effect` is the modern, well-maintained
+  TypeScript choice — it absorbed the fp-ts ecosystem in 2024 and
+  is positioned as the spiritual successor to fp-ts v2. `purify-ts`
+  for a much lighter surface area (less actively developed but
+  stable). `Result` types are increasingly common in domain layers
+  even without a full FP library.
+
+The middle path — hand-rolled `Just`/`Nothing` wrappers in a normal
+JS app — gives you the verbosity of ADTs without the type safety,
+and forces every collaborator to learn your dialect.
+
+## When ADTs are wrong
+
+- **Throw-and-catch is fine** for unexpected errors. Don't `Result`-wrap
+  network calls just because they can fail.
+- **`Promise` is fine** for async sequencing. `Task` only matters when
+  you need re-runnability or referential transparency.
+- **`Maybe` is overkill** for a single nullable field — `?.` handles
+  it.
+- **`Validation` is overkill** for a single check — `if (!x) throw`
+  reads better.
+
+ADTs are a precision tool. In a library boundary, a parser, a
+distributed-systems client, a domain model where errors are first-class
+— they earn their weight. In glue code and CRUD handlers, they
+become noise.
+
+## Common mistakes
+
+- **Mixing wrapped and unwrapped values mid-pipeline.** Either
+  everything is `Result<T>` or nothing is. Half-wrapped is the worst
+  of both worlds.
+- **Reaching for ADTs to fix runtime errors a type system would
+  catch.** If you have TypeScript, `T | null` + `--strictNullChecks`
+  is often enough. ADTs add composition, not safety per se.
+- **Using `IO`/`Task` in code that's already imperative.** The lazy
+  effect model only pays off when the *whole* pipeline is lazy.
+  Mixing eager `Promise`s and lazy `Task`s defeats the point.
+- **Calling it a monad to sound smart.** Use the wrapper name
+  (`Result`, `Maybe`) — that's what your reader cares about.

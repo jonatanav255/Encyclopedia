@@ -434,5 +434,69 @@ export const bank: QuestionBank = {
       answer:
         'Don\'t `await res.json()` — it buffers the whole body before parsing. Stream the response body through a JSON parser like `stream-json`: `Readable.fromWeb(res.body).pipe(parser()).pipe(streamArray())`, then `for await` over the records. Process each record (insert to DB, push to Kafka, write to file) inside the loop — don\'t accumulate into an array, or you\'ve recreated the memory problem. Memory stays flat at one record. If you control the producer, push them toward NDJSON instead — line-delimited JSON is streamable with `readline` and no parser library.',
     },
+
+    // --- algebraic data types ---
+    {
+      level: 'mid',
+      question: 'What does a `Result<T, E>` type give you that `try/catch` doesn\'t?',
+      answer:
+        'It moves the error channel into the **return value** so the caller can\'t miss it. `try/catch` hides errors in a side channel — the function signature says it returns `T`, but it might throw, and you only learn that by reading the body or hitting it at runtime. `Result` makes the error part of the type: `{ok: true, value} | {ok: false, error}`. In TypeScript, `Result<T, ParseError | ValidationError>` enforces handling at compile time; `throws` doesn\'t. Use it for *expected* errors (validation, parse, not-found) — keep exceptions for genuinely unexpected state.',
+    },
+    {
+      level: 'senior',
+      question: 'Why would you use `Task` instead of `Promise`?',
+      answer:
+        '`Promise` runs **eagerly** the moment you construct it — `new Promise((res) => fetch(...))` fires the fetch immediately. `Task` (a `Promise`-returning thunk) defers execution until you call `.run()`. That laziness matters for: **retries** (re-running a Task re-runs the effect; re-awaiting a Promise returns the cached resolution), **composition** (build a pipeline without executing it, then decide whether to run), and **cancellation** (a Task you haven\'t run is trivially cancelled). For typical app code, eager Promises are fine. Tasks earn their keep in libraries that need referential transparency or composable retries.',
+    },
+
+    // --- transducers ---
+    {
+      level: 'senior',
+      question: 'What problem do transducers solve over chained `.map().filter().reduce()`?',
+      answer:
+        '`.map().filter()` allocates an intermediate array at each step and walks the data multiple times. For a 10M-row pipeline that\'s 3 passes and 2 large allocations. A transducer is a *reducer transformer* — `mapping(f)(reducer)` returns a new reducer that maps before reducing. Composed transducers (`compose(mapping(f), filtering(p))`) collapse the pipeline into **one pass with no intermediates**, while keeping the readable shape. They also work over any reducible — arrays, iterables, async iterators, custom collections — so the same pipeline can run over a stream you couldn\'t `.map()` at all. For small N (< 1k), plain `.map().filter()` is fine.',
+    },
+
+    // --- scope-chain cost ---
+    {
+      level: 'mid',
+      question: 'Why is `with` banned in strict mode?',
+      answer:
+        '`with (obj) { console.log(x) }` introduces dynamic name resolution — `x` could be `obj.x` or an outer-scope `x`, and the engine can\'t know until runtime. That defeats every scope-analysis optimization V8 wants to do. Strict mode bans it because it broke performance in every engine and gave up nothing important in exchange. `eval` in non-strict (direct) form has the same problem — it can introduce bindings into the enclosing scope, so the optimizer has to treat the whole function as dynamic. Use indirect eval (`(0, eval)(s)`) if you must eval at all; it runs in global scope without tainting the caller.',
+    },
+    {
+      level: 'mid',
+      question: 'When does replacing an `if`/`else if` chain with an object lookup actually win?',
+      answer:
+        'Around **5+ cases**, and especially when you\'re mapping discrete keys (enum/status strings) to fixed values or handlers. The chain walks branches linearly; the lookup is O(1) hash. Beyond perf, the table version is shorter, makes the cases first-class data (mergeable, generateable), and eliminates the "did I forget a return?" risk. For ~3 cases, the `if` chain reads more clearly. Use `Map` instead of `{}` when keys aren\'t strings or come from untrusted input. For "dispatch to a function," same shape: `(HANDLERS[type] ?? handleUnknown)(payload)`.',
+    },
+    {
+      level: 'senior',
+      question: 'You see a hot function allocating a regex on every call. Why does it matter and what\'s the fix?',
+      answer:
+        '`const RE = /.../` inside a function body **allocates a new `RegExp` object every invocation**. In a tight loop or a per-request handler, that\'s GC pressure plus the regex\'s internal state setup (compiled bytecode is cached by V8 for literals, but the wrapper object isn\'t). Fix: hoist the literal to module scope so it\'s allocated once at load time. Same applies to lookup tables, option objects, and any non-primitive literal in a hot path. Doesn\'t matter for primitives — those are typically constant-folded by the optimizer.',
+    },
+
+    // --- memoization (extension to currying-and-composition) ---
+    {
+      level: 'mid',
+      question: 'What\'s wrong with this memoizer? `function memo(fn) { const cache = new Map(); return (x) => cache.has(x) ? cache.get(x) : cache.set(x, fn(x)).get(x); }`',
+      answer:
+        'Three problems. (1) **Single primitive key only** — fails for multi-arg functions and produces wrong cache hits for object args (object keys would use reference identity, which rarely matches across calls). (2) **Unbounded growth** — the `Map` lives forever; one-shot inputs leak memory in a long-running process. Use an LRU cache (`lru-cache`) with a `max` cap. (3) **Assumes the function is pure** — if `fn` reads env vars, `Date.now()`, mutates input, or depends on external state, the cache returns wrong values. Memoize only genuinely pure functions, or accept staleness with an explicit TTL.',
+    },
+    {
+      level: 'senior',
+      question: 'When should you use a `WeakMap` for a memoization cache instead of a `Map`?',
+      answer:
+        'When the cache key **is** an object that the caller owns. A `Map` keyed by an object holds a strong reference forever — the object can never be GC\'d as long as it\'s a key. `WeakMap` ties the cache entry\'s lifetime to the key: when the caller drops the object, the GC reclaims both and the entry vanishes. Pattern: `const cache = new WeakMap(); function f(obj) { if (cache.has(obj)) return cache.get(obj); const r = compute(obj); cache.set(obj, r); return r; }`. Works only for single-object-arg functions (WeakMap keys must be objects, no iteration, no size). For multi-arg or scalar-keyed memoization, fall back to LRU.',
+    },
+
+    // --- async iterator cleanup ---
+    {
+      level: 'senior',
+      question: 'Your custom async iterator wraps a database cursor. A caller `break`s out of the `for await` loop early. What goes wrong?',
+      answer:
+        'The cursor never closes. The async iterator protocol has three methods: `next()`, `return()`, and `throw()`. When a consumer breaks early or throws inside the loop, the runtime calls `iterator.return()` to signal "I\'m done, clean up." If you didn\'t implement `return()`, the cursor leaks — connection stays open, lock stays held. Fix: either implement `async return() { await cursor.close(); return { done: true }; }` on the object, or use an `async function*` generator with `try/finally` — the runtime calls `return()` for you, which translates to running the `finally` block. The generator form is almost always cleaner.',
+    },
   ],
 };

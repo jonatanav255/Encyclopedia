@@ -143,13 +143,122 @@ to insert / remove / reorder steps.
 For this style at scale, libraries like **Ramda**, **lodash/fp**,
 and **fp-ts** provide curried versions of every common operation.
 
+## Memoizing pure functions
+
+A pure function — same input always produces the same output, no
+side effects — can have its result cached:
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return (arg) => {
+    if (cache.has(arg)) return cache.get(arg);
+    const value = fn(arg);
+    cache.set(arg, value);
+    return value;
+  };
+}
+
+const heavyParse = memoize((s) => /* expensive */);
+```
+
+This is the simplest memoizer — single primitive argument, unbounded
+cache. Three things to think about before using it in real code:
+
+### Multi-argument keys
+
+A `Map` keyed by `arg` only works for one primitive. For
+multi-argument functions, you need a composite key:
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return (...args) => {
+    const key = JSON.stringify(args);     // 👈 fragile for objects
+    if (cache.has(key)) return cache.get(key);
+    const value = fn(...args);
+    cache.set(key, value);
+    return value;
+  };
+}
+```
+
+`JSON.stringify` works for scalars and JSON-safe objects but loses
+information for Dates, Maps, Sets, and class instances. For object
+arguments, a nested `Map`-of-`Map`s by reference identity is more
+correct and avoids serialization entirely. Libraries like
+`memoize-one`, `lodash.memoize`, and `nano-memoize` handle this for
+you.
+
+### WeakMap for object-keyed caches
+
+When the cache key **is** an object, a regular `Map` keeps it alive
+forever — a memory leak waiting to happen. `WeakMap` ties cache
+lifetime to the key's lifetime:
+
+```js
+const cache = new WeakMap();
+
+function expensiveCompute(obj) {
+  if (cache.has(obj)) return cache.get(obj);
+  const result = /* heavy */;
+  cache.set(obj, result);
+  return result;
+}
+```
+
+When the caller drops `obj`, the cache entry is collected too. The
+single-arg case fits `WeakMap` perfectly. See `weakref-weakmap.mdx`.
+
+### Invalidation
+
+A pure function's cache never needs invalidation — that's the
+point. The trap is memoizing something that *isn't* actually pure:
+
+- Reads a config or env var that can change.
+- Depends on `Date.now()` or `Math.random()`.
+- Touches an external resource (DB, file, network).
+- Mutates the input.
+
+Any of these and your cache will return stale or wrong values. If
+the function isn't *purely* a function of its inputs, don't memoize
+it — or use a cache with TTL (`lru-cache`'s `ttl` option) and accept
+the staleness window explicitly.
+
+### Bounded memory
+
+A `Map`-based memo grows forever unless you cap it. For long-lived
+processes (servers, daemons), use an LRU cache:
+
+```js
+import { LRUCache } from 'lru-cache';
+const cache = new LRUCache({ max: 1000 });
+```
+
+Without a cap, a memoized parser called on user input is a slow
+memory leak with no upper bound.
+
+### When NOT to memoize
+
+- **Cheap functions.** Cache lookup + key hashing isn't free. If the
+  function runs in microseconds, memoization makes it slower.
+- **Called rarely.** No cache hits → pure overhead.
+- **Argument cardinality is huge.** A function called with millions
+  of distinct inputs has near-zero hit rate; the cache just leaks
+  memory.
+- **React `useMemo`.** That's a different mechanism — memoization
+  bounded to a single component's render lifecycle, not a global
+  cache. Use it for that purpose only.
+
+The win is a high hit rate on an expensive function. Profile before
+adding.
+
 ## TC39 pipeline operator
 
-The pipeline operator (`|>`) is at Stage 2 in TC39 as of 2026 —
-parked there for years due to a split between two competing forms:
-**Hack-style** (`x |> fn(^)` with a placeholder) and **F#-style**
-(`x |> fn` implicit single-argument). The committee hasn\'t
-resolved which to standardize, so the proposal hasn\'t advanced.
+The pipeline operator (`|>`) is at Stage 2 in TC39 as of 2026. The
+committee chose the **Hack-style** form (`x |> fn(%)` with a
+placeholder) over the F#-style; advancement has stalled on details
+like the placeholder token rather than on which form to adopt.
 
 ```js
 // Hypothetical syntax (not yet shipped)

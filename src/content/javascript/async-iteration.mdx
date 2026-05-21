@@ -280,6 +280,60 @@ fussy.
 - **Real-time event sources** — WebSocket messages, log tailing.
 - **Generators of computed values** that take time per element.
 
+## Custom async iterators with cleanup
+
+The async iterator protocol has three methods, not just `next()`:
+
+- `next()` — produce the next value.
+- `return(value)` — the consumer is done early (broke out of `for await`,
+  threw, etc.). Release resources here.
+- `throw(error)` — the consumer wants to propagate an error into
+  the iterator. Rarely used by callers; mostly used internally by
+  generators.
+
+Most hand-rolled async iterators forget `return()`, which means a
+consumer that breaks out of the loop **leaks the underlying resource**
+(file handle, socket, DB cursor):
+
+```js
+function rowsOf(cursor) {
+  return {
+    [Symbol.asyncIterator]() { return this; },
+    async next() {
+      const row = await cursor.read();
+      return row ? { value: row, done: false } : { value: undefined, done: true };
+    },
+    async return() {
+      await cursor.close();   // 👈 fires when consumer breaks early
+      return { value: undefined, done: true };
+    },
+  };
+}
+
+for await (const row of rowsOf(cursor)) {
+  if (row.bad) break;   // return() runs, cursor closes
+}
+```
+
+`async function*` generators handle this automatically — a `try/finally`
+inside the generator runs on break/throw because the runtime calls
+`return()` for you:
+
+```js
+async function* rowsOf(cursor) {
+  try {
+    let row;
+    while ((row = await cursor.read())) yield row;
+  } finally {
+    await cursor.close();
+  }
+}
+```
+
+Prefer async generators with `try/finally` whenever you can. The
+hand-rolled object form is for cases where you need state that
+doesn't fit a generator (e.g., multiple consumers, custom buffering).
+
 ## When NOT to use it
 
 - **Bounded collections** — just use an array.

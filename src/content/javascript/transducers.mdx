@@ -1,0 +1,219 @@
+export const level = 'senior';
+
+# Transducers
+
+`arr.map(f).filter(p).map(g)` is the most natural way to write a
+data pipeline in JS. It also allocates **three** intermediate arrays
+and walks the data **three times**. For a 10-element array, nobody
+cares. For a 10-million-row log, or for a stream where you don't
+even *have* the data all at once, those allocations and passes are
+where your latency lives.
+
+Transducers collapse the pipeline into one pass with no
+intermediates — without giving up the compositional shape.
+
+## The problem, concretely
+
+```js
+const out = events
+  .filter((e) => e.type === 'click')   // walk 1 → new array
+  .map((e) => e.target.id)              // walk 2 → new array
+  .filter(Boolean);                     // walk 3 → final array
+```
+
+Three array allocations. Three full passes. Each `filter`/`map`
+allocation is GC pressure, especially in hot paths.
+
+Imperative does it in one pass:
+
+```js
+const out = [];
+for (const e of events) {
+  if (e.type !== 'click') continue;
+  const id = e.target.id;
+  if (id) out.push(id);
+}
+```
+
+Fast, no intermediates — but you lost the composability. You can't
+hand `events`'s author a "things I want done" pipeline; you have to
+hand them a loop body.
+
+## Reducers, generalized
+
+Every `for` loop is structurally a reducer:
+
+```js
+const sum = arr.reduce((acc, x) => acc + x, 0);
+const out = arr.reduce((acc, x) => (acc.push(x * 2), acc), []);
+```
+
+A **reducer** is a function `(acc, x) => acc`. `map(f)` and `filter(p)`
+can be rewritten as functions that *transform* a reducer — take a
+"how to combine" function and return a new one that maps or filters
+first:
+
+```js
+const mapping = (f) => (reducer) => (acc, x) => reducer(acc, f(x));
+
+const filtering = (p) => (reducer) => (acc, x) => p(x) ? reducer(acc, x) : acc;
+```
+
+These are **transducers** — reducer transformers. They don't know or
+care what `reducer` does; they just feed it transformed (or selectively
+skipped) items.
+
+## Composing
+
+Transducers compose by function composition, in the order you'd
+write the pipeline:
+
+```js
+const compose = (...fns) => (x) => fns.reduceRight((v, f) => f(v), x);
+
+const xform = compose(
+  filtering((e) => e.type === 'click'),
+  mapping((e) => e.target.id),
+  filtering(Boolean),
+);
+
+// Apply to a base reducer to get a single combined reducer
+const pushReducer = (acc, x) => (acc.push(x), acc);
+const out = events.reduce(xform(pushReducer), []);
+```
+
+One pass over `events`. No intermediates. Same readable shape as
+`.filter().map().filter()`.
+
+## Why it's not just "a faster array pipeline"
+
+Transducers are agnostic about *what they reduce into*. The same
+`xform` works against:
+
+```js
+events.reduce(xform(pushReducer), []);                  // → Array
+events.reduce(xform((s, x) => s + x), 0);               // → sum
+events.reduce(xform((set, x) => set.add(x)), new Set()); // → Set
+```
+
+You can drive a transducer pipeline over:
+
+- **Arrays** (the obvious case).
+- **Iterables and async iterables** (logs, file streams, websocket
+  messages).
+- **Node streams** with a small adapter.
+- **Custom collections** by writing a one-line reducer.
+
+That separation — *what to do* (the transducer) from *what to build*
+(the reducer) — is what makes transducers more than "map+filter
+fusion."
+
+## With async iterators
+
+```js
+async function* runXform(source, xform) {
+  const sink = [];
+  const reducer = xform((acc, x) => (sink.push(x), acc));
+  for await (const x of source) {
+    reducer(sink, x);
+    if (sink.length) { yield* sink; sink.length = 0; }
+  }
+}
+
+for await (const id of runXform(eventStream, xform)) {
+  console.log(id);
+}
+```
+
+The same composed `xform` now drives a streaming pipeline over an
+async source. No materialization — items flow through one at a time.
+This is where transducers pay off hardest: you can't `.map().filter()`
+an infinite stream, but you can transduce it.
+
+This minimal driver doesn't handle early termination (see below);
+real drivers like `R.transduce` check for a `reduced` sentinel
+after each step and stop the iteration when they see it.
+
+## Performance — when it actually matters
+
+For typical app code with arrays under ~1000 elements, `.map().filter()`
+is fine. The intermediate allocations are small and short-lived,
+and modern V8 sometimes fuses them anyway.
+
+The crossover where transducers pull ahead:
+
+- **N is large** (10k+ items).
+- **The pipeline is long** (3+ steps).
+- **You're in a hot loop** running the pipeline thousands of times.
+- **You're working over a stream** (no array exists yet).
+- **GC pressure shows up in your profiler.**
+
+If none of those apply, prefer the readable `.map().filter()` and
+move on. Transducers are infrastructure; pay for them when you need
+them.
+
+## Early termination
+
+A reducer can signal "done early" by returning a sentinel value the
+driver respects:
+
+```js
+const REDUCED = Symbol('reduced');
+const reduced = (value) => ({ [REDUCED]: value });
+
+const taking = (n) => (reducer) => {
+  let count = 0;
+  return (acc, x) => {
+    if (count >= n) return reduced(acc);
+    count++;
+    return reducer(acc, x);
+  };
+};
+```
+
+The driver checks for the sentinel and stops iterating. This is the
+transducer equivalent of `arr.slice(0, n)` but works on infinite
+streams (where `.slice` makes no sense).
+
+## What real libraries do
+
+- **`ramda`** ships transducers as `R.into` and `R.transduce`. Same
+  API shape, more combinators.
+- **`rxjs`** operators (`map`, `filter`, `mergeMap`) are spiritually
+  transducers — they compose into a pipeline that runs over an
+  observable. The vocabulary differs ("operator" vs "transducer")
+  but the idea is the same.
+- **Effect's `Stream` module** — similar story in TypeScript-first
+  FP libraries (Effect absorbed fp-ts's ecosystem in 2024).
+- **Node `stream.pipeline`** — different in mechanics (each stage is
+  its own stream with backpressure) but the same goal: compose
+  transformations without materializing intermediates.
+
+Most teams reach for one of these rather than rolling their own.
+Rolling your own is fine for one-off cases or to understand the
+mechanism.
+
+## When NOT to use transducers
+
+- **Small N.** The pipeline overhead dwarfs the savings.
+- **Reads better as a loop.** A 3-line `for` is clearer than a
+  3-stage transducer for one-off code.
+- **You already use RxJS / Streams.** Don't layer two pipeline
+  abstractions.
+- **Junior team.** Transducers are clever — and clever code is
+  expensive to maintain. Pick your battles.
+
+## Common mistakes
+
+- **`compose` order confusion.** Transducer composition runs in the
+  order written (top to bottom of `compose`), because each transducer
+  wraps the *next*. Easy to get backwards.
+- **Mutating the accumulator unsafely.** Most reducers (like
+  `(acc, x) => (acc.push(x), acc)`) mutate the accumulator. Fine
+  for sequential reduction; broken if you ever parallelize.
+- **Trying to "compose" non-transducer functions.** `compose(mapping(f), arr)`
+  doesn't work — `arr` isn't a transducer. Apply the composed
+  transducer to a reducer, then `reduce`.
+- **Building transducers when `.flatMap` would do.** A single
+  `arr.flatMap((x) => p(x) ? [f(x)] : [])` is one pass and reads
+  better than transducer ceremony for small jobs.
