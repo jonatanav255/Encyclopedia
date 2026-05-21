@@ -1,0 +1,458 @@
+export const level = 'senior';
+
+# Design Google Docs
+
+A web-based collaborative word processor: documents live in
+the cloud, multiple users edit the same doc in real time,
+edits never overwrite each other, history is preserved
+forever, and the whole thing has to work offline and on a
+laptop with a flaky train-WiFi connection. The interesting
+parts: the live-editing engine, the file-system and sharing
+model that wraps around it, suggested edits and comments
+attached to evolving text positions, and an offline sync
+engine that lives inside a browser tab.
+
+`design-collaborative-editor.mdx` covers the OT-vs-CRDT
+debate in the abstract. This page is more concrete: how
+Google specifically built a production word processor on top
+of Drive, and what the rest of the system looks like once
+you accept that the merge problem is solved.
+
+## Requirements
+
+Functional:
+
+- Create, open, edit, share documents containing rich text,
+  images, tables, comments, and embeds.
+- Real-time co-editing with live cursors and presence
+  (typical 1-5 active editors, up to ~100 supported).
+- Suggested edits and inline comments that stay anchored to
+  the right text as the doc evolves.
+- Version history with named restore points.
+- Sharing model: per-doc and per-folder ACLs, link sharing
+  with role, domain restrictions.
+- Offline editing that syncs on reconnect.
+- Search across all docs you have access to.
+
+Non-functional:
+
+- ~3B Workspace users; ~1B docs created per year.
+- Edit latency under 100ms for the local view; remote edits
+  appear within ~300ms p95.
+- 99.95% availability per doc; loss of an edit is intolerable.
+- Per-doc concurrent editors: typical 1-5, hard ceiling ~200.
+- Version history retained for the lifetime of the doc.
+
+## Capacity estimate
+
+```
+Users (Workspace)        = 3B
+DAU on Docs              = 200M
+Active editing sessions  = ~20M concurrent at peak hour
+Docs created/year        = 1B
+Avg doc size             = ~25 KB rich text + ~few MB images
+Total doc storage        = ~1 EB raw across all Drive content
+
+Ops/sec across all docs  = 20M editors × 0.3 ops/s = 6M ops/sec
+Avg op size              = ~150 B
+Real-time fanout         = ~3M ops/sec broadcast across WebSockets
+
+Snapshots                = one every ~1000 ops or once daily
+                           per doc → ~1B snapshot writes/year
+```
+
+The volume of small writes is the dominant load. Each
+keystroke is a separate op routed through a server that
+mediates ordering, then broadcast to other editors. A typical
+typing session produces dozens of ops per second per user.
+
+## High-level architecture
+
+Google Docs is a product sitting on top of Drive's storage and
+ACL services.
+
+```
+[ browser tab ]
+      │  HTTPS + WebSocket
+      ↓
+[ Edge / front-end LB ]
+      │
+      ↓
+[ Docs front-end ]   (the per-doc editing service)
+      │
+      ├──── ops mediator (OT server) ──── ops log ─── snapshot
+      │
+      ├──── ACL service (Drive)  ←── share / unshare events
+      │
+      ├──── Comments service     ←── threads, mentions
+      │
+      └──── Version-history service
+                     │
+                     ↓
+              [ Drive storage ]
+              (metadata in a BigTable-style wide-column store;
+               doc bodies + snapshots in object storage with
+               per-version pointers)
+
+[ Notification fanout ] ←── mentions, share invites, comment replies
+      ↓
+[ Gmail / push / badge ]
+
+[ Search service ]   ←── async index of every doc you have access to
+```
+
+The editing engine is one service. ACLs, comments, version
+history, search, and notification each live in their own
+service, all keyed on the same `docId`.
+
+## Data model
+
+The canonical state of a document is **not the rendered text** —
+it's an ordered log of operations. The rendered text is a
+snapshot derived from the log.
+
+```
+documents {
+  doc_id          string PK
+  owner_id        string
+  parent_folder   string
+  created_at      timestamp
+  acl_version     int
+  current_snap    string         -- pointer into snapshot store
+  latest_version  int
+}
+
+ops_log         (keyed by doc_id)
+  op_id         monotonic per doc
+  author_id     string
+  client_id     string           -- one editing session
+  op            json             -- {type, position, content, attribs}
+  parent_op     int              -- the op this was based on
+  applied_at    timestamp
+
+snapshots       (object store, content-addressed)
+  doc_id, version → bytes
+
+acls            (Drive ACL service)
+  doc_id, principal, role, inherited_from_folder
+```
+
+A snapshot is a content-addressed blob. The op log is the
+authoritative history; snapshots exist as a performance trick
+so we don't replay millions of ops on every open.
+
+## Real-time sync: OT, not CRDT
+
+Google Docs uses **Operational Transformation**. The system
+predates production-ready text CRDTs and a server-mediated
+design suited Google's infrastructure: every op flows through
+a central ordering service per doc.
+
+The flow:
+
+<Steps>
+<Step n={1} title="Client applies op locally and sends to server">
+The user types `h`. The client immediately applies
+`insert(pos=12, "h")` to its local model and renders. It
+also sends the op tagged with `parent_op = lastSeen`.
+</Step>
+<Step n={2} title="Server transforms against any concurrent ops">
+The server has a totally-ordered op log. If other ops arrived
+since `lastSeen`, the new op is transformed against them so
+its position is correct relative to the latest state.
+</Step>
+<Step n={3} title="Server appends, broadcasts, and acks">
+The transformed op gets the next sequence number. The server
+appends to the log, broadcasts to other editors via
+WebSocket, and acks the original client with the
+post-transform version.
+</Step>
+<Step n={4} title="Client reconciles">
+The client receives the ack and any concurrent ops; it
+re-transforms its local pending ops, replays the model from
+the agreed prefix, and updates the rendered view. Cursor
+positions are transformed too.
+</Step>
+</Steps>
+
+The OT correctness theorem (TP1, TP2) is famously hard to get
+right. Google's editor team spent years tuning the transformation
+functions; the trade-off vs CRDTs is documented in
+`design-collaborative-editor.mdx`. The short version: OT keeps
+the wire format compact (ops carry positions and content, not
+character IDs) at the cost of needing a server that's always
+the source of order.
+
+Compare with Figma, which uses a CRDT-inspired per-property
+merge model (see `engineering-blogs.mdx` for Figma's
+multiplayer write-up).
+
+## Drive: the file-system underneath
+
+A doc is a file in Drive. Drive contributes:
+
+- **Metadata store**: BigTable-style wide-column DB keyed by
+  `file_id`, with secondary indexes on `parent_folder_id`,
+  `owner_id`, `shared_with`. Reads "list my folder" hit the
+  index, never a scan.
+- **Content storage**: object store with versioning. Each
+  snapshot is a versioned blob; old versions are kept for
+  history.
+- **ACL service**: separate microservice. Each open of a doc
+  is mediated by ACL check; the editing server holds the
+  current ACL snapshot and listens for invalidations.
+- **Quota and search indexing**: Drive owns disk usage and
+  full-text search across all your files.
+
+The editing service is essentially "lease a file from Drive,
+mediate ops on it, write snapshots back."
+
+## Offline editing
+
+A laptop on a train must keep working. Offline mode lives in
+the browser tab itself.
+
+```
+local model + local op queue   ←── IndexedDB
+        ↓                              ↑
+  applied locally                      │
+        ↓                              │
+  queued for server upload   ──when online──→  server transform
+```
+
+When connection drops:
+
+- The op queue persists to IndexedDB on each edit.
+- Local edits keep applying optimistically; the model is
+  the latest local view.
+- The doc shows an "Offline" indicator; suggested edits and
+  comments are still produced, queued.
+
+When connection returns:
+
+- The client sends queued ops in order, each transformed
+  server-side against any concurrent server ops.
+- If conflicts produce surprising merge results, both OT and
+  CRDT models guarantee convergence but not the user's
+  *intent* — the UI surfaces "These edits were made offline"
+  hints when ambiguity is detected.
+
+The fundamental constraint is that **the browser is the sync
+engine**. There's no native daemon, no system-level
+file-watcher. IndexedDB is your durability primitive; service
+workers do background sync.
+
+## Suggested edits
+
+Suggested edits are a parallel stream of ops attached to a
+position in the doc, marked as "proposed" rather than applied.
+
+```
+suggestions {
+  suggestion_id    string PK
+  doc_id           string
+  author_id        string
+  ops              [op...]
+  base_version     int
+  status           enum(open, accepted, rejected)
+  created_at       timestamp
+}
+```
+
+The tricky part: as the doc evolves, the *position* a
+suggestion references must transform along with it. If I
+suggest "delete the third paragraph" and you add two paragraphs
+above it, the suggestion now points at the fifth paragraph. The
+same OT machinery that handles concurrent edits also handles
+position-transforms for suggestions.
+
+Acceptance applies the suggestion's ops as a regular ops batch.
+Rejection discards.
+
+## Comments and anchors
+
+Inline comments anchor to a range of text. As the text changes,
+the anchor must move.
+
+```
+comments {
+  comment_id       string PK
+  doc_id           string
+  thread_id        string
+  author_id        string
+  body             string
+  anchor           { startId, endId }   -- stable text positions
+  base_version     int
+  resolved         bool
+}
+```
+
+The anchor uses **stable position identifiers**, not character
+offsets. Each character (or paragraph boundary, in a coarser
+implementation) has an identifier that doesn't change when other
+text is inserted around it — the same idea CRDTs use natively,
+borrowed back into the OT system as a thin overlay.
+
+If both anchor endpoints are deleted in concurrent edits, the
+comment becomes "orphaned" and is shown in a sidebar with the
+quoted-at-create text, not inline.
+
+@-mentions in comments emit a notification through the central
+notification service.
+
+## Version history
+
+Two implementation approaches; Google does a mix.
+
+<Compare a="Snapshot per N ops" b="Replay from log">
+<>
+Every ~1000 ops or once daily, write a full snapshot to the
+content store. Old snapshots are retained.
+
+**Pros**: opening any version is fast (one blob fetch).
+
+**Cons**: storage grows with version count; near-identical
+snapshots store redundant content.
+</>
+<>
+Store only the op log; reconstruct any version by replay.
+
+**Pros**: minimal storage; perfect granularity.
+
+**Cons**: reconstructing an old version requires replaying
+potentially millions of ops; slow for deep history.
+</>
+</Compare>
+
+The production answer is **periodic snapshots + ops in between**.
+Restore-to-version finds the nearest snapshot and replays
+forward. Named versions ("save as named version") are explicit
+snapshots regardless of cadence.
+
+Compaction merges runs of small ops into coarser ones once
+history is older than a threshold (you can no longer see
+single-character history from 5 years ago, only paragraph-level
+diffs). That bounds long-term storage.
+
+## Sharing and ACLs
+
+Sharing happens at two granularities:
+
+- **File level**: `(doc_id, principal, role)` rows. Principal
+  is a user, group, or special token (link, domain).
+- **Folder level**: `(folder_id, principal, role, inherited)`.
+  Files inherit unless overridden.
+
+Reads check the effective ACL by walking up the folder tree.
+Caching is aggressive: the editing service holds the current
+effective ACL for an open doc and listens for invalidation
+events. Sharing changes happen at click-time; the open editor
+must re-evaluate the user's role within seconds.
+
+Link sharing with `roles=anyone-with-link-can-view` is one of
+the highest-traffic ACL paths — and the source of historical
+data leaks when defaults were wrong. Defense-in-depth: domain
+restrictions, link expiry, audit logs.
+
+## Search and cross-document features
+
+Each save event emits an indexing event; the search service
+maintains a full-text inverted index keyed on `(user_id,
+doc_id)` so that searches scope to "docs you have access to"
+without query-time joins. See `inverted-index.mdx` and
+`search-system-architecture.mdx`.
+
+Cross-document features (referencing a Sheet from a Doc,
+@-mentioning a Doc inside a comment) flow through a generic
+"object reference" service: the embedded link carries a
+file-id; the rendering layer resolves it with a fresh ACL
+check.
+
+## Tradeoffs
+
+- **OT** over CRDT: smaller wire/memory footprint and a clean
+  central source of order, at the cost of correctness proofs
+  that are notoriously hard. Newer products (Figma, Notion,
+  Linear) lean CRDT for new builds; Google stuck with OT
+  because it already worked and the cost of switching exceeds
+  the benefit.
+- **Periodic snapshots + ops** over either-alone: balances
+  storage cost against version-open latency.
+- **Browser-resident sync engine**: meets users where they
+  are (no install), at the cost of being limited to IndexedDB
+  for offline durability and rebuilding entire state on every
+  cold tab open.
+- **WebSocket per editing session** over polling: lower
+  latency and lower total traffic, at the cost of long-lived
+  connections to scale (Google's WebSocket front-ends are a
+  large fleet in their own right).
+- **Eventual ACL propagation** over synchronous: open docs
+  may briefly hold a stale ACL when sharing changes;
+  acceptable in exchange for surviving a 3B-user ACL service.
+
+## Common mistakes
+
+- Assuming co-edit conflicts are rare. They aren't — two
+  editors typing in the same paragraph happen constantly.
+  The OT/CRDT layer isn't a fallback, it's the hot path.
+- Storing rich-text as HTML strings. Snapshots are not HTML;
+  they are the structured op-log-derived model. HTML is a
+  rendering, not a representation.
+- Anchoring comments to character offsets. Inserting a
+  paragraph above breaks every comment in the doc. Stable
+  position ids are the fix.
+- Treating offline as a fallback for slow networks. Online
+  and offline are the *same code path*; the network is the
+  variable.
+- Forgetting that the browser is the constraint. A
+  beautiful native-style sync engine that needs a daemon
+  isn't shipping on Google Docs.
+
+## Further reading
+
+<Reference
+  kind="blog"
+  title="How Figma's multiplayer technology works"
+  authors="Evan Wallace"
+  year="2019"
+  source="Figma blog"
+  url="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/"
+>
+The clearest production write-up of the CRDT-inspired
+alternative path. Useful to read alongside the OT approach
+described here — same problem, different design choice,
+different trade-offs.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="High-latency, low-bandwidth windowing in the Jupiter collaboration system"
+  authors="Nichols, Curtis, Dixon, Lamping"
+  year="1995"
+  source="ACM UIST"
+  url="https://dl.acm.org/doi/10.1145/215585.215706"
+>
+The Jupiter paper is the conceptual ancestor of Google
+Wave's OT and, indirectly, the editing engine inside Google
+Docs. Worth reading for the historical context that explains
+why Google's system has the shape it does.
+</Reference>
+
+## In summary
+
+- The doc itself is an ordered op log; the rendered text is
+  a derived snapshot. Snapshots exist as a perf trick.
+- Google Docs uses OT (server-mediated) where modern systems
+  often use CRDTs (peer-friendly). The trade is wire-size
+  and correctness-proof complexity.
+- Drive provides the file-system, ACL, content storage, and
+  search; Docs is the editing engine on top.
+- Suggested edits and comments use stable position IDs that
+  transform with the doc — character offsets don't survive
+  concurrent edits.
+- Offline mode is the same code path as online; IndexedDB
+  is the durability primitive. The browser is the sync
+  engine.
+- Version history is periodic snapshots + ops in between;
+  named versions are explicit snapshots; old history gets
+  compacted to bound storage.

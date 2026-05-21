@@ -1,0 +1,359 @@
+export const level = 'senior';
+
+# OLAP engines: ClickHouse, Druid, Pinot
+
+The three open-source real-time analytical engines that show up
+in every modern analytics stack. ClickHouse, Apache Druid, and
+Apache Pinot solve the same problem — **sub-second analytical
+queries over billions of rows, with streaming ingestion from
+Kafka** — and they do it with overlapping but distinguishable
+architectures.
+
+They are not Snowflake, BigQuery, or Redshift. Those cloud
+warehouses optimize for petabyte ELT queries on demand against
+S3-backed storage and bill per query. The real-time OLAP engines
+optimize for high QPS, low latency, and continuous ingestion —
+think user-facing dashboards, ad analytics, log search, and
+metrics backends. Same SQL surface, very different operating
+points.
+
+This page is a comparison and a decision guide, not a tutorial
+on any one engine.
+
+## What "real-time OLAP" means
+
+Three things together:
+
+- **Streaming ingestion** — Kafka, Kinesis, Pulsar — with
+  second-level visibility from ingest to query.
+- **Sub-second p95 query latency** — single-digit milliseconds
+  for cached/indexed queries; sub-second for ad-hoc scans on
+  hundreds of millions of rows.
+- **High QPS** — thousands of concurrent queries from user-facing
+  dashboards, not the few-dozen-analyst concurrency of a
+  warehouse.
+
+This is a different operating point from the OLTP-vs-OLAP split
+(cross-reference `oltp-vs-olap.mdx`). It's also distinct from a
+lakehouse query engine like Trino over Iceberg — which is
+phenomenal for ad-hoc analytical SQL but typically takes seconds,
+not milliseconds, and isn't built for thousands of concurrent
+dashboard queries.
+
+## Shared design ingredients
+
+Despite the differences, all three rest on the same five pillars:
+
+<Cheatsheet>
+| Ingredient | What it does |
+|---|---|
+| Columnar storage | Only the columns in your SELECT are scanned — see `columnar-storage.mdx`. Dramatically lower I/O for analytical queries that touch a few of many columns. |
+| Vectorized execution | Operate on batches of values per CPU instruction; exploit SIMD; minimize per-row interpreter overhead. |
+| Time-partitioned segments | Data is partitioned by time so old segments can be tiered to object storage or dropped wholesale. |
+| Filter pushdown via bitmap/inverted indexes | Roaring bitmaps, sparse primary indexes, bloom filters — skip whole blocks at scan time. |
+| Streaming ingestion from Kafka | Records visible to queries within seconds; merged into immutable segments on a roll. |
+</Cheatsheet>
+
+The differences are in **how each engine wires these together**,
+what kind of pre-aggregation it favors, and how complex the
+operational story is.
+
+## The three engines side by side
+
+<Cheatsheet>
+| Axis | ClickHouse | Apache Druid | Apache Pinot |
+|---|---|---|---|
+| Origin | Yandex, 2016 | Metamarkets, 2011 (Apache 2015) | LinkedIn, 2014 (Apache 2018) |
+| Storage layout | MergeTree (columnar, sparse primary index) | Time-segmented column files; bitmap indexes | Time-segmented column files; bitmap, sorted, range, StarTree indexes |
+| Query language | SQL (full ANSI-ish dialect) | Native JSON queries + Druid SQL | Pinot SQL (JDBC-compatible) + Pinot QL |
+| Joins | Full SQL joins (hash, merge, broadcast); local-table joins fast, distributed less so | Limited — lookup joins; star-schema friendly | Lookup joins; v2 multi-stage engine adds broader join support |
+| Pre-aggregation | Mostly skips it; relies on raw scan speed plus materialized views | Heavy — rollups at ingest time | Heavy — rollups plus the StarTree index for low-latency multi-dim aggregations |
+| Ingestion model | Pull (Kafka engine) or push (HTTP/native) | Middle-manager peons stream; handoff to historicals | Real-time servers tail Kafka; segment flush to historical (offline) servers |
+| Best-fit workload | Ad-hoc SQL, log analytics, observability, time series | Sub-second time-series dashboards, big-fan-out simple queries | Very high QPS user-facing analytics, multi-dimensional filters |
+| Operational story | One binary (`clickhouse-server`); small surface | Multi-service (coordinator, overlord, broker, historical, middle manager) | Multi-service (controller, broker, server, minion) |
+| Cloud-managed offerings | ClickHouse Cloud, Altinity | Imply, Aiven | StarTree |
+</Cheatsheet>
+
+A useful way to read this: **ClickHouse trades complex
+pre-aggregation for raw query speed and operational
+simplicity. Druid and Pinot trade operational complexity for
+sub-second multi-dimensional dashboard latency at very high
+QPS.**
+
+## ClickHouse in one paragraph
+
+A C++ columnar database with a single-binary deployment story
+and a query engine that's brutally fast on raw scans. The
+canonical storage engine is `MergeTree`: columnar files on disk
+with a sparse primary index, sorted by a user-chosen sort key,
+periodically merged in the background (LSM-style — see
+`btree-vs-lsm-storage-engines.mdx`).
+
+ClickHouse leans hard on **vectorized execution** and a JIT-ish
+expression evaluator. It can scan billions of rows per second
+per server. It supports full SQL joins, though distributed
+joins across sharded tables require careful planning. Materialized
+views provide on-write aggregations when you need them.
+
+**Who uses it**: Cloudflare (HTTP analytics, ~30M rows/s
+sustained ingestion), Uber (M3 metrics backend; previously their
+ad analytics), Yandex (still — it's their internal Google
+Analytics), eBay, the Sentry error-tracking product. Increasingly
+the default "log/event/observability backend" choice when teams
+outgrow Elasticsearch.
+
+**Sweet spot**: ad-hoc SQL on large event streams, observability,
+"give me a real database for telemetry without operating five
+services."
+
+**Weak spot**: very high QPS user-facing dashboards (hundreds to
+thousands of queries per second). Distributed joins across
+sharded tables. State-of-the-art multi-dimensional rollups when
+you need sub-100ms p99 on faceted queries.
+
+## Druid in one paragraph
+
+A pre-aggregation-first time-series OLAP engine. Druid splits
+ingestion and serving into separate processes — **middle
+managers/peons** ingest streaming data, **historicals** serve
+finalized segments, **brokers** fan queries out, a **coordinator**
+balances segments across historicals, an **overlord** manages
+ingestion tasks. There are six process types in a Druid cluster.
+
+Druid leans on **rollup at ingest time**: as data flows in,
+Druid pre-aggregates by your declared dimensions (typically time,
+plus a handful of categorical fields) into a smaller summary.
+This is what makes sub-second dashboards possible on years of
+data — the rolled-up segments are much smaller than the raw.
+
+Druid's strongest case is **time-series dashboards with high QPS
+and big fan-out simple queries**: "show me clicks by hour by
+campaign for the last 30 days," replayed by thousands of users
+concurrently.
+
+**Who uses it**: Netflix (Atlas operational metrics), Airbnb,
+Confluent Cloud (telemetry), Walmart, Salesforce.
+
+**Sweet spot**: rollup-friendly multi-dimensional time series
+with sub-second user-facing dashboards.
+
+**Weak spot**: complex SQL joins, ad-hoc queries that don't
+match the rollup grain (forcing a slow re-scan), and operational
+complexity — running six service types correctly is real work.
+
+## Pinot in one paragraph
+
+LinkedIn's answer to the same problem Druid solves, with a heavy
+focus on **very high QPS user-facing analytics**. Architecturally
+similar to Druid (controllers, brokers, real-time servers,
+offline servers, minions) but designed from day one for the
+"every member sees their personalized analytics" use case.
+
+Pinot's distinguishing feature is the **StarTree index** — a
+materialized tree of pre-aggregations that lets multi-dimensional
+filtered aggregation queries finish in microseconds. Where Druid
+pre-aggregates at fixed dimensions chosen at ingest, the
+StarTree gives you sub-millisecond fan-out across many dimension
+combinations at the cost of more index storage.
+
+**Who uses it**: LinkedIn (origin — "Who Viewed Your Profile,"
+real-time member analytics, ad analytics), Uber Eats (real-time
+restaurant analytics), Stripe (some analytics surfaces), Walmart.
+
+**Sweet spot**: per-user-facing dashboards at LinkedIn scale —
+thousands of QPS, p99 in the tens of milliseconds.
+
+**Weak spot**: same as Druid (joins, ops complexity), with the
+added cost of the StarTree's index storage overhead. Recent
+versions (Pinot 1.0+) have shipped a multi-stage query engine
+that broadens join support, but it's newer than ClickHouse's
+join story.
+
+## What none of them replace
+
+These engines are not warehouses, not OLTP databases, not search
+engines, and not time-series specialty stores.
+
+<Cheatsheet>
+| Need | Better choice |
+|---|---|
+| Elastic petabyte-scale ad-hoc analytics, query-as-a-service | Snowflake, BigQuery, Databricks SQL |
+| OLTP — single-row reads/writes, transactions | Postgres, MySQL, CockroachDB |
+| Narrow IoT time-series with retention policies | InfluxDB, TimescaleDB, VictoriaMetrics, Prometheus |
+| Full-text search with relevance scoring | Elasticsearch, OpenSearch (though Pinot has text search) |
+| Open table-format warehouse on object storage | Trino + Iceberg, Athena, Databricks |
+</Cheatsheet>
+
+The honest framing: **real-time OLAP is a separate tier**, not
+a replacement for any of the above. A typical mature stack runs
+Snowflake or BigQuery for batch warehousing **and** ClickHouse
+or Druid or Pinot for real-time serving. Same data, two storage
+shapes, two access patterns.
+
+(See `data-warehouse-vs-lake-vs-lakehouse.mdx` for the warehouse
+side of the picture, and `real-time-analytics-architecture.mdx`
+for the streaming pipeline that feeds these engines.)
+
+## Production patterns
+
+### Kafka in front
+
+The canonical pipeline is **Kafka → real-time OLAP engine**.
+ClickHouse has a built-in `Kafka` table engine; Druid has the
+`KafkaIndexingService`; Pinot has real-time servers that tail
+Kafka directly. All three support **upsert** semantics on
+streaming ingestion via primary keys or merge keys.
+
+(See `kafka-internals.mdx` for the producer side of that
+pipeline.)
+
+### Pre-aggregation as a cost control
+
+Druid and Pinot lean on rollup to make queries fast and storage
+small. The price is **query flexibility**: queries that don't
+match the rollup grain either scan the raw segments (slow) or
+fail. ClickHouse offers materialized views for the same purpose
+but doesn't require them.
+
+If your query patterns are stable and predictable, rollup is
+free latency. If they evolve weekly, rollup is operational debt.
+
+### Hot/cold tiering
+
+All three engines support tiered storage: recent segments on
+local NVMe, older segments on S3 or HDFS. ClickHouse calls these
+**storage policies**; Druid has the **historical tier**
+abstraction; Pinot has **tiered storage** since version 0.10.
+Tiering is what makes "we keep 5 years of data and still serve
+queries" affordable.
+
+### Sizing the cluster
+
+Two rules of thumb that hold across all three:
+
+- **Working-set size on local NVMe** is the real constraint.
+  Once a query has to fall through to S3, p99 latency jumps an
+  order of magnitude. Size hot storage for the rolling window
+  most queries touch.
+- **Brokers are a fan-out cost**. A query that hits N segments
+  on N servers and gets results back is N RPCs. Wide queries
+  across many segments dominate at high QPS. Aggressive segment
+  pruning via partition keys and indexes is what keeps fan-out
+  manageable.
+
+## Decision sketch
+
+When do you reach for one of these over a cloud warehouse?
+
+<Steps>
+<Step n={1} title="High QPS dashboard serving">
+Hundreds to thousands of concurrent queries from a user-facing
+product. Warehouses choke at this concurrency or get expensive
+fast. Reach for an OLAP engine.
+</Step>
+<Step n={2} title="Strict sub-second p95 on user-facing surfaces">
+Anything served inside a product page where users are watching
+a spinner. Pinot for the strictest latency; Druid for
+time-series dashboards; ClickHouse if SQL flexibility matters
+more than the last 50 ms.
+</Step>
+<Step n={3} title="Streaming ingestion with second-level freshness">
+"Last 30 seconds visible in the dashboard." Any of the three.
+Warehouses are improving here (Snowpipe Streaming, BigQuery
+Storage Write API) but still trail.
+</Step>
+<Step n={4} title="Engineer wants SQL, doesn't want to run six services">
+ClickHouse. One binary. Real SQL. The "I want a real database
+for telemetry" answer.
+</Step>
+<Step n={5} title="Complex rollups, big fan-out, dashboard-first">
+Druid or Pinot. Choose Pinot if the use case is "personalized
+analytics per user at LinkedIn scale"; Druid if it's "operational
+time-series dashboards in the style of Netflix Atlas."
+</Step>
+</Steps>
+
+If none of those match — if your workload is batch nightly
+queries by a handful of analysts — stay in Snowflake or
+BigQuery. The OLAP engines are a real operational commitment;
+don't pay it without a use case that demands it.
+
+## Cross-references
+
+- `columnar-storage.mdx` — the storage primitive all three share.
+- `oltp-vs-olap.mdx` — why these aren't replacements for Postgres.
+- `data-warehouse-vs-lake-vs-lakehouse.mdx` — the
+  Snowflake/BigQuery side of the analytics stack.
+- `real-time-analytics-architecture.mdx` — the streaming pipeline
+  feeding these engines.
+- `kafka-internals.mdx` — the canonical upstream.
+- `btree-vs-lsm-storage-engines.mdx` — relevant for ClickHouse's
+  MergeTree storage layout.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Druid: A Real-time Analytical Data Store"
+  authors="Yang, Tschetter, Léauté, Ray, Merlino, Ganguli"
+  year="2014"
+  source="SIGMOD"
+  url="https://static.druid.io/docs/druid.pdf"
+>
+The original Druid paper. Explains the segment-and-broker
+architecture, the rollup-at-ingest design choice, and the
+ingestion/historical split. The architectural skeleton has held
+up — modern Druid is recognizably this paper plus a decade of
+hardening.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Pinot: Realtime OLAP for 530 Million Users"
+  authors="Im, Gopalakrishna, Subramaniam, Shrivastava, Tumbde, Jiang, Dai, Lee, Pawar, Li, Aringunram"
+  year="2018"
+  source="SIGMOD"
+  url="https://www.dbgroup.cs.tsinghua.edu.cn/ligl/courses/ds/papers/sigmod18-pinot.pdf"
+>
+The LinkedIn paper introducing Pinot's design and the StarTree
+index. Worth reading alongside the Druid paper — same problem,
+different tradeoffs, particularly on per-user-facing QPS and
+multi-dimensional aggregation latency.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="ClickHouse Architecture"
+  authors="ClickHouse documentation"
+  year="2024"
+  source="clickhouse.com"
+  url="https://clickhouse.com/docs/architecture/introduction"
+>
+The closest thing to a paper for ClickHouse. Covers MergeTree
+storage, vectorized execution, replication via ClickHouse Keeper
+(a Raft-based replacement for ZooKeeper, in the same lineage
+as Kafka's KRaft), and the operational shape of a deployment.
+</Reference>
+
+## In summary
+
+- **ClickHouse, Druid, Pinot** are the three open-source
+  real-time OLAP engines. They share columnar storage,
+  vectorized execution, time-partitioned segments, bitmap/index
+  pushdown, and streaming Kafka ingestion.
+- **ClickHouse** is the SQL-and-simplicity choice — one binary,
+  full SQL, brutally fast on raw scans, excellent for ad-hoc
+  analytics and observability.
+- **Druid** is the time-series dashboards choice — heavy rollup,
+  multi-service architecture, sub-second p95 on big fan-out
+  simple queries.
+- **Pinot** is the very-high-QPS user-facing analytics choice —
+  StarTree index for low-latency multi-dimensional aggregations,
+  born from LinkedIn's per-member analytics workload.
+- None of them replaces a cloud warehouse (Snowflake/BigQuery),
+  an OLTP database (Postgres), a search engine
+  (Elasticsearch), or a narrow time-series store (Prometheus,
+  InfluxDB). Real-time OLAP is its own tier in the stack.
+- The honest cost is operational: Druid and Pinot are
+  multi-service systems with real ops surface; ClickHouse is
+  easier but still a database you have to run.

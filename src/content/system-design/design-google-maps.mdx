@@ -1,0 +1,503 @@
+export const level = 'senior';
+
+# Design Google Maps
+
+A planet-scale mapping service: render the entire world at
+varying zoom levels, find businesses near you, compute
+routes across continents, and show live traffic — all on a
+phone that may be on a flaky LTE connection. The interesting
+parts: the tile pyramid that powers map rendering, the
+spatial indexing systems that answer "what's near here," the
+routing engine that handles a graph with hundreds of millions
+of nodes, and the live traffic pipeline that turns every
+phone with location services on into a road sensor.
+
+The defining physics here is **geography is hierarchical and
+spatial**, not relational. The data structures the system
+uses — quadtrees, hexagonal grids, Hilbert-curve indexes,
+contraction hierarchies — exist precisely because relational
+indexes do not scale to "find me the closest gas station" at
+billion-row tables.
+
+## Requirements
+
+Functional:
+
+- Render an interactive map of the world at zoom levels 0
+  (whole planet) through ~22 (a single building).
+- POI search: "coffee near me", "Italian restaurants in
+  Brooklyn".
+- Turn-by-turn navigation with real-time traffic-adjusted
+  ETAs.
+- Multi-modal routing: driving, walking, biking, transit.
+- Crowdsourced live traffic and incident reports.
+- Offline maps: download a region for use without network.
+- Satellite imagery, Street View, indoor maps.
+
+Non-functional:
+
+- ~1B monthly active users.
+- Tile load p95 under 200ms on a warm region.
+- Route computation p95 under 500ms for cross-continent
+  queries.
+- Map currency: road network changes propagate within days
+  to weeks; live traffic propagates within ~1 minute.
+- 99.95% availability on tile and route endpoints.
+
+## Capacity estimate
+
+```
+MAU                      = 1B
+DAU                      = 500M
+Map view sessions/day    = 1B (most users open it once a day)
+Tile requests/day        = 1B sessions × ~40 tiles = 40B/day
+                           avg ~500K QPS, peak ~2M QPS
+Tiles in pyramid         = sum of 4^z for z=0..22 ≈ 2 × 10^13
+                           but only ~10^11 are actually rendered
+                           (oceans don't need 22-zoom tiles)
+
+Road network             = tens of millions of km of roads
+                           worldwide (~21M km per GRIP, ~40M
+                           km per OpenStreetMap, ~64M km via
+                           country-aggregate estimates)
+                           ~1B road segment edges (graph)
+                           ~3B intersection nodes (with detail)
+POIs                     = ~250M businesses + 1B addresses indexed
+
+Route requests/day       = ~10B (sessions × route attempts)
+                           avg ~120K QPS
+
+Live traffic ingest      = ~500M devices reporting location
+                           one ping every ~30s while moving
+                           = ~15M pings/sec at peak
+```
+
+The tile workload is the headline number on traffic. The
+routing graph and POI index are the headline numbers on
+storage and compute.
+
+## High-level architecture
+
+```
+                  [ mobile / web client ]
+                          │
+                          ↓
+                  [ edge / CDN ]
+                          │
+   ┌──────────────────────┼──────────────────────┬───────────────┐
+   ↓                      ↓                      ↓               ↓
+[ Tile  ]            [ POI search ]         [ Routing ]    [ Traffic ]
+[ svc   ]            [ svc        ]         [ svc      ]   [ ingest  ]
+   │                      │                      │               │
+   ↓                      ↓                      ↓               ↓
+[ Tile  ]   ←──── [ Inverted index ]    [ In-mem graph ]    [ Kafka ]
+[ store ]         [ + spatial bucket]    [ partitioned   ]      │
+[ (CDN  ]              │                 [ by region     ]      ↓
+[ tier) ]              ↓                       │           [ stream agg]
+                  [ POI DB        ]            │                │
+                  [ wide-column   ]            │                ↓
+                                               │          [ traffic map ]
+                                               │                │
+                                               ↓                ↓
+                                          [ routing engine consumes traffic ]
+
+                  [ Map data pipeline (offline) ]
+                          │
+                          ↓
+                  [ tile renderer + graph builder + POI indexer ]
+                          │
+                          ↓
+                  [ versioned data snapshots → all serving tiers ]
+```
+
+The serving plane is largely read-only. The map data pipeline
+runs continuously, ingests new survey data, OpenStreetMap-style
+edits, and validated user contributions, and rebuilds the
+serving artifacts (tiles, graph, indexes) in a versioned roll.
+
+## The tile pyramid
+
+The map is a quadtree of tiles. Each zoom level has 4× the
+tiles of the level above.
+
+```
+Zoom 0:  1 tile      (whole world)
+Zoom 1:  4 tiles
+Zoom 2:  16 tiles
+...
+Zoom z:  4^z tiles
+...
+Zoom 22: ~17 trillion tiles in principle
+```
+
+In practice, ocean tiles at z=22 don't exist; they're served
+as "blue tile" placeholders. The pyramid is sparse where
+detail is sparse.
+
+A standard tile is 256×256 pixels (or 512×512 on retina
+displays). The Mercator projection maps lat/lng to tile
+coordinates with simple arithmetic. URLs follow the pattern
+`/tiles/{z}/{x}/{y}.png` so they're CDN-friendly static
+assets.
+
+```js
+function lngToX(lng, z) {
+  return ((lng + 180) / 360) * Math.pow(2, z);
+}
+
+function latToY(lat, z) {
+  const sinLat = Math.sin((lat * Math.PI) / 180);
+  return (
+    (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) *
+    Math.pow(2, z)
+  );
+}
+```
+
+The CDN does most of the work. Every map view fetches 20-40
+tiles; that fan-out is what makes tile serving the dominant
+QPS workload but also the easiest to scale — every tile is a
+static byte sequence.
+
+## Raster vs vector tiles
+
+<Compare a="Raster tiles" b="Vector tiles">
+<>
+Pre-rendered PNG or WebP images. Server renders once per
+update, CDN distributes.
+
+**Pros**: trivial to serve; client just blits.
+
+**Cons**: appearance is baked. Restyling, swapping label
+languages, or overlaying dynamic data requires re-rendering
+the whole pyramid. Storage scales with style variations.
+</>
+<>
+Geometric primitives in a protobuf format (Mapbox Vector
+Tile spec). Client renders.
+
+**Pros**: tiles are smaller (~1/4 the bytes). Restylable at
+runtime — toggle dark mode, change label language, overlay
+traffic without new tiles. Smooth zoom interpolation.
+
+**Cons**: client must do rendering work. Older devices
+struggle with GPU-accelerated rendering of vector data.
+</>
+</Compare>
+
+Google Maps migrated to vector tiles around 2014. The
+restyling flexibility alone justifies the change: traffic
+overlays, dark mode, transit modes, and indoor maps all
+compose on the client without server-side variants.
+
+The storage savings matter too: rasterizing every style for
+every zoom level produces multi-PB tile sets. Vector tiles
+are one source of truth, the styles are JSON.
+
+## Spatial indexing
+
+"Find businesses within 500m of me" is the universal map
+query. A B-tree on lat/lng will not answer it — adjacent
+lat/lng values can be on different continents (the line
+from -180 to +180 longitude). You need a *spatial* index.
+
+Three main approaches:
+
+<Cheatsheet>
+| Index | Shape | Containment | Notes |
+|---|---|---|---|
+| **Geohash** | Rectangular cells, base-32 string | Prefix matching | Older, simple. Bad at high latitudes; uneven cells. |
+| **S2** (Google) | Cells on a sphere via Hilbert curve, 64-bit integers | Prefix matching on cell IDs | Google's choice for Maps. Uniform area on the sphere. |
+| **H3** (Uber) | Hexagonal hierarchical cells | Parent/child relationships | Uber's choice — hexagons have uniform distance to all neighbors. See `engineering-blogs.mdx`. |
+</Cheatsheet>
+
+Google uses **S2** internally. The Hilbert curve preserves
+locality — points close in 3D space have close S2 cell IDs,
+which means a range scan on cell ID returns spatially-close
+items. The query "businesses near me" becomes a prefix /
+range scan on the S2 column of the POI table, then a
+distance filter on the candidates.
+
+```js
+// Query for POIs near a point at S2 level 13 (~1km cells).
+const cell = s2.cellIdFromLatLng(myLat, myLng, 13);
+const neighbors = cell.neighbors();              // 8 surrounding cells
+const candidates = await db.scanByS2Range(cell, neighbors);
+return candidates
+  .filter(p => haversine(p, { myLat, myLng }) < 500)
+  .sort(byDistance);
+```
+
+The cells are chosen at a level that matches the query
+radius. Too coarse and the candidate set is huge; too fine
+and the candidate set misses points just over the edge.
+
+## Routing: graph algorithms at planet scale
+
+The road network is a directed graph:
+
+- **Nodes**: intersections, road endpoints, special points.
+- **Edges**: road segments. Cost = traversal time, computed
+  from length, speed limit, and current traffic.
+
+Naive **Dijkstra** is O((N + E) log N), which is unworkable
+for cross-continent routing on a graph with ~1B edges. The
+production answers:
+
+- **A***: Dijkstra with a heuristic (straight-line distance
+  to destination) that prunes search. Great for short and
+  medium routes.
+- **Contraction Hierarchies**: pre-process the graph to add
+  shortcut edges that skip over low-importance nodes.
+  Queries become effectively O(log N) with a one-time
+  pre-processing cost.
+- **Hub Labeling**, **Customizable Contraction Hierarchies**:
+  newer variants that make re-customization (traffic update)
+  fast.
+
+<Steps>
+<Step n={1} title="Preprocess the graph">
+Order nodes by "importance" (intersection of many edges, on
+many shortest paths). Contract nodes from least to most
+important; when contracting node v, add a shortcut edge
+between each pair of v's neighbors if their shortest path
+through v is shorter than any path avoiding v.
+</Step>
+<Step n={2} title="Query is bidirectional Dijkstra">
+Run Dijkstra from source upward (only follow edges to
+higher-importance nodes) and from destination upward;
+they meet in the middle.
+</Step>
+<Step n={3} title="Reweight for traffic">
+Edge weights change as traffic moves. Customizable
+Contraction Hierarchies separate the topology preprocessing
+(slow, infrequent) from the weight customization (fast,
+every few minutes).
+</Step>
+</Steps>
+
+The graph is **partitioned by region**. A cross-continent
+query uses a coarser "overlay" graph at country level, then
+descends to fine detail at the endpoints.
+
+## Live traffic
+
+The system turns every phone with Maps open into a road
+sensor.
+
+```
+phone GPS                ── 30s pings ──→  [ traffic ingest ]
++ accelerometer                                   │
+                                                  ↓
+                                          [ snap to road ]
+                                          (map-match the GPS
+                                           track to a road segment)
+                                                  │
+                                                  ↓
+                                          [ aggregate per segment ]
+                                          (median speed, vehicle count)
+                                                  │
+                                                  ↓
+                                          [ traffic map publish ]
+                                                  │
+                                                  ↓
+                              consumed by routing engine and shown on tiles
+```
+
+Privacy is paramount. The pipeline:
+
+- **Snaps** GPS points to a known road segment before they're
+  written anywhere personally identifiable. Raw lat/lng is
+  dropped within minutes.
+- **Aggregates** speeds over many devices per segment per
+  short window. No single device is identifiable in the
+  output.
+- **Suppresses** segments with too few samples — the famous
+  "Berlin hack" (Simon Weckert pulling 99 phones in a wagon
+  to fake a jam) exploited exactly this: a small N is a
+  false signal, so the threshold must be set high enough to
+  reject one person's contribution.
+
+Live traffic re-weights the routing graph every few minutes.
+Active navigation sessions get re-routed if a faster path
+opens.
+
+## POI search
+
+"Find Italian restaurants in Brooklyn open now."
+
+The query is a join of:
+
+- **Full-text** on the POI name, tags, and reviews.
+- **Spatial** filter to "in Brooklyn" or a radius.
+- **Predicate** filters: open now, rating > 4, price level.
+
+Implementation is an inverted index keyed on
+`(spatial-bucket, term)` — the spatial bucket is an S2 cell
+at a coarse level, the term is a tokenized word from the POI
+name. See `inverted-index.mdx` and
+`search-system-architecture.mdx`. Query intersects posting
+lists for terms and a posting list for the spatial bucket,
+then re-ranks by distance and quality.
+
+The POI data itself is a wide-column store
+(BigTable-shaped): one row per POI, denormalized columns for
+name, location, categories, opening hours, ratings, photos.
+The data pipeline rewrites this nightly from many upstream
+sources (Maps for Business submissions, web crawl, partner
+feeds, Street View OCR).
+
+## Offline maps
+
+A user can download a region for offline use. The download
+contains:
+
+- Tiles for the region at multiple zoom levels.
+- Vector data and styles.
+- A serialized chunk of the routing graph for the region.
+- POI data for the region.
+
+All queries (rendering, POI search, routing) execute against
+the local copy. Cross-region routes from offline are
+typically restricted ("downloaded region only") or fall back
+to a network call.
+
+This is fundamentally why vector tiles matter: a 50 MB
+download covers a city at all zoom levels, where the raster
+equivalent would be hundreds of MB.
+
+## Storage and serving
+
+<Cheatsheet>
+| Data | Store | Tier | Why |
+|---|---|---|---|
+| Vector tiles | Object store + CDN | Edge | Static; insanely cacheable; massive fan-out |
+| POI metadata | Wide-column (BigTable-like) | Hot | Random reads by POI id and spatial bucket |
+| POI search index | Inverted index, sharded by spatial bucket | Hot | Term + spatial intersect |
+| Routing graph | In-memory on routing servers | Hot | Latency budget; partitioned by region |
+| Live traffic | In-memory + Pub/Sub | Hot | Sub-minute freshness |
+| Source map data | Object store | Cold | Input to nightly rebuild |
+| Historical traffic | Columnar warehouse | Cold | Used for ETA modeling; see `columnar-storage.mdx` |
+</Cheatsheet>
+
+The build pipeline produces a new versioned snapshot of
+tiles + graph + index periodically (continuously for tiles
+in dense areas, weekly to monthly for the global graph
+rebuild). Snapshots are rolled out via canary, and a single
+deployment uses one consistent version across all serving
+components — otherwise a route can reference a road segment
+the tile renderer doesn't know about.
+
+## Tradeoffs
+
+- **Vector tiles** over raster: smaller payloads, runtime
+  flexibility, lower storage cost. Pays in client GPU/CPU
+  work and a more complex rendering pipeline.
+- **Contraction Hierarchies** over A* alone: cross-continent
+  routes drop from seconds to tens of milliseconds, at the
+  cost of expensive preprocessing whenever the graph
+  topology changes meaningfully.
+- **S2 spatial index** over geohash: uniform cell area on
+  the sphere; slightly more complex to implement than
+  geohash but worth it past city-scale.
+- **Aggressive pre-positioning of tile data** over
+  pull-through CDN: makes the heaviest workload cheap, at
+  the cost of regenerating and pushing tiles when the map
+  data changes.
+- **Per-region partitioning of the routing graph** over a
+  global in-memory graph: makes the working set fit on a
+  reasonable fleet, at the cost of an overlay graph for
+  cross-region queries.
+- **Live traffic ingest from devices** over fixed sensors:
+  vastly more coverage at near-zero marginal cost, but
+  requires careful aggregation and privacy hygiene; rare
+  edges (rural roads) get sparse signal.
+
+## Common mistakes
+
+- Storing locations as `(lat, lng)` with a B-tree index.
+  Range queries don't work; the prime meridian and poles
+  break the math.
+- Treating routing as just Dijkstra. It works in a demo. It
+  does not work for "Lisbon to Helsinki in 200ms".
+- Forgetting tile freshness. A road built in 2024 should
+  show on the map by 2024, not 2026. The data pipeline is
+  more important than the renderer.
+- Letting raw GPS pings into the analytics store. Privacy
+  is regulatory, not optional; snap and aggregate at the
+  ingest edge.
+- Pre-rendering raster tiles for every style. The storage
+  growth is multiplicative and the next dark-mode launch
+  doubles your tile pyramid.
+- Skipping the version-consistency requirement across
+  tiles, graph, and POI index. They must roll together; a
+  road that exists in the graph but not the tiles is a
+  bug.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Contraction Hierarchies: Faster and Simpler Hierarchical Routing in Road Networks"
+  authors="Geisberger, Sanders, Schultes, Delling"
+  year="2008"
+  source="WEA"
+  url="https://algo2.iti.kit.edu/schultes/hwy/contract.pdf"
+>
+The original paper introducing contraction hierarchies. The
+seminal step that made interactive cross-continent routing
+possible. The technique is now the default in OSRM,
+GraphHopper, and (with refinements) in production at Google
+and TomTom.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Uber's Hexagonal Hierarchical Spatial Index"
+  authors="Brodsky"
+  year="2018"
+  source="Uber engineering"
+  url="https://eng.uber.com/h3/"
+>
+Why hexagons beat rectangles for geo-indexing, and the
+trade-offs against S2. Reading this and the S2 docs in
+parallel is the clearest way to understand spatial indexing
+options in practice.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Mapbox Vector Tile specification"
+  authors="Mapbox"
+  year="2020"
+  source="GitHub"
+  url="https://github.com/mapbox/vector-tile-spec"
+>
+The de-facto standard format for vector tiles, used or
+inspired by every modern mapping product. The spec doc is
+short and explains exactly why vector tiles are so much
+cheaper than raster for the storage and bandwidth a
+planet-scale map needs.
+</Reference>
+
+## In summary
+
+- The map is a quadtree of tiles served as static assets
+  from a CDN; the tile pyramid is the single biggest QPS
+  workload.
+- Vector tiles beat raster tiles at this scale: smaller,
+  restylable, friendlier to overlays and offline use.
+- Spatial queries use a Hilbert-curve cell index (S2 at
+  Google) rather than relational indexes — geography is
+  hierarchical and spherical, B-trees aren't.
+- Routing is not Dijkstra at planet scale; Contraction
+  Hierarchies (plus regional partitioning) make
+  cross-continent routes cheap to query at the cost of
+  expensive preprocessing.
+- Live traffic is a crowdsourced sensor network. Privacy
+  is enforced at the ingest edge: snap, aggregate,
+  threshold.
+- Offline support drops out of the vector-tile + regional
+  graph design — the same data, served from local storage.
+- Tile + graph + POI version consistency is non-optional;
+  the data pipeline is a first-class system.

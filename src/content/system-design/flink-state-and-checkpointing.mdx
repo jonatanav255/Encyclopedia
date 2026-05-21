@@ -1,0 +1,332 @@
+export const level = 'senior';
+
+# Flink state and checkpointing
+
+A streaming engine that doesn't manage state is just a fancy
+filter. The interesting work — windowed aggregations, joins,
+deduplication, sessionization — all requires keeping data
+around between events, sometimes for hours or days, and
+recovering it after the inevitable failure.
+
+This page is about how Apache Flink does that: a per-task state
+backend (RocksDB or heap), an asynchronous distributed snapshot
+algorithm adapted from Chandy-Lamport, and a two-phase-commit
+sink protocol that lets all of it line up with Kafka and JDBC
+for exactly-once. The Flink details are specific; the patterns —
+local state, periodic global snapshots, replay-driven recovery —
+generalize to Kafka Streams, Materialize, Pulsar Functions, and
+Spark Structured Streaming.
+
+## What "state" means
+
+Streaming state isn't one thing. Flink exposes several flavors,
+each backed by the same storage primitives:
+
+<Cheatsheet>
+| State kind | Used for |
+|---|---|
+| Keyed state (`ValueState`, `ListState`, `MapState`, `ReducingState`) | Per-key working memory; aggregations, dedup sets, custom logic. |
+| Window state | Buffered events per (key, window) until the window fires. |
+| Join state | Per-key buffers on both sides of a stream-stream or stream-table join. |
+| Broadcast state | Small replicated state available to every parallel task (configuration, rule sets). |
+| Operator state | Per-task non-keyed state — primarily for source/sink offsets. |
+</Cheatsheet>
+
+Without durable state, every restart starts from scratch — a
+14-day windowed aggregation becomes "the last few seconds of
+events" until the windows fill again. The point of checkpointing
+is to make state survive failures and code redeploys.
+
+## State backends
+
+Flink supports two state backends in modern releases:
+
+- **HashMapStateBackend** — keyed state lives on the JVM heap.
+  Fast (everything is a Java object reference); bounded by
+  heap size; checkpoints serialize the heap to durable storage
+  on every checkpoint.
+- **EmbeddedRocksDBStateBackend** — each task runs its own
+  embedded RocksDB on local disk. State can be far larger than
+  heap. Reads pay a disk hop; writes are LSM-fast (cross-reference
+  `btree-vs-lsm-storage-engines.mdx`). Checkpoints are
+  **incremental** — only the new and changed SST files are
+  uploaded since the previous checkpoint.
+
+The incremental property is the practical reason RocksDB wins
+for large state. A 1 TB state with a 1% per-checkpoint change
+rate uploads ~10 GB per checkpoint to S3, not 1 TB. Without
+incremental snapshots, checkpoint cost grows with total state
+size and you can't keep checkpoint intervals short.
+
+(The third historical backend, `FsStateBackend`, was deprecated
+and merged into `HashMapStateBackend` in Flink 1.13.)
+
+## Asynchronous snapshots: Chandy-Lamport adapted
+
+Flink's checkpointing is the **Asynchronous Barrier Snapshotting
+(ABS)** algorithm from Carbone et al. (2015), which adapts
+Chandy-Lamport's 1985 distributed snapshot protocol to dataflows.
+
+The core idea: snapshots are taken by sending **barriers** down
+the data stream. Each operator, on seeing barriers on all of
+its inputs, snapshots its local state and forwards the barriers
+downstream. No global pause; no centralized coordination of
+data flow during the snapshot.
+
+A barrier is just a special record with a checkpoint ID:
+
+```
+... e7 e8 [barrier N] e9 e10 ...
+```
+
+Events before the barrier belong to checkpoint N; events after
+the barrier belong to checkpoint N+1. Each operator handles them
+on either side of the snapshot boundary.
+
+## A checkpoint, end to end
+
+<Steps>
+<Step n={1} title="JobManager triggers checkpoint N">
+The JobManager (the cluster coordinator) periodically — say every
+60 seconds — sends a "trigger checkpoint N" RPC to all source
+tasks. Sources stop the world for one record's worth of time,
+snapshot their offsets (Kafka offsets, file positions), then
+inject barrier N into every outgoing channel.
+</Step>
+<Step n={2} title="Barriers propagate downstream">
+Each non-source operator has one or more input channels. When
+the first barrier N arrives on some channel, the operator starts
+**barrier alignment** — it pauses reading from that channel and
+keeps reading from the others. Once barrier N has arrived on
+every input channel, the operator is ready to snapshot.
+</Step>
+<Step n={3} title="Operator snapshots local state">
+The operator takes a snapshot of its keyed state and operator
+state. With the RocksDB backend, this is "create a RocksDB
+checkpoint" (cheap — just hardlinks SST files) followed by an
+**asynchronous** upload of changed SST files to durable storage.
+Processing resumes immediately; the upload happens in parallel
+with new records flowing through.
+</Step>
+<Step n={4} title="Operator forwards the barrier">
+The operator emits barrier N into every outgoing channel and
+goes back to processing. Downstream operators repeat steps 2–4.
+</Step>
+<Step n={5} title="Sinks see the barrier and pre-commit">
+When a transactional sink sees barrier N, it **pre-commits** —
+flushes data to its sink target (Kafka, JDBC) inside an open
+transaction but doesn't commit yet.
+</Step>
+<Step n={6} title="JobManager declares checkpoint N complete">
+Once every operator has acked snapshot N to the JobManager,
+checkpoint N is marked durable. The JobManager broadcasts a
+**checkpoint-complete notification**.
+</Step>
+<Step n={7} title="Sinks commit on notification">
+Sinks receive the notification and commit their pre-committed
+transactions. The records produced under checkpoint N are now
+externally visible.
+</Step>
+</Steps>
+
+The work that happens **asynchronously** with steady-state
+processing is the snapshot upload. The work that happens
+**synchronously** is the barrier alignment and the act of
+forking a local snapshot — both cheap with the RocksDB backend.
+
+## Exactly-once via two-phase commit sinks
+
+The two-phase commit pattern in step 5/7 is what makes
+end-to-end exactly-once work. The `TwoPhaseCommitSinkFunction`
+abstract class formalizes it; concrete implementations include:
+
+- **KafkaSink** (`EXACTLY_ONCE` mode) — uses Kafka transactions
+  (cross-reference `kafka-internals.mdx`). Pre-commit opens a
+  Kafka transaction; checkpoint-complete commits it. Consumers
+  must use `read_committed` to see the records.
+- **JdbcSink (XA)** — uses XA transactions on the database.
+  Pre-commit prepares; checkpoint-complete commits.
+- **File sinks** — write to a temp directory; rename on
+  checkpoint-complete. Atomic on POSIX filesystems and S3 (with
+  caveats around S3 multipart uploads).
+
+On failure between pre-commit and commit, recovery aborts the
+pre-committed transaction and replays from the previous
+checkpoint. No duplicates emitted; no records lost.
+
+(See also `exactly-once-stream-processing.mdx` for the same
+pattern at the conceptual level, and `snapshots-and-checkpoints.mdx`
+for the storage-side primitives.)
+
+## Recovery
+
+When a task fails, the JobManager:
+
+1. Picks the most recent **complete** checkpoint (call it N).
+2. Cancels the entire job (Flink's default strategy; regional
+   restart is available since 1.9 for restarting only the
+   affected pipeline region).
+3. Restores every operator's state from snapshot N.
+4. Restores source offsets to the values snapshotted at N.
+5. Aborts any in-flight pre-committed sink transactions from
+   checkpoints later than N.
+6. Resumes processing.
+
+Sources replay from the snapshotted offsets. The replayed
+records produce identical state changes (assuming deterministic
+operators) and identical sink writes. The sinks emit those
+writes inside a fresh transaction that commits only on the
+next checkpoint-complete notification.
+
+The exactly-once guarantee holds because (a) keyed state is
+restored from the snapshot, (b) source offsets are part of the
+snapshot, (c) sink transactions never commit work past the
+snapshot boundary.
+
+## Savepoints
+
+A **savepoint** is a checkpoint with three differences:
+
+- **Explicit**: triggered by a human or CI/CD step via
+  `flink savepoint` or `flink stop -p`.
+- **Forward-compatible**: written in a stable format with
+  operator IDs, so you can restore into a modified job graph
+  (new operators, scaled parallelism, swapped state schema).
+- **Never garbage-collected**: checkpoints are dropped after
+  their checkpoint slot rolls over; savepoints stay until you
+  delete them.
+
+Savepoints are the migration tool. Code change? Take a savepoint,
+deploy the new version, restore from the savepoint. Scaling
+from parallelism 32 to 64? Same. A/B comparison between two
+versions? Run both from the same savepoint.
+
+## Operational gotchas
+
+### Checkpoint interval tuning
+
+The interval is a tradeoff between rework on failure (longer
+interval = more replayed work) and steady-state load (shorter
+interval = more snapshot upload pressure). 60 s is a common
+default; 10 s is achievable with incremental RocksDB and a
+fast object store; 1 s is rare and usually a bad idea.
+
+If checkpoints take longer than the interval, you get
+**checkpoint storms** — back-to-back checkpoints with no idle
+time between them. Watch `lastCheckpointDuration` versus the
+configured interval; the ratio should be well under 1.
+
+### Barrier alignment can stall the job
+
+If one input channel lags badly behind others — a slow upstream
+task, a sluggish Kafka partition — the downstream operator has
+barrier N on three of its four inputs and is waiting for the
+fourth. Records on the aligned channels pile up in network
+buffers.
+
+**Unaligned checkpoints** (Flink 1.11+) solve this by letting
+the operator snapshot in-flight buffered records as part of the
+snapshot instead of waiting for alignment. The tradeoff: snapshot
+size grows (you're storing in-flight records too), and recovery
+is more expensive. Enable when alignment time is your bottleneck;
+don't enable proactively.
+
+### RocksDB tuning is its own subject
+
+Write buffer size, block cache size, compaction style (level vs
+universal), bloom filters — RocksDB exposes the same knobs as
+any LSM-tree engine, and they matter for streaming workloads
+that are write-heavy. Defaults are sensible up to mid-sized
+state (a few hundred GB per task); larger jobs need tuning.
+
+### Restoring a savepoint with schema changes
+
+Adding fields to state types is fine if you've registered a
+schema-evolution-aware serializer (Avro, POJO with Flink's POJO
+serializer, custom logic). Reordering fields or changing types
+silently corrupts state. Test savepoint migration in a staging
+job before promoting.
+
+### Snapshot upload bandwidth
+
+S3 upload of an incremental RocksDB checkpoint runs at whatever
+your S3 multipart throughput is — typically 100–500 MB/s per
+task. If your state grows quickly, upload time becomes the
+bottleneck for checkpoint duration, not the snapshot itself.
+Use a local fast object store (MinIO, GCS regional) or scale
+out parallelism so each task uploads less.
+
+### "Exactly-once" requires cooperating sinks
+
+The Flink job alone gives you exactly-once **inside Flink**.
+End-to-end exactly-once requires the sink to be transactional
+and to participate in the two-phase commit protocol. Writing to
+a non-transactional REST endpoint? At best you get idempotent
+delivery (cross-reference `idempotency-keys.mdx`); never
+exactly-once.
+
+## Cross-references
+
+- `snapshots-and-checkpoints.mdx` — the storage-layer primitives.
+- `exactly-once-stream-processing.mdx` — the conceptual pattern
+  across engines.
+- `watermarks.mdx` — how Flink knows a window is "done."
+- `event-time-vs-processing-time.mdx` — the time semantics
+  watermarks operate on.
+- `kafka-internals.mdx` — the transactional producer the
+  KafkaSink uses for end-to-end exactly-once.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Lightweight Asynchronous Snapshots for Distributed Dataflows"
+  authors="Carbone, Fóra, Ewen, Haridi, Tzoumas"
+  year="2015"
+  source="arXiv"
+  url="https://arxiv.org/abs/1506.08603"
+>
+The paper that defined Flink's checkpointing algorithm.
+Chandy-Lamport adapted for dataflows: barriers in the stream,
+alignment at operators, asynchronous snapshot upload. Short and
+readable — the algorithm is the page.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="A Deep-Dive into Flink's Network Stack"
+  authors="Nico Kruber, Piotr Nowojski"
+  year="2019"
+  source="Apache Flink blog"
+  url="https://flink.apache.org/2019/06/05/a-deep-dive-into-flinks-network-stack/"
+>
+Useful counterpart to the snapshot algorithm — the network
+stack is what backpressure and barrier alignment actually happen
+in. Explains why "unaligned checkpoints" is a network-level
+change, not just a logical-protocol change.
+</Reference>
+
+## In summary
+
+- Flink keeps **per-task local state** in either the heap
+  (`HashMapStateBackend`) or embedded RocksDB
+  (`EmbeddedRocksDBStateBackend`), with incremental SST upload
+  for large state.
+- Checkpoints use **Asynchronous Barrier Snapshotting** (Carbone
+  et al. 2015): barriers flow through the dataflow, each
+  operator aligns and snapshots locally, upload happens
+  asynchronously.
+- **Two-phase commit sinks** (KafkaSink EXACTLY_ONCE,
+  JdbcSink XA, file sinks) pre-commit on barrier and commit on
+  checkpoint-complete — this is what gives Flink end-to-end
+  exactly-once with cooperating systems.
+- **Savepoints** are explicit, format-stable checkpoints used
+  for upgrades, scaling, and migration.
+- The operational hazards are checkpoint storms (interval too
+  short), barrier-alignment stalls (mitigated by unaligned
+  checkpoints since 1.11), RocksDB tuning, and S3 upload
+  bandwidth.
+- The patterns generalize: every modern stateful streaming
+  engine (Kafka Streams, Spark Structured Streaming,
+  Materialize) uses some variant of "local state + periodic
+  global snapshot + replay-driven recovery."

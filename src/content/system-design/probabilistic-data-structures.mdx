@@ -1,0 +1,150 @@
+export const level = 'mid';
+
+# Probabilistic data structures
+
+A small family of data structures that trade an exact answer
+for orders-of-magnitude less memory, plus a small and
+controllable error budget. Instead of storing every element,
+they store a compact sketch — a few KB to a few MB — and
+answer queries from the sketch.
+
+The headline property for distributed systems isn't the
+compactness on its own; it's that the sketches are
+**mergeable**. Each node computes its own sketch from its
+slice of the data, ships the sketch to a central aggregator,
+and the merge of all the sketches behaves as if you had run
+the algorithm over the union of all the data. Exact counters
+cannot do this without shipping every event.
+
+This page is a short index. Each row has its own page that
+goes into how it works and where it falls over.
+
+## The four sketches
+
+<Cheatsheet>
+| Structure | Question it answers | Memory | Error type |
+|---|---|---|---|
+| Bloom filter | "Have I seen X?" | ~10 bits/element for 1% false positive | Asymmetric — false positives only, never false negatives |
+| HyperLogLog | "How many unique items?" | O(log log N), ~12 KB for billions | Symmetric — ±1% standard error |
+| Count-Min Sketch | "How many times has X appeared?" | O((1/ε) × log(1/δ)) | One-sided — overestimates only |
+| t-digest | "What's the p99?" | O(δ⁻¹), ~100 clusters for 0.1% accuracy | Concentrated at the extremes (tight near p0, p99, p999) |
+</Cheatsheet>
+
+The error column is the part to internalize. The structures
+don't just lose accuracy — they lose it in **specific, known
+directions**. A Bloom filter will never tell you a key is
+absent when it isn't. A Count-Min Sketch will never
+under-report a count. Knowing which direction the error goes
+is how you decide whether a sketch is safe for your use case.
+
+## When to reach for a sketch instead of an exact structure
+
+<Steps>
+<Step n={1} title="Streaming data.">
+Exact answers require state proportional to the input. Over
+an unbounded stream, that's unbounded memory. Sketches give
+you a fixed memory footprint regardless of stream length.
+</Step>
+<Step n={2} title="Aggregates that don't need to be exact.">
+Telemetry, dashboards, anomaly detection, fraud signals,
+"trending now," rough user counts. A 1% error is invisible to
+the consumer; the 100× memory saving is not.
+</Step>
+<Step n={3} title="Sketching at the edge.">
+Each node, region, or shard computes its own sketch and ships
+it to a central aggregator. Mergeable sketches make this
+trivial — the central rollup is just merge-then-query. This
+is the killer pattern for distributed analytics.
+</Step>
+</Steps>
+
+If you need an exact answer (billing, accounting,
+compliance), do not use a sketch. The error budget is real,
+not a rounding artifact.
+
+## One use case each
+
+- **Bloom filter** — web crawler dedup. Before fetching a
+  URL, ask the Bloom filter if it's been seen. False
+  positives mean you occasionally skip a fresh URL; false
+  negatives are impossible, so you never re-fetch. See
+  `bloom-filter`.
+- **HyperLogLog** — daily active users. Each app server
+  emits a per-day HLL keyed by user ID; the analytics
+  pipeline merges them. 12 KB per day per cohort estimates
+  DAU to within 1%. See `hyperloglog`.
+- **Count-Min Sketch** — trending searches. Increment
+  `cms[query]` on every search event; the top-K heavy
+  hitters are the trending list. Memory is independent of
+  the number of distinct queries. See `count-min-sketch`.
+- **t-digest** — latency SLO monitoring. Each service
+  instance maintains a t-digest of request latencies; the
+  metrics pipeline merges them per region per minute. The p99
+  is read off the merged digest, not recomputed from raw
+  samples. See `t-digest-and-streaming-percentiles`.
+
+## What's not on this list
+
+**Merkle trees** are sometimes lumped in with "probabilistic
+data structures" because they share an
+information-compression vibe, but they're deterministic — a
+Merkle root is an exact fingerprint of the underlying data,
+not an estimate. They live next to this family conceptually
+but answer a different question ("did this dataset change?"
+rather than "roughly how many?"). See `merkle-trees`.
+
+**Cuckoo filters** and **quotient filters** are
+Bloom-filter-shaped alternatives with the same false-positive
+profile but support for deletion. Production usage is much
+smaller; reach for them only when deletion is required.
+
+## The mergeable property in practice
+
+The single sentence that explains why these four show up
+together in every modern analytics stack:
+
+> Compute the sketch locally; merge centrally; answer
+> queries from the merged sketch.
+
+This pattern works for HLL (union of two HLLs is the HLL of
+the union), Bloom filters (bitwise OR), Count-Min sketches
+(element-wise sum), and t-digests (cluster-merge with
+re-compression). No raw events need to leave the edge. The
+network bill drops by orders of magnitude.
+
+<Callout variant="info">
+Production stacks that lean on this pattern: ClickHouse's
+`uniqCombined` / `quantileTDigest` aggregations, Druid's
+sketch column types, Redis modules for Bloom/HLL/Top-K, every
+modern observability vendor's percentile rollups.
+</Callout>
+
+## Further reading
+
+<Reference
+  kind="book"
+  title="Probabilistic Data Structures and Algorithms for Big Data Applications"
+  authors="Andrii Gakhov"
+  year="2019"
+  source="Books on Demand"
+  url="https://www.gakhov.com/books/pdsa.html"
+>
+A reasonably complete catalog of the sketches in production
+use, with explanations of the error analysis that
+peer-reviewed papers gloss over. Worth keeping nearby when
+you're sizing a sketch for a specific accuracy target.
+</Reference>
+
+## In summary
+
+- Probabilistic data structures swap exactness for a fixed,
+  small memory footprint and a known error direction.
+- Four show up everywhere: **Bloom** (membership),
+  **HyperLogLog** (cardinality), **Count-Min Sketch**
+  (frequency), **t-digest** (quantiles).
+- All four are **mergeable** — compute at the edge, roll up
+  at the center.
+- The error is one-sided or symmetric in known ways; pick a
+  sketch only when that direction is acceptable.
+- Do not use sketches for anything that has to balance to
+  the cent.

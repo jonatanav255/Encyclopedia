@@ -1,0 +1,427 @@
+export const level = 'senior';
+
+# Design Zoom / video conferencing
+
+A real-time video meeting service: dozens to thousands of
+participants share audio and video bidirectionally with
+sub-second perceived latency, gracefully degrade when the
+network gets bad, record to the cloud, transcribe, and bridge
+to phones and livestreams. The interesting parts: the server
+topology choice (SFU vs MCU vs P2P), how multiple resolutions
+get encoded and forwarded selectively, jitter buffers and
+echo cancellation at the client edge, and the operational
+complexity behind a single meeting button.
+
+Video conferencing is fundamentally different from request /
+response systems. **There is no request.** There are
+continuous bidirectional streams that degrade gracefully
+under packet loss rather than failing. Loss tolerance is
+designed in from the bottom of the stack. A 1% packet loss
+on an HTTP request is failure; on a video call it should be
+invisible.
+
+## Requirements
+
+Functional:
+
+- 1-1 calls and group meetings up to ~1000 active video
+  participants (~10000 in webinar/listen-only mode).
+- Bidirectional audio and video, screen-share, chat, reactions.
+- Cloud recording with transcript generation.
+- Breakout rooms, waiting rooms, host controls.
+- Dial-in via PSTN; livestream-out to YouTube/Facebook.
+- E2E encryption available as opt-in (the keys aren't held
+  by the server in that mode).
+
+Non-functional:
+
+- One-way audio mouth-to-ear latency under 150ms p95 (above
+  that, conversation gets "two-way radio" awkward).
+- Video latency budget is more generous (~300ms).
+- Audio packet loss survivable up to ~30% before quality is
+  unacceptable.
+- Adapt to bandwidth changes within ~1 second.
+- 99.99% availability on the meeting join path.
+
+## Capacity estimate
+
+```
+Peak DAU                 = 300M meeting participants
+Concurrent meetings      = ~2M peak hour
+Concurrent participants  = ~30M peak
+Audio bandwidth          = ~32 kbps per participant
+Video bandwidth          = ~600 kbps SD, ~1.5 Mbps HD,
+                           ~3-5 Mbps when sender is in active speaker view
+
+Per-meeting bandwidth:
+  4-person HD call       = each sends 1.5 Mbps up, receives 3 × 1.5 Mbps = 4.5 Mbps down
+  100-person all-video   = each sends 1 stream up, but SFU forwards
+                           only the visible thumbnails to each receiver
+
+Aggregate egress         = 30M × ~1 Mbps avg = ~30 Tbps
+                           (similar order to Netflix on a peak evening)
+
+Recording storage        = ~1 GB/hr × X recorded hours/day
+```
+
+The bandwidth and CPU profiles drive every architectural
+choice. Audio and video tolerate loss but not latency. The
+inverse of HTTP.
+
+## High-level architecture
+
+```
+                       [ client app ]
+                            │
+              ┌─── signaling (HTTPS/WSS) ──→ [ meeting service ]
+              │                                     │
+              │                                     ↓
+              │                              [ meeting state DB ]
+              │
+              └─── media (UDP/SRTP) ────→ [ SFU (Selective Forwarding Unit) ]
+                                                  │
+                                                  ├──→ other participants (UDP)
+                                                  │
+                                                  ├──→ [ recording composer ]
+                                                  │           ↓
+                                                  │     [ object store + transcript ]
+                                                  │
+                                                  └──→ [ PSTN bridge ]   [ livestream pkger ]
+
+                       [ TURN / STUN ] ──── NAT traversal
+                       [ Anycast / GeoDNS ] ── routes client to nearest SFU
+```
+
+Signaling is small — it's the meeting state, the participant
+list, ICE candidates. Media is the bulk traffic, on UDP, not
+through the same path. Clients connect to the **nearest** SFU
+to keep RTT low (see `geo-dns-and-anycast.mdx`).
+
+## Why video is different
+
+HTTP says: "send a request, retry on failure." Video says:
+"send a stream of packets at the wire speed of human time, drop
+what doesn't make it." The protocols below the codec are built
+for that.
+
+- **UDP, not TCP.** TCP's head-of-line blocking is fatal: a
+  single lost packet stalls the stream until retransmission,
+  which arrives too late to be useful. UDP plus app-level loss
+  concealment is the only viable shape.
+- **SRTP** (Secure Real-time Transport Protocol) carries the
+  encrypted media.
+- **DTLS** sets up the SRTP keys via WebRTC's handshake.
+- **ICE** finds a working path between peers (direct, via
+  TURN relay, via SFU).
+
+Losing a packet isn't an error; it's a hint to the codec to
+conceal the gap, and a signal to the bandwidth estimator to
+ease off.
+
+## SFU vs MCU vs P2P
+
+Three topology choices, with very different trade-offs.
+
+<Compare a="MCU" b="SFU">
+<>
+**Multipoint Control Unit**: the server receives every
+participant's stream, decodes them all, composes them into a
+single output frame, re-encodes, and sends one stream to each
+participant.
+
+**Pros**: clients receive exactly one stream — light on client
+CPU and bandwidth. Works on weak devices.
+
+**Cons**: server-side transcoding is extremely expensive at
+scale. Quality is fixed by the server. Adding a participant
+roughly linearly grows server CPU. Cannot adapt per-receiver
+without per-receiver re-encode.
+</>
+<>
+**Selective Forwarding Unit**: the server receives every
+participant's stream and forwards them as-is to each other
+participant, without decoding. Each client decodes N-1
+streams.
+
+**Pros**: server CPU is mostly I/O, not transcoding. Server
+scales much further. Per-receiver adaptation is just "which
+layer to forward" — no re-encode.
+
+**Cons**: each client decodes more streams, uses more
+downlink bandwidth. Bad for very weak devices in very large
+meetings.
+</>
+</Compare>
+
+And the third option, P2P:
+
+- **P2P** is WebRTC default for 1-1 calls. Direct UDP between
+  the two peers. No server media cost. But it doesn't scale
+  past ~3 participants because each peer uploads N-1 copies of
+  their stream, which murders uplink bandwidth.
+
+The modern industry default — Zoom, Google Meet, Twilio,
+Daily.co, Jitsi — is **SFU**. Server CPU stays linear in
+participants instead of quadratic. Per-receiver adaptation
+(see Simulcast below) makes the bandwidth cost on the client
+side manageable.
+
+## Simulcast and SVC
+
+A single sender uploads multiple resolutions; the SFU chooses
+which to forward to each receiver.
+
+```
+sender encodes 3 streams simultaneously:
+  low:   240p, 150 kbps
+  mid:   480p, 500 kbps
+  high:  720p, 1.5 Mbps
+
+SFU forwards to each receiver based on:
+  - the receiver's view (active speaker = high, thumbnail = low)
+  - the receiver's measured downlink bandwidth
+  - the receiver's CPU capacity
+```
+
+This is **simulcast** — three independent streams. The
+alternative is **SVC (Scalable Video Coding)**: a single
+hierarchically-encoded stream where the server can drop higher
+layers to produce a lower-resolution version without
+re-encoding. SVC is bandwidth-cheaper on the sender side but
+needs codec support (VP9, AV1 do; H.264 has limited SVC).
+
+Zoom uses a proprietary mix of techniques; Google Meet leans
+heavily on VP9 SVC. The trade-off is: SVC saves uplink
+bandwidth but is more complex to implement and locks you to
+SVC-capable codecs.
+
+## The jitter buffer
+
+Networks deliver packets at uneven intervals. Even a perfect
+network has jitter — packet 3 might arrive after packet 5.
+The client maintains a **jitter buffer**:
+
+- Incoming packets land in the buffer, ordered by sequence
+  number.
+- The decoder pulls from the buffer at a steady wall-clock
+  rate.
+- Buffer depth (~50-150ms) lets late packets catch up before
+  the decoder needs them.
+- If a packet doesn't arrive in time, the decoder uses **loss
+  concealment** — extrapolate from the previous frame, or for
+  audio, blend silence in.
+
+Deeper buffer = more resilience to jitter, but worse latency.
+The classic trade-off. Modern systems adapt buffer depth
+continuously based on observed jitter, growing it when the
+network is bad, shrinking it when it's good.
+
+## Codec choice
+
+A codec maps pixels into compressed bytes. The options:
+
+<Cheatsheet>
+| Codec | Strengths | Weaknesses | Where used |
+|---|---|---|---|
+| H.264 | Ubiquitous hardware decode | Limited SVC support; older | Most fallback paths |
+| VP9 | Good SVC support; royalty-free | Less hardware acceleration | Google Meet primary |
+| AV1 | Best compression; royalty-free | Encoder is CPU-heavy; newer | Increasing rollout |
+| Opus | Best audio at low bitrate | n/a | Default for WebRTC audio |
+</Cheatsheet>
+
+Real-world meetings negotiate the best codec all participants
+support. Hardware encode/decode availability matters a lot on
+mobile — software AV1 encoding on a phone melts the battery.
+
+## Audio is harder than video
+
+Counter-intuitive but real: audio has a tighter latency budget
+than video, and people notice audio glitches more.
+
+- Mouth-to-ear latency above ~150ms produces visible
+  awkwardness in conversation.
+- A single dropped audio frame is heard as a click; a single
+  dropped video frame is invisible.
+- Echo cancellation at the client edge is non-trivial — the
+  speaker output bleeds into the mic and must be subtracted
+  in real time using adaptive filters.
+- Automatic gain control (AGC) and noise suppression run on
+  the client before encoding.
+
+When a network degrades, the system prioritizes audio: drop
+video before audio, drop HD video before SD, drop screen-share
+quality before active-speaker video.
+
+## Edge architecture and routing
+
+Latency comes from the speed of light, so the SFU must be
+close to the participants.
+
+- **Anycast / GeoDNS** routes the client to the nearest
+  signaling endpoint and SFU (see `geo-dns-and-anycast.mdx`).
+- For mixed meetings (US + EU + APAC participants), the
+  meeting is **anchored** in one SFU or distributed across
+  regional SFUs that relay between each other. Inter-region
+  RTT adds to perceived latency but is unavoidable.
+- **TURN servers** relay traffic when direct UDP is blocked
+  by NAT or firewall; ~10% of corporate meetings end up
+  needing them.
+
+The meeting service tracks per-participant network quality
+and can re-anchor active speakers to a closer SFU if needed.
+
+## Recording and transcription
+
+Cloud recording is **server-side composition**. The SFU has
+all the streams; a recording worker subscribes to them, mixes
+audio, lays out video (active-speaker view or gallery view),
+and writes a single MP4 to object storage. This is
+essentially MCU functionality kicked in for one consumer (the
+recorder).
+
+```
+SFU ─── all participant streams ──→ [ Recording composer ]
+                                            │
+                                            ├── audio mixer
+                                            ├── video compositor
+                                            └── timeline serializer
+                                                    ↓
+                                          [ object store ]
+                                                    ↓
+                              [ async transcription pipeline ]
+                                    speech → text → diarization
+                                                    ↓
+                                          stored alongside recording
+```
+
+Transcription is asynchronous. The audio track is fed to a
+speech-to-text model that returns timestamped words; a
+diarization pass attributes words to speakers based on voice
+signatures captured during the meeting.
+
+## Reliability and graceful degradation
+
+The system never fails; it degrades. A clear precedence:
+
+<Steps>
+<Step n={1} title="Drop highest video layer">
+Stop forwarding HD streams; keep SD. Receiver still sees
+everyone, lower resolution.
+</Step>
+<Step n={2} title="Drop video for thumbnail participants">
+Forward video only to the active speaker; thumbnails get a
+single keyframe every few seconds (effectively a slideshow).
+</Step>
+<Step n={3} title="Drop video entirely">
+Audio-only mode. Conversation continues.
+</Step>
+<Step n={4} title="Switch audio to lowest bitrate">
+Drop from ~32 kbps to ~6 kbps. Robotic but intelligible.
+</Step>
+</Steps>
+
+The order is rigid: audio survives last. Reconnect logic is
+robust: a temporary network loss should not kick the user
+out of the meeting — the client keeps the session id and
+re-handshakes.
+
+## Bridging out: PSTN and livestream
+
+Phone dial-in is a separate subsystem: the PSTN gateway
+takes a phone call, encodes the audio with Opus, and joins
+it to the meeting as a participant with no video. The
+gateway is the most operationally complex external bridge
+because phone networks have their own latency, codec, and
+DTMF semantics.
+
+Livestream-out (YouTube, RTMP) is the inverse: the
+recording composer's output is also pushed as an RTMP
+stream to the external service. Same compositor, different
+output destination.
+
+## Tradeoffs
+
+- **SFU** over MCU: server-CPU savings dominate at scale;
+  client decodes more streams in exchange. Acceptable on
+  modern devices for typical meetings.
+- **UDP + custom loss concealment** over TCP: latency wins;
+  retransmissions get dropped when they can't help.
+- **Simulcast (multiple streams)** over SVC (single layered
+  stream): simpler, broadly codec-compatible; pays in sender
+  uplink bandwidth.
+- **Cloud recording** over per-client recording: consistent
+  output; centralized retention and compliance; costs
+  compositor CPU.
+- **Audio priority** over video at all stages: aligns with
+  user perception; video can drop invisibly, audio cannot.
+- **Per-region SFUs** over global anchored SFU: lower RTT for
+  participants; pays cross-region relay latency when the
+  meeting spans regions.
+
+## Common mistakes
+
+- Designing on top of TCP. WebSocket-relayed video looks
+  fine in demos and falls apart on a real network.
+- Treating audio and video as symmetric. They are not.
+  Audio's latency budget is half, and the human ear is
+  unforgiving.
+- Forgetting NAT and firewalls. Without TURN servers, 10%
+  of corporate meetings can't connect.
+- Building MCU because it "looks simpler." It is — until
+  the meeting hits 50 people and your server transcoding
+  CPU explodes.
+- Ignoring graceful degradation. A 1% packet-loss day will
+  eject everyone instead of just dropping HD video.
+- Putting recording inline with the meeting. Recording
+  must be async; if the recording composer falls behind,
+  the meeting must not.
+
+## Further reading
+
+<Reference
+  kind="blog"
+  title="WebRTC: protocols and architecture"
+  authors="MDN contributors"
+  year="2024"
+  source="MDN Web Docs"
+  url="https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Protocols"
+>
+A concise introduction to the WebRTC protocol stack — ICE,
+STUN, TURN, SDP, DTLS, SRTP — that every video system
+inherits. Good grounding before diving into SFU-specific
+designs.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="How Jitsi handles 1000-person calls"
+  authors="Jitsi team"
+  year="2020"
+  source="Jitsi.org"
+  url="https://jitsi.org/blog/scalable-video-conferencing-with-jitsi/"
+>
+An open-source SFU's own engineering notes on simulcast,
+last-N forwarding, and the bandwidth-CPU trade-offs that the
+Zoom and Meet teams have to make in private. The shape of
+the system carries over almost exactly.
+</Reference>
+
+## In summary
+
+- Real-time video is UDP all the way down; TCP's HOL
+  blocking is fatal at this latency budget.
+- SFU has won the topology question — MCU's transcoding
+  cost doesn't scale, P2P doesn't past 3 participants.
+- Simulcast lets each receiver get a layer matched to its
+  bandwidth and view. SVC is a more elegant alternative,
+  bound to capable codecs.
+- The jitter buffer trades latency for resilience to
+  network unevenness; adaptive depth follows network
+  conditions.
+- Audio's latency budget is tighter than video's, and audio
+  is the last to drop when networks degrade.
+- Recording is server-side composition (MCU-style for one
+  consumer); transcription runs async on the audio track.
+- Geographic placement of SFUs and TURN relays matters
+  because RTT is set by the speed of light — there are no
+  algorithmic shortcuts for a 200ms transcontinental hop.

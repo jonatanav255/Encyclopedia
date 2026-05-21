@@ -1,0 +1,346 @@
+export const level = 'senior';
+
+# Envoy and the xDS protocol
+
+Envoy is the data-plane proxy that powers most of the modern
+networking layer: Istio, Consul Connect, AWS App Mesh, Gloo,
+Contour, Emissary-ingress, and a long tail of API gateways and
+edge proxies. If you've adopted a service mesh in the last
+decade, you've almost certainly adopted Envoy underneath, even
+when the brand on the box says something else.
+
+Knowing what Envoy is — and how its control plane configures it
+via xDS — is what lets you reason about retries, timeouts,
+circuit breakers, mTLS, and ext_authz uniformly. The vocabulary
+travels across every product that wraps Envoy.
+
+(Note: Linkerd has never used Envoy. Linkerd 1.x was built on
+Scala/Finagle on the JVM; Linkerd 2's data plane is
+`linkerd-proxy`, written in Rust, with a narrower feature
+surface and lower per-pod overhead. Worth knowing the lineage —
+"service mesh" and "uses Envoy" aren't synonyms.)
+
+## What Envoy is
+
+A high-performance C++ L4/L7 proxy. Originally built at Lyft in
+2016 by Matt Klein; donated to the CNCF in 2017; graduated in
+2018. Used in three distinct deployment shapes:
+
+- **Edge proxy** — fronts a cluster, terminates TLS, routes by
+  hostname. Lyft, Pinterest, and others run Envoy as their
+  primary edge load balancer.
+- **Service-mesh sidecar** — one Envoy per pod, intercepting
+  inbound and outbound traffic for that application. Istio's
+  data plane.
+- **API gateway** — Gloo, Emissary, Contour, and Solo's products
+  are all Envoy with a particular control plane and management UI
+  on top.
+
+The single executable plays all three roles. The configuration
+changes; the binary does not.
+
+## The data-plane model
+
+Every connection that flows through Envoy passes through a chain
+of four primitives:
+
+<Cheatsheet>
+| Primitive | Job |
+|---|---|
+| Listener | Binds an address and port; decides which filter chain to apply based on protocol/SNI/peer identity. |
+| Filter chain | An ordered list of filters that operate on the connection (network filters) or on HTTP messages (HTTP filters). |
+| Cluster | A logical pool of upstream endpoints, with a load-balancing policy, health-check policy, and circuit-breaker thresholds. |
+| Endpoint | An actual `ip:port` of an upstream instance, discovered statically or via EDS. |
+</Cheatsheet>
+
+In one sentence: a **listener** accepts the connection, a
+**filter chain** transforms it, a **cluster** chooses where to
+send it, and an **endpoint** is the destination.
+
+## The xDS protocol family
+
+Envoy can be configured statically from a YAML or JSON file, but
+the interesting deployment is **dynamic** — Envoy holds open a
+gRPC stream to a **control plane** and receives configuration
+updates over it. The protocol family is xDS:
+
+<Cheatsheet>
+| API | Resource | What it pushes |
+|---|---|---|
+| LDS | Listener | Listener definitions (port, filter chains). |
+| RDS | Route | Route tables (host/path → cluster). |
+| CDS | Cluster | Cluster definitions (LB policy, health checks). |
+| EDS | Endpoint | Endpoint membership per cluster. |
+| SDS | Secret | TLS certificates and keys (rotated independently). |
+| ADS | Aggregated | Ordered updates across all of the above on a single stream. |
+</Cheatsheet>
+
+Each is a long-lived gRPC stream. The control plane sends a
+`DiscoveryResponse` with the current set of resources; Envoy
+replies with an ACK (or a NACK plus a reason).
+
+**ADS** matters because the order of updates matters. If RDS
+says "route to cluster X" but CDS hasn't yet defined cluster X,
+the listener is broken until the next CDS push. ADS serializes
+the updates onto one stream so dependencies arrive in order.
+
+xDS is a **generic spec**, not Istio-specific. Consul, Open
+Service Mesh, Gloo, AWS App Mesh, Kuma, and a dozen homegrown
+control planes all speak xDS to Envoy. The control plane writes
+xDS responses; Envoy doesn't care who's on the other end.
+
+## Filter chains in detail
+
+The filter chain is where Envoy does its actual work. Two layers:
+
+**Network filters** operate on raw TCP byte streams. Examples:
+
+- `envoy.filters.network.tcp_proxy` — plain L4 proxy.
+- `envoy.filters.network.http_connection_manager` — parses HTTP
+  and exposes the HTTP filter chain.
+- `envoy.filters.network.mysql_proxy` — speaks the MySQL wire
+  protocol for metrics and basic ACLs.
+- `envoy.filters.network.redis_proxy` — Redis-aware routing and
+  hash-based partitioning.
+
+**HTTP filters** sit inside `http_connection_manager` and operate
+on parsed HTTP requests and responses:
+
+- `envoy.filters.http.router` — the routing filter; must be last.
+- `envoy.filters.http.ext_authz` — call an external authz
+  service (OPA, custom).
+- `envoy.filters.http.jwt_authn` — validate JWTs.
+- `envoy.filters.http.ratelimit` — call out to a rate-limit
+  service (e.g., Envoy's `ratelimit` reference impl).
+- `envoy.filters.http.fault` — inject delays or HTTP errors for
+  chaos testing.
+- `envoy.filters.http.cors`, `compressor`, `decompressor`,
+  `header_to_metadata`, `wasm` (custom logic via WebAssembly).
+
+**Order matters.** Auth before routing. CORS before auth (CORS
+preflight must succeed without credentials). Compression after
+the router has chosen the response. A misordered chain is a real
+production bug class.
+
+## Life of a request
+
+<Steps>
+<Step n={1} title="Connection accepted on a listener">
+The kernel hands a TCP socket to the listener bound on, say,
+`0.0.0.0:8443`. Listener filters run first — `tls_inspector`
+peeks at the ClientHello to read SNI before TLS termination, so
+Envoy can pick the right filter chain (and the right
+certificate) based on hostname.
+</Step>
+<Step n={2} title="Transport socket terminates TLS">
+A `transport_socket` of type `tls` decrypts the bytes. The cert
+came from SDS (Secret Discovery), often rotated every 24h or
+sooner by the control plane.
+</Step>
+<Step n={3} title="HTTP connection manager parses">
+`http_connection_manager` reads the request line and headers,
+detects HTTP/1.1 vs HTTP/2 (vs HTTP/3 with QUIC if configured),
+and constructs an internal request object.
+</Step>
+<Step n={4} title="HTTP filters fire in order">
+ext_authz calls the authz service; jwt_authn validates a token;
+ratelimit checks the budget; fault injects an error if
+configured. Any filter can short-circuit the chain with a direct
+response.
+</Step>
+<Step n={5} title="Router picks a cluster">
+The `router` filter matches the request against the route table
+(from RDS) — by host, path prefix, header, regex — and selects
+a cluster. It also applies per-route timeouts, retries, and
+header rewrites.
+</Step>
+<Step n={6} title="Cluster picks an endpoint">
+The cluster's LB policy chooses one endpoint from the EDS-fed
+endpoint set: round-robin, least-request, ring-hash (consistent
+hashing), Maglev, or power-of-two-choices (p2c).
+(Cross-reference `load-balancing-algorithms.mdx`.)
+Outlier detection ejects endpoints that have produced too many
+5xxs; circuit breakers cap concurrent requests per endpoint.
+</Step>
+<Step n={7} title="Response flows back">
+The upstream response flows back through the same filter chain
+in reverse — response-side filters can rewrite headers,
+compress, or add metrics tags before the bytes hit the
+downstream socket.
+</Step>
+</Steps>
+
+That's the whole loop. Every Envoy-derived product — Istio,
+Consul, App Mesh, Gloo — is a particular set of filter-chain
+templates plus a particular control plane that drives xDS.
+
+## Why this matters for system design
+
+The hand-wavy version of "modern infrastructure" hides the fact
+that **the boundary between load balancer, API gateway, and
+service mesh has dissolved**. They're all the same primitive
+(Envoy) with different filter configurations and different
+control planes.
+
+Concretely, things you used to write in application code or in
+separate appliances now live in the same filter chain:
+
+- Retries, timeouts, circuit breakers
+- mTLS (both sides), cert rotation
+- Rate limiting and quotas
+- JWT validation, OIDC, ext_authz to a policy engine
+- Distributed tracing context propagation
+- Header transformation
+- Canary and traffic-mirroring rules
+- WAF-ish behaviors via Wasm filters
+
+This is the strongest argument for a mesh: **a polyglot fleet
+gets the same retry/timeout/mTLS behavior regardless of what
+language each service is written in**, because the behavior
+lives in the proxy, not the app.
+
+## Comparisons
+
+<Compare a="Envoy" b="NGINX">
+<>
+Dynamic config via xDS streams from a control plane. Native
+HTTP/2 and HTTP/3 throughout. First-class observability (RED
+metrics, OpenTelemetry tracing, access logs). Designed from day
+one for sidecar deployment. C++ — fast but large binary, heavier
+per-process footprint.
+</>
+<>
+File-based config (or NGINX Plus' API for some dynamic bits).
+Mature edge story going back two decades; the most-deployed web
+server on the public internet. Lower per-process memory, simpler
+operational model. HTTP/2 added later, HTTP/3 in recent
+versions. The default "we just need a reverse proxy" answer; not
+designed for thousand-instance dynamic sidecar fleets.
+</>
+</Compare>
+
+<Compare a="Envoy" b="linkerd-proxy">
+<>
+The kitchen sink. Feature-complete, used by Istio, AWS App
+Mesh, Consul, Gloo. Configuration surface is massive; Wasm
+extensions; every L7 protocol you've heard of. Per-sidecar
+memory commonly 100–200 MB; latency adds 1–5 ms p50.
+</>
+<>
+Rust, minimalist, opinionated. Linkerd 2's data plane.
+Per-sidecar memory commonly 10–30 MB; latency adds well under 1
+ms p50 on a warm path. Far fewer features — no WASM, no general
+filter chain — by design. "We did less so we could do it
+better" is the explicit Linkerd pitch.
+</>
+</Compare>
+
+## Operational caveats
+
+### Per-sidecar overhead is real at fleet scale
+
+A typical Envoy sidecar is ~50–200 MB of memory and noticeable
+CPU under load. Multiply by 10,000 pods and you're spending
+1–2 TB of cluster memory on proxies. Most of that is per-cluster
+endpoint metadata duplicated into every sidecar — every Envoy
+has every cluster's endpoints, even ones it never talks to.
+
+Mitigations: `Sidecar` CRDs in Istio (scope each sidecar's
+config to only what it needs), aggressive EDS filtering at the
+control plane, or moving away from sidecars entirely.
+
+### Latency adds up
+
+1–5 ms per hop sounds harmless until you realize a request might
+traverse 6 sidecars between edge and database. p99 latency
+attributed to Envoy across a chain can hit double-digit ms in
+practice.
+
+### Ambient mesh and node-level proxies
+
+The cost of one-sidecar-per-pod motivated several reactions:
+
+- **Istio Ambient mode** (beta-to-GA across 2023–2024) splits
+  the mesh into a per-node L4 proxy (`ztunnel`) for mTLS and a
+  per-namespace L7 proxy (a "waypoint"). Most pods don't get
+  their own Envoy.
+- **Cilium Service Mesh** uses eBPF in the kernel for L4 and
+  policy, with a per-node Envoy for L7 features when needed.
+- **Linkerd 2** keeps sidecars but makes them so small that the
+  overhead is closer to a sidecar logging agent than to Envoy.
+
+These are partial reactions to the same problem: per-pod Envoys
+at fleet scale are expensive.
+
+### Debug surface
+
+When traffic breaks, "is it the app, the sidecar, the route, the
+cluster, the endpoint, the control plane, the cert, the
+upstream's sidecar, or the upstream itself" is a real triage
+tree. `envoy admin` (the `:15000` admin port in Istio) exposes
+config dumps, stats, and live cluster state — learn to read it
+before adopting a mesh.
+
+(Cross-reference `service-mesh.mdx` for the broader operational
+tradeoff, and `sidecar-pattern.mdx` for the deployment shape.)
+
+## Further reading
+
+<Reference
+  kind="blog"
+  title="Life of a Request"
+  authors="Envoy Project"
+  year="2024"
+  source="Envoy docs"
+  url="https://www.envoyproxy.io/docs/envoy/latest/intro/life_of_a_request"
+>
+The canonical walkthrough of how a request flows through
+listeners, filter chains, and clusters. Pair with the
+`<Steps>` block on this page.
+</Reference>
+
+<Reference
+  kind="talk"
+  title="Service Mesh Data Plane vs Control Plane"
+  authors="Matt Klein"
+  year="2017"
+  source="Envoy blog"
+  url="https://blog.envoyproxy.io/service-mesh-data-plane-vs-control-plane-2774e720f7fc"
+>
+Matt Klein's original framing of what is and isn't a mesh and
+why Envoy is a data plane in search of control planes. Still the
+clearest mental model.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="xDS REST and gRPC protocol"
+  authors="Envoy Project"
+  year="2024"
+  source="Envoy API docs"
+  url="https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol"
+>
+The protocol spec for LDS/RDS/CDS/EDS/SDS and ADS. Reads as a
+gRPC streaming protocol with versioning, ACK/NACK, and incremental
+delta support. The reference for anyone writing a control plane.
+</Reference>
+
+## In summary
+
+- Envoy is a C++ L4/L7 proxy used as edge LB, mesh sidecar, and
+  API gateway — one binary, three deployment shapes.
+- The data plane is **listener → filter chain → cluster →
+  endpoint**, with filters as an ordered pipeline where order is
+  load-bearing.
+- **xDS** (LDS/RDS/CDS/EDS/SDS, aggregated as ADS) is a generic
+  gRPC streaming protocol that lets a control plane configure
+  Envoy fleets dynamically. Istio, Consul, App Mesh, and many
+  others all speak xDS.
+- The boundary between "load balancer" and "service mesh"
+  dissolves — retries, timeouts, mTLS, ext_authz, rate limiting,
+  and tracing live in the same filter chain.
+- Per-sidecar cost (50–200 MB memory, 1–5 ms latency) is the
+  honest tradeoff. **Ambient mesh**, node-level proxies, and
+  Linkerd's smaller proxy are reactions to that cost.
+- Linkerd 2 deliberately does not use Envoy; it has its own
+  smaller proxy. Don't assume "service mesh" implies Envoy.

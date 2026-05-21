@@ -1,0 +1,418 @@
+export const level = 'senior';
+
+# Design Instagram
+
+A photo-and-video sharing social network: users post images,
+follow other users, scroll a home feed, watch ephemeral stories,
+and discover new content via an algorithmic Explore page. The
+interesting parts: a photo upload pipeline that has to produce
+many derivative renditions, a feed that survives celebrities
+with 500M followers, a 24-hour story system whose entire shape
+is dictated by TTL, and a recommendation feed that looks nothing
+like the chronological one.
+
+Photo content is **write-once, read-many** at extreme ratios —
+a single upload may be served billions of times. That shape
+pushes almost every design decision toward object storage, CDN,
+and read-side caches.
+
+## Requirements
+
+Functional:
+
+- Upload photos and short videos with captions, tags, and
+  locations.
+- Follow / unfollow other users; profile pages with grids.
+- Home feed: chronological + ranked recent posts from people
+  you follow.
+- Stories: 24-hour ephemeral posts with view tracking.
+- Explore: algorithmically-ranked discovery of content from
+  users you don't follow.
+- Likes, comments, direct messages (DMs out of scope here).
+- Notifications: badge counts and push delivery.
+
+Non-functional:
+
+- ~3B MAU (Meta crossed this threshold in late 2025), ~700M DAU.
+- Upload p99 under 3s for a typical phone-sized photo.
+- Feed read p99 under 300ms.
+- Stories must reliably disappear at 24h; view counts are
+  best-effort.
+- 99.95% availability on the read path.
+- Multi-region active-active for reads; primary region for
+  writes.
+
+## Capacity estimate
+
+```
+DAU                  = ~700M
+Uploads/day          = 100M photos + 30M short videos
+Avg photo size       = 3 MB original; renditions ~1.5 MB total
+Storage uploaded/day = 100M × 3 MB + 30M × 8 MB = 540 TB/day raw
+                       (~200 PB/year before tiering)
+
+Feed reads/day       = 500M × 100 scrolls = 50B feed reads/day
+                       avg ~600K QPS, peak ~2M QPS
+
+Story views/day      = 500M × 30 stories = 15B view events/day
+                       ~170K QPS sustained, ~700K QPS peak
+
+Followers/user       = avg ~200; top creators 100M-600M
+Fanout (avg)         = 100M posts × 200 = 20B feed inserts/day
+                       at celebrity scale, one post = 600M inserts
+```
+
+The amplification is the headline number. Average fanout works
+out to manageable QPS, but the celebrity tail forces a hybrid
+strategy on the feed path.
+
+## High-level architecture
+
+```
+                            [ client app ]
+                                  │
+                                  ↓
+                       [ edge / CDN (read path) ]
+                                  │
+                                  ↓
+                        [ API gateway / LB ]
+                                  │
+   ┌──────────────┬───────────────┼───────────────┬──────────────┐
+   ↓              ↓               ↓               ↓              ↓
+[ Upload  ]   [ Feed  ]      [ Story  ]      [ Explore ]   [ Notification ]
+[ service ]   [ svc   ]      [ svc    ]      [ svc     ]   [ svc          ]
+   │              │               │               │              │
+   ↓              ↓               ↓               ↓              ↓
+[ Object  ]   [ Feed   ]     [ Story  ]      [ Ranking ]   [ Push & badge ]
+[ store + ]   [ cache  ]     [ store  ]      [ pipeline]   [ delivery     ]
+[  CDN    ]   [ Redis  ]     [ TTL    ]      [ + vector]
+   │              ↑          [ index  ]      [ index   ]
+   │              │                              │
+   ↓              │                              │
+[ Encoder ]      [ Fanout workers ] ← Kafka ──→ [ Engagement signals ]
+[ farm    ]                                     (likes, watch time)
+```
+
+The control plane (metadata, follow graph, feed orchestration)
+is separated from the data plane (raw media via object store and
+CDN). Most reads never touch a database.
+
+## Photo upload pipeline
+
+Uploads are async from the user's perspective the moment the
+client has handed bytes to the edge.
+
+<Steps>
+<Step n={1} title="Client requests pre-signed URL">
+Client posts intent (a small JSON with contentType and
+sizeBytes). API returns
+a short-lived pre-signed PUT URL into the object store and a
+pending `mediaId`.
+</Step>
+<Step n={2} title="Client uploads directly to object store">
+Bytes never traverse our API servers. The object store emits
+a notification (S3 event / GCS pub/sub) when the upload
+completes.
+</Step>
+<Step n={3} title="Encoder farm picks up the event">
+A worker pool reads the raw original and produces ~6
+renditions: thumbnail (150px), feed (640px), profile-grid
+(320px), full (1080px), HEIC and JPEG variants, plus a
+WebP/AVIF version for modern clients. Videos transcode to
+H.264 + HEVC + a small low-bitrate fallback.
+</Step>
+<Step n={4} title="CDN warm-up">
+The freshly-encoded renditions are pushed to regional CDN
+caches near the author's followers. For high-follower
+accounts, this happens proactively rather than on first
+miss — otherwise the first 10M followers all cache-miss the
+same PoP at once.
+</Step>
+<Step n={5} title="Post finalized; fanout kicks off">
+The `posts` row flips to `ready`. A `PostCreated` event hits
+Kafka. Fanout workers fan it out per the rules below.
+</Step>
+</Steps>
+
+The original master is kept on cold storage for re-encoding
+when a new codec ships. Renditions are regenerated lazily — if
+a 2014 photo needs an AVIF version today, that's a cache miss
+the first time, then served warm forever.
+
+## Feed architecture: hybrid fanout
+
+Feed is the most-touched system. See
+`fanout-on-write-vs-read.mdx` for the general comparison; here
+is how it specifically shakes out at Instagram scale.
+
+<Compare a="Fanout-on-write (push)" b="Fanout-on-read (pull)">
+<>
+On post, write the postId into every active follower's inbox
+in Redis.
+
+**Pros**: feed read is one Redis range scan. Trivially fast.
+
+**Cons**: a creator with 600M followers writes 600M entries
+per post. That single tweet would torch a cluster.
+</>
+<>
+On post, write nothing extra. On feed read, fetch the user's
+followee list and merge their recent posts.
+
+**Pros**: no write amplification.
+
+**Cons**: heavy users follow 2,000+ accounts; merging recent
+posts from all of them on every scroll is brutal.
+</>
+</Compare>
+
+The production answer at Instagram scale is the same as Twitter
+and other big feed systems: **hybrid**. Tunable threshold (e.g.,
+>1M followers) marks an account as "celebrity"; their posts are
+never fanned out and are pulled at read time.
+
+```js
+async function getFeed(userId, cursor) {
+  const [pushed, celebPosts] = await Promise.all([
+    redis.lrange(`feed:${userId}`, cursor, cursor + 50),
+    pullCelebrityPosts(userId, cursor),
+  ]);
+  return mergeByCreatedAt(pushed, celebPosts).slice(0, 50);
+}
+```
+
+This caps write fan-out at the "normal user" threshold and caps
+read merge to ~5-20 celebrity accounts.
+
+Materialization is **only for active users** (logged in within
+last 14 days). Dormant users assemble their feed on first
+request and warm into the cache. This bounds the precomputed
+storage footprint sharply.
+
+## Stories: TTL-driven design
+
+Stories expire at 24 hours. This is a strong constraint that
+*simplifies* the system: nothing needs to be evicted by hand,
+GC'd, or counted forever.
+
+```
+stories {
+  id              snowflake PK
+  author_id       bigint
+  media_id        string         -- pointer into object store
+  posted_at       timestamp
+  expires_at      timestamp      -- posted_at + 24h
+  view_count      int            -- eventually consistent
+}
+```
+
+Reads filter `expires_at > now()`. The storage layer (DynamoDB,
+Cassandra) has native TTL columns that drop rows automatically.
+CDN entries get the same TTL. No coordinated delete.
+
+**View tracking is the heavy part**: 15B view events/day. Two
+patterns layered together:
+
+- **Counter writes** are batched in a stream: client emits a
+  `story_view` event → Kafka → 30-second windowed aggregator →
+  one increment per (story, user, batch) instead of one per
+  view. See `design-distributed-counter.mdx`.
+- **Viewer lists** (the "who saw it" list creators check)
+  are written into a per-story Redis sorted set keyed on
+  user-id, scored by timestamp. Bounded by the 24h TTL.
+
+View counts can be eventually consistent — nobody notices a
+story-view count being 30s behind. The author seeing exactly
+which followers saw the story is a slightly stronger guarantee,
+but still tolerates a few seconds of skew.
+
+## Explore: the algorithmic feed
+
+The Explore feed has almost nothing in common with the
+chronological feed. It's a recommendation system that surfaces
+content from creators you don't follow.
+
+Pipeline shape:
+
+```
+candidate sources           ranker          re-ranker / policy
+  trending in your region     ML model      diversity, safety,
+  embedding-similar to your   p(engage|     advertiser blocks,
+  recent likes                 user, post)  freshness
+  graph: 2-hop friends-of
+   friends
+  popular in your interest
+   clusters
+```
+
+<Steps>
+<Step n={1} title="Candidate generation">
+Multiple recall sources produce ~1000 candidate posts in
+~50ms. Sources: recent popularity per region, embedding-NN
+lookup against the user's interest vector, social graph
+hop-2, content matching your recent engagement topics.
+</Step>
+<Step n={2} title="Ranking">
+A deep neural net scores candidates by predicted probability
+of engagement. Features: real-time signals (likes on the post
+in the last hour), user-side features (your historical
+engagement), creator features.
+</Step>
+<Step n={3} title="Policy and diversity">
+Demote near-duplicates, enforce safety rules, mix creator
+diversity, inject ads at policy positions.
+</Step>
+</Steps>
+
+Real-time signals matter a lot. A post that's exploding right
+now ("the last hour" engagement velocity) outranks an
+older-but-cumulatively-popular post for a "what's hot" surface.
+That forces the ranking layer to read fresh counters, which is
+why the counter system is a first-class subsystem.
+
+The embedding-based retrieval pattern is the same approach
+Airbnb describes for search (see `engineering-blogs.mdx`):
+encode each post and each user into a dense vector, ANN-query
+the user against post embeddings via FAISS or ScaNN.
+
+## Search and hashtag pages
+
+Two parallel indexes:
+
+- **Inverted index** on captions, OCR'd text, alt-text,
+  hashtags, and usernames. See `inverted-index.mdx` and
+  `search-system-architecture.mdx`. Sharded by document with
+  a fanout query.
+- **Embedding index** for "visually similar" and "semantically
+  similar" lookups.
+
+Hashtag pages are materialized: when a post tagged `#sunset` is
+created, append its id to `hashtag:sunset:recent` (capped list)
+and `hashtag:sunset:top` (heap by engagement). Same trick as
+feeds, narrower scope.
+
+## Notifications
+
+Push delivery and badge counts are an entire subsystem of their
+own — see `design-notification-system.mdx`. Three classes of
+notification matter here:
+
+- **Engagement** (someone liked your post): batched and
+  coalesced — "8 people liked your photo" rather than 8 pushes.
+- **Direct** (someone tagged you, DM'd you): low-latency,
+  delivered immediately.
+- **Re-engagement** (story from someone you watch a lot just
+  posted): scheduled, throttled per user.
+
+Badge counts are eventual; we maintain a per-user counter that
+gets recomputed when the user opens the app. Push payloads
+carry the new count so the OS badge updates without an extra
+round-trip.
+
+## Storage tiers
+
+Photo storage is the largest cost. Tiering matters.
+
+<Cheatsheet>
+| Tier | Content | Cost | Latency |
+|---|---|---|---|
+| Edge CDN | Top 10K creators' recent posts; hot Explore items | $$$ | &lt;20ms |
+| Regional cache | Recent posts in region | $$ | &lt;80ms |
+| Hot object store | All posts &lt;90d | $ | &lt;200ms |
+| Cold archive | Originals &gt;1y, used for re-encoding | $/100 | seconds-minutes |
+</Cheatsheet>
+
+The vast majority of bytes are served from edge CDN. Cold
+archive exists almost entirely for re-encoding when a new codec
+ships — Instagram has shipped HEIC, WebP, AVIF over the years
+and each one rewrites the rendition library.
+
+## Tradeoffs
+
+- **Hybrid fanout** over pure push or pull: pays a small
+  read-time merge and lets the system survive 600M-follower
+  creators. Complexity is real — two code paths in the feed
+  reader, two failure modes in the writer.
+- **Algorithmic Explore** over chronological discovery:
+  engagement goes up, but the system now depends on a
+  ranking-model fleet, a feature store, and a candidate
+  generation pipeline. Each is a SPOF in its own right.
+- **TTL-driven story expiry** over coordinated deletes:
+  every storage layer must support TTL, but the operational
+  cost is near zero.
+- **Edge encoding** of new renditions over pre-encoding all
+  variants: saves storage for cold content; first request to
+  a new codec eats a one-time cache miss.
+- **Eventually-consistent counters and view tracking**: the
+  product tolerates it; exactness here would 100x the cost.
+- **Active-user-only feed materialization**: bounds Redis
+  storage; dormant users pay a one-time assembly cost on
+  return.
+
+## Common mistakes
+
+- Treating the feed and Explore as the same pipeline. They
+  share a UI, but the ranking, retrieval, and freshness
+  requirements are different.
+- Synchronous fanout on the write path. A celebrity post
+  would block the response for minutes. Always async via
+  Kafka.
+- Storing originals on hot storage. Originals are rarely
+  served; renditions are. Hot storage should hold only what
+  CDNs ask for.
+- Counting story views with a per-event database write. The
+  numbers are too large; batching is mandatory.
+- Building Explore with offline batch ranking only. Real-time
+  signals (last-hour engagement) are most of the lift; an
+  hourly batch model is too stale to surface fresh viral
+  content.
+
+## Further reading
+
+<Reference
+  kind="blog"
+  title="Embedding-based retrieval for Airbnb search"
+  authors="Haldar et al."
+  year="2020"
+  source="Airbnb engineering"
+  url="https://medium.com/airbnb-engineering/embedding-based-retrieval-for-airbnb-search-aabebfc85839"
+>
+A clear production write-up of the candidate-generation
+pattern Instagram Explore uses: encode users and items into
+vectors, ANN-query for recall, ML-rank for precision. The
+shape applies cleanly to a recommendation feed.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Sharding Pinterest: How we scaled our MySQL fleet"
+  authors="Marty Weiner"
+  year="2015"
+  source="Pinterest engineering"
+  url="https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f"
+>
+The classic write-up on sharding a Pinterest-style image
+social network. Same shape as Instagram metadata: posts,
+follow graph, engagement counters — Pinterest's id-routing
+scheme is the canonical reference for how to design shard
+keys when the access pattern is "everything about a user".
+</Reference>
+
+## In summary
+
+- Photo content is write-once, read-many — push everything to
+  object store and CDN; the API tier only mediates metadata.
+- Feed uses hybrid fanout: push for normal users, pull at read
+  time for celebrities. Pure push or pure pull both fail at
+  this scale.
+- Stories' 24h TTL is a feature, not a constraint — it
+  simplifies storage, CDN, and view tracking by removing the
+  need for explicit eviction.
+- Explore is a real-time recommendation pipeline with
+  candidate generation, ML ranking, and policy re-ranking; it
+  shares no architecture with the chronological feed.
+- View counts and like counts are eventually consistent;
+  batching is mandatory to survive the per-post traffic on
+  viral content.
+- The storage stack is tiered by access pattern; cold
+  originals only exist for re-encoding when codecs change.

@@ -1,0 +1,256 @@
+export const level = 'mid';
+
+# Bloom filters
+
+A Bloom filter answers one question: **"have I seen this key
+before?"** with two possible replies — *definitely not* or
+*probably yes*. The "probably" has a controllable false-positive
+rate; the "definitely not" is exact. In exchange, you spend
+roughly 10 bits per element regardless of how big each element
+actually is.
+
+That tradeoff is why Bloom filters sit in the hottest read paths
+of HBase, Cassandra, RocksDB, Bitcoin SPV clients, and countless
+CDNs. They turn an expensive lookup ("is this row in this
+SSTable on disk?") into a cheap in-memory check that filters out
+the vast majority of misses before any I/O happens.
+
+## The mechanism
+
+A Bloom filter is a bit array of `m` bits plus `k` independent
+hash functions. To **insert** an element, hash it `k` ways and
+set the `k` corresponding bits to 1. To **query** an element,
+hash it the same `k` ways; if **all** `k` bits are 1, report
+"probably present"; if **any** bit is 0, report "definitely
+absent".
+
+```
+m = 16 bits, k = 3 hash functions
+
+insert("apple"):  h1=2, h2=5, h3=11  →  set bits 2, 5, 11
+insert("pear"):   h1=5, h2=9, h3=14  →  set bits 5, 9, 14
+
+bit array:  0 0 1 0 0 1 0 0 0 1 0 1 0 0 1 0
+                ^     ^       ^   ^     ^
+
+query("apple"): bits 2,5,11 → all set → probably present
+query("plum"):  bits 1,5,9  → bit 1 is 0 → definitely absent
+query("grape"): bits 5,9,11 → all set → "probably" (FALSE POSITIVE)
+```
+
+The false positive in the last line is the price of compression.
+"grape" was never inserted, but its three hash bits happened to
+collide with bits set by other keys.
+
+## The math you actually need
+
+Three formulas drive everything:
+
+- For `n` items in an `m`-bit array with `k` hash functions, the
+  optimal `k` is `(m/n) · ln 2 ≈ 0.693 · (m/n)`.
+- At optimal `k`, false-positive rate `p ≈ (1 - e^(-kn/m))^k ≈ 0.6185^(m/n)`.
+- Solving for size: `m/n ≈ -1.44 · log2(p)`.
+
+That last line gives you the practical table — bits per element
+required to achieve a target false-positive rate:
+
+<Cheatsheet>
+| Target FP rate | Bits per element | Optimal k |
+|---|---|---|
+| 10%   | 4.8  | 3 |
+| 1%    | 9.6  | 7 |
+| 0.1%  | 14.4 | 10 |
+| 0.01% | 19.2 | 13 |
+| 0.001%| 24.0 | 17 |
+</Cheatsheet>
+
+Two things to internalize: bits-per-element grows **linearly** in
+the number of nines you want, and 1% costs about 10 bits per key
+no matter what the keys are — 36-byte UUIDs and 4-byte ints take
+the same space.
+
+<Callout variant="info">
+You don't need `k` independent hash functions in practice. The
+standard trick (Kirsch & Mitzenmacher, 2006) is to compute two
+hashes `h1`, `h2` and synthesize the rest as `h_i = h1 + i*h2`.
+Same false-positive behavior, half the hash work.
+</Callout>
+
+## Where Bloom filters earn their keep
+
+- **LSM-tree storage engines** (RocksDB, LevelDB, HBase,
+  Cassandra). Each SSTable carries a Bloom filter over its keys.
+  On lookup, the engine consults the per-SSTable filter before
+  touching disk; the filter eliminates ~99% of tables that
+  don't contain the key. This is the single biggest reason LSM
+  reads aren't catastrophically slow. See
+  `btree-vs-lsm-storage-engines`.
+- **Bitcoin SPV nodes** (BIP-37). A light client sends a Bloom
+  filter to a full node describing the addresses it cares
+  about; the node only ships back matching transactions. The
+  privacy of this scheme has been criticized, but the
+  bandwidth saving is real.
+- **CDN cache filters**. Akamai, Cloudflare, and Fastly use
+  Bloom-filter-style structures to short-circuit "is this URL
+  cacheable?" lookups at the edge.
+- **NSQ deduplication**. Bitly's NSQ uses a Bloom filter to
+  drop already-seen message IDs at consumers.
+- **Google Chrome's Safe Browsing** historically used a Bloom
+  filter of malicious URLs locally; a hit triggered a precise
+  remote check. (Now replaced by a hash-prefix scheme, but the
+  Bloom-filter version shipped for years.)
+- **Database query planning**. PostgreSQL's `bloom` extension
+  and "Bloom join" optimizations in DuckDB and Snowflake filter
+  out non-matching rows before the join.
+
+## Variants worth knowing
+
+### Counting Bloom filters
+
+A standard Bloom filter can't delete — clearing bits for one
+element might also clear bits for another. **Counting Bloom
+filters** replace each bit with a small counter (4 bits is
+typical); insert increments, delete decrements. Cost: 4× the
+space.
+
+### Scalable Bloom filters
+
+A standard filter's false-positive rate degrades sharply once
+you exceed the designed capacity `n`. **Scalable Bloom filters**
+(Almeida et al., 2007) chain a sequence of filters with
+geometrically tightening FP rates; when the current filter
+fills, allocate a new one. Lookups query all filters; the
+combined FP rate is bounded.
+
+### Cuckoo filters
+
+The modern alternative. A cuckoo filter (Fan, Andersen,
+Kaminsky, 2014) stores small fingerprints in a cuckoo hash
+table. It supports **deletions**, has **better cache behavior**
+(typically 2 lookups vs `k` for Bloom), and at FP rates below
+about 3% is **smaller** than a Bloom filter for the same
+guarantee.
+
+<Compare a="Bloom filter" b="Cuckoo filter">
+<>
+- ~10 bits/element at 1% FP.
+- No deletions (without going to counting variant).
+- `k` random memory accesses per query — bad for cache.
+- Trivially mergeable: bitwise OR two filters of the same shape.
+- Decades of production use; libraries everywhere.
+- Best when: insert-only, FP rate above ~3%, you may need to
+  merge filters from multiple shards.
+</>
+<>
+- ~9 bits/element at 1% FP; lower than Bloom below ~3%.
+- Supports deletions natively.
+- Two memory accesses per query, both cache-friendly.
+- Not mergeable in general — fingerprints would collide.
+- Insertions can fail under high load (cuckoo eviction loops).
+- Best when: you need deletions, FP rate below ~3%, single-process
+  index where merging isn't required.
+</>
+</Compare>
+
+## Classic mistakes
+
+### Assuming deletions work
+
+A standard Bloom filter has no delete. Clearing the bits for one
+element silently clears bits shared by other elements, producing
+false negatives — the one thing a Bloom filter is supposed to
+never do. If you need deletions, use a counting Bloom filter or a
+cuckoo filter.
+
+### Exceeding the design capacity
+
+The FP rate formula assumes you insert `n` items. Push 2n into a
+filter sized for `n` and your "1% FP" becomes ~10% or worse.
+Either size for the maximum, use a scalable Bloom filter, or
+rebuild from a fresh source when you cross a threshold.
+
+### Trusting the filter for correctness
+
+A Bloom filter is a **negative cache**. A "yes" answer must be
+followed by the authoritative check. Anyone writing
+`if (filter.has(x)) { /* assume x exists */ }` has introduced a
+bug — false positives will fire and the code will treat unseen
+elements as seen.
+
+### Hashing too few independent ways
+
+Using `k` correlated hashes (e.g., MD5 truncated to multiple
+slices without independence) causes worse-than-predicted FP
+rates. Use the `h1 + i*h2` synthesis with two good hashes
+(MurmurHash3, xxHash), or use a library that's already proven.
+
+### Sharing filter parameters across writers without coordination
+
+If process A built the filter with `m=1024, k=7` and process B
+uses `m=2048, k=5`, the same key hashes to different bits.
+Filter shape is part of the contract; pin it.
+
+## Sizing in practice
+
+```ts
+// Size a Bloom filter for n items at false-positive rate p.
+function bloomParams(n: number, p: number) {
+  const m = Math.ceil(-(n * Math.log(p)) / (Math.LN2 ** 2));
+  const k = Math.max(1, Math.round((m / n) * Math.LN2));
+  return { bits: m, hashes: k, bitsPerElement: m / n };
+}
+
+// bloomParams(1_000_000, 0.01)
+// → { bits: 9_585_059, hashes: 7, bitsPerElement: 9.585 }
+```
+
+For a million keys at 1% FP that's about 1.2 MB — small enough
+to live in memory next to a multi-gigabyte SSTable on disk.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Space/Time Trade-offs in Hash Coding with Allowable Errors"
+  authors="Burton H. Bloom"
+  year="1970"
+  source="CACM"
+  url="https://dl.acm.org/doi/10.1145/362686.362692"
+>
+The original paper. Five pages; motivates the structure with a
+hyphenation dictionary too large to fit in memory, and derives
+the optimal `k` calculation directly. Still the cleanest
+introduction.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Cuckoo Filter: Practically Better Than Bloom"
+  authors="Fan, Andersen, Kaminsky, Mitzenmacher"
+  year="2014"
+  source="CoNEXT"
+  url="https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf"
+>
+Introduces the cuckoo filter as a modern alternative — supports
+deletion, better cache behavior, often smaller than Bloom for
+the same target FP rate. Worth reading before defaulting to
+Bloom in 2026.
+</Reference>
+
+## In summary
+
+- A Bloom filter answers "definitely not present" exactly and
+  "probably present" with a tunable false-positive rate.
+- About **9.6 bits per element** for 1% FP; **14.4** for 0.1%.
+  Optimal `k = (m/n) · ln 2`.
+- Production homes: LSM-tree SSTables (RocksDB, Cassandra,
+  HBase), Bitcoin SPV, CDN cache filters, NSQ dedup, Bloom
+  joins in modern databases.
+- Standard filters can't delete; for that, use **counting Bloom**
+  or **cuckoo filters**. For unbounded growth, use **scalable
+  Bloom filters**.
+- A "yes" must always be followed by the authoritative check.
+  Bloom filters are negative caches, not sources of truth.
+- Cuckoo filters are the modern default below ~3% FP and when
+  deletions are needed; Bloom remains best when filters need to
+  be merged across shards.

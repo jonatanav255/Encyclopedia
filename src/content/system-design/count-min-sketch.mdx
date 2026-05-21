@@ -1,0 +1,240 @@
+export const level = 'senior';
+
+# Count-Min Sketch
+
+A Count-Min Sketch (Cormode & Muthukrishnan, 2005) answers
+**"how many times have I seen this item?"** in sub-linear memory.
+It is to frequency estimation what HyperLogLog is to cardinality
+and Bloom filters are to membership — a small, fixed-size table
+that absorbs an arbitrarily large stream while giving bounded
+answers in O(1) per update and query.
+
+The signature property: the estimate is **one-sided**. CMS may
+overestimate, but never underestimate. That's exactly what you
+want for problems like "find heavy hitters in a 100-billion-event
+stream" or "should this DDoS source IP be throttled?" — false
+positives are cheap to recover from, false negatives let the
+worst items hide.
+
+## The mechanism
+
+A Count-Min Sketch is a **2D array** of `d` rows and `w`
+columns, plus `d` pairwise-independent hash functions. Each row
+is treated as an independent counting Bloom-style array.
+
+To **increment** an item's count: hash it with each of the `d`
+hash functions and increment the corresponding counter in each
+row.
+
+To **query** an item's count: hash it the same way, read the
+counter from each row, and return the **minimum** across rows.
+
+```
+d = 4 rows, w = 8 columns
+
+after incrementing "alice" three times:
+
+         col: 0  1  2  3  4  5  6  7
+row 0:        0  3  0  0  0  0  0  0     <- h0("alice") = 1
+row 1:        0  0  0  0  3  0  0  0     <- h1("alice") = 4
+row 2:        0  0  0  3  0  0  0  0     <- h2("alice") = 3
+row 3:        3  0  0  0  0  0  0  0     <- h3("alice") = 0
+
+query("alice"): min(3, 3, 3, 3) = 3   correct
+query("bob"):   reads min over h0..h3("bob"). If all four bins
+                happen to be shared with frequent items, "bob"
+                appears more frequent than it is — that's the
+                overestimate.
+```
+
+Other items hashing into the same bins inflate counters; taking
+the **minimum** across `d` rows discards the worst
+collisions. Underestimation is impossible because every
+occurrence of an item touches all `d` of its bins.
+
+## The math you actually need
+
+For width `w = ⌈e/ε⌉` and depth `d = ⌈ln(1/δ)⌉`, the estimated
+count `f̂(x)` satisfies:
+
+```
+f(x)  ≤  f̂(x)  ≤  f(x)  +  ε · ||a||₁     with probability 1 − δ
+```
+
+where `||a||₁` is the total stream length (sum of all counts).
+
+Two concrete examples to make this real:
+
+- `ε = 0.001`, `δ = 0.001` → `w ≈ 2,719`, `d = 7`. About
+  **19,000 counters** total. For 4-byte counters, ~76 KB.
+- `ε = 0.0001`, `δ = 0.00001` → `w ≈ 27,183`, `d = 12`. About
+  **326,000 counters**. ~1.3 MB.
+
+Read this as: at the second setting, on a stream with `||a||₁
+= 10⁹` events, every estimate is within 100,000 of the truth
+with probability 0.99999. For *heavy hitters* (items appearing
+millions of times), that's signal; for the long tail it's noise.
+
+<Callout variant="info">
+The error bound is additive in `||a||₁`, not multiplicative in
+`f(x)`. That's why CMS is excellent for **heavy hitters** (items
+whose count is large relative to total stream) and **bad for rare
+items** (where the additive error swamps the true count).
+</Callout>
+
+## Heavy-hitter detection — the killer pattern
+
+Top-K detection is where CMS earns its keep. Combine a
+Count-Min Sketch with a **min-heap of size K**:
+
+```ts
+type Item = { key: string; estimate: number };
+
+class HeavyHitters {
+  private heap: Item[] = []; // min-heap by estimate, capacity K
+
+  constructor(private cms: CountMinSketch, private k: number) {}
+
+  observe(key: string) {
+    this.cms.increment(key);
+    const est = this.cms.estimate(key);
+
+    const existing = this.heap.find(i => i.key === key);
+    if (existing) { existing.estimate = est; heapify(this.heap); return; }
+
+    if (this.heap.length < this.k) { pushHeap(this.heap, { key, estimate: est }); return; }
+
+    // replace the smallest if this item is bigger
+    if (est > this.heap[0].estimate) {
+      popHeap(this.heap);
+      pushHeap(this.heap, { key, estimate: est });
+    }
+  }
+
+  topK(): Item[] { return [...this.heap].sort((a, b) => b.estimate - a.estimate); }
+}
+```
+
+Memory is `O(w · d + K)`, independent of the number of distinct
+items in the stream. For "top 100 trending hashtags in the last
+hour" with billions of tweets, that's a few hundred KB total.
+
+## Production homes
+
+- **Twitter's trending topics** pipeline historically used
+  CMS-based heavy-hitter detection on the tweet stream.
+- **Spotify and Netflix recommendation feature stores**: CMS to
+  count co-occurrences of items in user sessions before
+  promoting them to a precise top-K aggregator.
+- **Cloudflare DDoS detection**: per-source IP request frequency
+  in a CMS lets the edge throttle high-rate sources without
+  storing per-IP state for 30+ million sources.
+- **Apache Druid and Apache DataSketches**: `frequencies` sketch
+  is a CMS variant; used for top-K queries in time-series
+  analytics.
+- **Real-time anomaly detection** on metric and log pipelines:
+  CMS gives a cheap "is this string suddenly common?" check
+  before triggering a more expensive analysis.
+- **Prometheus / VictoriaMetrics** label cardinality limiters
+  use sketch-style structures (sometimes CMS, sometimes
+  count-based variants) to drop high-cardinality offenders.
+
+## Variants worth knowing
+
+### Conservative Update
+
+Instead of incrementing all `d` counters for an item, increment
+**only the counters equal to the current minimum**. Provably
+reduces overestimation without sacrificing the one-sided
+guarantee. Strictly better; should be the default in any new
+implementation.
+
+```ts
+// classical update
+for (let i = 0; i < d; i++) table[i][h[i](x)] += 1;
+
+// conservative update
+const cur = Math.min(...d_indexes.map(i => table[i][h[i](x)]));
+for (let i = 0; i < d; i++) {
+  if (table[i][h[i](x)] === cur) table[i][h[i](x)] += 1;
+}
+```
+
+### Count-Mean-Min
+
+Instead of returning the minimum, subtract the average
+"background noise" estimate from each row and return the median.
+Gives **unbiased** estimates (CMS is biased upward); useful when
+the additive error of plain CMS dominates the signal for
+mid-frequency items.
+
+### Count-Sketch
+
+Uses a **signed** increment (+1 or -1 chosen by a separate hash)
+and returns the median across rows. Yields unbiased estimates
+with similar memory. Different error model: `f̂(x) - f(x)` has
+zero mean and bounded variance, instead of one-sided
+overestimate. Pick CMS when "never underestimate" matters; pick
+Count-Sketch when "unbiased" matters.
+
+## When NOT to use CMS
+
+- **You need exact counts for billing or auditing.** Use a
+  precise counter, not a sketch.
+- **The dataset fits in memory.** A regular hash map of `(key,
+  count)` is faster, simpler, and exact.
+- **You care about the long tail.** CMS is designed to find
+  heavy hitters; rare items live in the noise floor.
+- **Strict memory bound but unknown stream skew.** If the
+  stream has very few heavy hitters (low skew), CMS overhead
+  isn't justified vs Misra-Gries or Space-Saving algorithms,
+  which deterministically find top-K with O(K) memory.
+
+## Pitfalls
+
+- **Forgetting to bound the heap.** A naive "remember every key
+  we've seen" defeats the point — memory blows up with
+  cardinality. Keep the heap at size K.
+- **Adding decay incorrectly.** For time-windowed top-K
+  (trending in the last hour), the standard trick is
+  **multiple CMSes with a sliding window** or a **decaying**
+  CMS where increments are exponentially weighted. Don't just
+  zero the table periodically — you lose all in-flight signal.
+- **Using one hash function with `d` seeds derived non-randomly.**
+  The error bound assumes pairwise-independent hashes; correlated
+  hashes give worse-than-predicted accuracy.
+- **Treating the estimate as exact when it suits you.** It's
+  one-sided high; downstream logic must tolerate `f̂(x) > f(x)`.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="An Improved Data Stream Summary: The Count-Min Sketch and its Applications"
+  authors="Cormode & Muthukrishnan"
+  year="2005"
+  source="Journal of Algorithms"
+  url="http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf"
+>
+The original paper. Cleanly presented; includes the heavy-hitter
+algorithm, range queries, and inner-product estimation. Worth
+reading end-to-end — the abstractions generalize beyond plain
+frequency counting.
+</Reference>
+
+## In summary
+
+- Count-Min Sketch estimates per-item frequency in a stream using
+  `d` rows × `w` columns of counters; update and query are O(d).
+- Estimate is **one-sided high**: `f(x) ≤ f̂(x) ≤ f(x) + ε·||a||₁`
+  with probability `1 − δ`, sized via `w = e/ε`, `d = ln(1/δ)`.
+- Killer pattern: CMS + min-heap of size K for **top-K heavy
+  hitters** in a few hundred KB regardless of distinct-key count.
+- Production homes: Twitter trending, Spotify/Netflix feature
+  pipelines, Cloudflare DDoS frequency, Druid/DataSketches,
+  log/metric anomaly detection.
+- **Conservative Update** is strictly better than the textbook
+  increment; use it by default.
+- Bad for rare items (additive error swamps small counts) and
+  for billing-grade exact counts. Excellent for the head of
+  long-tail streams.

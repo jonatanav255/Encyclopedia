@@ -1,0 +1,377 @@
+export const level = 'staff';
+
+# Flexible Paxos and EPaxos
+
+`consensus-algorithms-overview` and `paxos` both name-drop a
+handful of variants — Flexible Paxos, EPaxos, Generalized
+Paxos — and then move on. This page is where they live in full.
+
+The question this page tries to answer honestly is: **when do
+the leaderless or quorum-flexible variants actually pay off, and
+why do production systems mostly still pick Raft anyway?**
+
+The short version: the variants are mathematically real wins
+for specific workloads (geo-distributed writes, write-heavy
+with rare elections, commutative operations), but the
+implementation and operational cost is high enough that the
+default answer remains "use Multi-Paxos or Raft per shard, run
+many shards." The longer version is below.
+
+## Why anyone bothers with variants
+
+Classic Multi-Paxos and Raft share three properties that look
+like constraints once you start running them at scale:
+
+- **A single leader is the write bottleneck.** Every write
+  goes through one node. In a geo-distributed deployment that
+  is one region paying the WAN cost for every other region's
+  writes.
+- **Quorum intersection is rigid.** In classic Paxos, both the
+  leader-election quorum and the write quorum are majorities,
+  because two majorities always intersect. This is sufficient
+  but not necessary.
+- **Strict total ordering is overkill for commutative work.**
+  If two writes operate on disjoint keys, ordering them
+  globally is wasted effort. The protocol does it anyway.
+
+Each variant attacks one of these.
+
+## Flexible Paxos
+
+Flexible Paxos (Howard, Malkhi, Spiegelman, 2016) is a small
+but powerful observation about the Paxos safety argument:
+
+> Paxos is safe as long as **every phase-1 quorum (Q1)
+> intersects every phase-2 quorum (Q2)**. There is no
+> additional requirement that Q1 or Q2 individually be
+> majorities.
+
+In classic Paxos, both Q1 and Q2 are majorities — which
+trivially satisfies the intersection condition. But you can
+shrink one at the cost of growing the other:
+
+- For 5 nodes, classic uses **{Q1=3, Q2=3}**.
+- Flexible Paxos allows **{Q1=4, Q2=2}** — writes commit with
+  only 2 acks, elections need 4.
+- Or **{Q1=2, Q2=4}** — writes need 4 acks, elections need 2.
+  (Rarely useful, but legal.)
+
+```
+Five-node cluster, write path under different (Q1, Q2) settings:
+
+Classic Paxos        : write needs 3/5 acks, election needs 3/5
+Flexible {4, 2}      : write needs 2/5 acks, election needs 4/5
+Flexible {3, 3}      : equivalent to classic
+Flexible {5, 1}      : write needs 1/5 ack (the leader's own),
+                       election needs all 5 (impossible if any node is down)
+```
+
+### When this helps
+
+In write-heavy workloads where leader elections are rare —
+which is the steady-state case for most production
+consensus — paying more for the rare election to make every
+write faster is a good trade. {4, 2} on a 5-node cluster
+shaves a round trip off the median write at the cost of slower
+failover during the unusual case of leader loss.
+
+The extreme {5, 1} is occasionally proposed: writes are local
+to the leader, but the cluster becomes unavailable for elections
+if any node is down. This is rarely useful in practice but is
+sometimes used in research configurations.
+
+### Production status
+
+Flexible Paxos has appeared in academic systems and some
+experimental NewSQL configurations. As of 2026, it is not the
+default in any major open-source consensus library — etcd-raft,
+hashicorp/raft, and dragonboat all use standard majority
+quorums. WPaxos and some research databases experiment with
+flexible quorums in geo-distributed configurations.
+
+The barrier is not correctness. It is that "smaller write
+quorum, larger election quorum" requires operators to reason
+about the asymmetric failover behavior — a category of
+operational complexity that has not paid off enough to
+overcome the default.
+
+## EPaxos / Egalitarian Paxos
+
+EPaxos (Moraru, Andersen, Kaminsky, SOSP 2013) is the more
+ambitious variant: it removes the leader entirely.
+
+### The core idea
+
+Every replica can **propose its own commands** in its own
+instance space. There is no single sequencer. Two commands that
+**do not conflict** (the conflict relation is
+application-defined — for a KV store, two writes to different
+keys do not conflict) commit in **one round trip** with a fast
+quorum.
+
+Two commands that **do** conflict (same key, or in general any
+pair the application says conflicts) require an extra round to
+establish a dependency order between them — they cannot be
+committed in arbitrary order.
+
+```
+Three regions, A in us-east, B in eu-west, C in asia-east.
+
+EPaxos, uncontended writes (different keys):
+  client in eu-west → leader B → 1 RTT, eu-local quorum → commit.
+  No WAN round-trip to us-east or asia-east.
+
+EPaxos, contended writes (same key from us-east and eu-west):
+  proposers detect conflict, take an extra round to agree on order.
+  Two RTTs for the contended writes.
+
+Raft, same scenario:
+  every write goes to the elected leader (say in us-east).
+  eu-west and asia-east always pay the WAN cost.
+```
+
+The win is real for **geo-distributed deployments with
+write-locality** — clients write keys that are mostly
+geographically local, and conflicts are rare. In that
+workload, EPaxos avoids the WAN round-trip that Raft
+unconditionally pays.
+
+### Where it falls down
+
+- **Conflict-heavy workloads.** Every conflict costs an extra
+  round; if conflict rates approach 100%, EPaxos is **slower**
+  than Raft (which paid for one leader-bounce, but only once,
+  not per conflict).
+- **Implementation complexity.** EPaxos has more state per
+  instance, more inter-replica messages, and a recovery
+  protocol that is genuinely subtle. Multiple published
+  implementations have shipped bugs in the dependency tracking
+  or recovery paths.
+- **Tail latency is harder to reason about.** A workload with
+  occasional bursts of contention sees variable round counts
+  per commit. Raft's tail latency is predictable: it is the
+  slowest of the quorum acks.
+
+### Production status
+
+EPaxos has not displaced Raft in mainstream production. The
+notable attempts:
+
+- **Internal hyperscaler systems** at a few companies (research
+  papers reference Microsoft and Facebook experiments).
+- **A handful of NewSQL and research databases.**
+- **CockroachDB** — explicitly evaluated EPaxos and chose
+  per-range Raft instead, citing operational and complexity
+  reasons in their public design docs.
+
+The pattern: companies who could implement EPaxos correctly
+mostly decided that running many small Raft groups (one per
+partition or range) buys them the same horizontal scaling
+without the implementation risk. EPaxos is a real win on
+paper; Raft-per-shard is a real win in production.
+
+## Generalized Paxos
+
+Generalized Paxos (Lamport, 2005) is the most abstract variant.
+It extends Paxos to handle **commutative** operations
+natively — two operations that commute (e.g., "increment x by
+5" and "increment x by 10") can be committed in any order, and
+the protocol does not need to fix one.
+
+Conceptually elegant; production implementations are rare. The
+common cited use case is CRDT-shaped state, where commutativity
+is structural — but in those workloads the application usually
+chooses **eventual consistency** with CRDTs directly and
+avoids the consensus protocol entirely.
+
+We mention Generalized Paxos here for completeness; it is more
+common in research literature than in deployed systems.
+
+## How EPaxos compares to Raft head-to-head
+
+<Compare a="Raft" b="EPaxos">
+<>
+- Leader: one elected leader at a time
+- Write rounds (uncontended): 1 round to a majority via the
+  leader
+- Write rounds (contended): same — there is no "contention"
+  concept; everything is leader-ordered
+- Geo-WAN cost: every write pays the round trip to the leader
+- Recovery: leader election with randomized timeout
+- Library maturity: etcd-raft, hashicorp/raft, dragonboat,
+  tikv-raft — all production-vetted
+- Used in: etcd, Consul, CockroachDB, TiKV, Kafka KRaft, many
+  others
+</>
+<>
+- Leader: none — any replica proposes in its own instance space
+- Write rounds (uncontended): 1 round to a fast quorum (local
+  to the proposer)
+- Write rounds (contended): 2 rounds (extra round for
+  dependency ordering)
+- Geo-WAN cost: only for the proposer's local quorum on
+  uncontended writes
+- Recovery: per-instance recovery protocol; genuinely
+  intricate
+- Library maturity: research implementations and
+  hyperscaler-internal; no comparable production library
+- Used in: a small number of research systems and internal
+  hyperscaler experiments
+</>
+</Compare>
+
+## Why production largely picked Raft anyway
+
+A few honest reasons that go beyond "papers vs reality":
+
+### Implementation complexity is a first-class cost
+
+EPaxos's dependency tracking, conflict detection, and recovery
+protocol are easy to get subtly wrong. Bugs in consensus
+protocols destroy data; the bar for "good enough
+implementation" is high. Raft's specification is short, has a
+TLA+ proof, and is implemented correctly in multiple vetted
+libraries. That is worth a lot.
+
+### Predictable tail latency
+
+Operators love p99 latency that they can model. Raft commits
+in "majority ack" time — slow nodes drag out the tail in a
+predictable way. EPaxos commits in "1 round if no conflict, 2
+if conflict" — and the conflict rate depends on workload
+patterns the operator may not control.
+
+### Library ecosystem
+
+`etcd-raft`, `hashicorp/raft`, `tikv-raft`, `dragonboat` are
+all battle-tested. Picking one is a low-risk decision. Picking
+EPaxos means either writing your own or vendoring an academic
+implementation, both of which are high-risk decisions for any
+team that does not have a research-grade distributed-systems
+group.
+
+### Sharding gets you most of the way
+
+The EPaxos pitch is "avoid the leader bottleneck." But you can
+**shard** — run many independent Raft groups, one per partition.
+CockroachDB has tens of thousands of Raft groups per cluster;
+TiKV does the same. The single-leader cost is bounded by what
+one Raft group is asked to do, and one group handles a small
+slice of the workload.
+
+Spanner uses Paxos per shard for similar reasons: shard first,
+then consensus per shard. The leader bottleneck disappears at
+the shard granularity.
+
+This is the structural reason EPaxos has not won. The problem
+EPaxos solves at the protocol layer was already solved at the
+**architecture** layer by sharding.
+
+## When the variants do pay off
+
+There are workloads where the variants genuinely beat Raft:
+
+<Cheatsheet>
+| Workload | Best variant | Why |
+|---|---|---|
+| High write rate, rare elections, can accept slow failover | Flexible Paxos {N-1, 2} | Smaller Q2 = faster writes; rare elections absorb the larger Q1 cost |
+| Geo-distributed, write-local, rare key conflicts | EPaxos | Avoids WAN round-trip to a single leader for local writes |
+| Commutative operations (counters, CRDT-like) | Generalized Paxos (or just use CRDTs) | Native commutativity removes ordering overhead |
+| Anything else | Multi-Paxos or Raft per shard | Predictable, vetted, well-tooled |
+</Cheatsheet>
+
+## A pragmatic recommendation
+
+Pick Raft (or Multi-Paxos) with a vetted library. Shard until
+single-leader throughput is no longer a problem. Only reach for
+the variants if you have **measured** the bottleneck the
+variant addresses and the savings exceed the cost of running an
+un-vetted protocol in production.
+
+<Callout variant="warning">
+Reading the EPaxos paper convinces most engineers that one
+WAN round trip is worth saving. The papers are correct. They
+are also written by people who own the codebase and the test
+infrastructure. The cost of "we shipped a subtle EPaxos bug
+to production" is high enough that almost every major
+distributed database has weighed that math and chosen Raft
+anyway.
+</Callout>
+
+The interesting consequence is that the variants live mostly
+in the literature. They are worth knowing because they show up
+in design conversations, in interview questions, and in
+internal proposals at hyperscalers — but the answer to "should
+we use one?" in 99% of cases is "use Raft, shard more."
+
+## Related pages
+
+- `paxos.mdx` — classic Paxos and Multi-Paxos
+- `raft.mdx` — Raft, the production default
+- `consensus-algorithms-overview.mdx` — the family map
+- `quorum-systems.mdx` — the quorum math the variants relax
+- `multi-region-replication.mdx` — where geo-distributed
+  consensus actually matters
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Flexible Paxos: Quorum Intersection Revisited"
+  authors="Howard, Malkhi, Spiegelman"
+  year="2016"
+  source="OPODIS"
+  url="https://arxiv.org/abs/1608.06696"
+>
+The short paper that reframed Paxos's quorum requirement.
+Eight pages and worth reading in full — it is one of the
+clearest "small but powerful" results in the consensus
+literature.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="There Is More Consensus in Egalitarian Parliaments"
+  authors="Moraru, Andersen, Kaminsky"
+  year="2013"
+  source="SOSP"
+  url="https://www.cs.cmu.edu/~dga/papers/epaxos-sosp2013.pdf"
+>
+The EPaxos paper. The first half explains the leaderless
+design and conflict ordering; the second half evaluates it
+against Multi-Paxos and Mencius on geo-distributed workloads.
+Read the recovery section last and slowly.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Generalized Consensus and Paxos"
+  authors="Lamport"
+  year="2005"
+  source="Microsoft Research TR-2005-33"
+  url="https://www.microsoft.com/en-us/research/publication/generalized-consensus-and-paxos/"
+>
+Lamport's generalization of Paxos to non-totally-ordered
+agreement. Dense but short, and an important conceptual
+ancestor of EPaxos and related work.
+</Reference>
+
+## In summary
+
+- **Flexible Paxos**: relaxes the requirement that both Q1
+  (election) and Q2 (write) be majorities — only that they
+  intersect. Lets you trade slower elections for faster
+  writes, or vice versa. Used in research; rarely the default.
+- **EPaxos**: removes the leader entirely. Any replica can
+  propose; non-conflicting commands commit in one round,
+  conflicting commands in two. Wins for geo-distributed
+  workloads with write-locality and rare conflicts. Loses on
+  implementation complexity, tail-latency predictability, and
+  library maturity.
+- **Generalized Paxos**: handles commutative operations
+  natively. Conceptually elegant, rarely implemented;
+  commutative workloads usually pick CRDTs instead.
+- **Production reality**: Raft per shard, with sharding doing
+  the horizontal-scaling work the variants promised. Pick a
+  variant only if you have measured the bottleneck it
+  addresses and can absorb the implementation cost.

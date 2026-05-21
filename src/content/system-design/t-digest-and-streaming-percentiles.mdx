@@ -1,0 +1,312 @@
+export const level = 'senior';
+
+# t-digest and streaming percentiles
+
+Computing the p99 of a stream sounds easy and isn't. An exact
+answer requires either holding every sample (unbounded
+memory) or pre-binning into fixed buckets (which loses
+accuracy exactly where you need it most — the tail). t-digest
+is the data structure behind virtually every modern "p99 in
+real time" dashboard, including Datadog, Wavefront, AWS
+CloudWatch's percentile aggregations, ClickHouse's
+`quantileTDigest`, Micrometer, and Druid's percentile
+aggregator.
+
+Ted Dunning's original idea (~2013) was to cluster samples
+**adaptively**: many small clusters near the extremes, where
+you need accuracy, and few large clusters near the median,
+where you don't. Each cluster stores a mean and a count.
+Twenty kilobytes of t-digest can estimate the p99 of a
+10-million-sample stream to within about 0.1% relative error,
+and two t-digests can be merged into one t-digest of the
+union — which is the property that makes it work in
+distributed systems.
+
+## Why naive approaches fail
+
+Three common attempts and why they break:
+
+<Steps>
+<Step n={1} title="Keep all samples, sort, pick index 0.99 × N.">
+Exact, but memory is O(N). Unbounded streams blow up. Even
+bounded ones thrash GC and lose cache locality.
+</Step>
+<Step n={2} title="Fixed-bucket histogram (e.g., 1ms buckets from 0 to 10s).">
+Constant memory and fast, but tail accuracy is determined by
+bucket width near the top. A "1 to 2 second" bucket can hide
+a 1.9-second p99.9 problem. And you have to pre-pick the
+range — outliers above it get clamped.
+</Step>
+<Step n={3} title="Reservoir sample of K samples, sort that.">
+Gives an unbiased uniform sample of the stream. Great for the
+median, terrible for the tail — a 1000-sample reservoir has
+maybe 10 samples above the true p99, and the resulting p99
+estimate has roughly ±5% noise. The whole point of tail
+monitoring is to be precise where samples are rare; reservoir
+sampling does the opposite.
+</Step>
+</Steps>
+
+t-digest sidesteps all three by **spending memory where it
+matters** — many tight clusters near q=0 and q=1, broader
+clusters near q=0.5.
+
+## The data structure
+
+A t-digest is a sorted list of **centroids**. Each centroid
+stores:
+
+- `mean`: the (weighted) average value of all samples in the
+  cluster.
+- `count`: the number of samples in the cluster.
+
+The centroids tile the sample space. For each centroid, the
+left and right boundaries in the quantile space (0 to 1) are
+implied by the prefix-sum of counts divided by total count.
+The k-th centroid covers some quantile range `[q_k, q_{k+1}]`.
+
+## The scale function
+
+The clever part. A **scale function** `k(q)` controls how
+much "compression budget" each quantile range gets. The
+standard one is:
+
+```
+k(q) = (δ / 2π) × arcsin(2q - 1)
+```
+
+The point of this specific function isn't the trigonometry —
+it's that the slope `dk/dq` is largest at `q = 0.5` and
+smallest at `q = 0` and `q = 1`. Each centroid is allowed to
+cover a fixed Δk in k-space, so:
+
+- Near `q = 0.5`, slope is large → a small range in q maps to
+  a fixed Δk → centroids cover **wide** quantile ranges →
+  fewer centroids → less accuracy. Fine; nobody cares about
+  the p50 to single-digit precision.
+- Near `q = 0` or `q = 1`, slope is small → a small range in
+  q maps to a small Δk → centroids cover **narrow** quantile
+  ranges → many centroids → tight accuracy. This is the p99
+  and p999 you actually need.
+
+The compression parameter δ (typically 100) controls the
+total number of centroids: roughly O(δ) of them. Larger δ →
+more centroids → tighter accuracy at all quantiles, including
+the tails.
+
+The headline guarantee: relative error in q is bounded
+proportional to `q(1-q)`. At q=0.99 that's 0.0099 — tight
+enough for SLO work.
+
+## Operations
+
+**Insert** a new sample of weight 1:
+
+```
+find the centroid whose mean is closest
+if adding to it would exceed its k-space budget:
+  create a new centroid
+else:
+  update the centroid's running mean and count
+```
+
+Amortized O(log n) with a balanced search structure; the
+canonical implementation uses an AVL tree keyed by mean.
+Insert is the hot path — Datadog and ClickHouse both add some
+buffering (insert into a small array, sort, merge in batches)
+to amortize the tree-update cost.
+
+**Query** a quantile q:
+
+```
+walk centroids accumulating count
+find the centroid whose [q_left, q_right] range contains q
+return centroid.mean (or interpolate between neighbors)
+```
+
+O(log n) with binary search on prefix sums, O(n) with linear
+scan — both are fast in absolute terms because n is small
+(usually 100-500 centroids).
+
+**Merge** two t-digests:
+
+```
+concatenate the centroid lists
+sort by mean
+re-cluster in one pass under the same scale function
+```
+
+This is the property that matters. Merging is associative and
+commutative; the union of N digests is the same regardless of
+merge order. You can compute digests on every machine in the
+fleet, ship them to a central aggregator, merge, and the
+result behaves as if you'd computed one digest over the
+union of all samples — at a tiny fraction of the bandwidth.
+
+## A worked accuracy claim
+
+A 100-centroid t-digest (δ = 100), fed 10 million samples
+from a realistic latency distribution, will report the true
+p99 with relative error around 0.1%. The full digest fits in
+about 1.6 KB.
+
+That's three orders of magnitude smaller than the raw samples
+and accurate enough that the second decimal place of the p99
+is meaningful. The cost: an O(log n) tree update per sample
+and an O(n) re-cluster on merge.
+
+## Where it's used in production
+
+<Cheatsheet>
+| System | Where |
+|---|---|
+| Datadog | Percentile aggregations in dashboards and SLO monitors |
+| Wavefront | Native percentile metric type |
+| AWS CloudWatch | High-resolution percentile statistics |
+| ClickHouse | `quantileTDigest`, `quantileTDigestWeighted` aggregations |
+| Apache Druid | `tdigestSketch` aggregator |
+| Micrometer | Default percentile implementation; ships with Spring Boot |
+| Elastic APM | Internal latency aggregations |
+</Cheatsheet>
+
+The pattern is the same in every case: agents compute
+t-digests locally, the aggregator merges them, the UI reads
+quantiles off the merged digest.
+
+## Alternatives
+
+<Compare a="t-digest" b="HDR Histogram">
+<>
+**t-digest** is adaptive — clusters get smaller near the
+tails. Per-quantile error is proportional to `q(1-q)`, so the
+p99.9 is very tight. Slightly slower per-insert (tree
+update). Mergeable. Memory is roughly proportional to the
+compression parameter δ.
+</>
+<>
+**HDR Histogram** (Gil Tene) uses **logarithmic bucketing**
+across a pre-declared range (e.g., 1µs to 10s). Constant
+memory regardless of sample count, extremely fast inserts
+(O(1) array index), and per-bucket error bounded by the
+configured significant-digits parameter (typically 2 or 3).
+Mergeable. The cost is the upfront range declaration —
+outliers above your max are clipped, and the relative error
+near the absolute tail is fixed by your significant-digits
+setting, not by data density.
+</>
+</Compare>
+
+In practice, HDR is the better choice when you can pre-bound
+the range (most JVM service latencies) and need the fastest
+possible insert path. t-digest is the better choice when you
+can't (the range varies by service, percentile aggregations
+across heterogeneous metrics) or when you want extra accuracy
+specifically at the very tails.
+
+A few other names you'll see and what they are:
+
+- **CKMS** (Cormode-Korn-Muthukrishnan-Srivastava, 2005).
+  Bounded relative error percentile sketch with formal
+  guarantees. Older, more theoretically elegant, less popular
+  in practice — its constant factors are worse than t-digest
+  and HDR.
+- **Q-digest**. Predecessor to t-digest. Bounded absolute
+  error rather than relative. Largely superseded.
+- **DDSketch** (Datadog, 2019). Logarithmic bucketing similar
+  to HDR but designed for relative-error guarantees across an
+  unbounded range. Datadog ships this alongside t-digest for
+  cases where merge cost matters more than tail accuracy.
+
+## Operational notes
+
+**Don't ask for p99.99 of a small sample.** A t-digest fed
+100K samples literally doesn't have enough data points above
+the p99.99 mark for a 0.01%-accurate answer. The structure
+doesn't lie about what it has; it just gives you the best
+estimate from the data it saw. Wait for more samples, or
+report a wider band.
+
+**Merge across regions, not across time.** A t-digest is
+designed to merge samples from the same time window across
+many machines. Merging digests from different time windows
+collapses temporal information — you lose the ability to ask
+"what was the p99 yesterday vs today." Keep one digest per
+(metric, window, dimension) cell and merge across machines
+within that cell only.
+
+**Compression parameter δ is your accuracy knob.** δ = 100 is
+the standard and is usually fine. Bump to δ = 200 if you need
+tighter p999/p9999 numbers and have memory to spare; drop to
+δ = 50 if you have thousands of metric streams and need to
+fit them all in cache.
+
+**Beware of negative values and zero.** Most t-digest
+implementations handle them, but a few older ones assume
+positive samples. Latency is always positive so this rarely
+bites, but a digest over signed deltas (e.g., clock skew
+samples) will need a tested implementation.
+
+<Callout variant="warning">
+A t-digest is not a substitute for a real histogram when you
+need to **count things in buckets** (e.g., "how many requests
+took more than 500ms?"). It answers "what value is at
+quantile q?" not "what fraction is above value v?" — the
+inverse query exists but is less accurate. For SLO compliance
+counting, keep a coarse histogram alongside.
+</Callout>
+
+## Cross-references
+
+- `latency-percentiles` — what p50/p95/p99/p999 mean and why
+  they're the right metric for user-facing systems.
+- `tail-latency` — why the tail dominates user experience at
+  any non-trivial fan-out.
+- `red-method` and `the-four-golden-signals` — the metric
+  taxonomies that latency percentiles plug into.
+- `probabilistic-data-structures` — the broader family of
+  sketches t-digest belongs to.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Computing Extremely Accurate Quantiles Using t-Digests"
+  authors="Ted Dunning, Otmar Ertl"
+  year="2019"
+  source="arXiv"
+  url="https://arxiv.org/abs/1902.04023"
+>
+The definitive write-up of the algorithm, including the scale
+function analysis and the merge proof. Earlier drafts on
+GitHub are more accessible; this version is the academic
+treatment with the error bounds nailed down.
+</Reference>
+
+<Reference
+  kind="talk"
+  title="How NOT to Measure Latency"
+  authors="Gil Tene"
+  year="2015"
+  source="Strange Loop"
+  url="https://www.youtube.com/watch?v=lJ8ydIuPFeU"
+>
+The single best talk on percentile measurement and the
+"coordinated omission" problem most homegrown latency tools
+have. Motivates HDR Histogram but the lessons apply to
+t-digest too.
+</Reference>
+
+## In summary
+
+- t-digest is the standard streaming-percentile sketch.
+  Adaptive clusters give tight error at the tails where you
+  need it.
+- ~100 centroids → ~1.6 KB → 0.1% accurate p99 on millions
+  of samples.
+- **Mergeable**: each node sketches locally, central
+  aggregator merges. This is why every modern observability
+  stack uses it.
+- Alternatives: HDR Histogram (constant memory, pre-bounded
+  range, very fast inserts), DDSketch, CKMS.
+- Don't query p9999 from a small digest; don't merge across
+  time windows; pick δ to balance accuracy vs memory.

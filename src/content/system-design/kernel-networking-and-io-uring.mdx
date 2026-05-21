@@ -1,0 +1,379 @@
+export const level = 'senior';
+
+# Kernel networking and io_uring
+
+The layer most system-design conversations stop one step
+above. An HTTP request entering a Linux box goes through the
+NIC, the kernel's network stack, a socket buffer, a context
+switch, the userland event loop, and back — every step costs
+syscall and copy time. For a 1 KB request on a busy server,
+that machinery dominates over the application's actual work.
+
+The interesting question for 2026 is what's changed since
+epoll became the default a decade ago. The short answer:
+**io_uring** has matured, **eBPF** has eaten the kernel's
+extensibility story, and **kernel-bypass** (AF_XDP, DPDK,
+RDMA) has gone from telco-only to "available in your cloud."
+None of this matters for most services, where the framework's
+HTTP server is fine. All of it matters when p99 latency
+budgets shrink below a millisecond.
+
+## The default request path
+
+```
+NIC interrupt
+  → kernel softirq processes the packet
+  → sk_buff allocated, network stack walked (IP, TCP, conntrack, iptables/nftables)
+  → bytes deposited in socket receive buffer
+  → epoll readiness event raised
+  → userland blocks in epoll_wait return
+  → userland calls read() — kernel copies bytes user-side
+  → userland processes
+  → userland calls write() — kernel copies bytes back kernel-side
+  → kernel TCP stack segments, IP routes, NIC transmits
+```
+
+Each `epoll_wait`, `read`, `write`, and `accept` is a
+syscall. A syscall on modern x86 is ~50-100 ns of pure
+transition cost (KPTI mitigations roughly doubled this after
+Meltdown). Add the time the kernel spends actually doing
+the work — usually 500 ns to a few µs of pure kernel CPU per
+small request — and you have a per-request kernel tax that
+can match the application's CPU work on small payloads.
+
+At 1M concurrent connections, the syscall overhead alone
+dominates. This is the problem io_uring was designed to
+solve.
+
+## epoll
+
+The Linux readiness-based async API since 2002. Userland
+maintains an `epoll` instance, registers file descriptors,
+calls `epoll_wait`, and gets back a list of fds that are
+ready for I/O. It then does the actual `read`/`write` itself
+— epoll only tells you **when** an fd is ready, not the
+result of any operation.
+
+This is the foundation of every high-concurrency Linux
+server: nginx, HAProxy, Envoy, Node.js, the Go runtime's
+netpoller, Tokio (Rust), Java's NIO selectors.
+
+```ts
+// shape of an epoll loop, in pseudocode
+const ep = epoll_create1();
+epoll_ctl(ep, ADD, listen_fd, { events: EPOLLIN });
+
+while (running) {
+  const events = epoll_wait(ep, MAX_EVENTS, -1);
+  for (const ev of events) {
+    if (ev.fd === listen_fd) {
+      const conn = accept4(listen_fd);
+      epoll_ctl(ep, ADD, conn, { events: EPOLLIN | EPOLLET });
+    } else {
+      const buf = read(ev.fd, BUF_SIZE);
+      handle(ev.fd, buf);
+    }
+  }
+}
+```
+
+**Why it bottlenecks:**
+
+- Each `read`, `write`, `accept`, `epoll_ctl` is its own
+  syscall.
+- Buffered I/O still copies between kernel and user space.
+- Edge-triggered mode is fast but requires careful drain
+  loops; level-triggered mode is easier but slower.
+- At 1M connections doing 10k req/s each, you're at 10G
+  syscalls/s. Even at 50 ns/syscall, that's 500 CPU-seconds
+  per wall-clock second — impossible.
+
+In practice, services running on epoll cap out well below
+this. Real numbers: a finely tuned nginx hits a few hundred
+thousand req/s per core for tiny static responses; a typical
+Node.js or Go HTTP server is in the tens of thousands.
+
+## io_uring
+
+Jens Axboe (Linux 5.1, 2019; production-ready ~5.10, 2020;
+genuinely mature in 6.x). The model is **completion-based
+async**, not readiness-based, plus shared-memory ring
+buffers.
+
+```
+userland ─┐                                 ┌─ kernel
+          │     Submission Queue (SQ)       │
+          │  ┌──────────────────────────┐   │
+          ├─►│ op1 | op2 | op3 | op4 |..│──►│
+          │  └──────────────────────────┘   │
+          │                                 │
+          │     Completion Queue (CQ)       │
+          │  ┌──────────────────────────┐   │
+          │◄─│ res1| res2| res3| ..     │◄──┤
+          │  └──────────────────────────┘   │
+          └─                                 ─┘
+```
+
+Both rings are mapped into both kernel and user address
+spaces. Userland writes SQEs (submission queue entries)
+directly into shared memory and posts them with **one
+syscall** (`io_uring_enter`) that can carry many ops. The
+kernel completes them asynchronously and writes CQEs back.
+
+The big-deal features:
+
+- **Batched submission.** N operations cost one syscall, not
+  N. At high concurrency this is the order-of-magnitude win.
+- **SQPOLL mode.** A kernel thread polls the submission ring
+  on its own. Userland doesn't syscall at all — just writes
+  the SQE and updates the head pointer. Effectively zero
+  syscalls per op, at the cost of one kernel thread spinning.
+- **Fixed buffers and fixed files.** Pre-register buffers and
+  fds; the kernel skips the per-op cost of looking them up
+  and pinning their memory.
+- **Operation linking.** Express dependencies between ops
+  (e.g., `accept` then `read` then `write` then `close`) so
+  the kernel runs them in sequence without round-tripping to
+  userland between each.
+- **Multishot accepts/reads.** A single SQE persistently
+  accepts new connections (or reads from a socket) and emits
+  one CQE per result — eliminates the resubmit overhead.
+
+## A worked performance claim
+
+ScyllaDB, Tigris, and other database/storage projects that
+went all-in on io_uring report **2-3× throughput** for
+small-request workloads versus the equivalent epoll setup,
+once fixed buffers and multishot are turned on. For
+disk-heavy workloads on NVMe, the wins are larger — 4-5× on
+high-IOPS reads — because io_uring also replaced the older
+AIO (`io_submit`) API, which was synchronous in disguise for
+buffered I/O.
+
+These are best-case numbers from teams who rewrote their I/O
+layer end-to-end. A drop-in epoll replacement that doesn't
+use fixed buffers or SQPOLL gets nowhere near 2×.
+
+## epoll vs io_uring side by side
+
+<Compare a="epoll" b="io_uring">
+<>
+**Readiness-based.** Kernel tells userland "fd N is ready";
+userland does the actual `read`/`write` itself, each as its
+own syscall.
+
+One syscall per op (epoll_wait amortizes wakeups, but actual
+I/O is still per-syscall).
+
+Available on every Linux since 2.6. Universal ecosystem
+support (nginx, Node, Go, every async runtime).
+
+Mature security history. No major recent CVEs in the epoll
+API itself.
+
+**Best for:** general async servers, anything that has to
+run on older kernels, anything that has to run on non-Linux.
+</>
+<>
+**Completion-based.** Userland posts the operation itself;
+kernel does the I/O and posts the result.
+
+Many ops per syscall (or zero, in SQPOLL mode). Shared-memory
+rings eliminate copy on the submission/completion path.
+
+Requires Linux 5.10+ for production use; 5.19+ for the best
+feature set. Several distros (e.g., ChromeOS, some hardened
+container hosts) **disable io_uring for unprivileged users**
+because of a string of CVEs in 2022-2023 — io_uring's wide
+attack surface was the cost of its flexibility.
+
+Userland ecosystem is still catching up. Tokio has solid
+io_uring support; Go does not (as of Go 1.22, the netpoller
+is still epoll). Liburing is the canonical C library.
+
+**Best for:** high-IOPS storage engines, custom proxies and
+gateways at hyperscale, anything where you control the kernel
+and can spare one CPU for SQPOLL.
+</>
+</Compare>
+
+## Other things in the modern kernel networking stack
+
+**`sendfile(2)` and zero-copy.** Send a file's contents
+directly from page cache to a socket without copying through
+userland. Kafka uses this for consumer reads (the famous
+"zero-copy" pipeline); nginx and HAProxy use it for static
+files. Saves both a copy and a syscall pair. Variants:
+`splice`, `tee`, `MSG_ZEROCOPY` for `send()`.
+
+**`SO_REUSEPORT`.** Multiple sockets bound to the same port,
+each owned by a different accept thread, the kernel
+load-balances incoming connections across them. Removes the
+single-accept-thread bottleneck. Standard pattern for
+multi-core HTTP servers since Linux 3.9. nginx, HAProxy, Go's
+net/http with `SO_REUSEPORT` build tags.
+
+**`TCP_FASTOPEN`.** Skips the initial round-trip of the TCP
+handshake by carrying data in the SYN. Useful only when
+clients support it (modern browsers do); the data is sent
+before the handshake completes, so the receiver must be
+prepared for replay. Real-world deployment is sparse outside
+CDNs.
+
+**AF_XDP / XDP / eXpress Data Path.** A userland packet I/O
+mechanism, sitting above the driver but below the kernel
+network stack. Userland gets raw packets via a shared-memory
+ring; bypasses the kernel TCP/IP stack entirely for the
+selected flows. Used by load balancers and DDoS-mitigation
+appliances. Often paired with eBPF programs that decide which
+flows go to XDP and which go through the normal stack.
+
+**eBPF (extended Berkeley Packet Filter).** Programmable
+in-kernel execution. You write small bytecode programs that
+the kernel verifies for safety, JIT-compiles, and runs at
+specific hook points: packet ingress, socket ops, syscall
+entry, tracepoints. eBPF has eaten the kernel's
+extensibility story over the last few years. Real-world
+users: Cilium (CNI plugin and service mesh), Falco (runtime
+security), Pixie and Coroot (observability), Cloudflare's L4
+DDoS protection, Meta's `bpfilter`. If you find yourself
+saying "I wish I could write code that ran in the kernel
+network path," that's eBPF.
+
+**DPDK (Data Plane Development Kit).** Kernel-bypass packet
+processing. Userland polls the NIC directly via PMDs (poll
+mode drivers); kernel is entirely out of the data path. Used
+in cloud routers, NFV / telco workloads, Open vSwitch fast
+path, MoonGen. Higher absolute throughput than AF_XDP at the
+cost of dedicated CPUs spinning at 100%.
+
+**RDMA / RoCE / iWARP.** Remote Direct Memory Access. NIC
+DMAs into another machine's memory without involving either
+kernel. Sub-microsecond latency, zero CPU. Used heavily in
+HPC, distributed training (NCCL on InfiniBand), some storage
+systems (Ceph BlueStore + RDMA, SPDK NVMe-oF). Most cloud
+providers now offer RDMA-capable instance types.
+
+## What this means for system design
+
+For 95% of services the answer is: **none of this matters**.
+Your framework's HTTP server is built on epoll, it's fine,
+the kernel is not your bottleneck. Database queries, GC
+pauses, cache misses, downstream tail latency — those are
+your bottlenecks.
+
+You reach for this layer when:
+
+- **Sub-millisecond service-to-service latency** matters
+  (mostly hyperscaler-internal, sometimes ad-tech).
+- You're building a **storage engine** or **proxy** that has
+  to push millions of small ops/sec per core. ScyllaDB,
+  Redpanda, FoundationDB, Cloudflare's pingora — all of them
+  care.
+- You need **observability into kernel behavior** that
+  classic tools can't give. eBPF replaces a swath of older
+  ad-hoc tracers.
+- You need **packet-level processing** that can't go through
+  the kernel TCP stack (load balancers, DDoS mitigation,
+  custom L4 protocols).
+
+When you do reach for it, the levers in order of "most
+impact per engineering hour":
+
+1. **`SO_REUSEPORT` + tune accept threading.** Often the
+   biggest win for free.
+2. **`sendfile` / zero-copy** for any file-serving or
+   message-pipe workload.
+3. **io_uring** for IOPS-bound storage layers.
+4. **eBPF** for observability and policy.
+5. **AF_XDP** or **DPDK** when the kernel TCP stack itself
+   is the wall.
+6. **RDMA** when even the local CPU is in the way.
+
+<Callout variant="warning">
+Most teams that "moved to io_uring" got a small win because
+they kept the same userland-blocking architecture and just
+swapped the I/O syscall. The 2-3× numbers come from
+rewriting the data path around batched submission, fixed
+buffers, and multishot ops. Without that rewrite, expect
+10-30% at best.
+</Callout>
+
+## Cross-references
+
+- `latency-numbers-every-engineer-should-know` — the
+  underlying CPU/memory/network numbers that explain why
+  kernel transition cost matters.
+- `tail-latency` — why kernel jitter shows up at p99.
+- `connection-pooling-arch` — the userland-side fix for
+  connection-establishment overhead, complementary to the
+  kernel-level fixes here.
+- `service-mesh` — many modern meshes (Cilium especially)
+  are eBPF-based, blurring the line between userland proxy
+  and kernel data path.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Efficient IO with io_uring"
+  authors="Jens Axboe"
+  year="2019"
+  source="kernel.org"
+  url="https://kernel.dk/io_uring.pdf"
+>
+The original design document from io_uring's author. Reads
+like a kernel hacker explaining their work to other kernel
+hackers, but the conceptual model (rings, SQEs, CQEs, SQPOLL)
+is laid out in the first few pages and is the right starting
+point for any deeper reading.
+</Reference>
+
+<Reference
+  kind="book"
+  title="BPF Performance Tools"
+  authors="Brendan Gregg"
+  year="2019"
+  source="Addison-Wesley"
+  url="https://www.brendangregg.com/bpf-performance-tools-book.html"
+>
+The reference for eBPF as a performance-analysis tool — bcc,
+bpftrace, and the catalog of tracers that have largely
+replaced strace/perf for production diagnosis. The networking
+chapters are particularly relevant if you've never traced a
+packet through the kernel stack before.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Why we built Pingora, the proxy that connects Cloudflare to the Internet"
+  authors="Yuchen Wu"
+  year="2022"
+  source="Cloudflare blog"
+  url="https://blog.cloudflare.com/how-we-built-pingora-the-proxy-that-connects-cloudflare-to-the-internet/"
+>
+A real production motivation for caring about kernel
+networking efficiency at this layer. Cloudflare's writeup
+explains why nginx hit a wall for their scale and what
+choices Pingora made differently — including the bits where
+io_uring helped and where it didn't.
+</Reference>
+
+## In summary
+
+- The kernel's per-syscall and per-copy overhead is the
+  invisible tax under every networked service. At small
+  request sizes and high concurrency, it dominates.
+- **epoll** is the universal readiness API and what almost
+  everything runs on. Its limit is the per-op syscall cost.
+- **io_uring** replaces that with shared rings and
+  completion-based async — 2-3× wins on small-request
+  workloads if you rewrite the data path around it. Mind the
+  CVE history; some hardened distros disable it.
+- The rest of the modern stack: `sendfile` for zero-copy,
+  `SO_REUSEPORT` for multi-core accept, **eBPF** for
+  programmable kernel hooks, **AF_XDP** and **DPDK** for
+  kernel-bypass packet processing, **RDMA** for cross-host
+  memory access.
+- Most services don't need any of this. When you do, reach
+  for it in order of impact, not novelty.

@@ -1,0 +1,384 @@
+export const level = 'senior';
+
+# Chain replication
+
+Chain replication is the lesser-known but elegant alternative
+to Raft/Paxos for primary-backup replication. Writes flow
+through an ordered chain of replicas; reads are served by the
+tail. The protocol falls out of two simple rules and gives you
+linearizable reads with no extra round trip — properties that
+quorum-based replication has to work much harder for.
+
+The original paper is van Renesse & Schneider, "Chain
+Replication for Supporting High Throughput and Availability"
+(OSDI 2004). The idea has shown up under various names in
+production at Microsoft Azure Storage, HBase, FAWN-KV, Hibari,
+and several hyperscaler-internal storage systems.
+
+This page covers the basic protocol, the CRAQ extension that
+makes reads scale, the honest tradeoffs against Raft/Paxos, and
+where chain replication actually wins.
+
+## The architecture
+
+N replicas form an ordered chain:
+
+```
+   head ──→ middle1 ──→ middle2 ──→ ... ──→ tail
+```
+
+Two rules cover everything:
+
+- **Writes** enter at the head, propagate down the chain, and
+  are acknowledged from the tail.
+- **Reads** are served by the tail only.
+
+That is the entire protocol surface. The invariants follow
+directly:
+
+- A read at the tail returns the most recently committed write,
+  because every write must reach the tail (in chain order)
+  before it is acknowledged.
+- Two committed writes cannot have been observed in different
+  orders by two clients, because both reads go to the same
+  node (the tail).
+
+The reads are **linearizable**. No quorum math, no lease, no
+read-index round trip — just hit the tail.
+
+## A walkthrough
+
+<Steps>
+<Step n={1} title="Client sends write W to the head.">
+The head node receives W from the client. It does not yet ack.
+</Step>
+<Step n={2} title="Head applies W and forwards it.">
+The head appends W to its local state, then forwards W to the
+next node in the chain.
+</Step>
+<Step n={3} title="Each middle node applies and forwards.">
+Each middle node applies W locally, then forwards to its
+downstream neighbor. The forwarding is strictly ordered.
+</Step>
+<Step n={4} title="Tail applies W and acks.">
+The tail applies W, then sends an ack back along the chain (or
+directly to the client, depending on the variant). Once the
+tail has applied W, W is **committed**.
+</Step>
+<Step n={5} title="Client read goes straight to the tail.">
+For any read, the client contacts the tail directly. The tail
+returns its latest committed state — linearizable by
+construction.
+</Step>
+</Steps>
+
+The ack path can either bounce back along the chain (each node
+learns that W committed) or short-circuit straight to the
+client (with a side channel telling middle nodes about
+commits). Production implementations vary; the safety argument
+does not depend on which choice you make.
+
+## Why it is elegant
+
+A few properties drop out of the chain shape that are
+non-trivial in quorum-based systems:
+
+- **No quorum-read math.** Reads return committed data because
+  they hit the tail, which by construction sees writes only
+  after they have propagated everywhere upstream.
+- **No leader-election protocol per se.** There is no in-band
+  election; a separate small coordination service tracks the
+  current chain configuration (more on this in a moment).
+- **Simple recovery topology.** Lose a middle node — splice it
+  out and reconnect its neighbors. Lose the head — the second
+  node becomes the new head. Lose the tail — the
+  second-to-last becomes the new tail. Each case is a local
+  configuration change, not a full election.
+- **Linearizable reads with one network hop.** Compare with
+  Raft's read-index (one hop + a heartbeat round trip to
+  confirm leadership) or quorum reads (multiple hops to a
+  majority).
+
+## The catch: configuration management
+
+Chain replication does not avoid consensus — it **offloads it
+to a small metadata service**.
+
+The chain's current membership (which nodes are in the chain
+and in what order) is itself a replicated value that needs to
+be agreed upon. If two clients disagree about who the head is,
+two writes can race; if two nodes disagree about who is the
+tail, reads can be served from the wrong place.
+
+The standard solution: a small, reliable coordination service
+(ZooKeeper, etcd, or a Paxos/Raft cluster) holds the
+authoritative chain configuration. Failures are detected and
+reconfigurations are issued by this service.
+
+So a chain-replicated storage system typically has:
+
+- A handful of coordination nodes running Paxos or Raft for
+  the metadata.
+- Many chains of data nodes for the actual storage.
+
+The consensus traffic on the coordination service is low
+(membership changes only). The data path uses chain
+replication. This is the same architectural shape as Google's
+Chubby + GFS, ZooKeeper + HBase, or etcd + Kubernetes data
+planes.
+
+## Other costs
+
+### Write latency scales with chain length
+
+A 5-node chain at 1 ms per hop has a 5 ms minimum write
+latency. The chain length is bounded by the latency you can
+tolerate; replication factor 3 is common, 5 is the practical
+upper end for synchronous chains.
+
+Compare with Raft, where a write commits as soon as a
+**majority** has acked — for a 5-node Raft group that is the
+3rd-fastest ack, not the slowest.
+
+### Tail failure stalls reads briefly
+
+While the metadata service detects the tail is down and
+promotes the second-to-last node, reads are unavailable. With a
+fast failure detector this is sub-second; with conservative
+timeouts it can be many seconds.
+
+### Throughput at the tail
+
+The tail serves **all** reads. For read-heavy workloads, one
+node becomes the bottleneck. The standard answer is either to
+partition (run many chains, each serving a partition of the
+key space) or to use CRAQ.
+
+## CRAQ: reads from any node
+
+**CRAQ** — Chain Replication with Apportioned Queries (Terrace
+& Freedman, USENIX ATC 2009) — extends chain replication so
+that **every** node can serve reads, not just the tail.
+
+The trick: each node keeps a per-object **clean/dirty** flag.
+
+- A version is **clean** if every downstream node (toward the
+  tail) has also applied it.
+- A version is **dirty** if it has been applied locally but
+  not yet acked from the tail.
+
+When a read arrives:
+
+- If the object is **clean** at this node, return it directly.
+  This is safe because every node downstream has the same
+  value.
+- If the object is **dirty** at this node, the node asks the
+  tail what the latest committed version is, and returns that
+  to the client.
+
+In a write-light workload, most objects are clean almost all
+the time, and reads scale roughly linearly with chain length.
+In a write-heavy workload, the tail-check rate goes up and the
+benefit shrinks.
+
+CRAQ is the version of chain replication you actually want for
+mixed read/write systems. The original paper showed throughput
+scaling near-linearly with chain length on read-dominated
+workloads.
+
+## How it compares to quorum-based consensus
+
+<Compare a="Raft / Paxos quorum" b="Chain replication">
+<>
+- Write commit cost: ⌈N/2⌉+1 parallel acks
+- Read cost: leader read with lease, or read-index quorum, or
+  quorum read
+- Linearizable reads: extra protocol (lease or read-index)
+- Failure recovery: leader election with timeout-based
+  randomized backoff
+- Throughput ceiling: one leader's worth per group
+- Best for: small clusters, balanced read/write, when you
+  already have a Raft library
+</>
+<>
+- Write commit cost: N sequential hops down the chain
+- Read cost: one hop to tail (plain CR) or to any node (CRAQ)
+- Linearizable reads: free from the tail
+- Failure recovery: external metadata service reconfigures the
+  chain
+- Throughput ceiling: per chain — partition into many chains
+  for scale
+- Best for: read-heavy object stores, large replication factor
+  with tolerable write latency, when you already have a
+  reliable coordination service
+</>
+</Compare>
+
+The write-latency story is the main reason most general-purpose
+replicated stores went with Raft instead of chain replication.
+For object stores where writes are append-only and reads
+dominate, the chain-replication math comes out the other way.
+
+## Where chain replication shows up
+
+- **Microsoft Azure Storage** — Calder et al. (SOSP 2011) — uses
+  chain replication for the stream layer that backs blob,
+  table, and queue storage. Three-node chains, separate
+  partition layer above for the data model.
+- **HBase** — supports a "chain replication" mode for region
+  replicas in some deployments, though Raft via consensus
+  servers is the more common configuration today.
+- **FAWN-KV** (SOSP 2009) — used chain replication on a cluster
+  of low-power nodes; the chain shape was a good match for the
+  energy-per-op optimization goals.
+- **Hibari** (Gemini Mobile Technologies) — early open-source
+  production KV using chain replication, deployed at scale by
+  tier-1 telecom operators across Asia, Europe, and the
+  Americas in the late 2000s.
+- **Various academic and hyperscaler-internal systems** —
+  chain replication and CRAQ appear in research literature
+  regularly because their analytical properties are clean.
+
+The pattern is not "chain replication everywhere"; it is "chain
+replication where the workload has long chains, read-heavy
+mixes, or wants linearizable reads without a leader's worth of
+work."
+
+## A worked example: a small CR coordinator
+
+The metadata service tracks the chain. A minimal representation
+might look like:
+
+```ts
+type ChainConfig = {
+  chainId: string;
+  generation: number;        // bumped on every membership change
+  members: string[];         // ordered: members[0] is head, members[N-1] is tail
+};
+```
+
+Clients fetch the current config (cached for some TTL) and
+route writes to `members[0]`, reads to `members[N-1]`. When the
+coordinator detects a failure (heartbeat loss, health check),
+it issues a new `ChainConfig` with an incremented generation
+and the failed node removed.
+
+In-flight requests racing with reconfiguration are handled by
+versioning every RPC with the generation number; a node
+receiving an RPC from an older generation rejects it, and the
+client refetches the config.
+
+The coordinator itself is replicated via Paxos or Raft. This is
+the part of the system where you accept the consensus cost,
+because it runs rarely.
+
+## Pitfalls
+
+### Treating the chain like a quorum
+
+Chain replication does **not** survive arbitrary node failures
+the way a quorum does. A single failed node in the chain
+disrupts all writes (the chain is split) until the metadata
+service reconfigures. Quorum-based systems just tolerate the
+failure silently up to ⌊N/2⌋.
+
+The chain's failure-tolerance window is therefore "how fast
+can the metadata service detect and reconfigure" — which is
+usually fast (sub-second to a few seconds), but it is a real
+unavailability window that quorum protocols do not have.
+
+### Long chains for "more durability"
+
+Doubling chain length doubles write latency. It does not
+proportionately increase durability — N=3 is already past most
+practical durability bars for synchronous replication. Use
+erasure coding or async secondary replication for additional
+durability, not longer chains.
+
+### Forgetting that the metadata service is in the critical path
+
+If ZooKeeper is down, no reconfigurations happen. A failure
+during a ZooKeeper outage means the chain stays broken until
+ZooKeeper comes back. Operate the coordination service with
+appropriate care — it is your consensus dependency even if you
+think of yourself as "not using Paxos."
+
+### CRAQ without the dirty bit per version
+
+A common implementation bug is tracking a single dirty bit per
+object rather than per version. If a write commits and then a
+new write arrives, the bit needs to flip cleanly between
+versions; a single global bit per object can cause reads to
+either ask the tail unnecessarily or, worse, return stale data.
+
+## Related pages
+
+- `raft.mdx` and `paxos.mdx` for the consensus-based
+  alternative.
+- `quorum-systems.mdx` for the underlying read/write quorum
+  arithmetic.
+- `linearizability.mdx` for the consistency model chain
+  replication delivers.
+- `primary-backup-replication.mdx` for the general family of
+  replication strategies chain replication belongs to.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="Chain Replication for Supporting High Throughput and Availability"
+  authors="van Renesse & Schneider"
+  year="2004"
+  source="OSDI"
+  url="https://www.cs.cornell.edu/home/rvr/papers/OSDI04.pdf"
+>
+The original paper. Short and very readable — twelve pages of
+protocol, proof, and a throughput analysis comparing chain
+replication to primary-backup with quorum reads.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Object Storage on CRAQ: High-throughput chain replication for read-mostly workloads"
+  authors="Terrace & Freedman"
+  year="2009"
+  source="USENIX ATC"
+  url="https://www.usenix.org/legacy/event/usenix09/tech/full_papers/terrace/terrace.pdf"
+>
+CRAQ. Adds per-version clean/dirty flags so any node in the
+chain can serve linearizable reads. The implementation section
+is the most useful part if you are designing a CR-style system.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Windows Azure Storage: A Highly Available Cloud Storage Service with Strong Consistency"
+  authors="Calder et al."
+  year="2011"
+  source="SOSP"
+  url="https://www.cs.purdue.edu/homes/csjgwang/CloudNativeDB/AzureStorageSOSP11.pdf"
+>
+The deepest production writeup of chain replication at scale.
+Section 5 describes the stream layer's use of three-node chain
+replication and the coordination service that manages it.
+</Reference>
+
+## In summary
+
+- Chain replication: writes flow head-to-tail, reads from the
+  tail. Linearizable reads with one network hop, no quorum
+  math.
+- Failure recovery, membership, and head/tail identity are
+  delegated to a small external coordination service (itself
+  usually Paxos or Raft). Chain replication does not avoid
+  consensus; it isolates it.
+- Write latency scales with chain length (N sequential hops);
+  Raft's commit latency is the median of N parallel acks. For
+  long chains, Raft wins on write latency.
+- **CRAQ** lets every node serve linearizable reads via
+  per-version clean/dirty tracking — the right variant for
+  read-heavy workloads.
+- Used in Azure Storage, FAWN-KV, Hibari, and various
+  research and internal systems. Most general-purpose
+  replicated stores pick Raft instead, mainly because of
+  write-latency and tooling maturity.

@@ -186,6 +186,128 @@ LWW favors "later" clocks; CRDT semantics may favor
 Document the resolution rules explicitly so users (and ops)
 understand.
 
+## State-based vs operation-based CRDTs
+
+CRDTs come in two formal flavors that look superficially
+similar but make very different demands on the network. Both
+are defined in Shapiro et al.'s 2011 paper; production
+libraries pick between them based on what the underlying
+transport can promise.
+
+<Compare a="State-based (CvRDT)" b="Operation-based (CmRDT)">
+<>
+Replicas exchange **full state**. The merge function is
+commutative, associative, and idempotent, so re-delivering
+the same state or merging in any order is safe. Network
+model: any eventually-reliable delivery works — gossip,
+anti-entropy, redelivery on retry, all fine.
+</>
+<>
+Replicas broadcast **individual operations**. Each operation
+is applied **exactly once**, in causal order, on every
+replica. Wire cost per change is small, but the network must
+guarantee exactly-once causal delivery.
+</>
+</Compare>
+
+### State-based: easy network, expensive wire
+
+Concrete state-based CRDTs:
+
+- **G-Counter (grow-only counter)** — vector of per-replica
+  increment slots; merge takes element-wise max; total is the
+  sum. (Shown earlier.)
+- **G-Set (grow-only set)** — insert-only; merge is set
+  union. Cannot remove elements.
+- **2P-Set (two-phase set)** — pairs a G-Set of additions with
+  a G-Set of "tombstoned" removals. Once removed, an element
+  can never be re-added.
+- **PN-Counter** — pair of G-Counters, one for `+` and one
+  for `−`; merge each independently. Supports both
+  increments and decrements.
+- **OR-Set (Observed-Remove Set)** — each insert tagged with
+  a unique ID; remove drops only the specific IDs the
+  replica has seen. Concurrent add wins over remove (the new
+  ID wasn't observed by the remover).
+
+The merge function is the whole API; replicas can shovel
+their state over any unreliable channel and convergence is
+guaranteed. Riak's Datatypes are textbook state-based — every
+write is a full CRDT value persisted and gossiped between
+replicas.
+
+The downside: state grows. Even compact state-based CRDTs
+ship more bytes than a single operation would, and metadata
+(tombstones, per-replica counters) accumulates over time.
+
+### Operation-based: tight wire, demanding network
+
+Concrete operation-based CRDTs and use cases:
+
+- **RGA (Replicated Growable Array)** — Roh et al. 2011; the
+  basis of most production text CRDTs. Each character carries
+  a unique ID and a "parent" reference, building a tree that
+  flattens deterministically into a sequence.
+- **LSEQ / Logoot / Treedoc** — text CRDTs based on
+  variable-length position identifiers between existing
+  characters. Different complexity/density tradeoffs than
+  RGA.
+- **Yjs's YATA algorithm** — operation-based, similar in
+  spirit to RGA but with optimizations for the common
+  "insert at the end" pattern in collaborative editors.
+- **Automerge** — operation-based with the "Columnar"
+  binary encoding that batches many operations and
+  compresses them by column, drastically reducing wire and
+  on-disk cost compared to per-op JSON.
+
+The wire cost per edit is tiny (a few bytes), but the
+network must deliver every operation, in causal order, and
+exactly once. The application or library has to maintain the
+causal-delivery invariant — typically with vector clocks or
+Lamport timestamps on operations, plus a buffer that holds
+operations until their causal predecessors arrive.
+
+### What modern collaborative libraries actually do
+
+A practical wrinkle: most production libraries blur the
+formal distinction. They're *operationally* op-based (small
+wire messages), but they ship **state-based-style merges
+under the hood** for re-sync and offline reconciliation.
+
+- **Yjs** — op-based with a compact binary encoding; on
+  reconnect, replicas exchange "state vectors" and ship only
+  the missing operations. Effectively delta-state CRDT.
+- **Automerge 2** — same pattern: ops on the wire during
+  steady-state collaboration; the "save" format is a state
+  document that can be merged like a CvRDT for catch-up.
+- **Linear's sync engine** — closer to operational
+  transformation than to a pure CRDT: a central server assigns
+  a total order via a monotonic `lastSyncId`, clients apply
+  operations optimistically then reconcile against the server's
+  canonical sequence. The reverse-engineered writeup at
+  `github.com/wzhudev/reverse-linear-sync-engine` is the
+  clearest public source on the model.
+
+The takeaway: in 2026, "is it state-based or op-based?" is
+less useful than "does it tolerate lossy networks?" and "does
+it support efficient delta sync?" — and the best libraries
+answer yes to both.
+
+<Reference
+  kind="paper"
+  title="Conflict-free Replicated Data Types"
+  authors="Marc Shapiro, Nuno Preguiça, Carlos Baquero, Marek Zawirski"
+  year="2011"
+  source="INRIA Research Report RR-7687 / SSS 2011"
+  url="https://inria.hal.science/inria-00609399v1/document"
+>
+The canonical CRDT paper. Formalizes the two families
+(CvRDT and CmRDT), proves the equivalence under
+strong-eventual-consistency, and catalogs the standard
+building blocks (counters, sets, registers). Read this before
+implementing anything that calls itself a CRDT.
+</Reference>
+
 ## Further reading
 
 <Reference

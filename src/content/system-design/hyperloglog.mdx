@@ -1,0 +1,257 @@
+export const level = 'senior';
+
+# HyperLogLog
+
+HyperLogLog answers a question that comes up everywhere in
+analytics: **how many distinct items have we seen?** Unique
+visitors today, unique queries per shard, unique source IPs in a
+DDoS, unique users who clicked an ad. Exact answers require
+storing every item (or a hash of every item) — gigabytes of
+memory for a billion-element stream. HyperLogLog answers within
+about 0.8% accuracy in **12 KB** of memory, regardless of whether
+the true cardinality is 100 or 100 billion.
+
+The trick is to throw away nearly everything about each item and
+keep only one number: the position of the leading 1-bit in its
+hash. Across many "buckets" that statistic is enough to recover
+cardinality with bounded error. The original paper (Flajolet et
+al., 2007) is genuinely beautiful — six pages of probability
+theory wrapped around a structure you can implement in an
+afternoon.
+
+## The mechanism
+
+Hash each incoming item to a uniformly distributed bit string.
+Use the first `p` bits to select one of `m = 2^p` registers; use
+the remaining bits to count leading zeros, and store the
+**maximum** leading-zero count seen for that register.
+
+```
+item:    "user-12345"
+hash:    1011 0000 0010 1101 ...   (64 bits)
+         └──┬─┘ └────────┬──────┘
+        bucket idx   leading-zero count
+        = 11 (decimal)   in remaining bits
+                       = 3 (then a 1)
+        register[11] = max(register[11], 3)
+```
+
+A register only ever grows, so the structure is mergeable.
+
+Why does this work? If the hashes are uniform, the probability of
+seeing `k` or more leading zeros in any one observation is
+`2^-k`. Seeing a register with value `k` is evidence that
+**roughly `2^k` distinct items** hashed into that bucket. Take
+the **harmonic mean** of `2^register[i]` across all `m`
+registers, multiply by a constant `α_m`, and you get an estimate
+of the total cardinality.
+
+```
+estimate = α_m · m^2 · ( Σ_i 2^(-register[i]) )^(-1)
+```
+
+The harmonic mean (instead of arithmetic) tames outliers — one
+register seeing 30 zeros doesn't blow up the estimate.
+
+## The numbers that matter
+
+With `m = 2^p` registers the standard error is `≈ 1.04 / √m`.
+Each register stores a small count (6 bits is plenty —
+`log2(64) = 6` covers any leading-zero count from a 64-bit
+hash). Memory is `m · 6` bits, plus some constants.
+
+<Cheatsheet>
+| p (precision) | m = 2^p registers | Memory | Standard error |
+|---|---|---|---|
+| 10 | 1,024  | 768 B  | 3.25% |
+| 12 | 4,096  | 3 KB   | 1.62% |
+| **14** | **16,384** | **12 KB** | **0.81%** |
+| 16 | 65,536 | 48 KB  | 0.41% |
+| 18 | 262,144| 192 KB | 0.20% |
+</Cheatsheet>
+
+`p = 14` is Redis's default — the famous "12 KB regardless of
+cardinality" figure. That same 12 KB can count unique items in a
+stream of 10 trillion to within ~0.8% standard error.
+
+## A worked Redis example
+
+```bash
+redis-cli> PFADD visitors:2026-05-21 alice bob carol
+(integer) 1
+redis-cli> PFADD visitors:2026-05-21 alice dave   # alice is dup
+(integer) 1
+redis-cli> PFCOUNT visitors:2026-05-21
+(integer) 4
+
+# Merge two days' uniques in O(m). The "PF" is for Philippe Flajolet.
+redis-cli> PFMERGE visitors:weekly visitors:2026-05-20 visitors:2026-05-21
+OK
+redis-cli> PFCOUNT visitors:weekly
+(integer) 87
+```
+
+Every `PFADD` is O(1). Every `PFCOUNT` is O(m). Memory per key
+is capped at 12 KB. This is the structural reason Redis sketches
+work for any-scale analytics on a single box.
+
+## Where HyperLogLog lives in production
+
+- **Redis HyperLogLog** (PFADD/PFCOUNT/PFMERGE). The reference
+  in-memory implementation; uses HLL++ encoding.
+- **Google's BigQuery and internal telemetry**. The HLL++ paper
+  describes the design that "estimated unique searches"
+  dashboards run on.
+- **PostgreSQL's `postgresql-hll`** extension (originally from
+  Aggregate Knowledge). Lets you store HLLs in a column and
+  union them across rows.
+- **ClickHouse**: `uniqHLL12` and `uniqCombined` use HLL with
+  small-cardinality fallback.
+- **Apache DataSketches** (Yahoo / Apache): HLL is one of
+  several sketches; standard in Druid, Pinot, and Hive.
+- **Ad-tech "unique reach"**: how many distinct users did this
+  campaign reach across publishers? Each publisher contributes a
+  sketch; the union sketch gives the answer without sharing
+  user IDs.
+- **Metric ingestion deduplication**: counting unique series in
+  an OpenTelemetry pipeline before they hit a TSDB.
+
+## The merge property — why HLL beats almost everything else
+
+Two HLL sketches `A` and `B` of the same precision can be merged
+by taking the element-wise maximum of their registers:
+
+```ts
+function merge(a: number[], b: number[]): number[] {
+  const out = new Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = Math.max(a[i], b[i]);
+  return out;
+}
+```
+
+The merged sketch is **exactly** the HLL of the union of the
+underlying sets — no error penalty for merging. This is the
+property that makes HLL the workhorse of distributed counting:
+each shard produces a local sketch, a coordinator unions them in
+O(m), and the global cardinality is recovered with the same
+accuracy as if everything had been counted on one machine.
+
+You cannot do this with a hash set without paying O(union size)
+in network and memory. You can't do it with an exact counter
+without losing the "distinct" property under retries. HLL is the
+mergeable distinct-count sketch.
+
+## Small-cardinality bias and HLL++
+
+The basic HLL estimator is biased low when the true cardinality
+is below about `2.5 · m`. The original paper proposed switching
+to **linear counting** in that regime, and Google's **HLL++**
+paper (Heule et al., 2013) refined two things further:
+
+1. **Sparse representation**: for small N, store only the
+   non-zero registers in a compressed form. Often shrinks 12 KB
+   sketches to a few hundred bytes when populated lightly.
+2. **Empirical bias correction**: replace the closed-form
+   constant for small-N regions with a learned correction table.
+
+Redis, BigQuery, and most modern libraries use HLL++ by default.
+If you're reading "HyperLogLog" docs published after 2013, it's
+almost always HLL++ in practice.
+
+## When NOT to use HLL
+
+- **You need the exact answer.** HLL gives an estimate. For
+  billing-grade counts, use exact dedup.
+- **N is small (< ~100) and accuracy must be high.** Use a
+  small hash set; HLL's small-N regime, even with HLL++, has
+  more variance than just storing the values.
+- **You need to enumerate the distinct items, not just count
+  them.** HLL throws the items away; it cannot tell you which
+  IPs you've seen, only how many.
+- **You need very high precision (sub-0.1%).** Memory grows
+  inversely with the square of accuracy — sub-0.1% means
+  hundreds of KB per sketch, at which point KMV or Theta
+  sketches may be more efficient.
+
+## Compared to the alternatives
+
+<Cheatsheet>
+| Sketch | Memory for ~0.8% error | Merge support | Notes |
+|---|---|---|---|
+| Hash set (exact) | O(N) | Set-union, O(N) | Ground truth; doesn't scale. |
+| Linear Counting | Bit array sized to N_max | Bitwise OR | Best for small N (under ~10·m). |
+| **HyperLogLog / HLL++** | **~12 KB** | **Element-wise max, O(m)** | The standard. |
+| KMV (k-Minimum Values) | ~8 KB | Union via k smallest | Supports cardinality, intersection, Jaccard. |
+| Theta sketch (DataSketches) | ~16 KB | Set-theoretic union/intersect | Generalizes KMV; supports A ∩ B and A \ B with bounded error. |
+</Cheatsheet>
+
+The reason HLL dominates: cheapest memory for plain cardinality
+**plus** trivially mergeable. KMV and Theta win when you also
+need intersection or set-difference estimates, which HLL handles
+only approximately and badly.
+
+## Pitfalls
+
+- **Don't average estimates across nodes.** Merge the sketches
+  (element-wise max), then estimate. Averaging estimates loses
+  the harmonic-mean accuracy guarantee.
+- **All sketches in a merge must share the same precision `p`.**
+  Sketches of different sizes cannot be merged directly — you'd
+  need to downsample.
+- **Hash function matters.** A non-uniform hash (or one with
+  short output) breaks the leading-zero argument. 64-bit
+  MurmurHash3, xxHash, or SipHash are all fine.
+- **HLL of HLLs is not a thing.** You can't sketch the
+  cardinality of distinct sketches by sketching them; merge first,
+  then count.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="HyperLogLog: The Analysis of a Near-Optimal Cardinality Estimation Algorithm"
+  authors="Flajolet, Fusy, Gandouet, Meunier"
+  year="2007"
+  source="AofA"
+  url="https://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf"
+>
+The original paper. Six pages; derives the harmonic-mean estimator
+and the `1.04/√m` error bound from first principles. The motivating
+example is counting distinct words in Shakespeare with constant
+memory — and it works.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="HyperLogLog in Practice: Algorithmic Engineering of a State-of-the-Art Cardinality Estimation Algorithm"
+  authors="Heule, Nunkesser, Hall"
+  year="2013"
+  source="EDBT (Google)"
+  url="https://research.google/pubs/pub40671/"
+>
+The HLL++ paper. Adds sparse representation, 64-bit hashing, and
+empirical bias correction. This is what Redis, BigQuery, and most
+modern HLL libraries actually implement.
+</Reference>
+
+## In summary
+
+- HyperLogLog estimates the number of distinct items in a
+  stream using O(log log N) bits per register and `m = 2^p`
+  registers — about 12 KB for ~0.8% standard error at `p = 14`.
+- Each register stores the maximum leading-zero count seen in
+  the suffix of incoming hashes; the harmonic mean of `2^reg`
+  gives the cardinality estimate.
+- Standard error scales as `1.04 / √m`; memory is independent
+  of true cardinality from 100 to 100 billion.
+- Trivially mergeable in O(m) by element-wise max — the
+  property that makes HLL the default for distributed
+  cardinality counting.
+- HLL++ (Heule et al.) is what production systems ship: sparse
+  encoding for small N plus empirical bias correction.
+- Use exact dedup for tiny N or when you need to enumerate
+  items; use Theta/KMV sketches when you also need intersection
+  estimates.
+- Lives in Redis (PFCOUNT), BigQuery, ClickHouse, Druid,
+  Pinot, PostgreSQL `pg_hll`, and most modern analytics
+  pipelines.

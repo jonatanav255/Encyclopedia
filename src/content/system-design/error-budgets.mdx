@@ -160,6 +160,123 @@ rather than rolling over.
 - **Hard-real-time systems** (medical, aviation). Reliability
   isn't negotiable; budgets don't apply the same way.
 
+## Multi-window multi-burn-rate alerts
+
+The naive burn-rate alert — "page when the 1-hour burn rate
+is greater than 10× normal" — has two opposite failure modes:
+
+- **It misses slow chronic burns.** A service that's
+  consistently 2× over budget for a week never trips a 10×
+  threshold but quietly drains the month.
+- **It fires on noisy spikes.** A 60-second blip of 50× burn
+  rate that resolves itself pages on-call for nothing. The
+  alert says "burn happened" but is silent about whether it
+  *continued*.
+
+Chapter 5 of the Google SRE Workbook ("Alerting on SLOs")
+introduced the **multi-window multi-burn-rate** pattern that
+solves both. The idea: pair a **short window** that proves
+the burn is happening *right now* with a **long window** that
+proves it's been going on long enough to matter, and only
+alert when both exceed their thresholds.
+
+### The recommended set of alerts
+
+For a 99.9% SLO, the SRE Workbook recommends three alerts at
+three sensitivities:
+
+<Cheatsheet>
+| Severity | Long window | Short window | Burn rate | Budget consumed if sustained |
+|---|---|---|---|---|
+| Page (fast) | 1 hour | 5 min | 14.4× | 2% of monthly budget in 1 hour |
+| Page (slow) | 6 hours | 30 min | 6× | 5% of monthly budget in 6 hours |
+| Ticket | 3 days | 6 hours | 1× | 10% of monthly budget in 3 days |
+</Cheatsheet>
+
+Each alert fires only when **both** the long window and the
+short window show a burn rate above the threshold. The short
+window is roughly 1/12 the long window — small enough that it
+goes quiet within minutes once the issue resolves, large
+enough to filter out single-minute blips.
+
+### Why two windows
+
+The short window answers "is this happening now?" — without
+it, the alert lingers for the full long-window duration after
+the incident resolves, because the long-window average is
+still elevated.
+
+The long window answers "is this sustained?" — without it,
+every brief glitch pages.
+
+Requiring both eliminates the worst of both naive
+approaches: fast resets *and* noise suppression.
+
+### The math
+
+If your SLO is 99.9% over 30 days, the monthly error budget
+is **0.1% of requests** (or equivalently, 43.2 minutes of
+"bad time" over the month). Burn rate is "budget consumed
+per unit time, normalized so that 1× exhausts the budget over
+exactly the SLO window":
+
+```
+burn_rate = (errors_in_window / requests_in_window) / (1 - SLO)
+```
+
+Worked example: a 99.9% SLO has 43.2 minutes of monthly
+budget. If you observe a 1-hour error rate of 1.44% (well
+above the 0.1% target), that's `0.0144 / 0.001 = 14.4×` —
+exactly the fast-page threshold. At 14.4× sustained, you'd
+exhaust the month's budget in **30 days / 14.4 ≈ 50 hours**,
+which is why this rate warrants paging immediately.
+
+### Calibrating to your incident response
+
+The four windows aren't a fixed recipe; they're a starting
+point that assumes you can respond to a page within minutes.
+Things to consider when tuning:
+
+- **Page latency.** If your on-call response is "minutes,"
+  the SRE Workbook defaults are fine. If it's "tens of
+  minutes" (smaller team, on-call is a side duty), widen
+  the short window to reduce false pages.
+- **SLO target.** A 99.99% SLO has 10× less budget than
+  99.9%; the same absolute error rate produces a 10× higher
+  burn rate, so thresholds need to scale.
+- **Volume.** Very low-traffic services get noisy fast-burn
+  numbers from a single bad request; bias toward longer
+  windows and absolute-count alerts.
+
+### The pitfall: collapsing the two windows
+
+A common mistake when implementing this: setting both
+windows the same. If the long and short windows are both
+"1 hour," you've got one alert that the SRE Workbook is
+explicitly arguing against. The reset-time benefit comes
+entirely from the *shorter* window going quiet first when
+the incident ends.
+
+Equally bad: setting only the long window. The alert is
+slow to fire *and* slow to clear. On-call dashboards stay red
+for an hour after the issue resolves, eroding trust in the
+alert.
+
+<Reference
+  kind="book"
+  title="The Site Reliability Workbook, Chapter 5: Alerting on SLOs"
+  authors="Steven Thurgood, David Ferguson, Alex Hidalgo, Betsy Beyer"
+  year="2018"
+  source="Google SRE"
+  url="https://sre.google/workbook/alerting-on-slos/"
+>
+The canonical reference for multi-window multi-burn-rate
+alerting. Walks through six successive alerting approaches,
+showing exactly why each earlier approach fails before
+arriving at the recommended pattern. Required reading before
+designing real SLO alerts.
+</Reference>
+
 ## In summary
 
 - Error budget = 1 − SLO over a window. The amount of

@@ -1,0 +1,430 @@
+export const level = 'senior';
+
+# Kafka internals
+
+Most encyclopedia entries say "use Kafka" as if it's a primitive.
+It isn't. Kafka is a distributed append-only log with a particular
+storage layout, a particular replication protocol, a particular
+controller, and a particular set of choices around exactly-once
+that have evolved across half a dozen KIPs. This page is the load
+that everything else leans on.
+
+The mental model that matters: **a Kafka cluster is a collection
+of partitioned, replicated, segment-structured logs, with one
+metadata controller, and a transaction coordinator bolted on for
+exactly-once.** Each of those pieces is doing something specific.
+
+This page is internals, not a tutorial. If you want "how do I
+produce a message," start with the Confluent quickstart.
+
+## The log abstraction
+
+Every Kafka topic is split into **partitions**. Each partition is
+an append-only sequence of records:
+
+```
+(offset, key, value, timestamp, headers)
+```
+
+The **offset** is a monotonically increasing integer per
+partition. Producers send writes; the broker assigns an offset
+and returns it. Consumers track an offset and read forward.
+
+A partition is the unit of **two** things at once:
+
+- **Parallelism**: one consumer in a group reads one partition at
+  a time. To go faster you add partitions and consumers.
+- **Ordering**: messages within a partition are strictly ordered;
+  messages across partitions are not. Order is the partition.
+
+This is why partition-key selection (cross-reference
+`partition-key-selection.mdx`) is the single most consequential
+design decision when you adopt Kafka. The key chooses the
+partition; the partition chooses the order and the consumer.
+
+(See also `append-only-logs.mdx` — the partition is one of the
+canonical examples of the append-only-log primitive.)
+
+## Segment files on disk
+
+A partition is not one giant file. It's a sequence of **segment
+files**, each capped at a fixed size (default 1 GB) or a fixed
+roll interval. At any moment exactly one segment per partition is
+**active** (being appended to); the rest are **closed** and
+immutable.
+
+For each segment, Kafka writes three files in the data directory:
+
+```
+00000000000000123456.log     # the actual records
+00000000000000123456.index   # offset → byte position
+00000000000000123456.timeindex # timestamp → offset
+```
+
+The `.index` is sparse (one entry per ~4 KB of log by default).
+A fetch for offset O does a binary search in the index to find a
+nearby byte position, then scans forward in the `.log` until it
+hits O.
+
+Closed segments are eventually **deleted** (time/size retention)
+or **compacted** (key retention — see below). The active segment
+is never compacted; it gets compacted only after roll.
+
+The throughput trick: the broker writes records into the page
+cache, and consumers read them back via `sendfile(2)`. The kernel
+copies bytes from the page cache directly to the socket — no
+user-space copy, no serialization on the read path. This is why
+a single broker can sustain hundreds of MB/s on commodity disks.
+
+<Callout variant="info">
+Kafka's high throughput is mostly the kernel's high throughput.
+The broker is engineered around the OS page cache and zero-copy
+sendfile, not around clever per-record code. This is why Kafka
+on tmpfs or networked block storage often underperforms versus
+local NVMe — you've taken away the thing the design optimized
+for.
+</Callout>
+
+## The replication protocol
+
+Each partition has **one leader** and zero or more **followers**,
+spread across brokers. All reads and writes go through the
+leader. Followers fetch from the leader in a tight loop.
+
+The set of followers that have caught up to within
+`replica.lag.time.max.ms` (default 30 s in modern Kafka) is the
+**In-Sync Replica (ISR)** set. The ISR always includes the
+leader.
+
+A producer write is acknowledged based on `acks`:
+
+<Cheatsheet>
+| `acks` | What waits | Durability | Latency |
+|---|---|---|---|
+| `0` | nothing — fire and forget | Lose any in-flight write on crash | Lowest |
+| `1` | leader's local write | Lose the write if leader dies before any follower fetches | Low |
+| `all` (`-1`) | every replica in the ISR | Survives any single-broker failure when `min.insync.replicas` ≥ 2 | Higher |
+</Cheatsheet>
+
+`acks=all` plus `min.insync.replicas=2` (with replication factor
+3) is the durability sweet spot. The write commits as soon as 2
+of the 3 replicas have it on disk; one replica can be down or
+slow without blocking writes.
+
+**The trap**: `min.insync.replicas=1` with replication factor 3
+sounds redundant but isn't. If two followers fall out of the ISR
+and only the leader is left, the leader keeps acking writes —
+then if it crashes, those acked writes are gone. Set
+`min.insync.replicas` to `replication.factor - 1`.
+
+### Leader election
+
+When a broker dies, the controller picks a new leader for each
+partition it led. The election rule is:
+
+> Pick a replica from the **current ISR**, preferring the
+> "preferred leader" (the first replica in the assignment list,
+> used to balance leadership evenly across brokers).
+
+If the entire ISR is unavailable, the controller has two choices:
+
+- **Wait** for an ISR member to come back. The partition is
+  unavailable for writes until then. **This is the default.**
+- **Unclean leader election**: promote a non-ISR replica anyway.
+  The new leader's log is behind the old; any writes that were
+  acked but only on the dead ISR members are **lost**.
+
+`unclean.leader.election.enable=false` is the modern default.
+Turning it on trades durability for availability — a real choice
+for some workloads (cache fills, ad-impression logs) but never
+for payments or audit data.
+
+## The controller
+
+One broker in the cluster is the **controller**. It owns:
+
+- Partition-to-broker assignment
+- Leader election when a broker fails
+- Topic/partition create and delete
+- Reassigning partitions (`kafka-reassign-partitions`)
+
+For 12 years (Kafka 0.7 through 2.x), the controller was a
+broker elected via ZooKeeper, and ZooKeeper also stored the
+cluster metadata (topics, partitions, ACLs, configs).
+
+### KRaft (KIP-500)
+
+ZooKeeper had two problems: it was a second distributed system
+to operate, and metadata operations didn't scale past a few
+hundred thousand partitions.
+
+**KRaft** (Kafka Raft, KIP-500) replaces ZooKeeper with a
+Raft-replicated metadata log inside Kafka itself. A small set of
+brokers run as **controllers** (typically 3 or 5); they form a
+Raft quorum and replicate the metadata log among themselves.
+Other brokers are observers — they tail the metadata log and
+react to changes.
+
+(For the Raft mechanics, see `raft.mdx`.)
+
+KRaft was marked production-ready in Kafka 3.3 (KIP-833,
+2022) and became the default for new clusters in the same
+release. ZooKeeper mode was deprecated in Kafka 3.5 (the
+bridge release for ZK→KRaft migration) and is removed in
+Kafka 4.0.
+
+What changed in practice:
+
+- Faster failover (single-digit seconds for controller failover
+  versus tens of seconds with ZooKeeper).
+- Millions of partitions per cluster instead of hundreds of
+  thousands.
+- One distributed system to operate, not two.
+
+## Log compaction
+
+A Kafka topic has one of two **retention** modes:
+
+- **Delete** (the default): old segments are dropped after a
+  time or size threshold (`retention.ms`, `retention.bytes`).
+- **Compact**: Kafka keeps the **most recent value per key**
+  forever, and drops earlier values for the same key.
+
+Compaction runs as a background job on closed segments. It scans
+the segment, builds an index of (key → latest offset), and
+rewrites the segment with only the records whose offset matches
+the latest for their key. A `null` value is a **tombstone** —
+after compaction it survives long enough for consumers to see it,
+then it's removed.
+
+What compaction is actually for:
+
+- **Changelog topics** for Kafka Streams' state stores. Restore a
+  state store by replaying the compacted topic — you only need
+  the latest value per key, not the full history.
+- **Configuration topics** (the Connect config topic, KRaft
+  metadata, schemas in Schema Registry).
+- **KTable** in Kafka Streams: stream-table duality
+  (cross-reference `stream-table-duality.mdx`) relies on
+  compaction to make a topic a queryable table.
+
+You can also enable **both** delete and compact (`cleanup.policy=compact,delete`)
+— compact within the retention window, then drop the whole thing.
+
+## Idempotent producer (KIP-98)
+
+Without idempotence, a network blip causes this:
+
+```
+producer → broker: write A   (broker writes, ack lost in flight)
+producer → broker: write A   (retry — broker writes again)
+result: A appears twice
+```
+
+KIP-98 (Kafka 0.11, 2017) adds **producer IDs** and **sequence
+numbers**:
+
+- Each producer is assigned a producer ID (PID) on
+  initialization.
+- Each record carries a sequence number per `(PID, partition)`.
+- The broker remembers the last sequence number it accepted per
+  `(PID, partition)`. Retries with the same sequence are
+  deduplicated.
+
+Enable with `enable.idempotence=true`. Since Kafka 3.0 this is
+**default-on**. It solves "duplicate writes from a single
+producer to a single partition" — that's it. Not cross-partition,
+not cross-producer.
+
+## Transactional producer
+
+Idempotence handles one producer, one partition. **Transactions**
+(also KIP-98) handle one producer writing to many partitions
+atomically.
+
+```ts
+producer.initTransactions();
+producer.beginTransaction();
+producer.send(record1); // partition 7
+producer.send(record2); // partition 12
+producer.sendOffsetsToTransaction(consumerOffsets, group); // for read-process-write
+producer.commitTransaction();
+```
+
+A special broker, the **transaction coordinator**, owns the
+transaction. The protocol is two-phase commit:
+
+<Steps>
+<Step n={1} title="Begin">
+The producer calls `initTransactions`; the coordinator assigns a
+transactional ID and writes a transaction-begin marker to the
+internal `__transaction_state` topic.
+</Step>
+<Step n={2} title="Send">
+The producer writes records to data partitions with the
+transactional ID and PID. Records are visible to consumers in
+`read_uncommitted` mode immediately; consumers in
+`read_committed` mode skip them until the commit marker arrives.
+</Step>
+<Step n={3} title="Prepare-commit">
+The producer calls `commitTransaction`. The coordinator writes a
+prepare-commit record to `__transaction_state`.
+</Step>
+<Step n={4} title="Write markers">
+The coordinator writes a **transaction marker** (commit or abort)
+into every data partition the producer touched.
+</Step>
+<Step n={5} title="Complete">
+Once all markers are durable, the coordinator writes a
+commit-complete record. Consumers in `read_committed` mode now
+see the records.
+</Step>
+</Steps>
+
+This is what powers "exactly-once stream processing" in Kafka
+Streams and Flink-on-Kafka (cross-reference
+`exactly-once-stream-processing.mdx`). The key trick is the
+**read-process-write loop**: a stream processor reads from input
+topic, computes, writes to output topic, and commits the input
+offset — all in one transaction. If the commit fails, the offset
+isn't advanced and the work is replayed; if it succeeds, no
+record is duplicated.
+
+### EOS v1 versus v2
+
+The original implementation (Kafka 0.11) created one transaction
+per batch and one producer per input partition for stream
+processors. Overhead was substantial — 30–50% throughput cost
+versus non-transactional.
+
+**EOS v2** (Kafka 2.5, KIP-447) batches commits across many
+input partitions per stream task and shares one transactional
+producer across all the task's partitions. Overhead drops to
+roughly 10–20% on typical workloads. EOS v2 is the default in
+Kafka 3.0+; v1 is removed.
+
+## Operational gotchas
+
+### `acks=1` is the unsafe default in some clients
+
+The Java producer defaults to `acks=all` since Kafka 3.0. Older
+versions and several non-JVM clients default to `acks=1`. Always
+**explicitly** set `acks=all` in production; don't rely on
+defaults.
+
+### `min.insync.replicas` mismatch
+
+If `min.insync.replicas` equals `replication.factor`, the
+partition is unavailable for writes the moment any one replica
+is slow or down. If it's 1, you can lose acked writes when the
+ISR shrinks. Set it to `replication.factor - 1`. With RF=3, ISR
+floor=2.
+
+### Increasing partition count is (mostly) one-way
+
+```bash
+kafka-topics --alter --topic orders --partitions 24
+```
+
+This **adds** new partitions. It does not redistribute existing
+keys — and worse, future writes hash to a different partition
+than the old ones. Consumers that were aggregating per key now
+see "the same key" arrive in two partitions, breaking stateful
+processing.
+
+You can't decrease partitions at all. If you need to reshape a
+topic, the standard play is: create a new topic with the desired
+partition count, dual-write, drain the old one, cut over.
+
+### Consumer lag is a signal, not a target
+
+Lag of 0 means your consumers are bottlenecked on the broker.
+Lag of "stable, small, non-growing" is healthy. Lag that climbs
+linearly means you need more partitions, more consumers, or a
+faster handler.
+
+(See `partitions-and-consumer-groups.mdx` for consumer-side
+mechanics.)
+
+### Compaction lag
+
+Compaction is a background job. A compacted topic can have
+significant uncompacted tail at any moment — restoring a state
+store from a compacted topic re-reads the tail and gets many
+versions of the same key before settling on the latest. Plan for
+this in restore-time estimates.
+
+### Cross-region replication
+
+A Raft-style synchronous quorum across continents pays the
+worst RTT on every write. Most Kafka deployments either keep
+brokers within a region and use **MirrorMaker 2** or Confluent
+Cluster Linking for async cross-region copying, or use Confluent
+Stretched Clusters with careful follower placement. Don't naively
+stretch the ISR across regions.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="KIP-500: Replace ZooKeeper with a Self-Managed Metadata Quorum"
+  authors="Colin McCabe et al."
+  year="2019"
+  source="Apache Kafka KIPs"
+  url="https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum"
+>
+The design document for KRaft. Reads as both architecture and
+historical record — explains why a Raft-based metadata layer
+inside Kafka beat the ZooKeeper status quo, and what the
+operational consequences are.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Exactly-Once Semantics Are Possible: Here's How Kafka Does It"
+  authors="Neha Narkhede"
+  year="2017"
+  source="Confluent"
+  url="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"
+>
+The original post explaining KIP-98 (idempotent producer plus
+transactions). Pair it with the read-process-write pattern
+section of `exactly-once-stream-processing.mdx`.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Running Kafka at Scale: Lessons from LinkedIn"
+  authors="LinkedIn Engineering"
+  year="2015"
+  source="LinkedIn"
+  url="https://engineering.linkedin.com/kafka/running-kafka-scale"
+>
+The operational counterpart to the KIPs. Disk layout, page-cache
+behavior, partition counts, controller-failover war stories.
+Already referenced in `engineering-blogs.mdx`.
+</Reference>
+
+## In summary
+
+- Kafka is a **partitioned, replicated, segment-structured
+  append-only log**, with a metadata controller and a transaction
+  coordinator.
+- The partition is the unit of both parallelism and ordering;
+  pick the partition key with care.
+- Segment files plus sparse offset indexes plus `sendfile(2)`
+  zero-copy reads are what gives Kafka its throughput.
+- Replication is leader/follower with an ISR set;
+  `acks=all` + `min.insync.replicas` = RF − 1 is the durability
+  sweet spot.
+- **KRaft** has replaced ZooKeeper as the metadata layer (default
+  in Kafka 3.3+, ZooKeeper removed in 4.0).
+- **Log compaction** retains the latest value per key forever —
+  the foundation of changelog topics and KTables.
+- **Idempotent producer** (default in Kafka 3.0+) deduplicates
+  retries to one partition; **transactional producer** extends
+  this to atomic multi-partition writes, enabling exactly-once
+  stream processing via EOS v2.
+- The operational hazards are real: `acks=1` defaults in some
+  clients, `min.insync.replicas` misconfig, one-way partition
+  increases, and cross-region quorum latency.

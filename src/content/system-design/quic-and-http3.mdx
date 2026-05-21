@@ -1,0 +1,337 @@
+export const level = 'mid';
+
+# QUIC and HTTP/3
+
+QUIC is the transport that quietly replaced TCP+TLS+HTTP/2 for
+a large fraction of internet traffic between roughly 2020 and
+2024. If you load google.com, cloudflare.com, facebook.com, or
+youtube.com from a recent browser, you are almost certainly
+speaking HTTP/3 over QUIC — even though the URL still says
+`https://` and the API surface looks identical.
+
+Why it exists is a story about the limits of TCP. TCP was
+designed in the 1970s for unicast file transfer over a single
+stream; HTTP/2 piled stream multiplexing on top of it, but the
+underlying TCP connection still treats the byte stream as one
+ordered sequence. QUIC tears that abstraction down and rebuilds
+the transport from scratch, on top of UDP, with TLS 1.3 baked
+in.
+
+This page covers the actual wins, the costs you will pay, and
+when enabling HTTP/3 is — and isn't — worth the trouble.
+
+## The problem QUIC solves
+
+Three concrete pain points with TCP+TLS+HTTP/2:
+
+### TCP head-of-line blocking
+
+HTTP/2 multiplexes many logical streams over one TCP
+connection. To the application, requests are independent. To
+TCP, the connection is one ordered byte stream. If a single
+packet is lost, TCP must retransmit it before delivering
+**any** later bytes — even bytes that belong to a completely
+unrelated stream.
+
+```
+HTTP/2 over TCP:
+  stream 1: GET /image.jpg     ←─┐
+  stream 2: GET /style.css     ←─┤  multiplexed
+  stream 3: GET /script.js     ←─┘  on one TCP connection
+
+  one packet dropped on stream 1
+  → ALL three streams stall until the retransmit arrives
+```
+
+The HTTP/2 layer cannot work around this because it does not
+see TCP segments. The blockage happens below the streams
+abstraction.
+
+### Handshake cost
+
+A brand-new HTTPS connection over TCP+TLS 1.3 needs:
+
+- 1 RTT for TCP SYN / SYN-ACK / ACK
+- 1 RTT for TLS handshake (TLS 1.3 minimum)
+
+Total: 2 RTTs before the first byte of a GET request can be
+sent. On a 100 ms transcontinental link that is 200 ms of dead
+air before any work happens.
+
+### Connection pinning to the 4-tuple
+
+A TCP connection is identified by `(src IP, src port, dst IP,
+dst port)`. A phone walking out of WiFi range and onto LTE
+gets a new IP. Every TCP connection dies. Every HTTPS request
+in flight is reset. The application has to retry from zero,
+including a fresh TCP+TLS handshake.
+
+For a desktop on a stable network none of this is a big deal.
+For a mobile-heavy product (video, chat, navigation) it is the
+dominant source of "the app feels slow" complaints.
+
+## QUIC's design
+
+QUIC runs over **UDP**. The kernel sees UDP datagrams; QUIC
+implements reliability, ordering, flow control, congestion
+control, and encryption in userspace (or in newer kernel
+offloads).
+
+The headline features:
+
+### Per-stream loss recovery
+
+QUIC has streams as a first-class primitive. A lost UDP
+datagram stalls only the stream whose bytes it carried — other
+streams keep flowing. The head-of-line blocking that HTTP/2
+inherited from TCP is gone at the transport layer.
+
+This is the single biggest win and the original motivation for
+the protocol.
+
+### Combined transport + crypto handshake
+
+QUIC merges the connection setup and TLS 1.3 handshake into
+one round trip. For a new connection: **1 RTT**. For a resumed
+connection (where the client already has a session ticket):
+**0 RTT** — the client sends GET data alongside the handshake.
+
+### Connection migration
+
+A QUIC connection is identified by a **connection ID**, not by
+the 4-tuple. The client and server each pick connection IDs;
+either side can change its IP address mid-connection without
+the other side noticing anything beyond an address-validation
+exchange.
+
+WiFi to LTE handover keeps the same QUIC connection. The
+in-flight HTTP/3 requests do not restart.
+
+### Always encrypted
+
+TLS 1.3 is part of the protocol, not a layer on top. There is
+no unencrypted QUIC. Even most of the transport header is
+authenticated, and parts of it are encrypted — middleboxes
+cannot inspect or rewrite QUIC's internals the way they have
+historically done to TCP.
+
+## HTTP/3 is just HTTP over QUIC
+
+HTTP/3 keeps HTTP/2's semantics — streams, headers, methods,
+status codes, request/response framing — and changes only the
+transport. Application code that worked over HTTP/2 works over
+HTTP/3 with no API changes; the migration is mostly a
+configuration toggle at the load balancer or CDN.
+
+The wire format differs (HTTP/3 uses QUIC streams directly
+rather than HTTP/2 framing), and header compression is QPACK
+instead of HPACK to handle QUIC's out-of-order delivery — but
+to the application, it is the same HTTP.
+
+## How they compare
+
+<Compare a="HTTP/2 (TCP + TLS 1.3)" b="HTTP/3 (QUIC)">
+<>
+- New-connection handshake: **2 RTTs** (TCP + TLS)
+- Resumed connection: **1 RTT**
+- Head-of-line blocking: **yes** (TCP-level)
+- Connection migration: **no** — IP change kills it
+- Encryption: TLS 1.3 layered on TCP
+- Middlebox compatibility: **excellent** — TCP is universal
+- Server CPU per byte: **lower** (kernel TCP, mature offloads)
+- Standardized: RFC 7540 (2015)
+</>
+<>
+- New-connection handshake: **1 RTT**
+- Resumed connection: **0 RTT** (with replay risk)
+- Head-of-line blocking: **no** (per-stream loss recovery)
+- Connection migration: **yes** — connection ID survives
+- Encryption: TLS 1.3 baked into the transport
+- Middlebox compatibility: **mixed** — UDP often deprioritized
+- Server CPU per byte: **higher** (userspace, kernel offloads
+  catching up)
+- Standardized: RFC 9000 (2021), HTTP/3 in RFC 9114 (2022)
+</>
+</Compare>
+
+## 0-RTT and the replay problem
+
+0-RTT lets a returning client send application data in the
+very first packet. That packet is encrypted with a key derived
+from the previous session — but an attacker who captured that
+packet can **replay** it later, and the server cannot
+distinguish a legitimate first send from a replay.
+
+The rule: **0-RTT data must be idempotent**. A `GET /home` is
+fine. A `POST /transfer?amount=100` is not — a replayed packet
+would re-execute the transfer.
+
+Cloudflare, Google, and others enable 0-RTT for safe-method
+HTTP requests only, and reject 0-RTT for state-changing
+requests at the application layer. If you operate your own
+HTTP/3 stack, decide explicitly which routes are 0-RTT
+eligible.
+
+<Callout variant="warning">
+0-RTT is the only thing in QUIC that asks the application to
+reason about replay safety. It is also the feature most often
+cited in latency benchmarks. Do not advertise 0-RTT support
+without auditing which requests you are willing to let an
+attacker re-send.
+</Callout>
+
+## Deployment reality in 2026
+
+- **Cloudflare, Google, Meta, Fastly, Akamai, Apple** all
+  serve a substantial share of their public traffic over
+  HTTP/3 by default. Per Cloudflare Radar's 2024 Year-in-Review,
+  HTTP/3 is roughly 20% of global request volume, with HTTP/2
+  still the plurality (~50%). The share is growing year over
+  year as middlebox QUIC support improves.
+- **Chrome, Firefox, Safari, Edge** all support HTTP/3
+  client-side and enable it automatically when the server
+  advertises it via the `Alt-Svc` header.
+- **HTTP/3 is opt-in at the server**. Browsers fall back to
+  HTTP/2 over TCP if a UDP path is blocked, so enabling HTTP/3
+  is rarely a regression — but the fallback path is the same
+  HTTP/2 you had before, so you do not lose anything by
+  trying.
+
+## Costs and gotchas
+
+Real downsides, not theoretical ones:
+
+### UDP is filtered more aggressively than TCP
+
+Some corporate networks, hotel WiFi, and older middleboxes
+rate-limit or block outbound UDP on non-DNS ports. Browsers
+detect this and fall back to HTTP/2, but the fallback costs an
+extra few hundred milliseconds while QUIC is being tried and
+abandoned.
+
+The countermeasure is the `Alt-Svc` header with a sensible
+`ma=` (max-age) so clients learn the working transport once
+per session and remember it.
+
+### Higher server CPU per byte
+
+Kernel TCP has decades of optimization, hardware offload
+(TSO/GSO/GRO), and zero-copy paths. QUIC implementations are
+mostly userspace and cannot use those offloads directly. As of
+2025/2026, well-tuned HTTP/3 servers (nginx-quic, Cloudflare's
+quiche, Meta's mvfst) use roughly 1.5x to 2x the CPU per byte
+that HTTP/2 over TCP uses for the same workload.
+
+Linux kernel QUIC offload (UDP GSO/GRO, kernel TLS for QUIC) is
+narrowing the gap; expect this number to keep improving.
+
+### Load balancers must be QUIC-aware
+
+A QUIC connection survives a 4-tuple change. Old-style L4 load
+balancers that hash by 4-tuple will route a migrated connection
+to a different backend — which has no state for it and drops
+it. You need a load balancer that hashes by **connection ID**,
+not by 4-tuple. Modern Envoy, HAProxy, and the cloud-provider
+L4 LBs support this; older or roll-your-own LBs do not.
+
+### Per-connection state is heavier
+
+QUIC's per-connection state (multiple streams, flow control
+windows, packet number spaces, congestion controller) is larger
+than TCP's. On servers with millions of concurrent connections,
+memory per connection matters. Budget accordingly.
+
+## When to enable HTTP/3
+
+<Cheatsheet>
+| Situation | Verdict |
+|---|---|
+| User-facing web traffic, mobile-heavy | Yes — connection migration is a real win |
+| Behind a modern CDN (Cloudflare, Fastly, Akamai) | Yes — it is a checkbox |
+| Server-to-server inside your datacenter | No — no loss, no migration; stick with HTTP/2 |
+| Pure throughput (large file downloads) | Marginal — one fat stream does not benefit |
+| Strict corporate networks (a meaningful share of your users) | Test carefully — UDP may be blocked |
+| You operate your own HTTP/3 stack | Only if you can afford the CPU and the implementation maturity cost |
+</Cheatsheet>
+
+The honest summary: for public-facing HTTPS served via a CDN,
+HTTP/3 is a free win — enable it, let the CDN handle the
+transport. For your own infra terminating QUIC, weigh the CPU
+overhead against the latency and migration benefits.
+
+For internal east-west traffic, HTTP/3 mostly does not pay off.
+Datacenter networks do not lose packets the way mobile networks
+do, and connection migration is irrelevant. Use HTTP/2 or gRPC
+over HTTP/2.
+
+## Related transport choices
+
+For realtime application transports (chat, dashboards,
+streaming responses), see `long-polling-vs-websockets-vs-sse`
+and `choosing-realtime-transport`. HTTP/3 affects all of them
+underneath — SSE and HTTP-based long-polling ride the new
+transport transparently, and WebSocket-over-HTTP/3 is being
+specified (RFC 9220) but not yet universally deployed.
+
+For where QUIC fits in edge infrastructure, see
+`cdn-architecture` and `edge-compute-architecture`. CDNs are
+where most HTTP/3 traffic actually terminates.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="RFC 9000: QUIC: A UDP-Based Multiplexed and Secure Transport"
+  authors="Iyengar & Thomson (eds.)"
+  year="2021"
+  source="IETF"
+  url="https://datatracker.ietf.org/doc/html/rfc9000"
+>
+The QUIC v1 standard. Long, but the introductory sections are
+the clearest single explanation of the streams, packet number
+spaces, and connection ID design.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="RFC 9114: HTTP/3"
+  authors="Bishop (ed.)"
+  year="2022"
+  source="IETF"
+  url="https://datatracker.ietf.org/doc/html/rfc9114"
+>
+The thin layer that maps HTTP semantics onto QUIC streams.
+Read after RFC 9000 — it is much shorter and assumes you know
+QUIC.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="HTTP/3: the past, the present, and the future"
+  authors="Cloudflare engineering"
+  year="2019"
+  source="Cloudflare blog"
+  url="https://blog.cloudflare.com/http3-the-past-present-and-future/"
+>
+Cloudflare's overview of why they pushed HTTP/3 to production
+and what they measured. Useful as the practitioner's
+counterweight to the RFCs.
+</Reference>
+
+## In summary
+
+- QUIC runs over UDP and replaces TCP+TLS as the transport
+  beneath HTTP/3. It is always encrypted (TLS 1.3 baked in).
+- The three wins: **per-stream loss recovery** (no TCP-level
+  head-of-line blocking), **1-RTT handshake** (0-RTT for
+  resumed connections), and **connection migration** across
+  IP changes.
+- HTTP/3 is semantically the same as HTTP/2 — only the
+  transport changes. Applications need no code changes.
+- 0-RTT is replay-vulnerable. Use it only for idempotent
+  requests.
+- Costs: higher server CPU per byte, UDP blocked or
+  deprioritized in some networks, load balancers must hash by
+  connection ID rather than 4-tuple.
+- Enable it for user-facing traffic via a modern CDN. Skip it
+  for east-west datacenter traffic.

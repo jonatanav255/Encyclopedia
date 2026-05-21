@@ -233,6 +233,108 @@ adopt OpenTelemetry from day one. Retrofitting tracing across N
 services later is significantly more work than instrumenting one
 service at a time.
 
+## W3C Trace Context propagation
+
+The propagation discipline described above only works if every
+service speaks the same wire format. Before W3C standardized it,
+every vendor shipped its own headers: Zipkin used `X-B3-TraceId`
+/ `X-B3-SpanId`, Google Cloud used `X-Cloud-Trace-Context`,
+Datadog used `x-datadog-trace-id`, and so on. A request that
+crossed vendor boundaries lost its trace at every hop.
+
+**W3C Trace Context** (Recommendation, November 2021) unified
+this. It defines two headers — `traceparent` (required) and
+`tracestate` (optional) — and is now the format every major
+tracing library, proxy, and managed observability service
+understands.
+
+### The `traceparent` header
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+Format: `version-trace_id-parent_id-trace_flags`, all dash-
+separated, lowercase hex.
+
+<Cheatsheet>
+| Field | Width | Meaning |
+|---|---|---|
+| `version` | 2 hex chars | Spec version; `00` today. Future versions may add fields after `trace_flags`. |
+| `trace_id` | 32 hex chars (128 bits) | Globally unique per trace. All zeros is invalid. |
+| `parent_id` | 16 hex chars (64 bits) | The span ID of the *caller*. The receiving service treats it as its parent. All zeros is invalid. |
+| `trace_flags` | 2 hex chars (8 bits) | Bitfield. Only `sampled` (bit 0) is currently defined. |
+</Cheatsheet>
+
+The `sampled` flag is the headline field: `01` means the
+upstream service decided this trace should be recorded; `00`
+means it shouldn't be. Every downstream service **must respect
+the upstream decision** — do not independently flip a coin on
+each hop, or you'll record an incoherent fragment of the trace
+(some spans kept, others dropped). The sampling decision lives
+at the trace root; everything downstream inherits it. (See
+sampling-strategies for the head-vs-tail trade-offs that
+inform that root decision.)
+
+### The `tracestate` header
+
+```
+tracestate: vendor1=opaque-value,vendor2=other-value
+```
+
+A comma-separated list of `key=value` entries, one per vendor.
+Lets each vendor (Datadog, New Relic, Honeycomb, an internal
+team's custom system) carry a small amount of their own
+context alongside the standard `traceparent`. The W3C spec
+caps total size at ~512 bytes and entries at 32; vendors are
+expected to be polite about what they put here.
+
+`tracestate` is optional. If you don't have a vendor-specific
+need, ignore it.
+
+### Common pitfalls
+
+- **Middleboxes that strip unknown headers.** A load balancer,
+  WAF, or service mesh that allowlists headers will drop
+  `traceparent` and `tracestate` unless explicitly permitted.
+  The trace appears to "break" at that hop. Allowlist both
+  headers in every proxy in the path.
+- **Independently re-sampling downstream.** A downstream
+  service that decides "I'll sample 10% of what I see"
+  destroys the consistency guarantee. If the upstream said
+  `sampled=1`, record. If it said `sampled=0`, don't.
+- **Wrong-format header.** Older code that emits 64-bit trace
+  IDs (16 hex chars) instead of 128-bit (32 hex chars)
+  produces invalid `traceparent` values that conforming
+  receivers must treat as if no header were present —
+  silently breaking the trace.
+- **Confusing `parent_id` with `span_id`.** `parent_id` in the
+  *outbound* `traceparent` is the *current* span ID of the
+  sender — i.e., what becomes the parent on the receiving
+  side. Easy to swap when writing manual propagation code;
+  always use the library's inject helpers.
+
+OpenTelemetry's SDKs (see opentelemetry-architecture) emit and
+parse W3C Trace Context by default in current versions; you
+rarely write this code by hand. The pitfalls bite hardest when
+something in the path *isn't* OpenTelemetry — a hand-rolled
+HTTP client, a legacy proxy, a custom queue.
+
+<Reference
+  kind="spec"
+  title="W3C Trace Context"
+  authors="W3C Distributed Tracing Working Group"
+  year="2021"
+  source="W3C Recommendation"
+  url="https://www.w3.org/TR/trace-context/"
+>
+The official specification. Defines the `traceparent` and
+`tracestate` headers, their formats, validation rules, and
+the requirement that downstream services respect upstream
+sampling decisions. Short, readable, and the authoritative
+source for the propagation discipline.
+</Reference>
+
 ## Further reading
 
 <Reference

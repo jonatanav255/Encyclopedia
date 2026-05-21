@@ -325,7 +325,180 @@ participants. The instinct should be "design so I don't need
 this," not "let me find a 2PC implementation."
 </Callout>
 
+## Percolator and Sinfonia: alternatives to 2PC
+
+Two influential research systems showed that "distributed
+transactions" don't have to mean "classical 2PC with
+heavyweight locks." Both are still cited in modern transactional
+databases.
+
+### Percolator
+
+Daniel Peng and Frank Dabek's **Percolator** (Google, OSDI
+2010) provided a transactional layer on top of **Bigtable**,
+a non-transactional ordered key-value store. The original use
+case was Google's incremental web indexing — they needed to
+process small updates to the index without redoing batch
+MapReduce runs.
+
+The core ideas:
+
+- **Snapshot isolation** via a globally-sorted **timestamp
+  oracle**. The oracle hands out monotonic timestamps; reads
+  use a snapshot timestamp, writes commit at a later
+  timestamp.
+- **Locks stored in the data store itself.** Instead of a
+  separate lock manager, each row has extra columns: a
+  `lock` column, a `write` column (pointer to the committed
+  data), and a `data` column. A transaction in flight leaves
+  locks in the `lock` column; commit replaces them with
+  `write` entries.
+- **Primary / secondary locks.** One key in the transaction
+  is designated **primary**; all other keys are secondaries
+  whose locks point back to the primary. Commit happens in
+  two steps:
+  1. **Prewrite**: write a `data` entry and `lock` row to
+     every key. If any write fails, abort.
+  2. **Commit**: atomically flip the *primary* lock to a
+     `write` entry. This single atomic step is the
+     commit point of the whole transaction.
+  3. Secondaries are then resolved lazily — a reader that
+     finds a secondary lock looks up the primary to
+     determine commit status.
+
+So Percolator is still 2PC in shape, but the "coordinator
+state" lives inside the data store as data, not in a
+separate coordinator process. Coordinator crashes are
+recoverable by any client that stumbles across a stale lock:
+look up the primary, decide whether the transaction
+committed, and clean up.
+
+Used in production by Google's incremental indexing and
+later adopted by **TiDB / TiKV** as the foundation of TiKV's
+transaction model. TiDB transactions are recognizably
+Percolator with engineering refinements.
+
+### Sinfonia
+
+Aguilera et al.'s **Sinfonia** (HP Labs, SOSP 2007) takes a
+very different cut. Instead of a general-purpose
+transactional layer, it offers a tightly restricted
+primitive called a **mini-transaction**:
+
+- A mini-transaction is a small bundle of operations
+  (compare, read, write) addressed at specific items on
+  specific nodes.
+- All inputs and outputs are declared **upfront** — there's
+  no application logic between the read and the write,
+  because the whole bundle is shipped as a single message.
+- Participating "memory nodes" run a lightweight 2PC over
+  just this bundle. There are no general-purpose locks; the
+  data items in the bundle are the only contention.
+
+The trade-off is severe but deliberate:
+
+- **What you give up:** general programmability. You can't
+  read a value, decide based on it, then write — that
+  would require a round trip per decision and defeat the
+  point.
+- **What you get:** very high throughput. The 2PC is over
+  a small known set of items, completes in a few RTTs, and
+  doesn't hold locks waiting on application code.
+
+Sinfonia's restricted shape directly inspired the "atomic
+multi-object operations" in modern object stores —
+**RAMCloud**'s multi-object atomic ops, several KV stores'
+compare-and-swap-vector primitives, and the
+declared-read-write bundles used inside some sharded
+databases for internal coordination.
+
+### The shared pattern
+
+Both systems sidestep the worst pain of textbook 2PC by
+**constraining the protocol's scope**:
+
+- **Percolator** keeps 2PC's shape but pushes coordinator
+  state into the data store, so coordinator failure becomes
+  recoverable from any client and there are no permanently
+  orphaned locks.
+- **Sinfonia** keeps the data store simple but radically
+  restricts the transaction shape, so 2PC runs only over
+  declared items in a single network round-trip's worth of
+  work.
+
+Compare with how modern transactional databases handle the
+same problem:
+
+- **CockroachDB** uses neither Percolator nor Sinfonia
+  directly. Its transactions are timestamp-ordered (HLC),
+  with **intent records** written to each touched key. An
+  intent is logically "a tentative write held until the
+  transaction commits"; a reader that hits an intent
+  resolves it by looking up the transaction's state in a
+  separate transaction record. Failure recovery is similar
+  in spirit to Percolator's primary-lock resolution.
+- **TiDB / TiKV** uses Percolator directly.
+- **FoundationDB** uses a completely different model:
+  centralized commit through a sequencer + resolver.
+
+### When you'd reach for these
+
+You're unlikely to implement Percolator or Sinfonia from
+scratch in 2026 — the production-grade work is already done
+in TiKV, CockroachDB, Spanner. But the ideas are useful:
+
+- **Percolator-style locks in the data** are valuable any
+  time you're adding transactions on top of a
+  non-transactional store you can't modify. The pattern
+  generalizes: store lock state as data, with a designated
+  "primary" whose atomic update is the commit point.
+- **Sinfonia-style declared bundles** are the right model
+  for internal coordination operations in sharded systems —
+  things like "atomically rebalance these three ranges,"
+  where the operation is fixed and the latency budget is
+  tight.
+
+<Reference
+  kind="paper"
+  title="Large-scale Incremental Processing Using Distributed Transactions and Notifications"
+  authors="Daniel Peng, Frank Dabek"
+  year="2010"
+  source="OSDI 2010"
+  url="https://research.google/pubs/large-scale-incremental-processing-using-distributed-transactions-and-notifications/"
+>
+The Percolator paper. Describes the primary/secondary lock
+pattern, the timestamp oracle, and the incremental indexing
+workload that motivated the design. The foundation of TiDB's
+transaction model.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="Sinfonia: A New Paradigm for Building Scalable Distributed Systems"
+  authors="Marcos K. Aguilera, Arif Merchant, Mehul Shah, Alistair Veitch, Christos Karamanolis"
+  year="2007"
+  source="SOSP 2007"
+  url="https://www.cs.princeton.edu/courses/archive/fall08/cos597B/papers/sinfonia.pdf"
+>
+Introduces the mini-transaction: a bundle of declared
+read/compare/write items committed as a single 2PC over
+just those items. Influenced atomic multi-object APIs in
+RAMCloud and a generation of KV-store primitives.
+</Reference>
+
 ## Further reading
+
+<Reference
+  kind="book"
+  title="Designing Data-Intensive Applications"
+  authors="Martin Kleppmann"
+  year="2017"
+  source="O'Reilly Media"
+  url="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/"
+>
+Chapter 7's "Distributed Transactions and Consensus" covers 2PC,
+Paxos commit, and why most systems avoid both.
+</Reference>
 
 <Reference
   kind="paper"

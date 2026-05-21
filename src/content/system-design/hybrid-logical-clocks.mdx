@@ -15,6 +15,188 @@ Used by CockroachDB, MongoDB, YugabyteDB. The pragmatic
 sweet spot between vector clocks (exact but unbounded) and
 wall clocks (compact but lying).
 
+## The HLC algorithm in detail
+
+Kulkarni et al. (OPODIS 2014) define HLC as a triple
+`(pt, l, c)` on each node, but only the pair `(l, c)` is
+exchanged on the wire. The fields:
+
+- **`pt`** — the local physical clock reading at this instant.
+  Updated whenever the node looks at its NTP-synced wall
+  clock.
+- **`l`** — the largest physical time the node has ever
+  *observed* (across its own clock and any incoming
+  timestamps). Monotonic; only ever moves forward.
+- **`c`** — a logical counter that breaks ties when `l` does
+  not advance. Increments when two events would otherwise
+  share the same `l`.
+
+The algorithm preserves a single invariant: **`l ≥ pt`** at
+all times on every node, and `l` is bounded above by
+`pt + ε` where ε is the network's clock-skew bound.
+
+### The send (or local-event) update
+
+When a node generates a new event and needs an HLC for it:
+
+```js
+function tick(state, now) {
+  const l_old = state.l;
+  state.l = Math.max(state.l, now);  // never go backwards
+  if (state.l === l_old) {
+    state.c += 1;                    // l didn't advance: tick logical
+  } else {
+    state.c = 0;                     // l advanced: reset logical
+  }
+  return { l: state.l, c: state.c };
+}
+```
+
+The emitted timestamp is `(l, c)`. The "max with local
+wall clock" step is what makes HLC track real time: as long
+as `pt` moves forward, `l` follows.
+
+### The receive update
+
+When a message arrives carrying `(l', c')`, the node folds the
+incoming timestamp into its state:
+
+```js
+function recv(state, incoming, now) {
+  const l_old = state.l;
+  state.l = Math.max(state.l, incoming.l, now);
+
+  if (state.l === l_old && state.l === incoming.l) {
+    // both sides matched our l: pick the larger counter, bump
+    state.c = Math.max(state.c, incoming.c) + 1;
+  } else if (state.l === incoming.l) {
+    // we adopted the incoming l
+    state.c = incoming.c + 1;
+  } else if (state.l === l_old) {
+    // we kept our l (it was already largest)
+    state.c += 1;
+  } else {
+    // we adopted now (wall clock leapt forward)
+    state.c = 0;
+  }
+
+  return { l: state.l, c: state.c };
+}
+```
+
+These four cases enumerate every way `l` could have come out
+of the `max(...)` call.
+
+### Why this preserves causal order
+
+If event A happens before event B (in the Lamport
+happens-before sense), then either:
+
+1. A and B are on the same node, and `recv`/`tick` strictly
+   advances `(l, c)` for each successive event there; or
+2. B observed A via a message, and `recv` ensures B's `(l, c)`
+   is strictly greater than A's emitted `(l', c')`.
+
+In both cases the lexicographic compare `(l_A, c_A) <
+(l_B, c_B)` holds. So HLC gives a total order consistent with
+causality — the same property as vector clocks, but compressed
+into a single pair.
+
+### The bounded-drift invariant
+
+The key practical property: `|l - pt| ≤ ε` where ε is the
+maximum clock skew across nodes (NTP typically holds this to
+single-digit milliseconds in a datacenter, ~10s of ms across
+regions). This bound is what lets HLC timestamps *look like*
+real timestamps for logs, traces, and human inspection — you
+read `2026-05-21T10:42:17.421` and trust it to within NTP
+skew.
+
+If a node's wall clock leaps far into the future (a bad NTP
+jump), HLC will follow — `l` is then ahead of every other
+node's `pt` until they catch up. Peers reject HLCs that are
+"too far in the future" beyond `ε`, which forces operators to
+notice the skew.
+
+### Size budget
+
+A practical HLC fits comfortably:
+
+- `l` as a 64-bit integer (microseconds or nanoseconds since
+  epoch) covers centuries.
+- `c` as a 16-bit counter is plenty — `c` only ever
+  increments while `l` is unchanged, which happens for
+  events sharing the same microsecond. ~65k events per
+  microsecond per node is far beyond what any production
+  system generates.
+
+Total: ~80 bits per timestamp, vs vector clocks that scale
+with replica count.
+
+## Why CockroachDB picked HLC
+
+Spanner gets its ordering from TrueTime, which needs
+GPS receivers and atomic clocks in every datacenter. Most
+companies running on AWS, GCP, or Azure don't have that —
+they get NTP, which holds clocks to single-digit milliseconds
+on a good day and tens of milliseconds when something is
+wrong.
+
+CockroachDB's design choice: take Spanner's transaction model
+but replace TrueTime with **HLC + a bounded uncertainty
+interval**. The uncertainty interval is a configured `max
+offset` (default 500 ms in early versions, 250 ms today)
+that's larger than NTP's expected skew.
+
+How it plays out:
+
+- A transaction reads at HLC `T`. Any committed value with
+  HLC ≤ `T` is visible; the read is unambiguous.
+- Values with HLC in the range `(T, T + max_offset]` are
+  *uncertain*: they might have been written by a transaction
+  that started before this one in real time but got a
+  later-looking HLC due to skew.
+- If the transaction encounters such a value, it **restarts**
+  with a forwarded read timestamp (`T' > value's HLC`). The
+  retry re-reads with a more conservative view.
+
+In aggregate: most transactions complete in one attempt; a
+small fraction hit uncertainty restarts and pay an extra
+round trip. The trade is "very rare slow transactions on
+commodity NTP" vs "every transaction pays commit-wait on
+GPS/atomic hardware" (Spanner's approach).
+
+The CockroachDB engineering blog "Living Without Atomic
+Clocks" walks through this in detail; it's the canonical
+explainer for HLC-as-TrueTime-approximation.
+
+<Reference
+  kind="paper"
+  title="Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases"
+  authors="Sandeep S. Kulkarni, Murat Demirbas, Deepak Madappa, Bharadwaj Avva, Marcelo Leone"
+  year="2014"
+  source="OPODIS 2014"
+  url="https://cse.buffalo.edu/tech-reports/2014-04.pdf"
+>
+The original HLC paper. Defines the algorithm, proves the
+bounded-drift and causal-order properties, and sketches the
+snapshot read use case that CockroachDB and MongoDB later
+adopted.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Living Without Atomic Clocks: Where CockroachDB and Spanner Diverge"
+  authors="Spencer Kimball, Irfan Sharif"
+  year="2022"
+  source="Cockroach Labs Blog"
+  url="https://www.cockroachlabs.com/blog/living-without-atomic-clocks/"
+>
+The Cockroach Labs explainer for HLC + uncertainty intervals
+as an "approximate TrueTime" on commodity NTP — the practical
+counterpart to the Kulkarni paper.
+</Reference>
+
 ## The algorithm
 
 Each HLC value is a pair `(phys, logical)` where `phys`

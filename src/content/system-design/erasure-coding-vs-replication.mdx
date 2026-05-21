@@ -153,6 +153,138 @@ copy-on-write.
 For hot transactional data: replicate. For warm/cold
 analytic and archival data: EC.
 
+## Reed-Solomon vs LRC (Locally Repairable Codes)
+
+Reed-Solomon `(k, m)` — `k` data chunks plus `m` parity
+chunks — is the textbook erasure code and the one most
+systems started with. It tolerates any `m` simultaneous
+losses and has a clean failure model. But it has a quietly
+expensive property: **repair cost scales with `k`, not with
+how many chunks were lost.**
+
+### The repair-cost problem
+
+Under RS(10, 4), if a single chunk is missing, reconstructing
+it requires reading **any 10** of the remaining 13 chunks
+and recomputing the lost one. That's 10 chunk-reads (and 10
+chunks of network traffic) to recover from a single-disk
+failure.
+
+At hyperscale, this matters a lot:
+
+- Disk failure rates in a 100,000-drive fleet run to thousands
+  of failures per day.
+- Each failure triggers reconstruction of many chunks (a
+  failed disk holds millions of them).
+- Every reconstruction pulls 10× the chunk size across the
+  network.
+- The cumulative repair bandwidth becomes a meaningful
+  fraction of cluster capacity, sometimes contending with
+  user traffic.
+
+This is what motivated **Locally Repairable Codes** (LRC).
+
+### How LRC works
+
+LRC introduces an extra layer of **local parity groups**. The
+canonical Microsoft Azure design is `(12, 2, 2)`:
+
+- 12 data chunks, split into 2 groups of 6.
+- 1 local parity per group → 2 local parities total.
+- 2 global parities computed across all 12 data chunks.
+
+Total chunks: 12 + 2 + 2 = 16. Storage overhead: 16/12 ≈
+**1.33×**.
+
+The clever bit: a single-chunk loss within a group of 6 can
+be reconstructed by reading only the 5 surviving chunks in
+that group plus the local parity — **6 reads**, not 12. The
+global parities are used only for harder failure patterns
+(multiple losses spanning groups).
+
+The trade-off vs RS:
+
+- LRC tolerates fewer arbitrary `m`-out-of-`n` patterns than
+  RS with the same overhead, but covers all the failure
+  modes that actually happen in practice (one or two
+  correlated losses per group).
+- LRC uses slightly *more* storage than the equivalent RS for
+  the same worst-case fault tolerance, in exchange for
+  dramatically cheaper repair.
+
+### Worked numbers
+
+<Cheatsheet>
+| Code | Overhead | Chunks per single-chunk repair | Tolerates |
+|---|---|---|---|
+| 3-way replication | 3.00× | 1 | 2 arbitrary losses |
+| RS(6, 3) | 1.50× | 6 | 3 arbitrary losses |
+| RS(10, 4) | 1.40× | 10 | 4 arbitrary losses |
+| LRC(12, 2, 2) | 1.33× | 6 | most realistic patterns; 4 in many configs |
+| RS(14, 10) (Facebook f4) | 1.40× | 10 | 4 arbitrary losses |
+</Cheatsheet>
+
+LRC(12, 2, 2) is roughly *the same storage cost* as RS(10, 4)
+but cuts single-chunk repair bandwidth by ~40%. Across
+thousands of repairs per day, that's a major reduction in
+background network traffic.
+
+### Who runs which
+
+- **Microsoft Azure Storage** — LRC(12, 2, 2), described by
+  Huang et al. (USENIX ATC 2012). Won best paper; was the
+  first large-scale production LRC deployment.
+- **Facebook f4 (warm BLOB storage)** — RS(10, 4) per
+  datacenter plus an XOR across two datacenters for an
+  effective `(14, 10)` cross-DC code. Muralidhar et al. (OSDI
+  2014) walks through the design and the tradeoffs they
+  rejected (including LRC variants).
+- **HDFS Erasure Coding** (Hadoop 3.x) — RS(6, 3) and
+  RS(10, 4) by default; LRC is an option but less commonly
+  configured.
+- **Ceph** — RS-family by default; LRC support exists.
+
+### When to reach for LRC
+
+- You're operating a hyperscale storage tier (PB+) where
+  repair bandwidth is a measurable cost.
+- Your dominant failure mode is single-disk or single-node
+  loss, not correlated rack-wide failures.
+- You can afford the operational complexity of two parity
+  tiers (local + global) and the placement constraints they
+  impose.
+
+For a single-cluster deployment of "a few hundred TB,"
+RS(10, 4) is fine and simpler. LRC's win compounds at scale.
+
+<Reference
+  kind="paper"
+  title="Erasure Coding in Windows Azure Storage"
+  authors="Cheng Huang, Huseyin Simitci, Yikang Xu, Aaron Ogus, Brad Calder, Parikshit Gopalan, Jin Li, Sergey Yekhanin"
+  year="2012"
+  source="USENIX ATC 2012"
+  url="https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang"
+>
+The introduction of Local Reconstruction Codes (LRC) in
+production. Best Paper at ATC 2012. Walks through the
+LRC(12, 2, 2) design, the repair-cost math, and the
+operational impact on Azure Storage.
+</Reference>
+
+<Reference
+  kind="paper"
+  title="f4: Facebook's Warm BLOB Storage System"
+  authors="Subramanian Muralidhar et al."
+  year="2014"
+  source="OSDI 2014"
+  url="https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf"
+>
+Facebook's design for warm photos and videos: per-datacenter
+RS(10, 4) plus an XOR-based cross-datacenter parity for an
+effective (14, 10) code. The paper is also a good case study
+in *why* they didn't pick LRC.
+</Reference>
+
 ## In summary
 
 - Replication: full copies, simple, expensive in storage.

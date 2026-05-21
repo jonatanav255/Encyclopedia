@@ -1,0 +1,270 @@
+export const level = 'senior';
+
+# Merkle trees
+
+A Merkle tree is a hash tree: every leaf is `hash(data block)`,
+every internal node is `hash(left || right)`, and the root is a
+single hash that represents the entire dataset. Change one byte
+anywhere in the tree, and the root changes. Two parties holding
+the same data have the same root; two parties holding different
+data have different roots. That's the whole structure.
+
+The reason it matters is that comparing two large datasets
+becomes a recursive game over the tree: compare roots, descend
+into mismatching subtrees, ignore matching subtrees. The
+communication and work are **proportional to the diff**, not the
+dataset size. That single property is why DynamoDB, Cassandra,
+Git, BitTorrent, ZFS, Bitcoin, IPFS, and Certificate
+Transparency all chose the same structure independently.
+
+## The mechanism
+
+```
+data blocks:    D0    D1    D2    D3
+
+leaves:       H(D0) H(D1) H(D2) H(D3)
+                 \   /       \   /
+internals:    H(H(D0)||H(D1))  H(H(D2)||H(D3))
+                     \             /
+root:                H( left || right )
+```
+
+Build: O(N) work, one hash per leaf and one per internal node.
+Storage: 2N - 1 nodes for N leaves.
+
+Two derived properties matter to systems work:
+
+### Merkle proof (proof of inclusion) — O(log N)
+
+To prove that `D2` is part of the dataset whose root is `R`,
+send `D2` plus the **sibling hashes along the path from the
+leaf to the root**: `H(D3)` and `H(H(D0) || H(D1))`. The
+verifier recomputes the root from these and accepts if it
+matches `R`. The proof is `O(log N)` hashes, regardless of
+dataset size.
+
+### Anti-entropy diff — O(diff size)
+
+Two replicas can compare their datasets by exchanging roots,
+then recursing into mismatching subtrees only. If the data is
+mostly identical, almost the entire tree is pruned away after
+the first comparison.
+
+## The anti-entropy loop in detail
+
+This is the canonical reason Merkle trees appear in distributed
+storage. Two replicas drifted out of sync; bring them back into
+agreement without shipping the whole dataset.
+
+<Steps>
+<Step n={1} title="Exchange roots.">
+Both nodes send each other the Merkle root of their local data
+(for a given range, table, or partition).
+</Step>
+<Step n={2} title="Match? Done.">
+If the roots are equal, the datasets are byte-for-byte identical
+under the chosen hash. No further communication needed.
+</Step>
+<Step n={3} title="Mismatch? Exchange children.">
+Send the two children of the root. Compare each child hash.
+Subtrees with matching hashes are skipped entirely; subtrees
+with mismatching hashes are recursed into.
+</Step>
+<Step n={4} title="At the leaf, exchange data.">
+When recursion reaches the leaves that differ, the nodes ship
+the actual data blocks for those leaves (or fetch them on
+demand) and reconcile.
+</Step>
+</Steps>
+
+Bandwidth is **proportional to the number of differing leaves,
+times `log N`**. For two 100-million-row tables that differ in 100
+rows, you ship about 100 × 27 = 2,700 hashes plus the 100 row
+payloads — kilobytes instead of gigabytes.
+
+```ts
+async function reconcile(local: Node, peer: Replica) {
+  if ((await peer.hashAt(local.path)) === local.hash) return;   // match, prune
+
+  if (local.isLeaf) {
+    const peerBlock = await peer.fetchBlock(local.path);
+    local.merge(peerBlock);
+    return;
+  }
+
+  await reconcile(local.left, peer);
+  await reconcile(local.right, peer);
+}
+```
+
+## Production homes
+
+- **DynamoDB and Cassandra anti-entropy repair.** The canonical
+  use case. Each replica maintains a Merkle tree over the
+  primary key range it owns; the periodic `nodetool repair` in
+  Cassandra walks the trees pairwise and re-replicates only the
+  divergent ranges. Without Merkle trees, repair would mean
+  shipping the entire dataset between replicas.
+- **Git's tree objects.** A Git tree is a Merkle tree where
+  internal nodes are directories and leaves are file blobs. The
+  root commit hash uniquely identifies the entire worktree.
+  Sub-O(N) diff and sync follow for free.
+- **BitTorrent v2 / Webtorrent.** Piece hashes are organized
+  into a Merkle tree (BEP-30 onward); peers can verify
+  individual pieces against the root without trusting the
+  source.
+- **Bitcoin and Ethereum.** The block header includes a Merkle
+  root over all transactions, enabling SPV clients to verify
+  membership of a single transaction with `O(log N)` proof
+  size. Ethereum uses Merkle Patricia tries for account state.
+- **ZFS and Btrfs.** Every block has a checksum; checksums are
+  arranged into a Merkle tree rooted at the superblock. Silent
+  corruption is detected on read; with redundancy, repaired
+  automatically.
+- **IPFS / content addressing.** Content IDs are Merkle DAG
+  roots; deduplication, verification, and partial sync are
+  inherited from the structure.
+- **Certificate Transparency** logs publish a Merkle tree of all
+  certificates; auditors verify both that a certificate is
+  included (proof of inclusion) and that the log is
+  append-only (consistency proofs between two roots).
+
+## Sparse Merkle trees
+
+A standard binary Merkle tree over `N` keys is dense — every
+position from 0 to N-1 has a real leaf. **Sparse Merkle trees**
+imagine a binary tree of depth ~256, indexed by `hash(key)`, with
+the **default value** at every empty position. Most subtrees are
+"all empty"; their hashes are precomputed constants.
+
+Why bother: SMTs support **authenticated key/value stores**
+where you can prove both inclusion ("key K maps to V") **and
+non-inclusion** ("key K is not in the set"). Ethereum's storage
+trie, Diem (Libra), and many modern blockchains use SMT
+variants for exactly this reason.
+
+Tradeoff: log-depth proofs and updates scale with the address
+space (e.g., 256 levels for 256-bit keys), not with the set size.
+Memoization of empty-subtree hashes keeps this practical.
+
+## Pitfalls
+
+### Second-preimage attack
+
+If `H(leaf) == H(internal)` is possible — i.e., a leaf hash can
+masquerade as an internal node hash — an attacker can construct
+two different trees with the same root by re-interpreting some
+nodes. The standard fix is **domain separation**:
+
+```ts
+hashLeaf(data)         = H(0x00 || data)
+hashInternal(L, R)     = H(0x01 || L || R)
+```
+
+This is RFC 6962 (Certificate Transparency) and the basis of
+every modern Merkle-tree spec. Don't roll your own without it.
+
+### Choice of hash function
+
+If the underlying hash function has collisions, the structure
+loses its core property: two different datasets can hash to the
+same root. Use SHA-256 or BLAKE3 for security-critical contexts;
+MurmurHash3 or xxHash are fine only for non-adversarial
+anti-entropy where collisions just mean missed diffs.
+
+### Tree structure choice
+
+Binary trees give clean `log N` proofs but ~`log2 N` levels of
+hashing per leaf — slow on large datasets. **K-ary trees** with
+K = 16 or 32 reduce depth substantially at the cost of bigger
+internal nodes. Cassandra uses configurable fan-out.
+
+### Tree imbalance
+
+If leaves are not in canonical order, two replicas with the
+same data can produce different trees. Always sort leaves by a
+canonical key (the primary key, the byte offset, etc.) before
+building.
+
+### Confusing Merkle with vector clocks
+
+Merkle trees detect **what** differs between replicas. They
+don't tell you **which write happened first** when the same key
+has divergent values. That's a different problem solved by
+`vector-clocks` and `hybrid-logical-clocks`. In Dynamo-style
+systems, Merkle finds the diff; vector clocks (or LWW
+timestamps) decide how to merge it.
+
+### Stale trees during heavy writes
+
+A Merkle tree built at time T is invalidated by any write after
+T. Practical systems either:
+
+- Rebuild trees periodically and accept some staleness in repair
+  decisions.
+- Maintain incremental trees that update on each write (more
+  expensive, more accurate).
+- Use **range hashes** over fixed key ranges and only rebuild
+  the affected range on each write.
+
+## Relationship to gossip protocols
+
+`gossip-protocols` are the transport for spreading information
+in eventually consistent systems. Merkle trees are the **diff
+algorithm** that gossip uses when it discovers two nodes might
+disagree. Pair them as follows: gossip propagates "I exist and
+my root is R", and when two nodes notice differing roots, they
+fall into the Merkle anti-entropy loop above. This pairing is
+the foundation of Dynamo-style replication.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="A Digital Signature Based on a Conventional Encryption Function"
+  authors="Ralph Merkle"
+  year="1987"
+  source="CRYPTO"
+  url="https://link.springer.com/chapter/10.1007/3-540-48184-2_32"
+>
+The canonical published description of Merkle's hash tree, in
+the context of one-time signatures. The 1979 Stanford PhD
+thesis ("Secrecy, Authentication, and Public Key Systems")
+contains the original construction.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Cassandra Anti-Entropy Repair"
+  authors="Apache Cassandra documentation"
+  year="2024"
+  source="cassandra.apache.org"
+  url="https://cassandra.apache.org/doc/latest/cassandra/managing/operating/repair.html"
+>
+The real-world operational treatment. Walks through Merkle-tree
+construction at repair time, the bandwidth properties, and the
+tradeoffs between full, incremental, and subrange repair modes.
+Worth reading before operating any Dynamo-style store.
+</Reference>
+
+## In summary
+
+- Merkle tree: leaves are `hash(data)`; internal nodes are
+  `hash(left || right)`; the root is a single hash representing
+  the entire dataset.
+- O(N) to build, O(log N) for inclusion proofs, **O(diff) to
+  sync** two replicas — the property that drives most
+  production uses.
+- Canonical use: **anti-entropy repair** in Dynamo-style stores
+  (DynamoDB, Cassandra). Same pattern in Git, BitTorrent,
+  Bitcoin/Ethereum, ZFS/Btrfs, IPFS, Certificate Transparency.
+- **Sparse Merkle trees** support both inclusion and
+  non-inclusion proofs; foundation of modern authenticated
+  KV stores and blockchain state.
+- Always domain-separate leaves from internal nodes
+  (`H(0x00 || data)` vs `H(0x01 || L || R)`) to prevent
+  second-preimage attacks.
+- Pair Merkle with `gossip-protocols` to spread root summaries
+  and with `vector-clocks` to decide how to merge divergent
+  values — Merkle finds the diff; conflict resolution lives in
+  a separate layer.

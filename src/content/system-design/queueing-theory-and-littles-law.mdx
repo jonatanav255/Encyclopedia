@@ -1,0 +1,306 @@
+export const level = 'senior';
+
+# Queueing theory and Little's Law
+
+There is one piece of math every backend engineer should
+internalize, and it explains more production incidents than any
+other single tool: as utilization approaches 100%, response time
+approaches infinity. Not gradually — explosively. A service
+sitting at 90% CPU has roughly **10×** the queueing delay of one
+sitting at 50%. At 99%, it has **100×**. The wall is not a
+metaphor; it falls out of the algebra.
+
+Two results carry most of the weight. **Little's Law** tells you
+the steady-state relationship between concurrency, arrival rate,
+and latency. The **M/M/1 response curve** tells you how that
+relationship behaves as a queue fills up. Together they explain
+why "we just need to push utilization a bit higher to save
+money" is the single most expensive sentence in capacity
+planning.
+
+## Little's Law
+
+In any system in steady state:
+
+```
+L = λ · W
+
+L = average number of items in the system
+λ = average arrival rate (items per unit time)
+W = average time each item spends in the system
+```
+
+This holds for **any** queueing discipline (FIFO, priority,
+round-robin), for **any** arrival distribution (Poisson, bursty,
+heavy-tailed), and for **any** service-time distribution. There
+is no fine print. If you measure two of the three, the third is
+fixed.
+
+### Worked examples
+
+**Example 1**: A service handles 1,000 req/sec with 50 ms
+average end-to-end latency. Average concurrency:
+
+```
+L = 1000 · 0.050 = 50 in-flight requests
+```
+
+At any instant, 50 requests are being processed somewhere. If
+your monitoring shows 200 in-flight, either λ is higher than
+1000 or W is higher than 50 ms — and it's almost always W,
+because λ is set by clients and is what it is.
+
+**Example 2**: Your service uses a 32-thread pool, each thread
+blocking on I/O for 50 ms per request. Maximum sustainable λ:
+
+```
+L_max = 32  (threads)
+W     = 0.050 s
+λ_max = 32 / 0.050 = 640 req/sec
+```
+
+Push past 640 req/sec and requests **queue** in front of the
+thread pool. The queue adds waiting time, W rises, but L can't
+exceed 32 active — so the queue grows without bound until
+something gives (timeouts, OOM, load shedding).
+
+**Example 3**: A database connection pool of size 20 serves
+queries averaging 10 ms. The pool tops out at:
+
+```
+λ_max = 20 / 0.010 = 2000 queries/sec
+```
+
+If application QPS exceeds 2000, queries queue on connection
+acquisition, not on the database itself. The database CPU graph
+looks fine; the latency graph looks awful. This is the most
+common shape of "the database is the bottleneck" incidents that
+aren't actually about the database.
+
+## The utilization wall — M/M/1
+
+Little's Law is universal but doesn't model **what happens as
+the queue fills**. For that, the textbook starting point is the
+M/M/1 queue: Poisson arrivals, exponentially distributed service
+times, one server.
+
+For an M/M/1 queue with arrival rate `λ`, service rate `μ`, and
+utilization `ρ = λ/μ`:
+
+```
+mean response time   W = 1 / (μ − λ) = (1/μ) · 1 / (1 − ρ)
+```
+
+That `1 / (1 − ρ)` factor is the **utilization wall**. Multiply
+the raw service time by it to get the actual experienced
+latency.
+
+<Cheatsheet>
+| Utilization ρ | Latency multiplier 1/(1−ρ) |
+|---|---|
+| 50% | 2× |
+| 70% | 3.3× |
+| 80% | 5× |
+| 90% | 10× |
+| 95% | 20× |
+| 99% | 100× |
+| 99.9% | 1000× |
+</Cheatsheet>
+
+Read this table once a week. It explains everything from
+"why does our p99 spike during peak hours" to "why is the
+autoscaler chasing its tail."
+
+<Callout variant="warning">
+The wall is convex. Going from 80% to 90% utilization is
+nominally "10% more load" but actually **doubles** mean response
+time. Going from 90% to 95% doubles it again. Treating
+utilization as linear is the most common capacity-planning
+mistake.
+</Callout>
+
+## Why p99 is even worse
+
+Mean response time follows `1/(1−ρ)`. **Higher percentiles grow
+faster.** In M/M/1, the p99 of waiting time grows roughly as
+`ln(100) · 1/(1-ρ)` of the mean — about 4.6× the mean wait at
+any given ρ. So:
+
+- At ρ = 50%, p99 wait is small.
+- At ρ = 90%, mean response is 10× service time, p99 is
+  somewhere around 30–50× service time.
+- At ρ = 95%, mean is 20× service, p99 enters the
+  hundreds-of-multiples regime.
+
+The intuition: variance accumulates in the queue. A single
+unusually long request blocks many short ones behind it, and
+the longer the average wait, the more "bad luck" the worst
+percentiles inherit. See `tail-latency` for what to do about
+this beyond capacity planning.
+
+## M/M/c — more servers, statistical multiplexing
+
+A single 4-CPU server modelled as M/M/c with c=4 is **not** the
+same as four 1-CPU servers each modelled as M/M/1. With one
+shared queue and c servers, a burst at one server can borrow
+idle capacity from the others. The result: M/M/c hits the wall
+later than 4 × M/M/1.
+
+In practice this is why:
+
+- **One big pool beats many small pools.** A 100-thread pool
+  draining one queue handles burstier load than 10 separate
+  10-thread pools.
+- **Worker steal queues** (Tokio, Rayon, Go's scheduler) exist —
+  they let idle workers grab work from busy ones, recovering
+  statistical multiplexing inside the process.
+- **Per-tenant isolation has a cost.** Splitting capacity into
+  per-customer pools improves fairness but reduces effective
+  utilization headroom; you pay for the isolation with more
+  total capacity to keep tail latency bounded.
+
+The same math says: **two replicas at 50% utilization each are
+not equivalent to one replica at 100% — they're equivalent to a
+single pool at 50%, which has 2× the latency of zero load, not
+infinity.**
+
+## Practical implications
+
+### 1. Capacity-plan for 60–70% steady state, not 90%
+
+The textbook curve says you should provision so that average
+utilization sits around 0.6 to 0.7. Above that, mean latency
+swells fast; tail latency swells faster. This isn't waste — the
+headroom is what **bounds your tails**.
+
+The temptation to "save 30% by running at 95%" is real and
+quantifiable: at 95%, you have ~20× the queueing delay, and any
+burst that pushes you to 99% briefly is a multi-minute outage.
+
+### 2. Batching effectively raises μ
+
+If batching halves the per-request service cost (because you
+amortize syscalls, network round trips, or per-request fixed
+overhead), `μ` doubles. At fixed λ, ρ halves, and `1/(1−ρ)`
+collapses. Batching is the most cost-effective latency
+intervention when it's applicable, precisely because it shifts
+ρ, not because it makes individual items faster. See
+`batching-and-coalescing`.
+
+### 3. Backpressure and shed before the queue grows
+
+The wall is so steep that **the queue is the enemy**. Bounded
+queues, deadlines that propagate, and explicit load shedding
+keep ρ below the cliff. Once the queue grows, you're already in
+the regime where serving the queue is making things worse — work
+in progress accumulates faster than it drains. See
+`backpressure` and `load-shedding`.
+
+### 4. Autoscaling fights the wall — but slowly
+
+Adding capacity reduces ρ, which is the right answer. But
+autoscalers have minutes-scale loops, while the wall acts in
+seconds. The autoscaler is the long-term remedy; load shedding
+is the short-term remedy. See `autoscaling`.
+
+### 5. Fair queueing matters under saturation
+
+When ρ ≈ 1, **who is in the queue** determines who suffers.
+Priority and fair-queueing disciplines decide whether one heavy
+tenant degrades everyone or only themselves. Under saturation,
+queueing discipline is the difference between graceful
+degradation and a uniformly broken service.
+
+## A worked capacity-planning calculation
+
+A service has measured service time of 20 ms (μ = 50 req/sec
+per worker). The team wants p99 latency under 200 ms at a peak
+load of 800 req/sec. How many workers?
+
+```
+At each ρ, p99 ≈ ~3-5× the mean in M/M/c (rough rule, c >= 4).
+
+Target: mean response time ≤ 50 ms (so p99 stays ≤ ~200 ms).
+mean = (1/μ_total) · 1/(1-ρ) where μ_total = c · 50 req/sec/worker.
+
+Try c = 20: μ_total = 1000, ρ = 800/1000 = 0.8 → wait_factor = 5×
+  mean ≈ 20ms · 5 = 100 ms, p99 ≈ 400 ms.  too slow.
+
+Try c = 32: μ_total = 1600, ρ = 800/1600 = 0.5 → wait_factor = 2×
+  mean ≈ 40 ms, p99 ≈ ~120-160 ms.  works.
+
+c = 32 workers, sitting at 50% utilization at peak.
+```
+
+Note the workers run at 50% even at peak. That is the headroom
+the wall demands. Anyone arguing "but we're only using half the
+boxes" is asking for a multi-100× p99 spike during the next
+burst.
+
+## When the math is approximate
+
+Real workloads aren't M/M/1. Service times are often
+heavy-tailed (rare, very slow requests); arrivals are bursty
+(synchronized retries, scheduled jobs); requests have priorities
+and dependencies. The exact formulas don't hold, but **the
+qualitative behavior does**: utilization has a convex wall, and
+the wall is steep above ~80%.
+
+For more realistic models, look at M/G/1 (general service-time
+distribution; the Pollaczek-Khinchine formula adds a variance
+term that makes things worse than M/M/1) and M/D/1 (deterministic
+service; lower latency than M/M/1 at the same ρ, since variance
+disappears). The pattern is the same in all of them.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="A Proof for the Queuing Formula: L = λW"
+  authors="John D. C. Little"
+  year="1961"
+  source="Operations Research"
+  url="https://www.jstor.org/stable/167570"
+>
+Little's original proof. Famously short; the result was already
+"folk knowledge" but Little nailed down the minimal assumptions
+(steady state, finite means). The reason the law applies to
+basically any queueing system you'll ever build.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Marc Brooker's posts on capacity, queueing, and load"
+  authors="Marc Brooker"
+  year="2014-2024"
+  source="brooker.co.za"
+  url="https://brooker.co.za/blog/"
+>
+A working AWS principal engineer's running treatment of these
+ideas applied to real systems — load shedding, retry storms,
+metastable failures, and why the textbook math actually predicts
+production incidents. "Metastable Failures" and "The Limits of
+Caching" are particularly worth reading.
+</Reference>
+
+## In summary
+
+- **Little's Law**: `L = λ · W`. Holds for any queueing system in
+  steady state. Two of the three quantities pin the third.
+- **The utilization wall**: in M/M/1, mean response time is
+  `service_time / (1 − ρ)`. At ρ = 50% you pay 2×; at 90%, 10×;
+  at 99%, 100×.
+- **p99 grows faster than mean.** Variance compounds in the
+  queue; the higher the percentile, the steeper the wall.
+- **M/M/c statistical multiplexing**: one big pool of c servers
+  beats c independent single-server pools at the same total
+  capacity — the same load reaches the wall later.
+- **Capacity-plan for 60–70% steady state**, not 90%. The
+  headroom isn't waste; it's what bounds tail latency.
+- **Batching** is the cheapest latency intervention because it
+  raises μ and collapses ρ; **bounded queues + load shedding**
+  prevent the wall from being touched at all; **autoscaling**
+  is the slow remedy.
+- Pair with `tail-latency`, `backpressure`, `load-shedding`,
+  `autoscaling`, and `batching-and-coalescing` for the
+  operational toolkit that lives downstream of this math.

@@ -223,6 +223,128 @@ Most "new" systems built since ~2014 use Raft instead.
 Pre-2014 systems and systems explicitly modeled on Google
 papers use Paxos.
 
+## Multi-Paxos in production: the real story
+
+Single-decree Paxos — the version in "Paxos Made Simple" — is
+not what any real system runs. It commits one value with two
+round trips, then starts over. Useful for understanding the
+safety argument; useless as a replicated log.
+
+Production Paxos systems run **Multi-Paxos with a stable
+leader**, and the optimization that matters more than any
+other is the **leader lease**.
+
+### The leader lease optimization
+
+Once a leader has completed phase 1 for a range of slots, it
+holds an implicit promise from a majority of acceptors not to
+acknowledge any other proposer. Production systems make this
+promise *explicit* and *time-bounded*:
+
+- The leader periodically renews a **lease** — typically by
+  exchanging heartbeats with a quorum.
+- Each acceptor records "I will not vote for anyone else
+  until time T."
+- While the lease holds, the leader can commit new values
+  with **one round trip** (phase 2 only) — phase 1 is skipped
+  entirely.
+- The leader can even serve **linearizable reads from local
+  state** without coordinating, because no other leader can
+  have committed anything during the lease window.
+
+This is the optimization that makes Paxos competitive with
+Raft in steady state. Both end up at "one RTT + one fsync" per
+commit; the difference is mostly in how leader-change is
+specified.
+
+### Worked example: Chubby's master lease
+
+Chubby's leader holds a renewable **master lease** of 12
+seconds by default (per Burrows OSDI 2006), configurable and
+extendable under load. The lease is short enough that a true
+partition recovers within an SLA budget, long enough that
+typical NTP-bounded clock skew is dwarfed by it.
+
+While the lease is valid:
+
+- Clients can route reads directly to the master without a
+  quorum read — the master serves from its local replicated
+  state.
+- Writes still go through Paxos commit, but skip phase 1.
+- A failed lease renewal forces the master to step down; a new
+  election begins.
+
+The trick: clients caching the master's identity work because
+the lease expiration provides a hard upper bound on stale
+results.
+
+### Textbook Multi-Paxos vs. real Multi-Paxos
+
+What's missing from "Multi-Paxos" as described in the papers
+versus what every production deployment actually ships:
+
+<Cheatsheet>
+| Concern | Textbook Multi-Paxos | Spanner / Chubby / Megastore |
+|---|---|---|
+| Leader election | "Pick one somehow" | Lease-based with stable terms; explicit fencing tokens |
+| Configuration changes | Vague | Joint consensus (run with both old and new majorities simultaneously) |
+| Log compaction | Unmentioned | Periodic snapshots + InstallSnapshot RPC for lagging replicas |
+| Pipelining | Implicit | Explicit: many slots in flight, out-of-order ACKs, careful in-doubt tracking |
+| Read paths | Quorum reads only | Lease reads, follower reads with bounded staleness, read indexes |
+| Disk format | Unmentioned | Tight WAL formats, group commit, parallel fsync |
+</Cheatsheet>
+
+Each of these is a paper in itself. "Paxos Made Live"
+(Chandra, Griesemer, Redstone, 2007) is the most honest writeup
+of how much engineering sits between the algorithm and a
+production system — orders of magnitude more code than the
+algorithm itself.
+
+### Why CockroachDB and TiKV chose Raft per partition, not EPaxos
+
+Both CockroachDB and TiKV evaluated EPaxos and Flexible Paxos
+(see flexible-paxos-and-epaxos), then chose **Raft per range /
+region** anyway. The reasoning:
+
+- **Library maturity.** etcd-raft and tikv-raft had years of
+  production hardening and Jepsen testing by 2015. No
+  comparable EPaxos library existed.
+- **Implementation cost.** EPaxos's conflict graph and
+  dependency tracking add complexity that scales with command
+  rate. The team estimated several engineer-years to match
+  Raft's correctness story.
+- **Many small groups beat one big group.** CockroachDB runs
+  thousands of Raft groups per cluster (one per range, ~64 MB
+  each); TiKV is similar. Throughput scales by adding ranges,
+  not by making any single group faster. EPaxos's "one global
+  leaderless consensus" optimization is irrelevant when you
+  already have parallelism through sharding.
+- **WAN latency wins are marginal at the SQL layer.** The
+  cross-region cost of a transaction is dominated by the
+  number of ranges it touches, not the per-range commit
+  latency. Sharding + smart placement beats leaderless WAN
+  consensus for the common workload.
+
+This is the pattern across the industry in 2026: pick a
+boring, leader-based, per-shard consensus algorithm and scale
+horizontally. Save the exotic variants for the specific
+workloads where they pay off (geo-distributed CRDTs,
+single-shard databases with global writes).
+
+<Reference
+  kind="paper"
+  title="The Chubby lock service for loosely-coupled distributed systems"
+  authors="Mike Burrows"
+  year="2006"
+  source="OSDI"
+  url="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/"
+>
+Section 4 ("Master election") and section 5 ("Database
+implementation") describe the master lease and the divergence
+between textbook Paxos and Chubby's actual database — the most
+cited concrete example of "Multi-Paxos in production."
+</Reference>
+
 ## Spanner: Paxos at scale
 
 Spanner runs Paxos groups per "tablet" — a range of data —

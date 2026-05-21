@@ -1,0 +1,397 @@
+export const level = 'staff';
+
+# NUMA and cache locality
+
+The hardware reality below the OS. A modern server is not a
+flat pool of cores and memory — it's two or four CPU sockets,
+each with its own DRAM controller, three levels of cache,
+and a coherence protocol that serializes writes to any
+cache line shared between cores. Most application-level
+architectures ignore all of this and get away with it. The
+ones that don't, hit walls that look like scaling problems
+but are actually hardware locality problems: throughput
+plateaus at 60% CPU utilization, "lock-free" data structures
+that don't scale past four cores, p99 latency that gets worse
+as you add hardware.
+
+This page is the staff-level layer below "we need another
+30% throughput and the framework can't give it to us." If
+your architecture diagram tops out at "service," you don't
+need this. If you're inside a single binary that's expected
+to saturate a 64-core box, this is where you live.
+
+## The hierarchy and the numbers
+
+These are from Drepper's "What every programmer should know
+about memory" (2007), updated for modern Intel/AMD server
+parts. Exact numbers vary by generation; the **ratios** are
+what to memorize.
+
+<Cheatsheet>
+| Level | Latency | Notes |
+|---|---|---|
+| Register | &lt;1 cycle | ~0.3 ns at 3 GHz |
+| L1 cache (per core) | ~0.5 ns | ~4 cycles, 32-64 KB |
+| L2 cache (per core) | ~7 ns | ~12 cycles, 256 KB - 1 MB |
+| L3 cache (shared per socket) | ~25 ns | ~40 cycles, tens of MB |
+| Local DRAM | ~100 ns | Same NUMA node |
+| Remote DRAM (cross-socket) | ~200-300 ns | Via QPI/UPI/Infinity Fabric |
+| Cache line size | 64 bytes | Intel/AMD; ARM is also 64 on most server parts |
+</Cheatsheet>
+
+Two things matter from this table:
+
+1. **Crossing the socket boundary is 2-3× more expensive
+   than local DRAM.** That gap doesn't appear in any
+   higher-level abstraction. The OS shows you "memory" as
+   one flat address space; the hardware quietly charges you
+   different prices depending on which socket the page
+   physically lives on.
+2. **64 bytes is the unit of coherence.** Cores don't share
+   memory at byte granularity — they share at cache-line
+   granularity. Two unrelated 8-byte variables that happen
+   to live in the same 64-byte line are, from the hardware's
+   point of view, the same memory.
+
+## NUMA effects
+
+A two-socket server has two NUMA nodes. Each has its own
+local DRAM bank and its own memory controller. Cross-socket
+memory access goes through an interconnect (Intel's UPI/QPI,
+AMD's Infinity Fabric) — adding 100-200 ns over local DRAM.
+
+Where it bites:
+
+- A thread allocates a buffer on socket 0 because that's
+  where it was running at allocation time. Later it migrates
+  to socket 1 (the scheduler decided, or you didn't pin it).
+  Every access to that buffer now pays the cross-socket
+  penalty.
+- A worker pool with shared queues placed on one socket
+  starves the other socket's workers.
+- A database's buffer pool is one contiguous mmap that spans
+  both nodes. Random page accesses pay the cross-socket cost
+  roughly half the time.
+
+**Control knobs:**
+
+- `numactl --cpunodebind=0 --membind=0 ./my-server` pins the
+  process to NUMA node 0 entirely.
+- `numactl --interleave=all` distributes pages round-robin
+  across all nodes — gives you predictable average latency at
+  the cost of no chance for locality wins.
+- Linux's **automatic NUMA balancing** (since 3.13) tries to
+  migrate pages closer to the threads accessing them. It
+  helps for steady-state workloads and thrashes for ones
+  with shifting access patterns. `numa_balancing=0` in sysctl
+  turns it off.
+- `numastat` shows per-process hit/miss counts. `numactl -H`
+  prints the topology.
+
+**Real-world cases where NUMA tuning matters:**
+
+- **PostgreSQL** with large `shared_buffers` benefits from
+  `huge_pages=on` and from running with `numactl --interleave`
+  on multi-socket boxes. The wiki explicitly warns about
+  NUMA misallocation under default kernel policies.
+- **MySQL/InnoDB** has had NUMA-aware buffer-pool patches
+  since 5.6; the `innodb_numa_interleave` setting is the
+  knob.
+- **JVM** apps with large heaps want
+  `-XX:+UseNUMA` for the parallel/G1 collectors, which
+  partitions the young generation per node.
+
+## Cache lines and false sharing
+
+The other invisible cost. Two threads writing to **different
+variables** that happen to share a 64-byte cache line don't
+share data semantically, but they share it at the cache
+level. Each write invalidates the other core's copy of the
+line, forcing a coherence message and a re-fetch. The
+hardware doesn't know your variables are independent.
+
+```
+struct counters {
+  uint64_t a; // thread 0 writes
+  uint64_t b; // thread 1 writes
+}; // a and b are 8 bytes apart, share a 64-byte line
+```
+
+Both threads' increments are now serialized through MESI
+cache coherence. What looks like a lock-free design is
+performance-equivalent to a contended spinlock. Measured
+cost: an uncontended increment is ~1 ns; a false-sharing
+increment under heavy contention is 50-100 ns.
+
+**The fix is padding.** Force each hot variable onto its
+own cache line:
+
+```bash
+# C
+struct counters {
+  uint64_t a;
+  char pad_a[56]; // 64 - 8
+  uint64_t b;
+  char pad_b[56];
+} __attribute__((aligned(64)));
+```
+
+Language-specific:
+
+- **Java** has `@Contended` (JDK 8+, hidden behind
+  `-XX:-RestrictContended`). The JIT pads annotated fields.
+- **Go** uses explicit padding: `[64]byte` between hot
+  fields, or wraps each in `struct{ x int64; _ [56]byte }`.
+- **Rust** has `crossbeam::utils::CachePadded<T>`.
+- **C++** has `std::hardware_destructive_interference_size`
+  (C++17) — though compilers ship varying values; treat 64
+  as the safe assumption.
+
+The pattern shows up in Disruptor (LMAX's ring buffer is
+fully cache-line padded), in every modern concurrent queue,
+and in the linux kernel's per-CPU counters.
+
+## Sequential vs random access
+
+The CPU's prefetcher reads ahead on sequential access — once
+it spots a stride pattern, it pulls future cache lines into
+L2 before you ask for them. Sequential reads from DRAM
+sustain something like 6-10 GB/s per core; random reads from
+DRAM are roughly 100× slower because every access is a cache
+miss.
+
+This is the entire reason **columnar storage** crushes row
+storage for analytical workloads. A SUM over one column
+streams contiguous bytes through the CPU; the same query
+over row storage thrashes the cache, pulling in 100 bytes of
+row data to access 8 bytes of the column. See
+`columnar-storage`.
+
+The same effect at the in-memory data-structure level:
+
+- **Array of structs (AoS)** — `{x, y, z, color}[]`. Good
+  cache behavior when you access most fields together (game
+  engines, graphics).
+- **Struct of arrays (SoA)** — `{x: [], y: [], z: [],
+  color: []}`. Good cache behavior when you access one field
+  at a time across many records (analytics, ML, physics).
+
+The choice is workload-dependent. ECS (entity-component
+systems) in modern game engines push SoA hard for the
+inner-loop systems precisely because of this.
+
+## Atomics and memory ordering
+
+Atomic operations aren't free. On x86:
+
+- A non-atomic 64-bit increment: ~1 ns.
+- `LOCK XADD` (atomic increment): ~10-20 ns uncontended,
+  100+ ns under contention.
+- `MFENCE` (full memory fence): ~10 ns on x86; weaker
+  architectures (ARM, POWER) pay more for explicit fences
+  because their default ordering is weaker.
+
+"Lock-free" doesn't mean "wait-free" doesn't mean "scales."
+Under contention, the cache-coherence traffic from atomic
+compare-and-swap loops dominates — the line bounces between
+caches, every retry stalls. A classic measurement: a single
+shared `AtomicLong` counter incremented from 16 cores
+delivers maybe **20 million updates/sec total**, not 16×
+single-core throughput. The serialization is in MESI, not in
+any visible lock.
+
+For high-write counters use per-CPU structures (see below).
+Java's `LongAdder` does exactly this — one counter per
+striped slot, `sum()` walks all slots; ~10× faster than
+`AtomicLong` under contention.
+
+## Practical patterns
+
+**Per-CPU data structures.** Each CPU has its own slot;
+writes are local, reads aggregate. Linux's `percpu_counter`,
+Java's `LongAdder`, Go's `sync.Pool` (per-P caching), DPDK's
+mempool. Cost: reads are O(cores); benefit: writes scale
+linearly.
+
+**RCU (Read-Copy-Update).** For data structures that are
+read very often and written rarely. Readers don't lock and
+don't atomic — they read directly. Writers create a new copy
+and atomically swap a pointer; old copy is reclaimed once
+all in-flight readers are gone. The Linux kernel uses RCU
+heavily (the dcache, routing tables, IDR). Userland RCU
+exists (`liburcu`) but adoption is mostly in databases.
+
+**Shard-per-core.** One thread per CPU, pinned. Each thread
+owns its own data partition. No shared mutable state — no
+locks, no atomics, no false sharing, no cache coherence
+traffic between cores. The downside: any inter-shard work
+goes through a message-passing channel. This is the
+architecture behind:
+
+- **ScyllaDB** (the Seastar framework). Shard-per-core was
+  the explicit thesis — Cassandra's per-row locking was the
+  scaling wall.
+- **Redpanda.** Kafka API on top of Seastar; same model.
+- **CFS** (Linux's completely fair scheduler) and **block
+  multiqueue** within the kernel.
+- **DPDK / SPDK** applications.
+
+**Pin threads to cores.** `pthread_setaffinity_np`,
+`taskset`, Go's `runtime.LockOSThread()` combined with
+deliberate affinity via raw syscalls. Eliminates scheduler
+churn for latency-critical work. The cost is you must build
+the rest of the system to honor those pins (the kernel will
+happily run other things on your "dedicated" core unless you
+also `isolcpus` it at boot).
+
+## A worked diagnostic
+
+Your service plateaus at 60% CPU utilization across 16
+cores. Throughput stops going up; latency starts going up.
+Adding cores doesn't help. The framework is "lock-free."
+What's happening?
+
+The shortlist:
+
+1. **False sharing in a hot data structure.** Run
+   `perf c2c record` for a minute, then `perf c2c report` —
+   it surfaces cache lines that bounce between cores. The
+   top of the report is usually the culprit.
+2. **Contended atomic.** `perf top` will show high
+   `LOCK XADD` or `cmpxchg` time in a specific function.
+3. **Cross-NUMA traffic.** `numastat -p <pid>` shows
+   per-node hit/miss. If `other_node` numbers are high and
+   growing, threads and memory are on different sockets.
+4. **Lock contention in something you didn't think was a
+   lock.** Allocator (`malloc` global state), logging
+   (shared file descriptor), metrics (shared map). `perf
+   sched`, off-CPU profiling.
+
+The first three are all locality problems. The fourth is the
+classic lock-contention problem. Tools in order of
+diagnostic power: `perf c2c` (cache-line contention),
+`perf top` (CPU hot spots), `pidstat`, `numastat`,
+`bpftrace`/eBPF for custom probes, `intel-pcm` for memory
+bandwidth and QPI traffic counters.
+
+<Callout variant="info">
+"My lock-free queue scales to 4 cores and then plateaus" is
+almost always false sharing on the queue's head/tail
+pointers, or a single shared sequence counter. The fix is
+literally cache-line padding; it's not a rewrite.
+</Callout>
+
+## What this means for system design
+
+At service-design level, almost nothing. The framework's
+buffer pool, the runtime's allocator, the database's storage
+engine — they're already doing whatever they're going to do
+about locality, and you can't easily reach inside them.
+
+At the "I need 30% more throughput from this machine and the
+profiler shows we're not CPU-bound" level, this is the next
+layer. The wins come in this order:
+
+1. **Eliminate cross-NUMA allocations** (`numactl
+   --membind`, NUMA-aware allocator).
+2. **Fix obvious false sharing** (`perf c2c`, cache-pad hot
+   counters and pointers).
+3. **Use the language's per-CPU primitive** for high-write
+   counters and pools (`LongAdder`, sharded counters,
+   per-P state).
+4. **Pin threads and partition data** if you're building a
+   ground-up data-plane component.
+5. **Shard-per-core** as the architectural commitment, not
+   as a tuning step. This is what ScyllaDB, Seastar, and
+   Redpanda picked.
+
+At hyperscaler level, shard-per-core is the modern answer
+for new storage and streaming systems. The trade is that the
+programming model is more constrained — you cannot reach
+into another shard's data, you can only send it a message —
+and the operational story (rebalancing, handling failed
+cores) becomes its own thing. See
+`shared-nothing-architecture` for the higher-level analog.
+
+## Cross-references
+
+- `latency-numbers-every-engineer-should-know` — the
+  service-level analog of the table at the top of this page.
+  Same orders-of-magnitude logic, larger scale.
+- `columnar-storage` — the most visible system-design
+  consequence of sequential vs random access patterns.
+- `shared-nothing-architecture` — the distributed-systems
+  cousin of shard-per-core. Same reasoning at a different
+  scale.
+- `kernel-networking-and-io-uring` — the kernel-side
+  companion to this page. NUMA and io_uring interact:
+  io_uring's SQPOLL thread should live on the same NUMA node
+  as the NIC.
+
+## Further reading
+
+<Reference
+  kind="paper"
+  title="What Every Programmer Should Know About Memory"
+  authors="Ulrich Drepper"
+  year="2007"
+  source="Red Hat / LWN"
+  url="https://people.freebsd.org/~lstewart/articles/cpumemory.pdf"
+>
+The canonical reference for cache hierarchies, NUMA, and the
+memory subsystem from a programmer's point of view. Some
+specific numbers are dated (DDR2 era), but the model and the
+mental framework are exactly what you need; nothing in the
+last fifteen years has displaced it.
+</Reference>
+
+<Reference
+  kind="blog"
+  title="Seastar architecture"
+  authors="ScyllaDB"
+  year="2020"
+  source="seastar.io"
+  url="https://seastar.io/shared-nothing/"
+>
+The clearest exposition of why a database team chose
+shard-per-core over the conventional thread-pool model.
+Read alongside the ScyllaDB engineering blog for measured
+results — particularly the writeups comparing Cassandra's
+per-core scaling to Scylla's.
+</Reference>
+
+<Reference
+  kind="book"
+  title="Systems Performance"
+  authors="Brendan Gregg"
+  year="2020"
+  source="Addison-Wesley"
+  url="https://www.brendangregg.com/systems-performance-2nd-edition-book.html"
+>
+The reference for the tools above — `perf c2c`, `numastat`,
+off-CPU profiling, USE method. If you're staring at a
+service that doesn't scale and don't yet know which of false
+sharing, NUMA, or lock contention is biting, this book is
+how you find out.
+</Reference>
+
+## In summary
+
+- Modern servers are NUMA. Cross-socket memory access costs
+  2-3× local. Pin processes (`numactl`) or interleave when
+  unsure.
+- The cache line is 64 bytes and is the unit of coherence.
+  Two unrelated variables sharing a line will serialize
+  through MESI under contention — "false sharing." Fix with
+  padding.
+- Sequential access prefetches; random access cache-misses.
+  This is the hardware reason columnar wins for analytics.
+- Atomics aren't free. Under contention, MESI traffic
+  dominates. High-write counters need per-CPU structures
+  (`LongAdder`, `percpu_counter`, sharded slots).
+- The architectural answer at the extreme is **shard-per-core**
+  — no shared mutable state, one thread per CPU, message
+  passing across shards. ScyllaDB, Seastar, Redpanda.
+- Most systems don't need this layer. When you do, diagnose
+  with `perf c2c`, `numastat`, off-CPU profiling — don't
+  guess.
