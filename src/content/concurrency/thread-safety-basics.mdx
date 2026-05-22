@@ -1,0 +1,208 @@
+export const level = 'junior';
+
+# Thread safety basics
+
+"Thread-safe" is a word that gets thrown around without anyone
+agreeing on what it means. The technical definition (from
+Goetz's *Java Concurrency in Practice*) is: **a class is
+thread-safe if it behaves correctly when accessed from multiple
+threads, with no additional synchronization required by the
+caller, and regardless of how those threads are interleaved by
+the runtime.** Three pieces in that definition, all of them
+load-bearing.
+
+## The three things "thread-safe" is *not*
+
+- **Not "uses a lock somewhere."** A class with a mutex in
+  every method can still be broken — for example, by exposing
+  internal state through a getter that the caller mutates.
+- **Not "fast under concurrent access."** A correctly-locked
+  but slow class is still thread-safe. Performance is a
+  separate axis.
+- **Not "deadlock-free in combination with everything else."**
+  A thread-safe class may still deadlock if used with others
+  that take locks. Safety is per-class; deadlock is system-wide.
+
+## Five levels of thread safety
+
+It helps to distinguish degrees rather than treat it as binary:
+
+<Cheatsheet
+  columns={["Level", "What it means", "Examples"]}
+  rows={[
+    ["Immutable", "State can't change after construction; no synchronization needed.", "String (Java), tuple (Python), Arc<T> wrapping immutable data"],
+    ["Thread-safe", "All operations are safe to call from any thread, in any order.", "ConcurrentHashMap, java.util.concurrent.atomic.*"],
+    ["Conditionally thread-safe", "Some sequences of operations need external sync.", "Collections.synchronizedList (each op safe; iteration needs a lock)"],
+    ["Thread-compatible", "Not safe by default; safe with external sync.", "ArrayList, HashMap, std::vector"],
+    ["Thread-hostile", "Unsafe even with external sync; cannot be made safe.", "Static state mutated without coordination; generally a design bug"],
+  ]}
+  caption="Pugh's taxonomy. 'Thread-safe' usually means level 2 — but immutable is the easiest path there."
+/>
+
+The cheapest path to thread safety is **immutability** — if
+nothing changes, nothing can race. The cheapest path *to
+mutable* thread safety is **not sharing** — if only one thread
+touches the data, no synchronization is needed. Reach for locks
+only when you've decided you must share mutable state.
+
+## Visibility, not just atomicity
+
+A common mental model bug: thinking thread safety is only about
+"two threads writing at once." Even **two threads where one
+writes and the other reads** has problems:
+
+```java
+class Stoppable {
+    private boolean stop = false;
+    public void stop() { stop = true; }
+    public void run() {
+        while (!stop) doWork();   // may never see stop=true!
+    }
+}
+```
+
+Without synchronization, the reader thread may *never see*
+the writer's update. The CPU/compiler is allowed to keep
+`stop` in a register and never re-fetch from memory; the
+write may sit in a store buffer for an unbounded time. This is
+**visibility**, and it's distinct from atomicity. The fix in
+Java is `volatile boolean stop`. In C++, `std::atomic<bool>`.
+In Rust, the borrow checker forces you to wrap it.
+
+Plain mutexes solve visibility for free — acquiring or
+releasing a lock includes a memory barrier, so anything a
+thread did before releasing is visible to the next thread after
+acquiring. That's why "just put a lock around it" works even
+for read-only-looking patterns.
+
+## Safe publication
+
+Once you've created an object, how do you let another thread
+see it without corruption? This is **safe publication**, and
+naïve sharing is broken:
+
+```java
+// UNSAFE
+public class Holder {
+    private int x;
+    public Holder(int x) { this.x = x; }
+}
+class Container {
+    public Holder holder;
+    public void publish() { holder = new Holder(42); }   // racy!
+}
+```
+
+Another thread reading `container.holder` may see a non-null
+`Holder` whose `x` field is still 0 — the constructor's stores
+haven't yet propagated, but the pointer write did. Safe
+publication idioms:
+
+- Store into a `volatile`/`atomic` field after construction.
+- Store into a field guarded by a lock; readers acquire the
+  same lock.
+- Use an immutable holder (`final` fields in Java; `const` in
+  C++; immutable by default in Rust/Erlang).
+- Use a thread-safe collection's `put` (it does the publication
+  internally).
+- For lazy init, use a holder class idiom or `Once`/`std::call_once`.
+
+This is one of the most-violated rules in real code. Static
+initialization in a constructor + a "global registry" is the
+shape that bites everyone at some point.
+
+## Composing thread-safe classes
+
+Two thread-safe classes don't combine into a thread-safe whole
+when sequenced. The classic example:
+
+```java
+ConcurrentMap<K, V> map = ...;
+if (!map.containsKey(k)) {     // atomic
+    map.put(k, compute(k));    // atomic
+}                              // ...the pair is not!
+```
+
+Two threads can both pass the `containsKey` check and both put
+— double work or, worse, double side effects. The fix is the
+**atomic composite operation** provided by the class:
+`putIfAbsent`, `computeIfAbsent`, `merge`. Or wrap the pair in
+your own lock. **You can't get a multi-step atomic operation
+by sequencing thread-safe pieces** unless the class gives you
+one.
+
+## The "is this thread-safe?" mental checklist
+
+When someone asks if a piece of code is thread-safe, run through:
+
+<Steps>
+<Step n="1" title="What state is shared across threads?">
+
+Fields of singletons, statics, things accessible via a global
+container or registry. If there's no shared state, you're done.
+
+</Step>
+<Step n="2" title="For each piece of shared state, who reads and who writes?">
+
+Read-only after init? Just safely publish it. Write-once,
+read-many? Use a `volatile` reference. Read-write by many?
+You need real synchronization.
+
+</Step>
+<Step n="3" title="What invariants link multiple fields?">
+
+`balance` and `transaction_log` are related; one without the
+other is broken state. The mutex has to cover the *whole*
+invariant — both fields together.
+
+</Step>
+<Step n="4" title="Are there multi-step operations callers may want?">
+
+If they exist, either provide them as a single atomic method
+on your class, or document that the caller needs to lock.
+Don't pretend the class is "fully safe" when it has a
+check-then-act hole.
+
+</Step>
+<Step n="5" title="Does anything escape construction?">
+
+`this` leaking from a constructor (a `Listener` registering
+itself before fields are initialized) is a classic
+thread-safety hole. The half-constructed object becomes
+visible to other threads.
+
+</Step>
+</Steps>
+
+## Language tools that help
+
+- **Rust**: the type system enforces "no shared mutable state
+  without a lock." `Send` (movable across threads) and `Sync`
+  (sharable across threads) are derived automatically; the
+  borrow checker rejects unsynchronized sharing at compile
+  time. The price is upfront ceremony; the reward is no
+  unsynchronized races, ever.
+- **Java**: `synchronized` blocks, `java.util.concurrent.*`,
+  `volatile`, `final` for safe publication. The Java Memory
+  Model is well-specified.
+- **Go**: the race detector (`go test -race`) is the cheapest
+  insurance you can buy. Channels for ownership transfer;
+  `sync.Mutex` for shared state; `sync/atomic` for low-level.
+- **C++**: `std::atomic<T>` for primitives, `std::mutex` for
+  blocks; the C++ memory model specifies six orderings. The
+  compiler will not help you find races at compile time.
+- **JavaScript (in one tab)**: only one task runs at a time;
+  races are limited to "across `await`" boundaries. Worker
+  threads with `SharedArrayBuffer` reintroduce the full
+  shared-memory model.
+
+## The takeaway
+
+A thread-safe class behaves correctly under arbitrary
+concurrent access without needing the caller to coordinate.
+The cheapest paths are *immutability* and *no sharing*. When
+you must share mutable state, you need atomicity, visibility,
+and safe publication — and you need to provide atomic
+composite operations for any multi-step invariant callers
+might want. "Has a lock somewhere" is not the same as
+"thread-safe."

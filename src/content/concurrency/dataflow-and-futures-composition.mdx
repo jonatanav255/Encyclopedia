@@ -1,0 +1,291 @@
+export const level = 'staff';
+
+# Dataflow and futures composition
+
+Once you have futures, the next interesting question is **how
+to compose them**. A single `await` is just sequencing. The
+power comes from building graphs of futures — dependencies,
+joins, races, dynamic spawns — and letting the runtime
+schedule them. This page is about that compositional layer:
+the patterns, the gotchas, and the way modern async runtimes
+expose dataflow as a first-class concept.
+
+## Futures as graph nodes
+
+A future is a node in a dataflow graph: its inputs are the
+futures it awaits; its output is the result it produces. The
+graph is *implicit* in normal async code:
+
+```python
+async def feature_vector(user_id):
+    profile = await fetch_profile(user_id)        # node A
+    history = await fetch_history(user_id)        # node B
+    return combine(profile, history)              # node C
+```
+
+Three nodes, two of which (A and B) are independent and one
+(C) depends on both. But the code as written is sequential —
+A blocks B's start. The optimization is to **make the
+independence explicit**:
+
+```python
+async def feature_vector(user_id):
+    async with TaskGroup() as tg:
+        p_task = tg.create_task(fetch_profile(user_id))
+        h_task = tg.create_task(fetch_history(user_id))
+    return combine(p_task.result(), h_task.result())
+```
+
+Now A and B start concurrently; only C is sequenced. This is
+the classic case: `Promise.all`/`join_all`/`gather` is how you
+express "these inputs in parallel, then this output."
+
+## The fork-join shape
+
+The most common composition. Spawn N futures, wait for all,
+combine results.
+
+```rust
+// Rust / Tokio
+let (a, b, c) = tokio::join!(fetch_a(), fetch_b(), fetch_c());
+
+// JS
+const [a, b, c] = await Promise.all([fetchA(), fetchB(), fetchC()]);
+
+// Python
+a, b, c = await asyncio.gather(fetch_a(), fetch_b(), fetch_c())
+
+// Go (with errgroup)
+g, ctx := errgroup.WithContext(ctx)
+var a, b, c Result
+g.Go(func() error { a, err := fetchA(ctx); return err })
+g.Go(func() error { b, err := fetchB(ctx); return err })
+g.Go(func() error { c, err := fetchC(ctx); return err })
+if err := g.Wait(); err != nil { ... }
+```
+
+Properties to understand:
+
+- **Failure semantics**. Most "all" combinators short-circuit
+  on the first failure and cancel siblings. `gather` in Python
+  has a `return_exceptions=True` mode that collects exceptions
+  instead.
+- **Bounded concurrency**. None of these limits concurrency by
+  default. 1000 inputs = 1000 in-flight. Use a semaphore or
+  bounded pool.
+- **Resource cleanup**. If you spawn but don't await, the
+  futures' resources may leak. Structured concurrency makes
+  this safe by tying the lifetime to a scope.
+
+## Race / select / first-to-finish
+
+The dual of join: don't wait for all, just one.
+
+```rust
+tokio::select! {
+    val = primary() => use(val),
+    val = backup()  => use(val),
+    _ = sleep(Duration::from_secs(5)) => timeout(),
+}
+```
+
+```js
+const winner = await Promise.race([primary(), backup(), timeout(5000)]);
+```
+
+```python
+done, pending = await asyncio.wait([primary(), backup()],
+                                   return_when=FIRST_COMPLETED)
+for p in pending: p.cancel()
+```
+
+Use cases:
+
+- **Hedged requests**: send the same request to two replicas;
+  take whichever responds first. Used heavily in low-latency
+  systems (Google's "tail at scale" paper).
+- **Timeouts**: race the real work against a sleep.
+- **Cancellation source vs work**: race the work against a
+  cancellation signal.
+- **Multi-source data**: race a fast cache against a slow
+  authoritative source.
+
+In Rust, dropping the losing futures is automatic and clean.
+In Python and JS, the runner-up futures keep running unless
+you explicitly cancel them — easy to leak.
+
+## Dynamic dataflow: spawn while you go
+
+Sometimes the graph isn't known upfront. You discover work as
+you process previous results.
+
+```python
+async def crawl(seed):
+    visited = set()
+    queue = asyncio.Queue()
+    queue.put_nowait(seed)
+    sem = asyncio.Semaphore(20)
+
+    async with asyncio.TaskGroup() as tg:
+        async def worker():
+            while True:
+                url = await queue.get()
+                if url in visited:
+                    queue.task_done(); continue
+                visited.add(url)
+                async with sem:
+                    page = await fetch(url)
+                for link in extract_links(page):
+                    queue.put_nowait(link)
+                queue.task_done()
+
+        for _ in range(20):
+            tg.create_task(worker())
+
+        await queue.join()              # all enqueued have been processed
+```
+
+Classic web crawler. The dataflow graph grows as workers find
+links. The workers, queue, and semaphore together form a
+self-paced dataflow engine. The TaskGroup ensures clean
+shutdown when `queue.join()` completes.
+
+## Stream-shaped dataflow
+
+When the inputs arrive over time, futures aren't quite right —
+you want **async streams**:
+
+```rust
+let mut stream = source.map(transform).buffer_unordered(8);
+while let Some(item) = stream.next().await {
+    process(item).await;
+}
+```
+
+`map` lazily applies a function. `buffer_unordered(8)` runs up
+to 8 stages concurrently and yields results in completion
+order. Streams compose like iterators but each operation is
+async. RxJS, Akka Streams, Tokio's `futures::stream`, and
+Kotlin Flow all implement this.
+
+The biggest win is **structural backpressure**: each downstream
+consumer pulls at its own rate; the source naturally throttles.
+
+## The "futures don't run until awaited" trap
+
+In lazy-future languages (Rust, Python coroutines), creating a
+future does nothing:
+
+```python
+async def main():
+    fetch_a()           # ← nothing happens
+    fetch_b()           # ← nothing happens
+    await fetch_c()     # ← only this one runs
+```
+
+If you don't `await` or `create_task`, the work is silently
+discarded. Static analyzers (`mypy`, `pyright`, Rust's compiler)
+catch this in many cases; runtime checks fire too. But the
+shape ("I built three futures, only one ran") is easy to
+write by accident.
+
+Eager-future languages (JS, C#) flip the problem: the future
+starts immediately, and *forgetting to await* means the work
+runs but errors go to the unhandled-rejection handler.
+
+## Error handling in compositions
+
+This is where each language's quirks show:
+
+- **`Promise.all` short-circuits.** First rejection wins;
+  other promises keep running but their results are
+  discarded. Use `Promise.allSettled` to collect all results
+  regardless.
+- **`asyncio.gather` with `return_exceptions=False`** raises
+  the first exception; siblings keep running unless TaskGroup
+  cancels them.
+- **TaskGroup propagates `ExceptionGroup`** if multiple
+  children fail.
+- **Tokio's `join!` returns a tuple of `Result`s**; you handle
+  each.
+- **errgroup in Go**: first non-nil error wins, others are
+  cancelled via `ctx`.
+
+The pattern that works across all: **decide upfront whether
+you want fail-fast or collect-all, and use the right
+combinator.**
+
+## Functional combinators
+
+The deeper compositional vocabulary that comes from FP
+libraries:
+
+- **`map`**: transform the inner value of a future. (Most
+  languages: `future.map(fn)`.)
+- **`flatMap`/`bind`**: chain a future producing another
+  future. (`Promise.then` with a function returning a Promise.)
+- **`zip`**: combine two futures into one yielding a pair.
+- **`fold`/`reduce`**: combine a sequence of futures
+  sequentially with an accumulator.
+- **`sequence`**: turn a list of futures into a future of a
+  list. (`Promise.all` is this with extra concurrency.)
+- **`traverse`**: map a function returning futures over a
+  list, then collect. (`Promise.all(items.map(fn))` is this.)
+
+Functional languages like Haskell formalize this as the
+`Monad` (and `Applicative`, and `Selective`) interfaces. Other
+languages give you specific combinators that map to the same
+algebra. Knowing the algebra means you can compose any future
+operation with any other in the right way.
+
+## Selectivity: knowing what you don't need
+
+A subtle staff-level concern. Most future systems are
+**applicative** — they look at all the futures' results and
+combine them. Some systems support **selective composition**
+where the structure of the computation depends on intermediate
+results:
+
+```haskell
+-- Selective: only run B if A says we need it
+selectAB = ifS A B (pure ())
+```
+
+In normal monadic style this is just `A >>= (\x -> if x then B else pure ())`,
+but the monad doesn't tell the runtime that A and the question
+are independent of B. Andrey Mokhov's *Selective Applicative
+Functors* paper (2019) argues that exposing this structure
+enables better scheduling. Build systems (Dune, Shake) and
+dependency-resolvers benefit from it.
+
+You probably won't use selective functors directly. But the
+underlying insight — "expose more structure to the runtime,
+get better scheduling" — is the next frontier in async
+runtimes.
+
+## Pitfalls in real compositions
+
+- **Implicit serialization.** `for item in items: await
+  process(item)` runs sequentially. Use `gather`/`all`.
+- **Overloading downstream.** 10K parallel HTTP requests
+  bring down the service. Add a semaphore.
+- **Cancellation chains.** If parent's `select` picks A and
+  drops B, did B's resources clean up? In Rust yes
+  (via drop); in others, only if you wrote it.
+- **Hidden sequencing through shared state.** Two
+  "concurrent" futures both touch a shared mutex; they
+  serialize at the lock.
+- **Exception swallowing.** Some compositions catch all
+  exceptions; some short-circuit. Know which.
+
+## The takeaway
+
+Composing futures is about building dataflow graphs the
+runtime can schedule. The basic shapes — fork-join, race,
+fan-out-with-bounded-concurrency, streams with backpressure —
+cover most needs. The wins come from making independence
+*explicit* so the runtime can parallelize, and from picking
+the right combinator for the failure mode you want.
+Structured concurrency turns these compositions into safe
+defaults; without it, every composition is one missed `await`
+away from a leak.

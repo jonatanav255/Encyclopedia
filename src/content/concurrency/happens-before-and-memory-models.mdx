@@ -1,0 +1,243 @@
+export const level = 'senior';
+
+# Happens-before and memory models
+
+If you've written threaded code that "worked on x86 but broke
+on ARM" or "passed tests for years and corrupted state once
+under load," you've met a memory-model bug. Memory models are
+the rules that say which writes one thread is *guaranteed* to
+see from another. Without those rules, the answer is "whatever
+the compiler and CPU feel like" — and they feel like quite a
+lot.
+
+This page is the **language-level** view: the abstract model
+your program is written against. A sister page in OS / memory
+covers the hardware level (cache coherence, store buffers, ARM
+vs x86 ordering). Both matter; they sit at different layers.
+
+## Why memory ordering isn't obvious
+
+Consider:
+
+```c
+// Initially: x = 0, y = 0
+// Thread 1:           // Thread 2:
+x = 1;                  y = 1;
+r1 = y;                 r2 = x;
+```
+
+What can `(r1, r2)` be after both threads finish?
+
+- `(1, 1)`: both stores happened first, then both reads. Fine.
+- `(0, 1)` or `(1, 0)`: one thread fully ran before the other
+  saw it. Fine.
+- `(0, 0)`: ??
+
+Sequentially-consistent intuition says `(0, 0)` is impossible:
+"if r1 == 0, then T2's y=1 hadn't run yet when T1 read y. But
+T1's x=1 ran before T1's read of y. So when T2 reads x, x is
+already 1, contradicting r2 == 0."
+
+**`(0, 0)` is observable on real x86, ARM, and POWER hardware.**
+Each CPU has a store buffer; the writes to x and y can sit
+there while the reads zoom past. The actual order of events
+from a third observer's view is allowed by the hardware.
+
+The compiler is also allowed to reorder the two independent
+operations within a thread. From the single-thread spec
+("as-if rule"), it can swap the load and the store. Different
+hardware, different compilers, different optimizer
+configurations — all change which weird outcomes are possible.
+
+The memory model is the contract that makes this tractable:
+the language says "you'll only see these specific weird
+outcomes; in exchange, you must use these specific primitives
+when you want stronger guarantees."
+
+## Sequential consistency: the gold standard
+
+Leslie Lamport defined **sequential consistency** in 1979 as
+the strongest reasonable model:
+
+> The result of any execution is the same as if the operations
+> of all processors had been executed in some sequential order,
+> and the operations of each processor appear in this sequence
+> in the order specified by its program.
+
+In short: there exists *some* global interleaving of all
+threads' operations that explains what every thread observed.
+The intuition you'd hope for.
+
+No mainstream language guarantees SC by default — it's too
+expensive. SC requires inserting memory fences between most
+operations, which kills performance. Every modern language
+gives you SC *opt-in* via specific primitives (`std::atomic`
+with `seq_cst`, `volatile` in Java for synchronized variables,
+`Mutex` in any language).
+
+## The happens-before relation
+
+The mental tool is **happens-before**, a partial ordering on
+the events of a multi-threaded execution. If event A
+*happens-before* event B, then B is guaranteed to see A's
+effects.
+
+Happens-before rules every language defines:
+
+1. **Program order within a thread.** Statements in one thread
+   happen-before in the order they're written. (After compiler
+   reordering, which the spec accounts for.)
+2. **Unlock happens-before subsequent lock.** Releasing a
+   mutex M happens-before the next acquire of M by any thread.
+3. **Write-of-volatile happens-before subsequent read.** Java
+   `volatile`, C++ `std::atomic`, similar in other languages.
+4. **Thread start happens-before that thread's first action.**
+5. **Thread's actions happen-before the join.**
+6. **Atomic store-release happens-before atomic load-acquire**
+   of the same variable seeing that value (C++ memory model).
+
+If you can draw a happens-before chain from event A in one
+thread to event B in another, B is guaranteed to see A. If
+you can't, there's no guarantee — even if A "looks like it
+clearly happened first" in wall-clock time.
+
+## A worked example: safe publication
+
+```java
+class Holder {
+    int x;
+    Holder() { x = 42; }
+}
+
+class Container {
+    Holder h;    // not volatile
+
+    void publish() { h = new Holder(); }
+    int read()    { return h.x; }       // unsafe!
+}
+```
+
+A reader thread that observes `h != null` might still read
+`h.x == 0`. Why? Because:
+
+- The construction's writes to `x` and the publication's
+  write to `h` aren't ordered by any happens-before edge
+  for the reader.
+- The compiler/CPU is free to reorder them so `h` becomes
+  visible before `x`'s write completes.
+
+Fix:
+
+```java
+volatile Holder h;       // adds a happens-before from write to read
+```
+
+Now:
+
+- Constructor's `x = 42` happens-before publication (program
+  order, single thread).
+- Publication's volatile write happens-before any volatile
+  read that observes it (Java rule #3).
+- Reader's volatile read happens-before its access to `h.x`
+  (program order).
+
+Chain: `x = 42` → write `h` → read `h` → read `h.x`. The
+reader sees `x = 42`. **The volatile write doesn't just
+publish `h`; it republishes everything the writer thread did
+before it.** That's the power of the happens-before model.
+
+Same idea in C++ requires `std::atomic<Holder*>` with release
+on the publish side and acquire on the read.
+
+## The six C++ memory orderings
+
+C++ exposes the model raw. Six options for atomic operations:
+
+<Cheatsheet
+  columns={["Ordering", "Meaning", "When to use"]}
+  rows={[
+    ["relaxed", "Atomic, but no ordering with anything else", "Independent counters, statistics"],
+    ["consume", "Acquire only for things dependent on the loaded value (rarely implemented)", "Pointers to immutable data (historically; deprecated)"],
+    ["acquire", "Load: subsequent ops can't move before this load", "Load side of release/acquire pair"],
+    ["release", "Store: prior ops can't move after this store", "Store side of release/acquire pair"],
+    ["acq_rel", "Both, for read-modify-write atomics", "CAS, fetch-add when both sides matter"],
+    ["seq_cst", "Total global ordering (sequential consistency)", "Default and what you should use unless profiling demands less"],
+  ]}
+  caption="Stronger orderings cost more cycles. Weaker orderings buy bugs you don't have the budget to debug."
+/>
+
+The pragmatic advice: **use seq_cst unless you've measured a
+real bottleneck.** The performance difference between seq_cst
+and acquire-release is small (one fence on x86, a few cycles
+on ARM); the reasoning cost difference is enormous.
+
+## Java Memory Model: simpler vocabulary, same shape
+
+Java's model (revised in JSR-133, 2004) gives you fewer knobs
+but the same happens-before discipline:
+
+- `volatile` variable: write happens-before subsequent reads.
+- `synchronized` block: monitor-enter happens-after monitor-exit
+  of the same monitor.
+- `final` field: properly published after constructor returns.
+- `j.u.c.atomic.*`: each method has documented HB semantics.
+- `j.u.c.locks.*`: lock/unlock have HB edges.
+
+Use these primitives and the model takes care of itself. Reach
+outside them ("clever" lock-free tricks with plain fields) and
+you're in undefined-behavior territory.
+
+## Go's memory model
+
+Go publishes a memory-model spec that mirrors Java's:
+
+- Channel sends happen-before the corresponding receive.
+- `sync.Mutex.Unlock()` happens-before subsequent `Lock`.
+- `sync.WaitGroup.Done()` happens-before `Wait` returning.
+- `sync/atomic` operations have documented orderings.
+
+For practical Go: if you only communicate between goroutines
+through channels, mutexes, or `sync/atomic`, you don't need to
+think about memory ordering. Use plain field reads/writes
+across goroutines and you'll have bugs.
+
+## Rust's memory model
+
+Rust uses C++'s underlying model (acquire/release/seq_cst), but
+adds a compile-time twist: the type system forces you to
+opt-in. You can't share mutable state across threads without
+`Mutex`, `RwLock`, or `atomic::*`. The compiler refuses to
+compile the unsafe code. The runtime never has races between
+threads on plain data because the type system forbade them.
+
+You still need to pick the right ordering on atomics, but the
+"forgot to synchronize" class of bug is gone.
+
+## What this means for everyday code
+
+You don't need to know the full memory model to write correct
+concurrent code. You need to know:
+
+1. **Always use synchronization primitives for shared mutable
+   state.** Mutex, atomic, volatile, channel, actor message.
+   Plain reads/writes across threads are wrong unless explicitly
+   blessed.
+2. **Acquire and release are paired.** If you do an "atomic
+   release" of one variable, the reader must do an "atomic
+   acquire" of the same variable. Mismatched orderings are
+   classic bugs.
+3. **Use the language's high-level primitives** unless you've
+   measured a real need to go lower. `Mutex` does everything
+   `atomic` does, and the cost is usually negligible.
+
+## The takeaway
+
+A memory model is the contract between you and the runtime
+about which writes from one thread are visible to another.
+Sequential consistency is the strongest, most intuitive, and
+most expensive. Happens-before is the partial ordering you
+should reason in. Every language gives you primitives that
+establish happens-before edges; if you stick to them, the
+nasty corner cases stay invisible. If you don't, your code
+will work for years and then corrupt under load on hardware
+you didn't test on.

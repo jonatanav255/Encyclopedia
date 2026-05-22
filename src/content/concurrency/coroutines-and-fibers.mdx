@@ -1,0 +1,256 @@
+export const level = 'mid';
+
+# Coroutines and fibers
+
+A coroutine is a function that can **suspend itself and resume
+later**, preserving its local state across the gap. Unlike a
+function, which has one entry and one exit, a coroutine can have
+many entry points — each `yield` (or `await`) is both a return
+and a resume target. The idea predates threads (1958, Conway)
+and keeps getting reinvented because it's the cheapest way to
+write many concurrent flows.
+
+## A first picture
+
+```python
+def counter():
+    n = 0
+    while True:
+        yield n          # suspend, return n; resume here next time
+        n += 1
+
+g = counter()
+print(next(g))   # 0
+print(next(g))   # 1
+print(next(g))   # 2
+```
+
+Each call to `next(g)` runs `counter` until it hits `yield`,
+returns the value, and parks the function. The next `next(g)`
+resumes from right after the `yield`, with all locals intact.
+This is a coroutine — not a thread, not a future. The
+scheduling is *explicit*: the caller decides when to resume.
+
+Coroutines are concurrency without parallelism. They give you
+the **structure** of many independently-progressing tasks
+without the cost of OS threads.
+
+## Generators, coroutines, async — same idea, different powers
+
+The terminology is muddled because the idea grew in stages:
+
+<Cheatsheet
+  columns={["Variant", "Suspends with", "Resumes with", "Can yield value?", "Can receive value?"]}
+  rows={[
+    ["Generator", "yield x", "next(g)", "Yes", "No"],
+    ["Two-way coroutine", "x = yield y", "g.send(v)", "Yes", "Yes (incoming v)"],
+    ["Async function", "await future", "Event loop", "Via return", "Via futures"],
+  ]}
+  caption="Generators are coroutines that only output. async/await is coroutines integrated with an event loop."
+/>
+
+Async/await is literally coroutines with a runtime attached.
+When you write `await someAsyncOp()` in Python or JS or Rust,
+the compiler is generating a coroutine: a function that
+suspends at each await and resumes when the awaited future
+fires. The "state machine" that async runtimes talk about *is*
+a coroutine.
+
+## Stackful vs stackless: the big architectural split
+
+This is the dimension that decides what your coroutine system
+can do.
+
+### Stackless coroutines
+
+The coroutine has no separate stack. The compiler turns the
+function into a state machine struct holding the locals across
+suspension points; "suspend" means write state and return;
+"resume" means re-enter and dispatch on state.
+
+- **Examples**: Rust futures, Python `async def`, JS `async`,
+  C# Task, Kotlin suspend functions.
+- **Pro**: trivially cheap. Each coroutine is a struct sized
+  exactly for what survives across `await` points. Millions of
+  them fit in memory.
+- **Pro**: no thread-affinity issues; the coroutine is just
+  data, can be moved anywhere.
+- **Con**: can only suspend at *explicit* points the compiler
+  knows about. You can't `await` from inside a synchronous
+  callback called by an external library.
+- **Con**: function coloring — every async function must be
+  called from another async function (or via a runtime
+  bridge).
+
+### Stackful coroutines (a.k.a. fibers, green threads)
+
+The coroutine has its own stack — a real chunk of memory that
+holds the entire call chain at the suspension point. Suspending
+is "save the registers, switch stacks." Resuming is the
+reverse.
+
+- **Examples**: Go goroutines, Java virtual threads (Project
+  Loom, GA 2023), Erlang processes, Lua coroutines, gevent.
+- **Pro**: suspend from *anywhere* — middle of a deep call
+  chain, inside a callback. No coloring.
+- **Pro**: synchronous-looking code; no `await` keyword needed.
+- **Con**: each fiber needs its own stack. Go starts at 2KB
+  (since Go 1.4) and grows on demand. Loom starts smaller.
+  Either way, more than the stackless option.
+- **Con**: stack-switching can interact poorly with native
+  code (the C stack expects a specific shape; switching out
+  from inside a JNI call is hard).
+
+## Why this matters: Go vs Rust async
+
+The classic illustration. Both Go and Rust let you write a
+million concurrent tasks. Their reasons differ:
+
+```go
+// Go: goroutine; stackful fiber; M:N scheduled
+go func() {
+    resp, _ := http.Get(url)        // looks blocking; isn't
+    process(resp)
+}()
+```
+
+```rust
+// Rust: future; stackless coroutine; polled by Tokio
+tokio::spawn(async move {
+    let resp = reqwest::get(&url).await?;
+    process(resp).await
+});
+```
+
+Both scale. Go's overhead is per-goroutine stack (2KB and up);
+Rust's is per-task state machine (often less than 200 bytes). Go's
+syntax doesn't change; Rust's requires `await` at suspension
+points. Go can deep-call into C and back without issue; Rust
+async hates synchronous C calls (you need `spawn_blocking`).
+
+For most teams, neither difference matters. For high-density
+servers (1M+ tasks), Rust's smaller per-task footprint wins.
+For "looks like normal code," Go does.
+
+## What "fiber" specifically means
+
+The word **fiber** is overloaded. The common usages:
+
+- **Windows fibers**: kernel-supported lightweight threads,
+  cooperatively scheduled. Existed since NT 4 but rarely used
+  outside enterprise software.
+- **Boost.Fiber / Boost.Context**: user-space stackful
+  coroutines for C++. Used in HPC and game engines.
+- **JVM "fiber"**: now called **virtual threads** (Project
+  Loom). User-mode stackful coroutines that look exactly like
+  `Thread` to existing code. JEP 444, GA in Java 21 (2023).
+- **Ruby fibers**: cooperative coroutines (since Ruby 1.9);
+  basis of EventMachine-style async.
+- **Lua coroutines** (`coroutine.yield`/`resume`): the
+  reference design; stackful, symmetric.
+
+In casual usage, "fiber" ≈ "stackful coroutine" ≈ "green
+thread" ≈ "user-mode thread." All point at the same idea.
+
+## Symmetric vs asymmetric
+
+Another axis. Asymmetric coroutines have a clear "caller" and
+"callee": resume runs the coroutine; yield returns to the
+caller. This is what most languages expose.
+
+Symmetric coroutines have no caller/callee distinction: each
+coroutine yields *to another specific coroutine*, not back up
+the call stack. Closer to true scheduling. Lua's coroutines
+are asymmetric but easy to build symmetric ones; Wren and
+classic Simula are symmetric.
+
+For day-to-day code, asymmetric is plenty. Symmetric matters
+when you're building schedulers or simulation systems.
+
+## Common patterns
+
+### Lazy sequences with generators
+
+```python
+def lines(path):
+    with open(path) as f:
+        for line in f:
+            yield line.rstrip("\n")
+
+for line in lines("/var/log/app.log"):
+    if "ERROR" in line:
+        print(line)
+```
+
+A generator over a 10GB file uses essentially no memory — the
+file iterator yields one line at a time, the consumer
+processes it, never holding more than one line. The same idea
+in JS is `function*` / `for…of`.
+
+### Cooperative scheduling
+
+```python
+# A trivial scheduler over generators
+tasks = [task1(), task2(), task3()]
+while tasks:
+    tasks = [t for t in tasks if next(t, None) is not None]
+```
+
+Round-robin run each generator to its next yield, repeat. This
+is the kernel of every async event loop, simplified. Real
+runtimes add an I/O selector (`epoll`) so they only resume
+tasks whose I/O is ready, rather than polling everyone.
+
+### State machines without boilerplate
+
+A coroutine is a natural state machine where each `yield` is a
+state transition. Parsing protocols, lexing, modeling game NPCs
+— all become much shorter as coroutines than as explicit
+state-machine classes.
+
+```python
+def http_parser():
+    while True:
+        request_line = yield "READING_REQUEST_LINE"
+        headers = []
+        while True:
+            line = yield "READING_HEADER"
+            if line == "":
+                break
+            headers.append(line)
+        body = yield "READING_BODY"
+        yield ("DONE", request_line, headers, body)
+```
+
+The state lives in the coroutine's location and locals; no
+explicit `state` variable, no big switch statement. Tools that
+have to keep many simultaneous parsers alive (web servers,
+proxies) benefit enormously.
+
+## Why coroutines came back
+
+In the 1990s coroutines were considered "an exotic curiosity"
+— threads had won. Three trends rehabilitated them:
+
+1. **C10K and async I/O** (~2000) — threads couldn't scale to
+   tens of thousands of connections, but coroutines could.
+2. **Single-threaded JS becoming the web's runtime** (~2010) —
+   suddenly everyone needed "structured non-blocking code,"
+   which is coroutines under another name.
+3. **Multicore but with millions of small tasks** (~2015) —
+   stackless coroutines fit per-task footprints small enough
+   for modern server workloads.
+
+Now every major language has them, often as the *default*
+concurrency model.
+
+## The takeaway
+
+A coroutine is a function that suspends and resumes,
+preserving its locals across the gap. Stackless versions are
+compiler-generated state machines (Rust/JS/C# async); stackful
+versions are real stacks the runtime switches between
+(Go/Java Loom/Erlang). Generators, async/await, and fibers are
+all coroutines wearing different syntactic clothes. The model
+beats OS threads for concurrency density and matches them for
+ergonomics when integrated into the language properly.

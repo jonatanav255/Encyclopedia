@@ -1,0 +1,189 @@
+export const level = 'junior';
+
+# Blocking vs async
+
+"Blocking" and "async" are the two stances a piece of code can
+take when it asks something slow to happen — a network call,
+a disk read, a wait on a lock. The difference isn't about
+*speed*; it's about **who holds the thread while we wait**.
+
+- **Blocking**: the calling thread parks until the result is
+  ready. While the thread is parked, it does nothing else.
+- **Async**: the call returns a handle (a future, promise,
+  callback registration) immediately; the thread is free to
+  do other work. When the result is ready, the runtime
+  resumes the continuation.
+
+The choice ripples through everything: how many concurrent
+operations you can have, how you handle errors, what your
+performance ceiling is, and which bugs you'll write.
+
+## A concrete picture
+
+```
+Blocking model:
+  fetch(url)         # thread blocked here for 100ms
+  parse(response)    # then runs
+  save(result)       # then this
+
+Async model:
+  promise = fetch(url)
+  promise.then(parse).then(save)
+  # thread immediately moves on to other work
+```
+
+The blocking version uses **one thread per concurrent operation**.
+Want 1000 concurrent HTTP requests? You need 1000 threads (or a
+pool of fewer threads with work queued behind them, which
+serializes). Each OS thread costs ~1MB of stack + scheduling
+overhead. 10K threads on a normal machine is painful; 100K is
+not happening.
+
+The async version uses **one thread for many concurrent
+operations**. The thread doesn't sleep on the network call —
+it registers interest with the OS (epoll/kqueue/IOCP) and goes
+to handle other work. When the OS signals "this socket has
+bytes," the runtime resumes the right continuation. 100K
+concurrent connections on a single thread is routine in Node,
+Tokio, Go, or any other async runtime.
+
+<Cheatsheet
+  columns={["", "Blocking (thread-per-task)", "Async (event-driven)"]}
+  rows={[
+    ["Concurrency unit", "OS thread", "Future / task / coroutine"],
+    ["Cost per concurrent op", "~1 MB stack + scheduling", "~hundreds of bytes"],
+    ["Practical limit", "Thousands", "Hundreds of thousands"],
+    ["Code style", "Straight-line, sync", "await / .then / callbacks / select"],
+    ["Best for", "CPU-bound work; small task counts; simple code", "I/O-bound work; high concurrency; long-tail latency"],
+    ["Common runtimes", "JVM, pthreads, Python (sync)", "Node.js, Tokio, Go (with M:N), asyncio, Erlang"],
+  ]}
+  caption="The same hardware can do either; the model decides the ceiling."
+/>
+
+## The C10K problem (why async exists)
+
+Around 2000, web servers hit a wall. Apache's "one thread per
+connection" model couldn't scale past ~10K concurrent connections
+on a single machine — you'd run out of memory, the scheduler
+choked, context switches dominated. Dan Kegel called it the
+**C10K problem**.
+
+The fix was async I/O: `epoll` (Linux, 2002), `kqueue`
+(BSD/macOS), IOCP (Windows). Instead of "block on each
+socket," you tell the kernel "here are 10K sockets; tell me
+which ones have activity." One thread + epoll loop can shepherd
+all 10K. Nginx, Node, Tokio, Twisted, asyncio — all evolved out
+of this insight. C10K became C100K, then C1M (the WhatsApp
+"2M connections per box" announcement around 2012).
+
+For raw connection count, async won. For raw CPU compute, async
+gives you nothing — there's no I/O to overlap, so the model
+just adds overhead. The choice is workload-dependent.
+
+## What "async" actually compiles to
+
+Under the hood, async code is a **state machine**. The compiler
+or runtime breaks your function at every `await` into a chunk,
+and turns the whole thing into something like:
+
+```
+fn fetch_and_save():
+    state = 0
+    poll(self):
+        match state:
+            0 -> request = http_send(url)
+                 state = 1
+                 return Pending(waker for socket)
+            1 -> response = request.poll()
+                 if pending: return Pending
+                 state = 2
+                 disk_write = save(response)
+                 return Pending(waker for disk)
+            2 -> disk_write.poll()
+                 if pending: return Pending
+                 return Done
+```
+
+When the I/O is ready, the runtime calls `poll` again. The
+function "resumes" by picking up at the right `state`. No
+thread sat blocked anywhere.
+
+The straight-line `await` syntax is sugar over this state
+machine — without it, async code reads as callback chains
+("callback hell") or `then` pipelines. Async/await landed in
+C# (2012), Python (2015), JavaScript (2017), Rust (2019). The
+ergonomics now match blocking code; the semantics are
+fundamentally different.
+
+## The colored-functions problem
+
+The famous "What color is your function?" essay by Bob Nystrom
+points out that **async is contagious**. Once any function in
+a call chain is async, every caller must either be async or
+block to await it. Mixing the two is awkward in most
+languages:
+
+```js
+function syncCaller() {
+  const x = asyncWork();          // returns a Promise, not the value
+  use(x);                          // bug: x is a Promise
+}
+```
+
+The bridge is uglier: `runUntilComplete(asyncWork())` in Python,
+`block_on(asyncWork())` in Rust, no clean answer in JS. The
+practical advice is **pick one model per layer.** Servers, web
+frameworks, libraries that do I/O — pick async and stay
+async. Pure compute / data structures — stay sync.
+
+Go is the famous exception: goroutines look sync but the
+runtime makes them async-under-the-hood. There's no "color" to
+a Go function; any function can block on I/O and the runtime
+hands the OS thread to another goroutine. That's why "Go
+concurrency feels easy" — the language hides the state
+machine. The trade-off is goroutines are a bit heavier than
+Rust futures and you don't get explicit cancellation tokens.
+
+## When blocking is the right choice
+
+The "async everywhere" crowd is loud but the blocking case is
+underrated:
+
+- **Pure CPU work.** A `parse_json(big_buffer)` doesn't need
+  to be async. Wrapping it in async adds overhead, complicates
+  cancellation, and runs at the same speed.
+- **Low concurrency.** If you've got 5 background tasks, threads
+  are fine. The 1MB/stack cost is negligible at that scale.
+- **Tooling and clarity.** Stack traces in blocking code show
+  the actual call chain. Async stacks lose context across
+  `await` points without extra runtime support
+  (`tokio-console`, Node's async-context).
+- **Calling sync libraries.** Every ecosystem has critical
+  libraries that don't have async APIs (sync database drivers,
+  sync image processors). Calling them from an async runtime
+  requires `spawn_blocking`/`run_in_executor` and is easy to
+  get wrong.
+
+## When async is the right choice
+
+- **Many concurrent I/O operations.** Servers, scrapers,
+  pipelines fanning out to many endpoints, real-time apps. The
+  thread-per-connection model just doesn't scale.
+- **You need a single-threaded, deterministic event order.**
+  JavaScript, the BEAM, single-threaded Tokio all give you "no
+  surprises from other threads." Easier to reason about.
+- **Cancellation and timeouts matter.** Async runtimes give you
+  cooperative cancellation (`AbortSignal`, `context.Done()`,
+  `tokio::select!`). Blocking threads can't really be canceled
+  safely (`pthread_cancel` is a minefield).
+
+## The takeaway
+
+Blocking parks a thread per concurrent operation; async multiplexes
+many operations onto one. Async exists because the
+thread-per-connection model can't scale to modern I/O loads —
+not because it's intrinsically faster. For CPU-bound work or
+small concurrency, blocking is simpler and just as good. For
+high I/O concurrency or long tail latency, async is essentially
+required. Pick the model that matches your workload, then commit
+to it through the layer.

@@ -1,0 +1,218 @@
+export const level = 'senior';
+
+# Work-stealing and schedulers
+
+When you have thousands of tasks and a handful of cores, how do
+you balance work without bottlenecking on a central queue? The
+answer most modern runtimes have settled on is **work-stealing**:
+each worker has its own local queue, and idle workers "steal"
+from the tail of someone else's queue. It's the engine inside
+Go's runtime, Tokio, Rayon, Java ForkJoinPool, .NET's TPL, and
+most parallel runtimes since the Cilk paper (Blumofe & Leiserson,
+1995).
+
+## The problem it solves
+
+Naive thread pool:
+
+```
+                   ┌──→ worker 1
+[ shared queue ] ──┼──→ worker 2
+                   └──→ worker N
+```
+
+Every worker pulls from one shared queue. Two issues at scale:
+
+1. **Lock contention.** Every dequeue touches the shared queue's
+   lock. With 32 workers, the queue becomes the bottleneck —
+   workers spend more time fighting for it than doing work.
+2. **Cache locality.** A worker that just finished task A is
+   warm for related tasks; pulling from a global queue gives it
+   unrelated work, blowing its cache.
+
+Work-stealing flips the topology:
+
+```
+worker 1 → [local deque 1]   ↘
+worker 2 → [local deque 2]    → steal from each other when empty
+worker N → [local deque N]   ↗
+```
+
+Each worker pushes and pops from its own deque (LIFO at its
+end). When it runs out, it picks another worker at random and
+**steals** from the *opposite* end of that worker's deque
+(FIFO from the victim's tail).
+
+## Why a deque (not a queue)
+
+Two ends, two access patterns:
+
+- **Owner's end (LIFO/stack)**: most recently pushed task is
+  popped next. The owner's deque is *hot* in cache —
+  parent task pushed child, then immediately pops and runs it.
+  Stack-like behavior matches recursive divide-and-conquer.
+- **Thief's end (FIFO)**: the oldest task in the victim's
+  deque is the one most likely to spawn its own subtree of
+  work — the *coarsest* task. Stealing it gets the thief a
+  big chunk of work, not a leaf.
+
+The combination gives **good locality for the owner**
+(short, related work) and **good amortization for the thief**
+(one steal, lots of follow-on work without further stealing).
+This is the key insight from the Cilk papers.
+
+## Sketch of the algorithm
+
+```
+worker_loop():
+    while not shutdown:
+        task = local_deque.pop()           # LIFO from my end
+        if task:
+            run(task)                       # may push new tasks onto my deque
+        else:
+            victim = pick_random_worker()
+            task = victim.deque.steal()    # FIFO from victim's end
+            if task:
+                run(task)
+            else:
+                spin / sleep / sched_yield
+```
+
+The key tricks:
+
+- **Lock-free deque**. The owner's `push`/`pop` use only
+  atomic operations on the deque ends. Thieves use CAS on the
+  far end. The Chase-Lev deque (2005) is the standard design.
+- **Steal randomization**. The thief picks a victim at random
+  to avoid hot-spotting one worker. Some runtimes (Tokio) use
+  a fixed neighbor; the simplification rarely matters.
+- **Backoff when idle**. After enough failed steal attempts,
+  the worker parks. The runtime wakes it when new work arrives.
+
+## What the major runtimes do
+
+<Cheatsheet
+  columns={["Runtime", "Variant", "Notable detail"]}
+  rows={[
+    ["Go", "M:N goroutines with work-stealing among P", "GOMAXPROCS Ps; runqueue per P; goroutines steal across Ps"],
+    ["Tokio", "Multi-threaded work-stealing", "LIFO slot per worker for cache locality; injector queue for external spawns"],
+    ["Rayon (Rust)", "Fork-join with work-stealing", "Parallel iterators dispatch divide-and-conquer; per-CPU deques"],
+    ["Java ForkJoinPool", "Cilk-style fork-join", "Common pool used by parallel streams and CompletableFuture"],
+    [".NET TPL", "Threadpool + local queues", "Local queues + global queue; promotes hot tasks"],
+    ["Cilk/OpenMP", "The original", "Parent-stealing semantics; built on language extensions"],
+  ]}
+  caption="The same idea reimplemented per ecosystem with each language's constraints."
+/>
+
+The general shape is universal: workers have local queues, idle
+workers steal, the scheduler tries to keep tasks where they were
+spawned.
+
+## Go's specific twist: M:N scheduling
+
+Go's runtime adds another layer. It has three things:
+
+- **G**: goroutine. Lightweight, with own stack.
+- **M**: machine. An OS thread.
+- **P**: processor. A logical scheduler context, equal in count
+  to `GOMAXPROCS`.
+
+Each P has a local run queue of goroutines and is bound to an M
+to run them. When a goroutine blocks on a syscall, the M is
+attached to the syscall; the P detaches and finds another M to
+keep running other goroutines. When the syscall returns, the M
+tries to grab a P to keep running the goroutine; if no P is
+available, the goroutine goes back to a queue.
+
+Work-stealing happens between Ps' local queues. A P with an
+empty queue steals from a random other P. This keeps all P
+contexts busy while gracefully handling I/O-bound goroutines
+that frequently park.
+
+## Why this scales
+
+Work-stealing has nice scaling properties:
+
+- **No contention until contention exists**. Workers stay on
+  their own queues; communication happens only when somebody's
+  idle and needs to steal.
+- **Locality is preserved**. Tasks spawned by a worker run on
+  that worker most of the time. Cache stays warm.
+- **Probabilistic load balancing**. Random victim selection
+  means in expectation the load equalizes; no central
+  coordinator needed.
+- **Adaptive parallelism**. If you spawn 1M tasks but most are
+  short, the active worker chews through its local queue; the
+  others mostly sleep. No "thread-per-task" overhead.
+
+The Cilk paper's headline theorem: a computation with critical
+path T_∞ and total work T_1 runs in expected time
+`T_1/P + O(T_∞)` on P processors. Provably near-optimal.
+
+## Common pitfalls when using a work-stealing runtime
+
+The runtime is doing the right thing under the hood. The user
+code can still hurt it:
+
+- **Blocking inside an async task.** Calling a synchronous
+  blocking API (DB driver without async support, `Thread.sleep`)
+  parks an entire worker thread. Other tasks queued on that
+  worker can't run. Use `spawn_blocking` (Tokio),
+  `runInterruptible` (Kotlin), `executorBlocking` (Rayon),
+  or move blocking work to a separate thread pool.
+- **CPU-heavy work without yields.** A task that runs for
+  100ms straight prevents work-stealing from rebalancing
+  *toward* that worker. Insert `tokio::task::yield_now()` or
+  `runtime.Gosched()` in long loops to allow rebalancing.
+- **Pinning tasks to specific workers.** Don't. The whole
+  point is the runtime decides.
+- **Spawning too few or too many tasks.** Too few and you
+  underutilize cores. Too many and overhead dominates. Aim
+  for "a few per core's worth" — work-stealing balances
+  spikes but you still need enough chunks to balance.
+
+## Local vs global queues
+
+Most production runtimes blend the pure work-stealing model
+with a small **global injector queue**:
+
+- **Tasks spawned by user code from outside the runtime** go
+  to the global queue. Workers periodically check it.
+- **Tasks spawned by code already inside a worker** go to that
+  worker's local queue.
+- This bound on global-queue check frequency prevents external
+  spawn storms from monopolizing local queues.
+
+Some runtimes (Tokio) add a **LIFO slot** in front of the
+local queue — the last spawned task gets to skip the queue
+and run immediately, optimizing for "spawn → soon awaited"
+patterns common in async code.
+
+## Helping the scheduler
+
+If you can express your work in chunks the runtime can
+schedule:
+
+- **Lots of small tasks beats one big task.** Work-stealing
+  needs *something* to steal. A single goroutine doing all
+  the work doesn't benefit.
+- **Tasks should be independent.** If task B waits on task A,
+  the scheduler can't parallelize them; you lose work-stealing's
+  win.
+- **Avoid global synchronization between tasks.** Each
+  inter-task dependency is a serial point. Amdahl's law caps
+  the parallelism above it.
+- **Use fork-join libraries for divide-and-conquer.** Rayon's
+  `par_iter`, ForkJoinPool's `RecursiveTask`, OpenMP's tasks —
+  they're shaped exactly for what work-stealing scales.
+
+## The takeaway
+
+Work-stealing is the scheduling strategy that lets modern
+async/parallel runtimes scale to many cores: each worker owns a
+deque, idle workers steal from others' tails, locality is
+preserved by default. It's why Go, Tokio, Rayon, and ForkJoinPool
+all handle thousands of concurrent tasks without a central
+bottleneck. As a user, your job is to express work as many
+small independent tasks and avoid blocking inside the runtime
+— the scheduler does the rest.

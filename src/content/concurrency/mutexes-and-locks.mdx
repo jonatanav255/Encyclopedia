@@ -1,0 +1,179 @@
+export const level = 'junior';
+
+# Mutexes and locks
+
+A **mutex** ("mutual exclusion") is the workhorse concurrency
+primitive: at most one thread holds it at a time. Threads that
+try to acquire it while it's held wait until the holder releases.
+Mutex use accounts for the bulk of concurrent-correctness work
+in real-world systems — most threads spend their lives either
+holding a mutex, waiting for one, or about to ask for one.
+
+## What a mutex actually is
+
+A mutex is a tiny piece of state — usually a single integer plus
+a wait queue — with two operations: `lock` and `unlock`. The
+state encodes whether anyone holds it; the wait queue holds
+threads that are blocked trying to acquire it.
+
+```c
+mutex_t m;
+
+void critical() {
+    lock(&m);            // block until I hold it
+    // ... critical section ...
+    unlock(&m);
+}
+```
+
+The implementation has two paths:
+
+1. **Fast path** — uncontended. A single atomic compare-and-swap
+   on the mutex word: "if it's 0 (free), set it to 1 (held)."
+   ~10–20 cycles, entirely in user space, no syscall.
+2. **Slow path** — contended. If the CAS fails (someone holds
+   it), the thread enters the kernel via a `futex` syscall and
+   sleeps on the mutex's wait queue. When the holder releases,
+   it issues another `futex` call to wake a waiter.
+
+Most acquires are uncontended; the slow path only fires under
+real contention. That's why `pthread_mutex_lock` is "basically
+free" most of the time and *not* basically free when threads
+fight over the same lock.
+
+## The discipline
+
+A mutex is useful only if every shared-state access uses the
+same lock. The convention is:
+
+- The mutex is *associated with the data it protects.* Not "the
+  mutex around the counter" but "the mutex for counter C."
+- Every read and every write of C must happen with M held.
+- No I/O, no blocking calls, no callbacks into user code while
+  M is held. Otherwise you risk deadlock or huge tail latency.
+- Acquire in a consistent global order across all locks. The
+  rest of this site has a whole page on deadlock; the short
+  version is **lock-ordering or you'll regret it.**
+
+The most common production bug is "we *mostly* used the lock"
+— one method on the class accesses the data without locking,
+and that's the one that corrupts state at 3 AM under load.
+
+## Recursive locks
+
+A normal mutex deadlocks if the same thread tries to acquire it
+twice (the second acquire waits on… itself). A **recursive
+mutex** tracks the owner and a count: the same thread can
+acquire it N times and must release N times. This lets you call
+into your own already-locked methods without thinking.
+
+The catch: **almost every reach for a recursive mutex hides a
+design problem.** If you find yourself wanting recursion, your
+locking discipline is unclear — you're not sure who holds what
+when. The cleaner refactor is to split your API into "external"
+methods that take the lock and "internal" methods that assume
+the lock is already held. Java's `synchronized` blocks are
+implicitly recursive, which is partly why Java codebases tend to
+accumulate over-locked classes.
+
+## Reader-writer locks
+
+When the protected data is mostly read and rarely written, a
+plain mutex serializes the reads pointlessly. A **reader-writer
+lock (RWLock)** lets either:
+
+- Any number of *readers* to hold it concurrently, OR
+- *one writer* to hold it exclusively (and no readers).
+
+The promise is reads scale; the reality is more nuanced:
+
+- Acquiring a read lock still writes a shared counter or wait
+  queue. Every reader bounces a cache line between cores. On
+  short critical sections with many readers, **a plain mutex is
+  often faster** because there's nothing to contend on.
+- Fairness is tricky. Reader-preference starves writers;
+  writer-preference starves readers; FIFO is slower.
+- For genuinely read-heavy data with rare writes, **copy-on-write
+  with an atomic pointer swap** (or RCU) beats both: readers
+  pay zero, writers pay one atomic plus a grace period.
+
+Rule of thumb: don't reach for an RWLock until you've measured
+that a plain mutex is the bottleneck *and* the critical sections
+are long enough to amortize the RWLock's overhead.
+
+## Spinlocks
+
+A **spinlock** doesn't sleep — it loops on a CAS until it
+acquires the lock. Two situations make sense:
+
+1. **Inside the kernel**, where sleeping isn't always possible
+   (interrupt handlers, scheduler internals).
+2. **Very short, very contended** user-space critical sections
+   where the cost of putting the thread to sleep and waking it
+   exceeds the expected wait. Real implementations (e.g., glibc
+   mutex with `PTHREAD_MUTEX_ADAPTIVE_NP`) spin for a few
+   hundred cycles, then sleep — best of both.
+
+Pure user-space spinlocks are a foot-gun: if the holder gets
+descheduled while you're spinning, you burn CPU until *its*
+slice comes back. On heavily-loaded boxes this can be
+catastrophic.
+
+## Try-lock and timed-lock
+
+Real-world mutex APIs almost always have variants:
+
+- **`try_lock`**: returns immediately, success or failure. Never
+  blocks. Useful for: "if this is contended, do something else
+  instead of waiting."
+- **`timed_lock(timeout)`**: try for up to `timeout`, then give
+  up. Useful for: "I'd rather fail fast than freeze the
+  request."
+
+`try_lock` is also the standard way to avoid deadlock when you
+can't establish a global lock order: grab L1, try L2, if L2
+fails release L1 and retry. (Beware of livelock; add backoff.)
+
+## Common bugs
+
+<Cheatsheet>
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| Forgot to acquire (some path) | Intermittent data corruption | Audit every access. Helper class with `lock(); ... unlock();` in destructor (RAII) or `with` block. |
+| Forgot to release | All other threads block forever | RAII / `defer unlock()` / `try-finally`. |
+| Recursive acquire on non-recursive mutex | Single-thread hang | Use recursive mutex sparingly OR refactor to non-recursive API. |
+| Lock held across blocking I/O | Latency spike for all callers | Move I/O outside the critical section. |
+| Lock held during callback | Deadlock if callback re-enters | Document; or release before calling out. |
+| Different locks for same data | Silent corruption | Lock-per-data, name conventions ("`m_` prefix"). |
+| Inconsistent lock order across call sites | Deadlock under contention | Global ordering: lower address first, smaller ID first, alphabetical. |
+
+</Cheatsheet>
+
+## When NOT to use a mutex
+
+Three good signals you want something else:
+
+1. **The data is read-only after initialization.** No lock at
+   all — just publish the initialized value safely (Java's
+   `final`, Rust's `Arc<T>` to immutable T).
+2. **You're sharing for the sake of sharing, not for the
+   semantics.** Often the cleanest fix is to *not share*: each
+   thread owns its own copy and you merge periodically.
+3. **It's high-throughput with short critical sections.** Atomic
+   ops (CAS, fetch-add) or lock-free data structures can be
+   orders of magnitude faster — at the cost of subtle
+   memory-ordering reasoning.
+
+For most application code, "use a mutex" is the right default
+and the boring choice is the correct one. The fancy stuff is
+for hot paths where you've measured the bottleneck.
+
+## The takeaway
+
+A mutex is a tiny piece of state plus a contract: only one
+thread inside the critical section at a time. The hard part
+isn't the primitive — it's the discipline. Lock-per-data, hold
+briefly, acquire in a consistent order, never block while
+holding. Most concurrent bugs in real systems are violations of
+one of those four rules.

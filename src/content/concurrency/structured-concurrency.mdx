@@ -1,0 +1,236 @@
+export const level = 'mid';
+
+# Structured concurrency
+
+Structured concurrency is a discipline (and increasingly a
+language feature) that says: **a concurrent task can never
+outlive the scope that started it.** The "main" function waits
+for all its children; each child likewise waits for its own
+children. The result is that concurrency follows the same
+nesting rules as function calls — you can't accidentally leak
+a task into the void.
+
+The idea was named and popularized by Nathaniel J. Smith in
+"Notes on structured concurrency, or: Go statement considered
+harmful" (2018), and has since been adopted by Trio (Python),
+asyncio.TaskGroup, Swift, Kotlin coroutines, Java (preview in
+JDK 21 via JEP 453; second preview in 22 via JEP 462), and
+Rust's various scoped-task libraries.
+
+## What's broken about "unstructured" concurrency
+
+In most async runtimes, spawning a task and forgetting about it
+is the norm:
+
+```js
+// JS: fire and forget
+setTimeout(() => processBackground(), 0);
+processForeground();
+return;     // tasks may still be running; nothing knows
+```
+
+```go
+// Go: same shape
+go background()
+go alsoBackground()
+return       // goroutines outlive caller
+```
+
+The three problems this creates:
+
+1. **Leaks.** If a function returns while a child task is still
+   running, the parent doesn't know. The child can run forever,
+   consuming resources, in the dark.
+2. **Errors are swallowed.** If the background task throws
+   after the parent returned, the error has no caller to
+   propagate to. It either crashes the process, logs into the
+   void, or vanishes.
+3. **Cancellation doesn't compose.** If the parent is canceled,
+   nothing tells the children. You have to wire cancellation
+   manually through every layer.
+
+The pattern of "fire one off and hope" is everywhere in
+unstructured async code. Most of the worst production bugs in
+async systems trace to it.
+
+## The structured-concurrency contract
+
+A nursery / task group / scope has these properties:
+
+```python
+async with asyncio.TaskGroup() as tg:
+    tg.create_task(fetch_a())
+    tg.create_task(fetch_b())
+    tg.create_task(fetch_c())
+# at this point: all three are done. Errors propagated.
+```
+
+1. **The scope doesn't exit until every child has finished.**
+   The `async with` block blocks at its exit until all spawned
+   tasks have returned or failed.
+2. **If any child raises, the others are cancelled.** The first
+   error wins; siblings are signaled to stop.
+3. **The error(s) propagate up through the scope.** As an
+   exception, or as `ExceptionGroup` if multiple children
+   failed.
+4. **The scope owns the children.** External code can't spawn
+   into this scope from outside.
+
+The exit-point pause is the key idea — like a `Promise.all`
+that's built into the language. You can't "forget" a task,
+because the scope refuses to exit while one is running.
+
+## A worked example
+
+The classic "fan out to N URLs, fail if any fail" in three
+styles:
+
+<Compare
+  badTitle="Unstructured: tasks may leak"
+  goodTitle="Structured: scope waits on all"
+  language="python"
+  bad={`async def fetch_all(urls):
+    for u in urls:
+        asyncio.create_task(fetch(u))
+    # function returns. Tasks may or may not still be running.
+    # Errors will be logged as "Task exception was never retrieved".`}
+  good={`async def fetch_all(urls):
+    async with asyncio.TaskGroup() as tg:
+        for u in urls:
+            tg.create_task(fetch(u))
+    # On exit: all tasks have completed.
+    # If any raised, all others were cancelled, error re-raised here.`}
+  caption="Same surface; opposite semantics on exit and error."
+/>
+
+## Cancellation that actually works
+
+The most under-appreciated benefit. In an unstructured world,
+canceling a "background" task means knowing about every task
+the caller might have spawned and sending each a cancel signal.
+In a structured world, **cancellation propagates down the scope
+tree automatically**:
+
+```
+async with asyncio.TaskGroup() as outer:
+    outer.create_task(slow_a())
+    async with asyncio.TaskGroup() as inner:
+        inner.create_task(slow_b())
+        inner.create_task(slow_c())
+    # If outer is cancelled, the cancel propagates into inner,
+    # which cancels b and c, then inner exits, then a is cancelled.
+```
+
+If you `cancel()` the outer task or it hits a timeout, the
+runtime walks the scope tree and cancels every descendant. The
+shutdown is *bounded* (each scope waits for its children's
+cleanup) and *complete* (no orphaned tasks).
+
+This is what makes timeouts trustworthy. `asyncio.timeout(5)`
+or Kotlin's `withTimeout(5_000)` wraps a structured scope; if
+it fires, everything inside gets canceled together.
+
+## The "let one slow task delay the rest" anti-pattern
+
+A subtle interaction. The naïve `TaskGroup` will wait for ALL
+children at exit, even ones you don't strictly need:
+
+```python
+async with TaskGroup() as tg:
+    tg.create_task(slow_logging())      # 30s to flush
+    tg.create_task(important_work())    # 100ms
+# This block takes 30s, not 100ms.
+```
+
+Structured concurrency doesn't say "tasks must be short" — it
+says "tasks must have a clear scope." If `slow_logging`
+genuinely needs 30s, *its* scope is broader than this block.
+Move it to a higher scope (the application root) or attach it
+to a background scope that the request handler doesn't await.
+
+## Cancel scopes / supervision
+
+Trio's mental model is cleanest: every nursery is a **cancel
+scope**. Cancellation, timeouts, and error propagation are all
+expressed as operations on scopes:
+
+```python
+with trio.move_on_after(5):           # cancel scope with deadline
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(child_a)
+        nursery.start_soon(child_b)
+    # if 5s passes: both children cancelled, scope exits cleanly
+```
+
+The scope is a tree; cancellation flows from outside in;
+results and exceptions flow from inside out. This is the entire
+model.
+
+Erlang's supervisor trees are a different flavor of the same
+idea — an actor's lifetime is bounded by its supervisor's
+lifetime, and crashes propagate up.
+
+## Where the languages stand
+
+<Cheatsheet
+  columns={["Language", "Construct", "Notes"]}
+  rows={[
+    ["Python", "asyncio.TaskGroup (3.11+), Trio nursery", "TaskGroup added after Trio proved the design"],
+    ["Swift", "async let, TaskGroup", "Built into the language; cancellation is first-class"],
+    ["Kotlin", "coroutineScope { }, supervisorScope { }", "Scopes are tightly integrated with coroutine context"],
+    ["Java", "StructuredTaskScope (JEP 453 preview in 21; JEP 462 in 22)", "Pairs with virtual threads to make 'just spawn' affordable"],
+    ["JavaScript", "No native; libraries like 'aedge' or manual Promise.all wrapping", "TC39 explorations ongoing"],
+    ["Go", "errgroup.Group (third-party but standard), x/sync/semaphore", "Not in the language, but golang.org/x/sync provides it"],
+    ["Rust", "tokio::task::JoinSet, tokio_scoped, futures::stream", "Not a single canonical primitive yet"],
+  ]}
+  caption="The model is converging; the syntax isn't."
+/>
+
+## When you might break the rule deliberately
+
+There are legitimate cases for unstructured tasks:
+
+- **A genuine background process** with its own lifetime —
+  the metrics flusher, the connection-pool maintainer. Its
+  scope is "process startup → process shutdown," not "this
+  request."
+- **Detached state-machine actors** in actor systems —
+  supervised by their parent, not by the function that spawned
+  them.
+- **Lazy long-running iterators** that should outlive the
+  function that started them.
+
+The fix isn't "no detached tasks ever"; it's "every detached
+task is scoped to *some* explicit owner." Trio formalizes this
+with `nursery.start_soon` (scoped) vs handing the task off to
+a top-level service.
+
+## Why this matters for reliability
+
+The TaskGroup pattern turns "shutdown cleanly under failure"
+from a discipline into a property of the program structure.
+You no longer have to remember to add `await task` everywhere
+or `defer wg.Wait()` everywhere — the scope does it.
+
+Real-world failure modes that structured concurrency
+eliminates:
+
+- "We tried to shut down, but the metrics task was still
+  running and held the DB connection."
+- "An exception in the background task ate itself; we found
+  out from the on-call dashboard hours later."
+- "A timeout fired but the worker task didn't notice and kept
+  processing."
+- "Two requests interleaved their cleanup because no scope
+  bounded them."
+
+## The takeaway
+
+Structured concurrency says: a scope doesn't exit until every
+child it spawned has finished, errors propagate up, and
+cancellation propagates down. The model makes timeouts, error
+handling, and clean shutdown follow the call structure of the
+program — the same way `try/finally` follows it for resources.
+For new async code, prefer it as the default. For existing
+codebases, retrofitting one scope at a time is the standard
+migration.

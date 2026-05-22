@@ -1,0 +1,222 @@
+export const level = 'mid';
+
+# The actor model
+
+The actor model is a concurrency paradigm where the unit of
+work is an **actor**: an isolated entity that owns its private
+state and communicates with other actors *only* by sending
+asynchronous messages. No shared memory, no locks, no critical
+sections. The model was formalized by Carl Hewitt in 1973 and
+became practical through Erlang (1986), then Akka/Pekko on the
+JVM, then Microsoft Orleans, then everyone else's "lightweight
+process" framework.
+
+The defining property: **share-nothing**. Every actor has its
+own state; the only way to influence another actor is to send
+it a message. Most concurrency bugs (races, deadlocks, ABA)
+are impossible by construction.
+
+## The minimal definition
+
+An actor has three capabilities, and only these three:
+
+1. **Receive messages** (one at a time, from a mailbox).
+2. **Send messages** to other actors.
+3. **Create new actors.**
+
+Plus, while handling one message, it can mutate its private
+state and decide what behavior to use for the *next* message
+(state machines fall out naturally).
+
+```erlang
+%% Erlang: a counter actor
+counter() ->
+    receive
+        {inc, From} -> From ! ok, counter(N + 1);
+        {get, From} -> From ! N, counter(N);
+        stop -> ok
+    end.
+```
+
+Note the structure: receive → match on shape → reply →
+recurse with new state. The recursion is the loop; the state
+is the recursive argument. No mutex, no shared variable.
+
+## Why share-nothing solves so much
+
+Locking gives you problems precisely because state is shared. If
+state isn't shared, the problems disappear:
+
+- **No races.** Only one message processed at a time per actor;
+  the actor is the unit of serialization. Two actors can run
+  truly in parallel because they don't touch each other's state.
+- **No deadlocks from lock ordering.** No locks.
+- **No ABA, no memory ordering hazards.** Each actor's state
+  is private; there's no concurrent access to reorder around.
+
+You trade these for new problems: message ordering (sometimes
+non-deterministic), what happens when a message can't be
+delivered, when an actor crashes mid-message.
+
+## Mailboxes and message ordering
+
+Each actor has a **mailbox** — a queue of pending messages.
+Common guarantees:
+
+- **FIFO between any two actors.** If A sends m1 then m2 to B,
+  B receives them in that order.
+- **No order guarantee across senders.** If A and C both send
+  to B, B can receive them in any order.
+- **At-most-once delivery in-process.** Erlang's local
+  messaging never duplicates; distributed messaging may lose
+  messages or duplicate them.
+
+Erlang has **selective receive**: an actor can pattern-match
+and pull a specific message shape out of the mailbox, leaving
+others for later. Akka uses **stashing** (buffer messages you
+can't handle yet and replay them on state change). The two
+approaches are equivalent in expressive power.
+
+## Supervision: "let it crash"
+
+The famous Erlang philosophy: don't try to handle every error
+defensively in the worker. Instead, let the worker crash and
+have a **supervisor** restart it from a known good state.
+
+```
+       Supervisor
+      /    |    \
+     /     |     \
+   Worker Worker Worker
+```
+
+When a worker crashes:
+
+1. The supervisor receives an exit signal.
+2. It decides a restart strategy: `one_for_one` (restart just
+   the crashed one), `one_for_all` (restart everyone), `rest_for_one`
+   (restart the crashed one and everything started after it).
+3. The replacement starts fresh.
+
+The mental shift is profound. In a thread-with-locks world,
+crashes leave shared state corrupt; recovery is impossible. In
+the actor world, an actor's only state is its own; crashing
+just throws that state away, and restarting reinitializes. The
+*system* survives even though *components* die routinely.
+
+WhatsApp's BEAM-based servers famously ran for years with this
+model handling millions of concurrent users, with individual
+actors crashing constantly and supervisors restarting them
+silently. The model is the reliability strategy.
+
+## Backpressure: the model's weak point
+
+The classic actor model says "messages are async; senders
+never block." Combined with unbounded mailboxes, this is a
+**memory bomb** waiting to happen. A fast producer overwhelms
+a slow consumer; the consumer's mailbox grows until OOM.
+
+Production actor frameworks address this:
+
+- **Bounded mailboxes**. Send blocks (or fails) when the
+  mailbox is full. Now the producer has backpressure.
+- **`ask` patterns** (request-response with a future). The
+  asker waits for a reply, naturally pacing itself.
+- **Stream abstractions**. Akka Streams and similar wrap
+  actors in a backpressure-aware streaming layer (Reactive
+  Streams spec). The actor is hidden; the user sees a flow.
+
+This is the area where naïve actor models bite. "Fire and
+forget" sounds great until your mailbox is a million messages
+deep.
+
+## Location transparency
+
+A key actor-model claim: **sending a message to an actor in
+the same process looks the same as sending one across the
+network**. The framework hides the difference. Erlang has a
+single `Pid ! message` syntax that works across nodes; Akka has
+`ActorRef` that may point local or remote.
+
+The promise is "scale by adding nodes; the code doesn't
+change." The reality is more nuanced: distributed message
+sends can fail, duplicate, or be out of order. The 8 Fallacies
+of Distributed Computing all apply. Most production systems
+*do* care whether a call is local or remote, because the
+failure modes differ.
+
+Still, the abstraction is valuable as a starting point —
+build local actors first, federate later.
+
+## Where it works well
+
+- **Stateful, long-lived entities with their own behavior.** A
+  game character, a chat session, an IoT device's controller, a
+  user's connection state. Each maps cleanly to one actor.
+- **Soft real-time systems with millions of concurrent
+  entities.** Telecom (Erlang's home turf), online games, ad
+  servers, real-time messaging.
+- **Crash-and-restart tolerance.** When components fail
+  routinely (network, third-party APIs, bad inputs), the
+  supervisor model is structurally well-suited.
+
+## Where it works less well
+
+- **Pure computation.** A matrix multiply doesn't need actors.
+  Threads + parallel frameworks (TBB, Rayon, Java parallel
+  streams) crush actors on CPU-bound work.
+- **Strict transactional guarantees across multiple entities.**
+  Actor systems don't have ACID transactions; a 3-actor update
+  is hard to make atomic without bolting STM/orchestration on
+  top.
+- **Performance-critical hot paths.** Message dispatch has
+  per-message overhead. Shared-memory primitives with careful
+  locking can be 10–100× faster.
+
+## Variants worth knowing
+
+- **Erlang/Elixir (BEAM)**: the model in its purest form.
+  Processes are lightweight (KB each, millions per node), the
+  scheduler is preemptive, hot code swapping is built-in.
+- **Akka / Pekko (JVM)**: the most popular implementation
+  outside BEAM. Adds typed actors (Akka 2.6+) to catch wrong
+  message shapes at compile time.
+- **Microsoft Orleans**: "virtual actors" — actors are addressed
+  by ID, created on first use, garbage-collected after idle.
+  Useful for stateful cloud services.
+- **Pony**: research language with a capabilities-based type
+  system that enforces actor isolation at compile time.
+- **Ractor (Ruby 3+)**: experimental, but the same model.
+
+## Actors vs CSP / channels
+
+The two models look related but differ in subtle ways:
+
+<Cheatsheet
+  columns={["Actor model", "CSP / channels"]}
+  rows={[
+    ["Receiver named (actor ID/PID)", "Channel named, not the receiver"],
+    ["Sender knows the receiver", "Sender knows the channel"],
+    ["Mailbox per actor", "Queue per channel"],
+    ["Failure isolation per actor", "No failure unit (panics are global)"],
+    ["Often unbounded mailboxes", "Bounded channels are normal"],
+  ]}
+  caption="Both share-nothing-with-messages. Actor binds the receiver; CSP binds the route."
+/>
+
+In practice, Go's channels + goroutines borrow heavily from
+CSP but Go programs sometimes feel actor-shaped (each goroutine
+owning a channel and looping over messages = an actor). Erlang
+processes are sometimes used CSP-style (a channel-like queue
+between two of them). The lines blur.
+
+## The takeaway
+
+The actor model: every concurrent entity owns its state,
+communicates only by messages, is supervised by a parent that
+can restart it on crash. The win is that whole classes of
+concurrency bugs become impossible — no shared mutable state
+means no races. The cost is mailbox management, backpressure
+discipline, and the realities of distributed messaging when you
+scale out. For stateful, long-lived, partition-friendly
+problems (chat, games, telecom), it's the model that wins.

@@ -1,0 +1,243 @@
+export const level = 'mid';
+
+# Async/await models across languages
+
+Async/await is now a feature of every mainstream language —
+but the syntax is the easy part. The hard parts are *what
+exactly is the runtime doing*, *who picks where async tasks
+run*, and *what the cancellation/error story is*. Five
+languages picked five different sets of answers.
+
+## What's common
+
+Every async/await language has the same surface shape:
+
+```
+async function f() {
+  let result = await someAsyncOp();
+  return process(result);
+}
+```
+
+The compiler turns `f` into a state machine that yields at each
+`await`, parks the function until the awaited future is ready,
+then resumes from where it left off. The result is straight-line
+code that doesn't block the underlying thread. Beyond that, the
+runtimes diverge sharply.
+
+## JavaScript: single-threaded eager promises
+
+The simplest model. There's one event loop per realm (per
+browser tab, per Node process). Promises are **eager** —
+creating them starts the work. `await` suspends the calling
+async function and resumes it as a microtask once the promise
+settles.
+
+```js
+async function getUser(id) {
+  const resp = await fetch(`/users/${id}`);
+  return resp.json();
+}
+```
+
+Properties:
+
+- **No parallelism within a single realm.** Two async functions
+  can be "in flight" at the same time (their I/O overlapping),
+  but only one piece of JS runs at any instant.
+- **Microtask vs macrotask matters.** `.then`/`await`
+  continuations run as microtasks — drained before the next
+  macrotask. A tight `await` loop can starve I/O callbacks.
+- **No cancellation primitive.** Promises don't cancel; you
+  pass `AbortSignal` into APIs that support it (`fetch`, most
+  Node streams).
+
+The model's strength is its simplicity: you never have a
+true race within one tab because there are no preemption points
+outside `await`. The weakness is "you only get one core" —
+multi-core JS needs Workers, which is a much harder model.
+
+## Python: asyncio with explicit event loops
+
+Closest to JavaScript in spirit, but with explicit loop
+management. `asyncio.run(main())` starts a loop; `await`
+yields to it; the loop drives futures forward.
+
+```python
+async def get_user(uid):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"/users/{uid}")
+        return r.json()
+```
+
+Key differences from JS:
+
+- **Coroutines are lazy.** `get_user(1)` returns a coroutine
+  object that hasn't started — you must await it or pass it to
+  the loop (`asyncio.create_task`).
+- **Cancellation is a first-class primitive.** Tasks have
+  `.cancel()`; the running coroutine receives `CancelledError`
+  at the next `await`.
+- **`asyncio.gather` and `asyncio.TaskGroup` (3.11+) provide
+  structured concurrency.** Crashes propagate up; sibling
+  tasks are cancelled.
+- **Sync-vs-async colored functions.** Calling a sync blocker
+  inside async stalls the entire event loop. `run_in_executor`
+  bridges to a thread pool.
+- **Multiple event loops** (one per thread) are allowed but
+  awkward; usually a sign you've over-architected.
+
+## C#: tasks with a thread-pool scheduler
+
+C# invented modern async/await (2012) and ships the most
+production-tuned model. `Task<T>` is the future type; the
+runtime has a global thread pool plus a "synchronization
+context" for routing continuations.
+
+```csharp
+public async Task<User> GetUserAsync(int id) {
+  var resp = await httpClient.GetAsync($"/users/{id}");
+  return await resp.Content.ReadAsAsync<User>();
+}
+```
+
+Key concepts:
+
+- **Tasks are eager** — created by `async` methods or
+  `Task.Run`.
+- **The thread that runs your continuation isn't necessarily
+  the one that called you.** Continuations bounce between
+  pool threads unless you pin to a context (UI thread,
+  ASP.NET request context).
+- **`CancellationToken` is the standard cancellation
+  parameter.** Pass it through every async API; respect it
+  with `token.ThrowIfCancellationRequested()` or by passing it
+  into framework calls.
+- **`.ConfigureAwait(false)`** on library code lets the
+  continuation run on any thread, avoiding deadlocks in legacy
+  UI/ASP.NET sync-over-async code.
+- **Real parallelism.** Multiple tasks can run on multiple
+  pool threads simultaneously. That means **real shared-state
+  races** are possible — async/await isn't a magic safety
+  net.
+
+## Rust: zero-cost futures with pluggable runtimes
+
+Rust's async is the most ambitious of the bunch. The language
+defines the `Future` trait and `async`/`await` syntax; the
+runtime (Tokio, async-std, smol) is separate. Futures are
+**lazy** — they do nothing until polled by a runtime.
+
+```rust
+async fn get_user(id: u64) -> Result<User, Error> {
+    let resp = reqwest::get(&format!("/users/{id}")).await?;
+    Ok(resp.json().await?)
+}
+```
+
+Distinctive properties:
+
+- **Zero-cost abstraction.** The compiler generates a state
+  machine struct sized exactly for the locals across `await`
+  points. No allocations, no runtime overhead beyond what you
+  asked for.
+- **Cancellation by drop.** Dropping a future stops it. No
+  cooperative check needed; the state machine is destructed.
+  This makes select/race trivially correct.
+- **Runtimes are user-space.** Tokio gives multi-threaded
+  work-stealing; smol is single-threaded. The same code runs
+  on both — usually.
+- **`Send`/`Sync` enforced.** Spawning a future onto a
+  multi-thread runtime requires the future and everything it
+  borrows be `Send`. The borrow checker catches data races at
+  compile time.
+- **The async ecosystem is split.** Tokio-specific traits vs
+  `futures` crate traits cause "two ecosystems" friction;
+  improving over time.
+
+The trade-off is sharpness: Rust async is the most powerful
+and the most demanding. Lifetimes across `await` points,
+`Pin`, and the "function coloring" issue bite hard until you
+internalize them.
+
+## Go: goroutines, no `await` at all
+
+The odd one out. Go has no `async`/`await` keyword and no
+explicit future type. Every function looks synchronous; the
+runtime makes them async under the hood.
+
+```go
+func getUser(id int) (*User, error) {
+    resp, err := http.Get(fmt.Sprintf("/users/%d", id))
+    if err != nil { return nil, err }
+    defer resp.Body.Close()
+    var u User
+    return &u, json.NewDecoder(resp.Body).Decode(&u)
+}
+
+// Caller: just spawn it
+go getUser(42)         // fire and forget, or pipe through a channel
+```
+
+How this works:
+
+- **M:N scheduling.** The runtime multiplexes M goroutines
+  onto N OS threads. When a goroutine blocks on I/O, the
+  runtime grabs an OS thread and runs another goroutine.
+- **No colored functions.** Any function can block; the
+  runtime handles it. Mixing "sync" and "async" code is a
+  non-issue.
+- **Channels for results.** Instead of `await`, you send the
+  result to a channel and read from it.
+- **`context.Context`** for cancellation and deadlines —
+  propagates through call chains explicitly.
+- **Stacks grow on demand.** Each goroutine starts with 2KB
+  (since Go 1.4) and grows; many millions of goroutines per
+  process is feasible.
+
+The cost: every function call goes through the Go runtime,
+which adds ~50ns of overhead per call vs raw C. For most
+workloads the trade is great; for tight inner loops it shows
+up.
+
+## Side-by-side comparison
+
+<Cheatsheet
+  columns={["", "JavaScript", "Python", "C#", "Rust", "Go"]}
+  rows={[
+    ["Future evaluation", "Eager", "Lazy (coro)", "Eager", "Lazy", "N/A (goroutines)"],
+    ["Real parallelism in one process", "Workers only", "Workers, with GIL caveats", "Yes (thread pool)", "Yes (Tokio multi)", "Yes (M:N runtime)"],
+    ["Cancellation primitive", "AbortSignal", "Task.cancel()", "CancellationToken", "Drop future", "context.Context"],
+    ["Function coloring", "Yes", "Yes", "Yes", "Yes", "No"],
+    ["Hidden allocations", "Microtask queue", "Coroutine objects", "Tasks (pooled)", "Zero, state-machine on stack", "Per-goroutine stack"],
+    ["Defining feature", "Single-thread sanity", "Structured TaskGroup", "Tooling maturity", "Compile-time safety", "Sync-looking code"],
+  ]}
+  caption="Five solutions to the same problem, each shaped by its language's constraints."
+/>
+
+## What makes any of these models correct
+
+Three properties to check when picking up a new async runtime:
+
+1. **What does the executor do on `await`?** Sit on this
+   thread? Hand off? Run microtasks first? This drives both
+   performance and the kinds of bugs you'll write.
+2. **What happens to in-flight tasks when their parent
+   finishes/errors?** Detached and leaked? Cancelled? This is
+   the structured-concurrency question; the model shapes
+   reliability under failure.
+3. **What's the shared-state story?** Single-threaded
+   (JS/Python single loop) means no data races. Multi-threaded
+   (Tokio, C# pool, Go runtime) means you need real
+   synchronization on shared state — `await` is not a barrier.
+
+## The takeaway
+
+Async/await syntax converged across languages, but the
+underlying model didn't. JS and single-loop Python are
+single-threaded and free of data races. C#, Tokio, and Go give
+real parallelism and bring back the shared-state problem. Rust
+trades ergonomics for compile-time safety. Go skips the
+keyword entirely. Pick the model that matches your workload's
+need for parallelism, isolation, and cancellation — the
+syntax is the smallest part.

@@ -1,0 +1,249 @@
+export const level = 'senior';
+
+# Lock-free vs wait-free
+
+"Lock-free" gets used to mean "fast" or "doesn't use a mutex."
+The technical terms are more specific, and they matter when
+you're choosing between data structures. The hierarchy goes:
+
+1. **Blocking** — a thread can stall the whole structure (e.g.,
+   takes a lock then gets descheduled).
+2. **Obstruction-free** — a thread makes progress if it runs
+   alone; if it contends, all bets are off.
+3. **Lock-free** — at least *one* thread makes progress in
+   any finite number of steps.
+4. **Wait-free** — *every* thread completes its operation in
+   a finite number of steps regardless of what others do.
+
+Wait-free is strictly stronger than lock-free, which is
+strictly stronger than obstruction-free. The book that pinned
+this down is Herlihy & Shavit's *The Art of Multiprocessor
+Programming*; the foundational paper is Herlihy 1991.
+
+## The progress guarantee that matters
+
+Most "lock-free" claims in real systems mean **lock-free**,
+not wait-free. The difference is what happens to a single
+straggling thread:
+
+- **Lock-free**: under contention, *somebody* always makes
+  progress. The system isn't deadlocked. But one unlucky
+  thread can be starved indefinitely while others succeed.
+- **Wait-free**: every thread has a bounded number of steps
+  to complete its operation. No starvation, regardless of
+  scheduling.
+
+For server software, lock-free is usually enough — the
+average case wins and you don't really care if one thread
+takes 100µs sometimes. For real-time systems (avionics,
+medical devices, audio engines), wait-free is what you need:
+the bound is the whole point.
+
+## A lock-free stack (Treiber's)
+
+The simplest lock-free structure, by R. K. Treiber (1986). A
+CAS loop on the head pointer:
+
+```cpp
+template<class T>
+class Stack {
+  struct Node { T value; Node* next; };
+  std::atomic<Node*> head{nullptr};
+
+public:
+  void push(T value) {
+    Node* n = new Node{value, head.load(std::memory_order_relaxed)};
+    while (!head.compare_exchange_weak(
+        n->next, n,
+        std::memory_order_release,
+        std::memory_order_relaxed)) {
+      // CAS failed: head was updated by another push/pop;
+      // n->next now holds the latest head; retry.
+    }
+  }
+
+  bool pop(T& out) {
+    Node* h = head.load(std::memory_order_acquire);
+    while (h && !head.compare_exchange_weak(
+        h, h->next,
+        std::memory_order_acquire,
+        std::memory_order_relaxed)) {
+      // h was updated to current head by CAS; retry.
+    }
+    if (!h) return false;
+    out = h->value;
+    // ... when do we delete h? See "memory reclamation" below.
+    return true;
+  }
+};
+```
+
+The CAS loop is the heartbeat of every lock-free structure:
+read the current state, compute the new state, CAS the change.
+If somebody else changed the state first, retry.
+
+This is **lock-free**: at any moment, one of the contending
+threads' CAS will succeed (the others see the changed head
+and retry). It is **not wait-free**: a single unlucky thread
+could keep losing the CAS race forever.
+
+## The memory reclamation problem
+
+The hardest part of lock-free programming, glossed over above.
+When you `pop` a node, when is it safe to `delete` it? Another
+thread might be in the middle of an operation that's holding a
+pointer to it.
+
+The classic illustration is the **ABA problem**:
+
+1. Thread T1 reads `head = A`, computes `new_next = A->next`.
+2. T1 is descheduled.
+3. T2 pops A, pops the next node, pushes a new node that
+   happens to be at A's freed-and-reused address.
+4. T1 resumes. Its CAS sees `head == A` (true!) and succeeds
+   — splicing in a stale pointer. **Memory corruption**, no
+   bug in code review.
+
+Three real solutions, each a serious engineering investment:
+
+<Steps>
+<Step n="1" title="Tagged pointers / versioned CAS">
+
+Use a double-word CAS (`cmpxchg16b` on x86, `CASP` on ARMv8.1)
+that atomically compares `<pointer, counter>`. Every update
+bumps the counter. Now ABA can't happen — the address may
+recycle, but the counter doesn't.
+
+</Step>
+<Step n="2" title="Hazard pointers">
+
+Each thread publishes "I'm currently using node X" in a
+per-thread slot before dereferencing X. A retiring thread that
+wants to free X checks all hazard slots; if anyone's pointing
+at X, defer the free. Used in folly, libcds.
+
+</Step>
+<Step n="3" title="Epoch-based reclamation (EBR) / RCU">
+
+Group operations into epochs. Memory freed in epoch N is only
+actually reclaimed once all threads have left epoch N. Reads
+are extremely cheap (just check an epoch counter); writes
+defer reclamation. Used in the Linux kernel (RCU), crossbeam
+in Rust.
+
+</Step>
+</Steps>
+
+This is why lock-free libraries are large and rarely written
+from scratch. The data-structure logic is the easy part. Safe
+memory reclamation is the hard part.
+
+## When lock-free is actually faster
+
+Lock-free isn't a universal speedup. The honest comparison:
+
+- **Low contention**: lock-free and mutex are both fast; mutex
+  is often *faster* (futex fast path is one CAS, same as
+  lock-free; mutex doesn't have to retry on contention).
+- **Moderate contention**: lock-free wins, because the mutex
+  is putting threads to sleep and waking them up.
+- **Heavy contention**: lock-free can lose hard. Cache lines
+  ping between cores; CAS failure rates climb; everyone's
+  retrying. A mutex puts most threads to sleep and lets one
+  run.
+
+The graph everyone draws is "lock-free queue beats mutex queue
+by 5×." It's usually drawn with 4-8 contending threads on a
+read-heavy load. Re-draw it at 32 contending threads with
+write-heavy load and the mutex sometimes wins.
+
+The pragmatic guidance: **lock-free is a tool for short, hot,
+moderately contended operations.** A `std::atomic` counter
+that's incremented from many threads. A wait-free queue
+between a single producer and consumer (SPSC). A
+lock-free stack where pushes and pops are short. Beyond that,
+mutexes plus careful design tend to win.
+
+## Wait-free: the ideal you rarely reach
+
+Wait-free guarantees every thread finishes in a bounded
+number of steps. The poster child is the **single-producer,
+single-consumer queue** (SPSC): one producer enqueues, one
+consumer dequeues, both wait-free. The structure is:
+
+```cpp
+class SPSCQueue {
+  T* buffer;
+  alignas(64) std::atomic<size_t> head;
+  alignas(64) std::atomic<size_t> tail;
+public:
+  bool enqueue(T v) {
+    auto h = head.load(std::memory_order_relaxed);
+    auto next = (h + 1) % capacity;
+    if (next == tail.load(std::memory_order_acquire)) return false;  // full
+    buffer[h] = v;
+    head.store(next, std::memory_order_release);
+    return true;
+  }
+  // dequeue is symmetric
+};
+```
+
+Single producer means there's no contention on `head` between
+producers. Single consumer means no contention on `tail`. Both
+sides do a fixed number of operations. Wait-free.
+
+The instant you allow multiple producers or consumers, you're
+back to CAS loops and lock-free at best — and wait-free
+becomes much harder. There are known constructions (Herlihy's
+universal construction, Kogan-Petrank's queues) but they're
+complex and rarely faster than a well-tuned lock-free version.
+
+## When you need lock-free (not just "want fast")
+
+There are domains where blocking really isn't an option:
+
+- **Signal handlers**. Can't hold a lock that the interrupted
+  thread might hold. Must use lock-free or async-signal-safe
+  primitives.
+- **Real-time threads**. Priority inversion (low-priority
+  thread holds the lock the high-priority thread needs) can
+  blow real-time deadlines. Lock-free avoids the problem.
+- **Wait-free in hard real-time**. Avionics, automotive ECUs,
+  pacemakers. The bound on operation time is essential to
+  safety certification.
+- **Single-writer per-thread structures with a slow
+  aggregator.** Common in profilers, eBPF maps, perf-tools.
+
+For business logic, you almost certainly don't need
+lock-free. Reach for it after measuring contention on the
+mutex you started with.
+
+## Existing lock-free building blocks
+
+If you do need lock-free, use a library:
+
+- **C++**: `folly::ConcurrentHashMap`, `folly::MPMCQueue`,
+  `boost::lockfree`, `moodycamel::ConcurrentQueue`.
+- **Java**: `j.u.c.atomic.*` (lock-free counters),
+  `ConcurrentLinkedQueue` (Michael-Scott lock-free queue),
+  `ConcurrentHashMap` (lock-striped, not fully lock-free).
+- **Rust**: `crossbeam` (lock-free queues, deque,
+  epoch-based reclamation), `dashmap` (sharded).
+- **Go**: `sync.Map` (lock-free reads, occasional locking),
+  `sync/atomic`.
+
+Use them rather than rolling your own. The libraries have
+been hammered on; your hand-rolled version has not.
+
+## The takeaway
+
+Lock-free means "system makes progress under contention."
+Wait-free means "every thread makes progress in bounded time."
+Lock-free is the realistic target for high-perf concurrent
+code; wait-free is for hard real-time. Both come with serious
+engineering costs — especially safe memory reclamation. For
+most application code, a well-used mutex is faster than a
+hand-rolled lock-free attempt and far less likely to ship
+bugs. Reach for lock-free libraries when the profiler shows
+mutex contention, not because the term sounds cool.

@@ -1,0 +1,232 @@
+export const level = 'staff';
+
+# Sequential consistency and relaxed models
+
+There's a hierarchy of memory models that concurrent systems
+can offer, ranging from "looks like one CPU executing
+everything in program order" to "the writes you make might
+become visible in any order at all." Choosing where on the
+hierarchy your system sits is one of the deepest design
+decisions in concurrent programming — and the choice ripples
+into hardware costs, compiler freedom, and which bugs you can
+have.
+
+The shallow page on happens-before introduces the day-to-day
+practical mechanics. This staff-level page is the lattice of
+models themselves.
+
+## The hierarchy
+
+From strongest (most intuitive, most expensive) to weakest
+(hardest to reason about, fastest):
+
+<Cheatsheet
+  columns={["Model", "What's preserved", "Where you'd see it"]}
+  rows={[
+    ["Sequential consistency (SC)", "Total global order; each thread sees the same order", "Java volatile, C++ seq_cst, theoretical ideal"],
+    ["TSO (Total Store Order)", "Per-CPU FIFO of stores; loads can pass earlier stores", "x86, SPARC, IBM zSeries"],
+    ["PSO (Partial Store Order)", "Stores to different addresses can reorder", "SPARC PSO (deprecated)"],
+    ["RMO / Weak (relaxed)", "Almost any reordering allowed", "Old ARM, POWER, Alpha"],
+    ["ARMv8 / RISC-V WMM", "Acquire/release semantics; relaxed by default", "Modern ARM, RISC-V (the dominant relaxed model)"],
+    ["DRF-SC (data-race-free → SC)", "SC if your program has no data races", "C11/C++11/Java memory models (effective contract)"],
+  ]}
+  caption="What each model lets the CPU and compiler reorder. Stronger ≠ better; stronger = more expensive."
+/>
+
+## Sequential consistency
+
+Lamport's 1979 definition: *"the result of any execution is
+the same as if the operations of all the processors were
+executed in some sequential order, and the operations of each
+individual processor appear in this sequence in the order
+specified by its program."*
+
+Two parts:
+
+1. There exists a global interleaving of all operations.
+2. That interleaving respects per-thread program order.
+
+SC is what you instinctively assume concurrent code works
+like. It is also what no real CPU implements by default,
+because making it work requires draining the store buffer on
+every load — about 20–40 ns per fence, much worse on multi-core.
+
+Languages that "give you" SC do so by inserting fences. Java
+`volatile` writes are followed by a full barrier. C++
+`std::atomic<T>` with `seq_cst` operations does the same. The
+fences are why "use volatile/atomic everywhere" isn't free.
+
+## Total store order (TSO): x86
+
+x86's de facto memory model. The rules:
+
+- **Stores from one CPU appear in program order to others**
+  (no store-store reordering).
+- **A load can pass an earlier store to a different address**
+  — the store sits in the store buffer; the load grabs from
+  cache or memory.
+- **Loads from one CPU appear in program order** (no
+  load-load reordering).
+- **Atomic RMW (LOCK XADD, CMPXCHG)** is a full barrier.
+
+The famous TSO bug pattern:
+
+```
+// Thread 1:        Thread 2:
+x = 1;              y = 1;
+r1 = y;             r2 = x;
+```
+
+Under SC, `(r1, r2) = (0, 0)` is impossible. Under TSO, it
+*is* possible: T1's store of `x` sits in T1's store buffer;
+T1's load of `y` reads 0; meanwhile T2's store of `y` is
+buffered too; T2's load of `x` reads 0. Both stores eventually
+drain, but the loads already happened. The famous "Dekker's
+algorithm" bug.
+
+To prevent this on x86, insert `MFENCE` between the store and
+the load on each thread, or use atomic operations that are
+implicit fences (`LOCK XCHG`, `LOCK XADD`).
+
+x86's TSO is the strongest of mainstream hardware models. Code
+that "works on x86" often relies on TSO without realizing it,
+and breaks when ported to ARM.
+
+## ARM and POWER: weakly ordered
+
+ARM and POWER explicitly permit broad reordering:
+
+- **Store-store reordering**: two stores to different
+  addresses can become visible in either order.
+- **Load-load reordering**: two loads can complete in either
+  order regardless of program order.
+- **Load-store and store-load reordering**.
+
+The only thing guaranteed is **per-address program order** —
+two operations on the *same* address from the same CPU appear
+in program order to everyone.
+
+Why so weak? Performance. The weaker the model, the more the
+CPU's pipeline can do speculatively, out of order, and in
+parallel. ARM phones get most of their power efficiency this
+way.
+
+The cost is mandatory explicit barriers for any cross-thread
+ordering. ARMv8's instruction set has dedicated instructions:
+
+- `DMB SY`: full data memory barrier.
+- `DMB ISH`: barrier between operations of the inner shareable
+  domain (your cluster of CPUs).
+- `LDAR`/`STLR`: load-acquire / store-release semantics (the
+  ARMv8.0 way to do C++-style acquire-release).
+
+Code that worked on x86 because of TSO can break on ARM,
+because the compiler is allowed to (and the CPU is allowed to)
+reorder in ways x86 forbids. This is why Android's early years
+saw a wave of "works on x86 emulator, breaks on phone" memory
+ordering bugs.
+
+## DRF-SC: the language-level promise
+
+Most modern language memory models offer **data-race-free →
+sequential consistency**: *if* your program is
+data-race-free (every access to a shared variable uses an
+appropriate synchronization primitive), then the program
+behaves as sequentially consistent. The compiler and CPU can
+do anything they want — the moment you race, you're in
+undefined-behavior territory.
+
+This is the promise of:
+
+- **Java**, since JSR-133 (2004).
+- **C++11/C11 memory models**.
+- **Go's memory model** (with the channel/mutex/atomic story).
+- **Rust's memory model** (inherits from C++).
+
+The model rewards "use mutexes, volatiles, atomics correctly"
+with intuitive behavior. The model rewards "be clever with
+plain variables" with bugs that only show up under specific
+compilers, optimization levels, or hardware.
+
+This is also why **the type system or `volatile`/`atomic`
+annotation is mandatory**: the compiler needs to know which
+accesses are racy candidates so it can emit the right fences
+and avoid reorderings that would break SC for those accesses.
+
+## Acquire-release semantics
+
+The pragmatic middle ground. Most cross-thread synchronization
+needs neither full SC nor maximally relaxed access — it needs
+**pairs of release-acquire**:
+
+- **Store-release**: this store, and all stores/loads before
+  it in this thread, are visible to any thread that does an
+  acquire-load that sees this value.
+- **Load-acquire**: this load, and all stores/loads after it
+  in this thread, see what the store-release set up.
+
+The mental model is "release publishes a snapshot; acquire
+subscribes to it."
+
+```cpp
+// Producer
+data = compute_result();
+ready.store(true, std::memory_order_release);
+
+// Consumer
+if (ready.load(std::memory_order_acquire)) {
+  use(data);            // sees the producer's compute_result
+}
+```
+
+Acquire-release is what Mutex.lock/unlock implement. It's
+cheaper than seq_cst on weak hardware (a one-way fence vs a
+two-way one), and it's all most code actually needs.
+
+## When to care which model your language uses
+
+Most of the time you don't. The "use mutex/atomic primitives"
+rule keeps you out of trouble across all the models. But you
+need to know if you:
+
+- **Write lock-free code.** You're picking memory orderings
+  explicitly, and "relaxed" gives different bugs on different
+  hardware.
+- **Port code across architectures.** x86 code that
+  "happened to work" might break on ARM.
+- **Read or write a memory model spec.** The new Linux kernel
+  memory model (LKMM) is its own beast; understanding it
+  requires understanding the hardware models underneath.
+- **Build a runtime / VM / GC.** The whole language model
+  builds on assumptions about the hardware model.
+
+## What "relaxed" actually buys
+
+Choosing weak orderings (relaxed, acquire/release instead of
+seq_cst) saves cycles:
+
+- On x86, acquire-release is essentially free (TSO already
+  provides it), and seq_cst costs one fence per write.
+- On ARMv8, acquire-release uses LDAR/STLR (one-way fences),
+  cheaper than full DMB SY.
+- On POWER, relaxed atomics are essentially free; full
+  barriers are expensive.
+
+For most code, the savings are not worth the reasoning cost.
+Reach for relaxed orderings only on hot paths where profiling
+showed atomic operations as bottlenecks, and document why.
+
+## The takeaway
+
+Memory models are a lattice from "sequential consistency"
+(intuitive, expensive) to "almost anything goes" (fast,
+treacherous). Real CPUs sit somewhere in the middle: x86 at
+TSO, ARM/POWER weaker still. Mainstream language models
+(Java, C++, Go, Rust) offer DRF-SC: do your synchronization
+through the provided primitives, and the model behaves SC;
+race on plain data, and behavior is undefined. The map between
+hardware ordering, compiler reordering, and source-level
+guarantees is the deepest layer of concurrent programming —
+which most code never has to look at, and which is essential
+for anyone writing primitives, runtimes, or lock-free
+algorithms.

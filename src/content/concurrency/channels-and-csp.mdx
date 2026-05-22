@@ -1,0 +1,263 @@
+export const level = 'mid';
+
+# Channels and CSP
+
+Channels are a concurrency primitive that's about **passing
+values, not protecting state**. Two tasks (goroutines, async
+tasks, threads) coordinate by sending and receiving over a
+channel — like a typed, synchronizable pipe. The model goes
+back to Hoare's *Communicating Sequential Processes* (CSP,
+1978) and reached the mainstream through Go and Clojure's
+core.async.
+
+The slogan, often attributed to Pike: **"Don't communicate by
+sharing memory; share memory by communicating."** The mutex
+view of concurrency is "I'll protect this shared variable."
+The channel view is "I'll hand this value to whoever needs it
+next, and they own it."
+
+## What a channel is
+
+A channel is a typed FIFO queue with synchronization built in:
+
+```go
+ch := make(chan int)       // unbuffered
+ch := make(chan int, 10)   // buffered, capacity 10
+
+// sender:
+ch <- 42                   // send (may block)
+
+// receiver:
+v := <-ch                  // receive (may block)
+
+// close: signal "no more values"
+close(ch)
+```
+
+The synchronization behavior depends on the buffer:
+
+<Cheatsheet
+  columns={["Kind", "Send blocks when", "Receive blocks when", "Effect"]}
+  rows={[
+    ["Unbuffered", "No receiver is waiting", "No sender is waiting", "Synchronous handoff (rendezvous)"],
+    ["Buffered", "Buffer is full", "Buffer is empty", "Asynchronous up to capacity"],
+    ["Closed", "Never (panic on send)", "Returns zero value + ok=false", "Broadcast 'no more values'"],
+  ]}
+  caption="Same API, two different temporal semantics."
+/>
+
+Unbuffered channels are **synchronous** — the send completes
+exactly when the receive completes; the two sides hand off in a
+single moment. This is the canonical CSP rendezvous, useful for
+backpressure (the sender naturally waits for the receiver to
+catch up).
+
+Buffered channels are **asynchronous** up to capacity — sender
+deposits, receiver picks up later. Useful when sender and
+receiver run at different rates, or you want a small queue to
+absorb bursts.
+
+## The select statement
+
+Channels alone are too rigid — what if you want to receive from
+*either* of two channels, whichever is ready first? That's what
+`select` is for:
+
+```go
+select {
+case v := <-incoming:
+    handle(v)
+case ch <- outgoing:
+    // sent to ch
+case <-time.After(5 * time.Second):
+    return fmt.Errorf("timeout")
+case <-ctx.Done():
+    return ctx.Err()
+}
+```
+
+`select` picks **one** ready case (or blocks until one is). If
+multiple are ready, it picks pseudo-randomly. This is what
+makes channels expressive: combine with `time.After` for
+timeouts, with `ctx.Done()` for cancellation, with multiple
+channels for fan-in.
+
+In Rust/Tokio the equivalent is `tokio::select!`. In Kotlin
+coroutines, `select { }`. In Clojure core.async, `alt!`.
+
+## Common patterns
+
+### Fan-out: split work across workers
+
+```go
+jobs := make(chan Job, 100)
+for i := 0; i < numWorkers; i++ {
+    go worker(jobs)              // each pulls from the same channel
+}
+for _, j := range allJobs {
+    jobs <- j
+}
+close(jobs)                      // workers exit on close
+```
+
+Multiple workers competing for jobs on the same channel. The
+channel acts as the work-queue; whichever worker is free picks
+up the next job. The pattern is **load balancing for free**.
+
+### Fan-in: merge results from many sources
+
+```go
+func merge(cs ...<-chan int) <-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+    for _, c := range cs {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for v := range c { out <- v }
+        }(c)
+    }
+    go func() { wg.Wait(); close(out) }()
+    return out
+}
+```
+
+N input channels, one output channel. Each input gets a
+forwarding goroutine. The Goroutine waiting on `wg` closes the
+output when all inputs are done. This is the **collector**
+pattern at the end of a fan-out.
+
+### Pipeline: chain of transformations
+
+```go
+src := generate(items)
+filtered := filter(src, isEven)
+squared := mapStage(filtered, square)
+for v := range squared { fmt.Println(v) }
+```
+
+Each stage is a function that takes an input channel and
+returns an output channel. Stages run concurrently — `generate`
+produces while `filter` consumes and `mapStage` consumes from
+that. Backpressure flows naturally upstream: if downstream is
+slow, upstream blocks on its send.
+
+### Done / cancellation channel
+
+```go
+done := make(chan struct{})
+
+// signal:
+close(done)            // every receiver instantly observes
+
+// receive (in workers, in select):
+select {
+case <-done: return
+default:               // keep going
+}
+```
+
+`close(done)` is broadcast: every goroutine `<-done` immediately
+gets the zero value. The `struct{}` carries no data — it's just
+a signal. This is the idiomatic Go cancellation primitive, now
+mostly wrapped inside `context.Context`.
+
+## Channel ownership
+
+The most important Go convention: **the goroutine that creates
+a channel owns it and is responsible for closing it.** Closing
+a channel from a non-owner is a recipe for "send on closed
+channel" panics.
+
+The corollary: don't close channels from the receiver side.
+Receivers stop receiving when the channel closes; they don't
+*cause* the close.
+
+```go
+// Owner: creates, sends, closes
+func produce() <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)            // owner closes
+        for i := 0; i < 10; i++ {
+            out <- i
+        }
+    }()
+    return out
+}
+
+// Consumer: reads until close
+for v := range produce() {
+    use(v)
+}
+```
+
+The `range` over a channel automatically exits when the channel
+is closed and drained. No explicit "are we done?" check needed.
+
+## Why channels are easier than locks (sometimes)
+
+Channels eliminate three common lock-based bugs by design:
+
+- **No lock ordering.** Sending into a channel doesn't take a
+  user-visible lock; no chance of inconsistent acquire order
+  with another channel.
+- **No "forgot to release."** Sending and receiving are
+  atomic, single operations.
+- **Ownership is explicit.** Once you send a value, you've
+  given it away — no two goroutines accidentally mutating the
+  same struct.
+
+And one bug they trade for: **deadlock by missing receiver.**
+If you send into an unbuffered channel and nobody's receiving,
+the sender blocks forever. Go's runtime detects "all goroutines
+deadlocked" but a partial deadlock (one goroutine stuck on a
+channel) is harder to catch.
+
+## When channels are the wrong tool
+
+Despite the slogan, channels aren't always the right answer:
+
+- **Protecting a single shared structure.** A mutex is simpler
+  and faster than wrapping every access in a channel
+  send/receive. Goetz's *Java Concurrency* and Cox-Buday's
+  *Concurrency in Go* both agree: when you have a small piece
+  of state with multiple readers/writers, a mutex is
+  appropriate.
+- **Counting semaphore.** `sync.WaitGroup` is purpose-built;
+  using a channel to wait for N completions is more code.
+- **Performance-critical hot paths.** Channels have non-zero
+  overhead (~50–100ns per send/receive on Go). For inner
+  loops, atomics or shared memory with a mutex can be 10×
+  faster.
+- **Many readers, rare writer.** RWLock or copy-on-write beats
+  channel-broadcast.
+
+The right framing (from Cox-Buday): **mutexes protect
+invariants; channels coordinate goroutines.** If you find
+yourself protecting a single piece of state with a channel,
+you've picked the wrong tool. If you find yourself orchestrating
+goroutines with a mutex, same.
+
+## Channels in other languages
+
+- **Rust**: `tokio::sync::mpsc` (multi-producer single-consumer),
+  `broadcast`, `oneshot`. `crossbeam-channel` for sync versions.
+- **Kotlin**: coroutines `Channel<T>`, with `BUFFERED`,
+  `UNLIMITED`, `RENDEZVOUS`, `CONFLATED` capacities.
+- **Clojure**: `core.async` channels + `go` blocks. Brought CSP
+  to the JVM with state-machine compilation.
+- **JavaScript**: no native primitive; `MessageChannel` for
+  Workers; libraries like `js-csp` exist but aren't idiomatic.
+- **Python**: `asyncio.Queue`, `trio.MemoryChannel` (trio's are
+  closer to CSP semantics).
+
+## The takeaway
+
+A channel is a typed pipe with synchronization built in: send
+and receive coordinate the two sides. Unbuffered = rendezvous;
+buffered = small async queue; closed = broadcast end-of-stream.
+`select` extends them into "wait on any of these." The pattern
+shines for orchestrating concurrent tasks — fan-out, fan-in,
+pipelines, cancellation. For protecting a single piece of state
+shared between threads, a mutex is still usually right.

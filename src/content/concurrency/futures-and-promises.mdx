@@ -1,0 +1,227 @@
+export const level = 'junior';
+
+# Futures and promises
+
+A **future** (or **promise** — the words are essentially
+synonyms in most ecosystems) is "a value that isn't here yet."
+You get back a handle now; the underlying computation runs
+elsewhere or later; you observe the result by `await`-ing,
+calling `.then(...)`, or blocking on `get()`. The pattern shows
+up in every major language, sometimes under different names.
+
+## A taxonomy
+
+The terminology is a mess. Different communities use the words
+inconsistently. The most useful split is **how the value gets
+written**:
+
+<Cheatsheet
+  columns={["Term", "Who completes it", "Common in", "Notes"]}
+  rows={[
+    ["Future (read-side)", "Someone else", "Java, C++, Scala, Rust", "Read-only handle to a value"],
+    ["Promise (write-side)", "Whoever holds the promise", "Java, C++, Scala", "Setter half; pairs with a Future"],
+    ["Promise (JS sense)", "Resolver passed to constructor", "JavaScript, A+ spec", "Both halves bundled into one object"],
+    ["Task / Job", "Spawned computation", "C# Task, asyncio.Task, tokio::task", "Future + executor binding"],
+    ["Deferred", "Resolver via .resolve() method", "jQuery legacy, Twisted", "Older write-from-outside style"],
+  ]}
+  caption="Same idea, different vocabulary depending on the language."
+/>
+
+The JS-style "promise = future + resolver in one object" is the
+most accessible. The C++/Java split — `std::future` reads,
+`std::promise` writes — is more rigorous about ownership.
+They're isomorphic; pick the vocabulary your ecosystem uses.
+
+## The three states
+
+Every future is in exactly one of three states:
+
+```
+   ┌────────────┐    settle    ┌──────────────┐
+   │  Pending   │ ───────────► │  Fulfilled   │
+   │ (in flight)│              │  (has value) │
+   └────────────┘ ──┐          └──────────────┘
+                    │
+                    │ error    ┌──────────────┐
+                    └────────► │   Rejected   │
+                               │   (failed)   │
+                               └──────────────┘
+```
+
+Once settled (fulfilled or rejected), the state is final — a
+future never goes back to pending or changes its value. This
+immutability is what makes futures composable.
+
+## How you observe the value
+
+Three common shapes:
+
+```js
+// 1. Callback / .then (JS, A+ promises)
+promise.then(
+  value => use(value),
+  err   => handle(err),
+);
+
+// 2. await (suspends the calling function)
+const value = await promise;
+
+// 3. Blocking get() (sync code asks for the value)
+const value = future.get();    // blocks the thread
+```
+
+The three shapes are equivalent in expressive power but produce
+wildly different code styles. `.then` chains predate async/await
+and lead to "promise pyramids" if naively used. `await`
+straightens them out into pseudo-sequential code. `get()` is
+the blocking escape hatch — used at the boundary between sync
+and async worlds, or in tests.
+
+## Composition — the actual win
+
+A single future is useful. The reason futures took over is that
+they compose:
+
+```js
+// run in parallel; wait for all
+const [a, b, c] = await Promise.all([fetchA(), fetchB(), fetchC()]);
+
+// take whichever finishes first
+const first = await Promise.race([primary(), backup()]);
+
+// wait for all to settle (succeed or fail)
+const results = await Promise.allSettled(promises);
+
+// chain dependent steps
+const final = await fetchUser(id)
+  .then(user => fetchOrders(user.id))
+  .then(orders => total(orders));
+```
+
+`Promise.all` + `await` is "fan out, then converge" — the
+standard way to do parallel I/O in async code. Forgetting to use
+it is the most common performance bug in async code:
+
+<Compare
+  badTitle="Serial despite async"
+  goodTitle="Parallel with Promise.all"
+  language="js"
+  bad={`for (const id of ids) {
+  const user = await fetchUser(id);   // each waits for previous
+  process(user);
+}
+// 100 ids × 50ms = 5000ms`}
+  good={`const users = await Promise.all(
+  ids.map(id => fetchUser(id))         // all in flight
+);
+users.forEach(process);
+// 100 ids in ~50ms`}
+  caption="The await keyword sequentializes when used naively. Promise.all parallelizes the I/O."
+/>
+
+## Eager vs lazy
+
+A subtle but important distinction:
+
+- **Eager futures** start running the moment they're created.
+  JavaScript Promises, Java `CompletableFuture`, Scala
+  `Future`. Calling the function kicks off the work; the
+  future is the handle to its in-progress result.
+- **Lazy futures** don't run until someone awaits them. Rust
+  `Future`, Haskell's IO, Python `Coroutine`. The future is a
+  description of work; the runtime drives it forward only when
+  asked.
+
+The difference matters when you build a future and discard it:
+
+```js
+// JS: eager — the fetch happened, you just lost the result
+const _ = fetch("/important");
+
+// Rust: lazy — the future was dropped before being polled,
+// the request never went out
+let _ = client.get("/important").send();
+```
+
+Lazy futures are more controllable (you decide when work
+starts) and integrate better with cancellation (drop the future,
+nothing happens). Eager futures are friendlier to write because
+"calling the function does what you'd expect."
+
+## Error propagation
+
+A future that fails should make its failure visible. Two styles:
+
+```js
+// .then: separate onReject handler, or rely on a catch downstream
+fetch(url).then(
+  res => res.json(),
+  err => handle(err),
+);
+
+// await: errors become exceptions in the calling frame
+try {
+  const json = await fetch(url).then(r => r.json());
+} catch (err) {
+  handle(err);
+}
+```
+
+The bug everyone writes once: **a rejected promise with no
+handler.** Node logs an `UnhandledPromiseRejection`; browsers
+fire `unhandledrejection` events. Modern runtimes treat
+unhandled rejections as fatal because they almost always
+indicate a real bug.
+
+The rigorous languages (Rust, Haskell) force the issue at
+compile time — you can't get the value out of a `Result` or
+`IO` without explicitly handling the error case. The flexible
+ones (JS, Python) make it easy to forget.
+
+## Cancellation
+
+Most "promise" implementations are not cancellable: once
+created, the work runs to completion whether anyone's listening
+or not. Some languages bolt cancellation on:
+
+- **JS**: `AbortController` + `signal` parameter. The promise
+  itself isn't canceled; you pass the signal into the work so
+  it can check and abort.
+- **C#**: `CancellationToken` passed through every async API.
+  Cooperative.
+- **Rust**: drop the future. The runtime stops polling, the
+  state machine is destroyed.
+- **Go**: contexts (`context.WithCancel`). Pass a `ctx` into
+  every operation; check `ctx.Done()`.
+
+The pattern is always *cooperative* — the work has to check
+the cancellation signal. There's no "force-stop a future."
+The structured-concurrency page goes deeper on this.
+
+## Where futures came from
+
+The future/promise concept is one of the oldest in concurrency
+research. It traces to:
+
+- Baker & Hewitt's *futures* (1977), for Actor-based systems.
+- Halstead's MultiLisp (1985) — `(future X)` returned a handle
+  that blocked on use.
+- Liskov & Shrira's *promises* for distributed systems (1988) —
+  the term in its modern usage.
+- Argus, then E (Mark Miller, late 1990s) — the lineage that
+  gave us today's JS Promises via the A+ spec (2012).
+
+The reason the idea keeps reappearing is its composability —
+once you have a value-not-yet-here, you can write functions over
+"future X" the same way you write them over X, just with `await`
+sprinkled in.
+
+## The takeaway
+
+A future/promise is a handle to an in-flight value: pending,
+then settled (fulfilled or rejected). The point isn't the
+single future — it's that they compose. `Promise.all`,
+chaining, and `await` let you express concurrent data flow
+without managing threads or callback nesting. Once you have
+futures, every other async pattern in your language sits on
+top of them.

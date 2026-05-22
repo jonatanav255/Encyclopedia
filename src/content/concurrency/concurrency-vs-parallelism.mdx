@@ -1,0 +1,131 @@
+export const level = 'junior';
+
+# Concurrency vs parallelism
+
+Rob Pike's one-line definition, after years of people conflating
+them: **concurrency is about *dealing* with many things at once;
+parallelism is about *doing* many things at once.** Concurrency
+is a property of how a program is *structured*. Parallelism is a
+property of how it *runs* — specifically, on more than one
+execution unit at the same instant.
+
+A single-core machine can run a concurrent program just fine: the
+scheduler interleaves goroutines, async tasks, or threads in
+tiny slices. The program is concurrent but not parallel. Add a
+second core and the same program may now be parallel too — same
+code, more hardware. The structure didn't change; the execution
+did.
+
+## Why people confuse them
+
+Because in everyday code the two come bundled. Spawn 8 threads
+on an 8-core machine and you got both. Spawn 8 threads on a
+1-core machine and you got concurrency without parallelism. Run
+SIMD vector ops in a single thread and you got parallelism
+without (much) concurrency. The bundle makes it tempting to
+treat them as synonyms — until you try to reason about
+correctness, at which point the distinction is essential.
+
+<Cheatsheet
+  columns={["", "Concurrency", "Parallelism"]}
+  rows={[
+    ["What", "Composition of independently-progressing tasks", "Simultaneous execution"],
+    ["About", "Program structure", "Program execution"],
+    ["Needs", "A scheduler", "Multiple execution units"],
+    ["Example", "Async/await, goroutines, an event loop", "SIMD, multi-threaded matrix multiply, GPU"],
+    ["Bug class", "Race conditions, deadlock, livelock", "Cache contention, false sharing, Amdahl ceiling"],
+  ]}
+  caption="Two different problems that happen to use overlapping tools."
+/>
+
+## A worked example
+
+You want to download 100 URLs and process the results.
+
+- **Sequential**: download #1, process #1, download #2, process #2 …
+  Slow because each download blocks the CPU on network I/O.
+- **Concurrent (1 thread, async)**: an event loop juggles 100
+  in-flight downloads, processing each as its bytes return. CPU
+  is busy when there's work; idle when there isn't. Single
+  thread, no parallelism, but the program structure now treats
+  the 100 downloads as 100 independent tasks.
+- **Parallel (N threads, blocking I/O)**: spawn N OS threads,
+  each downloads 100/N URLs sequentially. If N matches your
+  cores, downloads and processing both run on multiple cores at
+  once — actual parallelism.
+- **Concurrent + parallel**: an async runtime (Tokio, Node
+  cluster, Go) spawns N workers that each handle many
+  in-flight downloads via an event loop. The model is concurrent
+  *and* the work runs on N cores.
+
+The right choice depends on the workload. For network-bound
+work, concurrency alone (one thread, async) often beats raw
+parallelism — your bottleneck is the network, not the CPU,
+so adding cores doesn't help. For CPU-bound work (image
+encoding, encryption, big numeric loops), parallelism is what
+moves the needle.
+
+## Where the bugs live
+
+- **Concurrent bugs** are about *interleaving*: two tasks
+  accessing shared state in an order that the developer didn't
+  anticipate. Races, deadlocks, livelocks, starvation. They show
+  up even on a single core if the scheduler can preempt.
+- **Parallel bugs** are about *simultaneous* execution: the same
+  instant two cores both modifying a cache line. False sharing.
+  Memory-ordering violations the compiler/CPU were free to do.
+  These only show up when execution is genuinely simultaneous,
+  so they're hard to reproduce on a single core.
+
+A program that has only one OS thread but many async tasks
+(`asyncio` in Python, single-threaded JS) gets concurrent bugs
+but is immune to most parallel bugs — because at any instant
+only one task is running, and atomicity at the `await` boundary
+is well-defined. That's why JS code can mutate shared state
+inside a `Promise.then` chain without a mutex.
+
+## Amdahl's law: the ceiling on parallelism
+
+Even perfect parallelism has a hard cap. If `s` of your
+program is inherently serial (only 5%, say), the maximum
+speedup from `n` cores is:
+
+```
+speedup ≤ 1 / (s + (1 - s) / n)
+```
+
+With s=0.05, even 1000 cores only gets you 19× speedup. The
+serial fraction dominates as `n` grows. Most real-world
+parallel speedups stall well before this — locking, memory
+bandwidth, cache contention, scheduling overhead each shave
+off more. **Concurrency has no such mathematical ceiling**
+because it doesn't promise speedup, only structure. You can
+have a million coroutines without diminishing returns from
+"too many."
+
+## What this means for design
+
+Pick the *structure* first. If your problem decomposes
+naturally into independent tasks that wait on I/O — web
+servers, scrapers, pipelines — model it concurrently and
+worry about parallelism later. If your problem is one big
+computation that's embarrassingly parallel — image batches,
+vector math — pick parallelism (threads, SIMD, GPU) and let
+concurrency be a thin layer around it.
+
+The mistake most teams make is reaching for threads ("we need
+to go faster") when the problem is concurrent (I/O-bound). They
+add threads, get locking complexity, see no speedup, and
+conclude "concurrency is hard." It is — but the framework
+they needed was async on one thread, not threads on shared
+state.
+
+## The takeaway
+
+Concurrency is a way of *thinking* about programs as
+collections of independent tasks. Parallelism is a way of
+*running* them on multiple cores at the same time. The first
+is mostly a design choice; the second is mostly a hardware
+deployment. Most real systems use a careful mix: concurrent
+structure (so the program is easy to reason about) plus
+selective parallelism (where the cores will pay off).

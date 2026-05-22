@@ -1,0 +1,201 @@
+export const level = 'junior';
+
+# Atomicity and critical sections
+
+An operation is **atomic** if other concurrent actors only
+ever see it as either "not started yet" or "completely done."
+There's no intermediate state for anyone else to observe. The
+operation either happened or it didn't; nothing in between is
+visible. Atomicity is the basic unit of safety for concurrent
+code — without it, you can't reason about *anything* shared.
+
+A **critical section** is a block of code that must run as if it
+were atomic with respect to other threads that might run
+overlapping blocks. The critical section is the *region of
+exclusivity*; atomicity is the *property* it provides.
+
+## What "atomic" actually means
+
+The word gets used in four distinct ways, which lead to a lot
+of cross-talk:
+
+<Cheatsheet
+  columns={["Sense", "What it means", "Example"]}
+  rows={[
+    ["Hardware-atomic", "One indivisible CPU instruction", "x86 LOCK XADD, ARM LDAXR/STLXR"],
+    ["Language-atomic", "Operation the language guarantees can't interleave", "Java volatile long, std::atomic<int>"],
+    ["Logically-atomic", "Multi-step op that user code treats as one", "Bank transfer inside a mutex or DB tx"],
+    ["DB-atomic", "ACID's A: a transaction is all-or-nothing", "BEGIN ... COMMIT"],
+  ]}
+  caption="All four are 'atomic'; they live at different layers."
+/>
+
+Hardware-atomic is the foundation: the CPU offers a small set of
+truly indivisible operations (load, store of word-sized
+aligned values, `cmpxchg`, `fetch-and-add`). Everything else —
+the language atomics, the mutex-protected critical section, the
+DB transaction — is built on top of these primitives. They
+provide *logical* atomicity over multi-step work.
+
+## Word tearing: when even reads aren't atomic
+
+A single 32-bit `int` read is atomic on most machines (it's one
+aligned load). A 64-bit value on a 32-bit CPU is *not* — the
+CPU does two 32-bit loads, and another thread can write in
+between. The reader sees high half of the old value, low half
+of the new. This is **word tearing**. The Java spec (JLS 17.7)
+allows non-`volatile` `long`/`double` writes to be split into
+two 32-bit halves for this reason — even though every
+production 64-bit JVM in practice makes them atomic, the spec
+doesn't promise it.
+
+Even on 64-bit machines, a struct of two `int`s read as a
+single value isn't atomic. Reading `Point{x, y}` field-by-field
+can give you `x` from before a writer's update and `y` from
+after. The fix is to atomically swap a pointer to an immutable
+`Point`, or hold a mutex.
+
+## The critical section
+
+A critical section is a region of code that, when executed by
+one thread, must not be interrupted by another thread executing
+the same (or any conflicting) region. The mutex's job is to
+*enforce* this:
+
+```c
+mutex_t m;
+
+void deposit(account *a, int amount) {
+    lock(&m);                  // entry
+    a->balance += amount;      // critical section
+    log_change(a, amount);     // (still inside)
+    unlock(&m);                // exit
+}
+```
+
+Three properties any correct mutual-exclusion scheme has to
+provide (formalized by Dijkstra):
+
+1. **Mutual exclusion**: at most one thread in the section at
+   any time.
+2. **Progress**: if no thread is in the section, one of the
+   waiting threads gets in within bounded time.
+3. **Bounded waiting**: a thread waiting to enter cannot be
+   passed over by other threads infinitely often.
+
+A naïve "set a flag, check the flag" version satisfies #1 but
+fails #2 and #3 under stress. Real mutexes use hardware
+atomics (`cmpxchg`) plus the OS scheduler (futex on Linux) to
+satisfy all three.
+
+## How big should a critical section be?
+
+The most common bug isn't *forgetting* the lock — it's
+**locking too much**:
+
+<Compare
+  badTitle="Holds lock during slow op"
+  goodTitle="Lock only the shared mutation"
+  language="js"
+  bad={`lock.acquire();
+const user = db.getUser(id);            // 50ms network call
+user.lastSeen = Date.now();
+db.saveUser(user);                       // 50ms network call
+cache.set(id, user);
+lock.release();
+// Every other request waits 100ms+ behind this lock.`}
+  good={`const user = db.getUser(id);
+user.lastSeen = Date.now();
+db.saveUser(user);
+// Only the in-memory cache is shared between requests.
+lock.acquire();
+cache.set(id, user);
+lock.release();`}
+  caption="Smaller critical sections = less contention. Don't lock around I/O if you don't have to."
+/>
+
+The other common bug is **locking too little** — releasing the
+lock between two operations that needed to be one atomic unit.
+The right size is "exactly the minimum needed to preserve the
+invariant," which requires knowing what the invariant is.
+
+## Invariants: the unit of atomicity
+
+The reason critical sections matter is *invariants*. An
+invariant is a property the code expects to be true whenever
+no thread is in the middle of changing things. Examples:
+
+- Account: `balance >= 0`.
+- Linked list: every node's `next` either points to another node
+  in the list or is null.
+- Bank transfer: `sum(all accounts) == constant`.
+- Cache: `key in map iff key in lru-list`.
+
+A critical section is the period during which the invariant is
+*temporarily broken* and then restored. The lock is there to
+hide the broken state from other threads.
+
+```c
+lock(&m);
+// invariant temporarily broken:
+from->balance -= amount;       // sum is now off by `amount`
+to->balance += amount;         // restored
+unlock(&m);
+```
+
+If you only locked one of the two updates, another thread would
+see the broken state. The size of the critical section is
+exactly the time during which the invariant is broken — not a
+line more, not a line less.
+
+## Atomicity composition: the trap
+
+A common assumption that's wrong: "if `a()` is atomic and
+`b()` is atomic, then `a(); b();` is atomic." It isn't. Two
+atomic ops are not atomic when sequenced — there's a gap
+between them, and another thread can step into that gap.
+
+```python
+# Both individually thread-safe. The pair is not.
+if not cache.contains(key):     # atomic
+    cache.put(key, compute())   # atomic
+```
+
+This is why `ConcurrentHashMap.putIfAbsent`,
+`Map.computeIfAbsent`, and `INSERT ... ON CONFLICT` exist:
+they fold two operations into one atomic primitive. **Atomicity
+doesn't compose** — every multi-step "atomic" operation needs
+its own atomic primitive (or a lock around the whole thing).
+
+This is also the entire reason for software transactional
+memory (STM) and database transactions: a way to make multiple
+operations atomic *together* without having to bake every
+combination into a primitive.
+
+## Read-modify-write atomics
+
+The CPU provides a handful of "all-in-one" instructions that
+do load, modify, and store as a single atomic unit. The
+classics:
+
+- **`fetch-and-add`**: atomically add and return the old value.
+  Used for counters, sequence numbers.
+- **`compare-and-swap (CAS)`**: store new value only if current
+  value matches expected. Used for lock-free data structures.
+- **`load-linked / store-conditional (LL/SC)`**: ARM/RISC-V
+  alternative; load tags a cache line, store fails if the line
+  was touched. Synthesizes CAS and more.
+
+These are the building blocks of every higher-level concurrency
+primitive. Mutex acquire is a CAS on a futex word. A lock-free
+queue is a CAS loop on the tail. Even reference counting in
+shared smart pointers uses fetch-and-add.
+
+## The takeaway
+
+Atomicity is "looks like one operation from outside." A
+critical section is the region of code we *want* to be atomic,
+enforced by a primitive (mutex, atomic instruction, transaction)
+strong enough to do the job. The skill is matching the size of
+the critical section to the invariant — too small and you have
+a race, too big and you've serialized the program.

@@ -1,0 +1,301 @@
+export const level = 'mid';
+
+# Fan-out, fan-in, and pipelines
+
+Three patterns that show up everywhere in concurrent code. They
+are how you decompose "process N independent things" or
+"transform a stream through M stages" into pieces a runtime
+can run in parallel without you hand-rolling thread management.
+Mattson's *Patterns for Parallel Programming* names them; Go's
+pipeline pattern formalizes them; every async ecosystem has
+some flavor.
+
+## Fan-out: one source, many workers
+
+```
+       ┌─→ worker ─┐
+source ─┼─→ worker ─┤─→ results
+       └─→ worker ─┘
+```
+
+A producer hands items to a pool of workers. Each worker takes
+the next item off the shared queue, does its work, emits the
+result. The number of workers is the parallelism knob.
+
+```go
+jobs := make(chan Job, 100)        // shared queue
+results := make(chan Result, 100)
+
+for i := 0; i < numWorkers; i++ {
+    go func() {
+        for j := range jobs {
+            results <- process(j)
+        }
+    }()
+}
+for _, j := range allJobs { jobs <- j }
+close(jobs)
+```
+
+Properties:
+
+- **Load-balancing for free.** Each worker pulls when it's
+  ready; faster workers naturally pick up more items.
+- **Bounded concurrency.** Exactly `numWorkers` items in flight
+  — useful for capping external API calls, DB connections,
+  or CPU cores.
+- **Backpressure via channel capacity.** If the jobs channel
+  is full, the producer blocks; if it's drained, workers
+  block.
+
+The number of workers is the design choice. For CPU-bound
+work, `numCores`. For I/O-bound work, much higher (hundreds or
+thousands, gated by what the downstream service tolerates).
+
+## Fan-in: many sources, one sink
+
+```
+worker ─┐
+worker ─┼─→ merge ─→ consumer
+worker ─┘
+```
+
+The mirror image. Each worker has its own output; one collector
+merges them.
+
+```go
+func fanIn(channels ...<-chan int) <-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+    for _, c := range channels {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for v := range c { out <- v }
+        }(c)
+    }
+    go func() { wg.Wait(); close(out) }()    // close when all inputs done
+    return out
+}
+```
+
+A common combination is **fan-out followed by fan-in** — the
+canonical "process N items in parallel, collect all results"
+pattern:
+
+```js
+// JS equivalent: Promise.all is fan-out + fan-in
+const results = await Promise.all(items.map(processOne));
+```
+
+`Promise.all` *is* fan-out (kicks off all promises) + fan-in
+(awaits all of them). It's the idiomatic JS way. In a more
+controlled setting you'd use a semaphore to cap concurrency.
+
+## The semaphore-bounded fan-out
+
+`Promise.all` of 10K items will try to do 10K things at once
+— often catastrophic (overwhelm the remote service, exhaust
+sockets, OOM). Add a semaphore:
+
+```js
+async function fanOutBounded(items, n, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+```
+
+Now exactly `n` items in flight at once, like the Go worker
+pool. Libraries like `p-limit`, `bluebird.map({ concurrency })`,
+or `Promise.allSettled` with chunking implement this.
+
+## Pipelines: stages in sequence
+
+```
+source → stage1 → stage2 → stage3 → sink
+        (concurrent with each other)
+```
+
+Each stage is a goroutine/task that reads from its input channel,
+transforms, writes to its output channel. Stages run
+concurrently — `stage1` produces while `stage2` consumes and
+`stage3` consumes what `stage2` produces.
+
+```go
+func gen(items []int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for _, n := range items { out <- n }
+    }()
+    return out
+}
+
+func sq(in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in { out <- n * n }
+    }()
+    return out
+}
+
+// Compose:
+for v := range sq(sq(gen(nums))) {
+    fmt.Println(v)
+}
+```
+
+Each stage is concurrent with its neighbors but serialized
+internally. The pipeline as a whole runs at the speed of the
+slowest stage. Backpressure flows upstream: if `sink` is slow,
+`stage3` blocks on send, `stage2` blocks, etc.
+
+This composes with fan-out. Slow stage? Replace it with N
+copies and a load balancer in front:
+
+```
+              ┌→ stage2 ─┐
+stage1 ─→ ───┤→ stage2 ──┼→ ─── stage3
+              └→ stage2 ─┘
+```
+
+Now stage2 runs in parallel; stage1 and stage3 stay
+single-threaded. This is the **work-stealing pipeline** that
+Linkerd, Envoy, and most modern data processors use.
+
+## Map-reduce: the most famous fan-out / fan-in
+
+Google's MapReduce paper (2004) made the pattern industry-wide:
+
+1. **Map** stage: fan-out, apply a function to each input,
+   emit (key, value) pairs.
+2. **Shuffle**: group by key.
+3. **Reduce** stage: fan-in for each key, combine values.
+
+In-process map-reduce is just bounded fan-out + a merging
+fan-in. Distributed map-reduce adds network and partitioning.
+The concurrency primitive is the same.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+with ProcessPoolExecutor() as pool:
+    mapped = pool.map(transform, items)     # fan-out
+    result = reduce(combine, mapped, init)  # fan-in
+```
+
+`reduce` accumulates serially; if the reduction is associative
+and commutative, you can also fan-out the reduction (parallel
+reduce — used by Spark, Beam, Java parallel streams).
+
+## When the pipeline shouldn't be a pipeline
+
+Pipelines are great when each stage is independently slow
+enough that overlapping them matters. They're overkill when:
+
+- **Stages are too cheap.** If each stage is a few hundred
+  nanoseconds, the channel sends and goroutine scheduling
+  dominate. A simple loop with inline functions is faster.
+- **Stages aren't independent.** If `stage2` needs context
+  from `stage1` that's not in the value, you're forcing
+  shared state. Inline the logic.
+- **One stage dominates the latency.** If `stage2` is 100×
+  slower than the others, you might as well just parallelize
+  stage2 directly and skip the pipeline framing.
+
+The right granularity is "each stage does enough work that the
+overhead of crossing channels is negligible." A microsecond
+per item is usually the floor.
+
+## Pipeline shutdown: harder than it looks
+
+The clean shutdown sequence:
+
+1. Close the source channel.
+2. Each stage exits its `range` loop when its input closes.
+3. Each stage closes *its* output when it exits.
+4. The sink's loop exits when its input closes.
+
+This works if every stage owns its output channel (closes it
+when done). It breaks if a stage panics — the close never
+happens, and downstream stages block forever waiting for a
+value or for the channel to close.
+
+The robust shape:
+
+```go
+func stage(in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)            // always close, even on panic
+        for n := range in {
+            out <- compute(n)
+        }
+    }()
+    return out
+}
+```
+
+For cancellation, add a `select` with `ctx.Done()`:
+
+```go
+for {
+    select {
+    case n, ok := <-in:
+        if !ok { return }
+        select {
+        case out <- compute(n):
+        case <-ctx.Done(): return
+        }
+    case <-ctx.Done(): return
+    }
+}
+```
+
+Verbose but correct. Helpers like `errgroup` (Go) or `aiostream`
+(Python) absorb the boilerplate.
+
+## A complete real-world example
+
+A scraper: read 10K URLs from a file, fetch each, parse, save
+to DB.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+defer cancel()
+
+urls := readURLs("urls.txt")              // <-chan string
+fetched := fanOut(ctx, urls, 50, fetch)   // 50 concurrent HTTP
+parsed  := fanOut(ctx, fetched, 8, parse) // 8 CPU-bound parsers
+errs    := saveBatch(ctx, parsed, db, 100)// batch writes
+for err := range errs { log(err) }
+```
+
+Three stages, each with their own concurrency level matching
+the bottleneck:
+
+- Fetch: I/O-bound, 50 concurrent (limited by remote service).
+- Parse: CPU-bound, 8 concurrent (limited by cores).
+- Save: I/O-bound, batched into 100-row inserts (limited by DB
+  throughput).
+
+This is the canonical shape for ETL, scraping, log processing,
+and most "do many of the same thing" workloads.
+
+## The takeaway
+
+Fan-out spreads work across N workers; fan-in merges N streams
+into one. Pipelines chain stages that run concurrently, with
+backpressure flowing upstream. The combination handles 95% of
+real-world concurrent-data workloads. Match the worker count
+to the bottleneck (CPU for compute, downstream throughput for
+I/O), close channels in order on shutdown, and pass cancellation
+through every stage.

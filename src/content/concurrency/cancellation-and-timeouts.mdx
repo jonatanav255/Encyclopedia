@@ -1,0 +1,281 @@
+export const level = 'mid';
+
+# Cancellation and timeouts
+
+A concurrent task you can't cancel is a liability. If a request
+times out at the edge but the work inside keeps running, you've
+got resource leaks, wasted compute, and stale state. Building
+cancellation in correctly is one of the things that distinguishes
+production-grade async code from prototype-grade.
+
+The problem is that cancellation is **inherently cooperative**.
+You can't safely yank a thread or task in the middle of an
+operation — it might be holding locks, midway through a
+transaction, or mid-write to a file. The task has to *check*
+for cancellation at safe points and stop voluntarily.
+
+## The five primitives
+
+Each ecosystem solved cancellation slightly differently:
+
+<Cheatsheet
+  columns={["Ecosystem", "Primitive", "Mechanism"]}
+  rows={[
+    ["Go", "context.Context", "Pass through every call; check ctx.Done()"],
+    ["JS/Node", "AbortController + AbortSignal", "Pass signal into APIs; fires 'abort' event"],
+    ["Python asyncio", "Task.cancel() + CancelledError", "Cancellation injected as exception at next await"],
+    ["C#", "CancellationToken", "Pass into every async API; throws OperationCanceledException"],
+    ["Rust/Tokio", "Drop the future, or tokio::select! with cancellation branch", "Future is dropped if not polled; select races against signal"],
+  ]}
+  caption="Same pattern, five different names. All are cooperative."
+/>
+
+The mechanism doesn't matter; the discipline does.
+
+## The shape of cooperative cancellation
+
+In every language:
+
+1. **Caller signals "stop"** — `cancel()`, `ctx.Cancel()`,
+   `controller.abort()`.
+2. **Callee checks the signal** at safe points — usually at
+   each `await`/`select`/loop iteration.
+3. **On detection, callee cleans up** and returns/raises.
+
+```go
+// Go
+func work(ctx context.Context) error {
+    for _, item := range items {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()        // cancellation propagates as error
+        default:
+        }
+        if err := process(item); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+```python
+# Python: cancellation arrives as an exception at await
+async def work():
+    for item in items:
+        try:
+            await process(item)
+        except asyncio.CancelledError:
+            await cleanup()
+            raise                    # re-raise so parent knows
+```
+
+```js
+// JS: respect the signal
+async function work(items, signal) {
+  for (const item of items) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    await process(item, signal);
+  }
+}
+```
+
+## Timeout = cancellation with a deadline
+
+Every timeout, in every language, is just "create a cancel
+signal that fires automatically after N ms":
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+result, err := work(ctx)
+```
+
+```js
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5000);
+const result = await work(controller.signal);
+```
+
+```python
+async with asyncio.timeout(5):
+    result = await work()
+```
+
+The library glue varies; the semantics are identical:
+*timeout = signal cancellation after N ms*. This is also why
+**every cancellable function is a timeout-capable function** —
+once your API takes a cancellation token, the caller can add a
+deadline at will.
+
+## Propagation: where most bugs hide
+
+A cancellation that doesn't propagate down isn't useful. If
+`handler(ctx)` calls `query(db)` without passing `ctx`, then
+canceling the handler does nothing to the in-flight query.
+
+<Compare
+  badTitle="Cancellation stops at the boundary"
+  goodTitle="Cancellation propagates through"
+  language="go"
+  bad={`func handler(ctx context.Context, req Req) (Res, error) {
+    user, err := db.GetUser(req.ID)         // ignores ctx
+    if err != nil { return Res{}, err }
+    return process(ctx, user)
+}`}
+  good={`func handler(ctx context.Context, req Req) (Res, error) {
+    user, err := db.GetUser(ctx, req.ID)    // ctx through
+    if err != nil { return Res{}, err }
+    return process(ctx, user)
+}`}
+  caption="Every async/IO call must take the context. Forgetting one breaks the chain."
+/>
+
+Same in JS: every API that accepts a signal should be passed
+the signal. The signal-passing should be uniform; the moment
+you have *one* call that doesn't, the cancel guarantee breaks.
+
+## What to do when cancelled
+
+Three reasonable strategies depending on what the task was
+doing:
+
+<Steps>
+<Step n="1" title="Just stop">
+
+Most common. If the task was midway through computation, just
+return. No state to clean up — the caller wrapped the work in
+something that handles the partial result.
+
+```go
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case result := <-ch:
+    return result, nil
+}
+```
+
+</Step>
+<Step n="2" title="Roll back partial state">
+
+If the task was midway through a multi-step external operation
+(DB transaction, partial file write), it needs to clean up
+before propagating. The cleanup itself often shouldn't be
+cancellable — otherwise you may abort the rollback mid-way.
+
+```python
+try:
+    async with tx():
+        await step1()
+        await step2()       # cancellation here triggers tx rollback
+        await step3()
+except asyncio.CancelledError:
+    # tx already rolled back via context manager
+    raise
+```
+
+</Step>
+<Step n="3" title="Finish what you started, ignore the cancel">
+
+Rare but valid: a critical operation that's "atomic enough"
+that completing is safer than aborting. Issuing a refund, say.
+Use `shield` (Python), `Context.WithoutCancel` (Go 1.21+), or
+a no-op signal to ignore cancellation for that block.
+
+</Step>
+</Steps>
+
+## The "must-not-cancel" cleanup problem
+
+Cleanup code that itself does async I/O is awkward:
+
+```python
+async def run():
+    try:
+        await main_work()
+    except asyncio.CancelledError:
+        await save_state()      # if cancel arrives during save_state, bad
+        raise
+```
+
+If a second cancel arrives while `save_state` is running, it
+gets cancelled too — possibly leaving partial state. The
+defensive shape is to **shield the cleanup**:
+
+```python
+await asyncio.shield(save_state())
+```
+
+`shield` makes the inner await uncancellable. The outer
+function still observes the cancel; the cleanup completes
+anyway.
+
+## Cancellation in CPU-bound code
+
+The biggest gap in every cancellation system: it only works at
+suspension points. A tight loop doing CPU work won't hit
+`await` or `ctx.Done()` unless you put a check in:
+
+```python
+async def cpu_bound(items):
+    for i, item in enumerate(items):
+        if i % 1000 == 0:
+            await asyncio.sleep(0)      # yield + cancel-check point
+        compute(item)
+```
+
+`asyncio.sleep(0)` is the idiomatic way to insert a yield
+point. Without it, your cooperative cancellation has nowhere
+to land for the duration of the loop. Same idea in Kotlin
+(`yield()`), Go (`runtime.Gosched()`), Rust (`tokio::task::yield_now()`).
+
+This is also why long synchronous library calls block all
+async cancellation — if `query(big_select)` is a blocking
+call, your async cancel has to wait for it to return.
+
+## Timeout vs deadline: a useful distinction
+
+A **timeout** is "max N more milliseconds." A **deadline** is
+"end of work by absolute time T." Most APIs let you choose:
+
+```go
+ctx, _ := context.WithTimeout(parent, 5*time.Second)
+ctx, _ := context.WithDeadline(parent, time.Now().Add(5*time.Second))
+```
+
+The difference matters when you propagate down a call chain.
+Suppose the request has 200ms total budget and it's already
+spent 150ms. A nested `WithTimeout(50ms)` is correct because
+it's "50ms from now." A nested `WithTimeout(200ms)` would
+extend the budget — usually wrong. Pass the parent context
+down and it carries the *deadline* — the child can't
+accidentally extend.
+
+## Common gotchas
+
+- **Race between cancel and completion.** The task may
+  complete normally just as cancellation fires. Both paths
+  should leave the system in a sane state.
+- **Cancellation arriving during cleanup.** Use `shield` /
+  `WithoutCancel` / similar to protect critical cleanup.
+- **Storing the cancel handle and forgetting to call it.**
+  Go's `cancel()` returned by `WithTimeout` *must* be called
+  (or deferred) — not doing so leaks the timer.
+- **Catching `CancelledError` and not re-raising it.** Python
+  cancellation works by exception propagation; eating the
+  exception means the parent never knows you were canceled.
+- **Signal-not-propagated-to-nested-fetches.** Pass the
+  AbortSignal/Context everywhere. Audit your wrappers.
+
+## The takeaway
+
+Cancellation is cooperative everywhere; the task has to ask
+"am I cancelled?" at safe points. Timeouts are cancellation
+with a deadline. The discipline is consistent passing of the
+cancel signal through every async/IO call, and explicit
+cleanup on detection. Done well, cancellation makes the whole
+system *responsive*: a timeout at the edge unwinds work
+through the layers, freeing resources and giving control back
+to the caller. Done badly, you ship leaky systems where work
+keeps running long after anyone wanted it.

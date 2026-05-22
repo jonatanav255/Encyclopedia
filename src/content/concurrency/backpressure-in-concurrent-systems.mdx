@@ -1,0 +1,242 @@
+export const level = 'mid';
+
+# Backpressure in concurrent systems
+
+Backpressure is what happens (or should happen) when a producer
+generates work faster than a consumer can process it. Without
+backpressure the queue between them grows without bound — RAM
+fills, GC thrashes, latency spikes, the process dies. With
+backpressure, the producer is *told* to slow down: blocked on a
+full buffer, throttled by a rate limiter, dropped at the edge.
+
+This page is the concurrency-paradigm view. There's a sister
+page in **system-design** that covers backpressure at the
+service-mesh level; this one is about how the primitive shows
+up inside a single process.
+
+## The four responses to overflow
+
+When the consumer can't keep up, the system has to do *one* of
+these. The choice is a design decision, not a bug:
+
+<Cheatsheet
+  columns={["Strategy", "What it does", "When it fits", "Failure mode"]}
+  rows={[
+    ["Block", "Sender waits until consumer drains", "Sender can wait; pipeline-style", "Cascade slows; deadlock risk if cyclic"],
+    ["Drop", "Excess items are discarded", "Sampling, telemetry, real-time UI", "Data loss; usually OK if measured"],
+    ["Buffer", "Excess items queue up", "Bursty input, steady consumer", "Unbounded → OOM; bounded → still falls to a strategy"],
+    ["Reject", "Sender gets an error/fail-fast", "External APIs, RPCs", "Caller must handle; preserves SLOs"],
+  ]}
+  caption="Pick one explicitly. 'Unbounded buffer' is not a strategy; it's deferring the decision."
+/>
+
+The mistake everyone makes once: trying to "be nice" by using
+an unbounded queue. Under sustained overload it just delays the
+crash and makes the failure worse (a 10GB queue full of stale
+work nobody wants).
+
+## How channels do backpressure
+
+Unbuffered channels are the cleanest case: the sender blocks
+until the receiver receives. The send-receive pair *is*
+backpressure. A fast producer naturally slows to the consumer's
+rate.
+
+```go
+ch := make(chan Job)        // unbuffered
+go func() {
+    for _, j := range jobs {
+        ch <- j             // blocks if consumer not ready
+    }
+    close(ch)
+}()
+for j := range ch {
+    process(j)              // back-presses upstream
+}
+```
+
+Buffered channels add an "absorb spikes" stage. With buffer 100,
+the producer can be ahead by up to 100 items before it blocks.
+The buffer is a knob: small = tight coupling; large = burst
+tolerance with risk of stale work.
+
+The closed-channel signal is the bottom of the pipe: receivers
+know "no more is coming" and finish up. This makes pipelines
+shutdown-clean by default.
+
+## How async runtimes do backpressure
+
+Asynchronous iterators (`async generator`, `Stream`, RxJS) are
+the modern face of backpressure. The classic Reactive Streams
+spec (Netflix/Akka/Lightbend) defined it as:
+
+> The consumer signals "give me N more items" to the producer.
+> The producer never sends more than what's been requested.
+
+```java
+// Reactive Streams Subscriber.request(n)
+subscription.request(10);   // I can handle 10 more
+// producer emits up to 10
+// when buffer drains:
+subscription.request(10);
+```
+
+This is **pull-based backpressure** — the consumer drives the
+rate. JS async iterators got this almost for free:
+
+```js
+async function* lines(stream) {
+  for await (const chunk of stream) {
+    yield chunk.toString();
+  }
+}
+for await (const line of lines(file)) {
+  await process(line);     // each await is a "give me one more" pull
+}
+```
+
+Each `await process` is implicitly "I've consumed this; produce
+the next." If `process` is slow, lines aren't pulled. If the
+underlying stream is `pause`/`resume`-capable (Node streams,
+TCP sockets), it pauses its source. Backpressure chained all
+the way to the kernel socket buffer.
+
+## Node streams: highWaterMark
+
+Node's stream library makes backpressure tactical:
+
+```js
+const readable = fs.createReadStream(in);
+const writable = fs.createWriteStream(out);
+readable.pipe(writable);
+```
+
+Each stream has a `highWaterMark` (default 16KB for binary,
+16 objects for objectMode). When `writable.write()` returns
+`false`, that means "buffer is at or above highWaterMark — slow
+down." `pipe` automatically pauses the readable when this
+happens.
+
+If you bypass `pipe` and call `write` in a loop, you bypass
+backpressure:
+
+<Compare
+  badTitle="Floods the writable"
+  goodTitle="Respects backpressure"
+  language="js"
+  bad={`for (const chunk of source) {
+  writable.write(chunk);     // ignores return value
+}
+// memory blows up if writable is slow`}
+  good={`for (const chunk of source) {
+  if (!writable.write(chunk)) {
+    await once(writable, 'drain');   // wait for buffer to drain
+  }
+}
+// stays bounded`}
+  caption="The whole point of stream backpressure is the return value of write()."
+/>
+
+## Bounded queues
+
+If the producer and consumer are in the same process but you
+*don't* want them tightly coupled, a bounded queue is the
+right primitive. Choose:
+
+- **Block on full** (`SynchronousQueue`, `ArrayBlockingQueue`):
+  classic backpressure.
+- **Drop oldest** (`Disruptor`-style with overwrite, or
+  `DropOldest` channel buffer in Kotlin): keep the newest
+  items, drop stale ones.
+- **Drop newest** (sentry/sampling logs do this): keep what's
+  in flight, drop incoming.
+- **Reject on full**: producer gets an error to handle.
+
+Choosing depends on what the data is. Telemetry events that
+get averaged anyway? Drop oldest. User commands that must
+execute? Block. Logs in a high-fanout system? Drop newest with
+a metrics counter.
+
+## The producer-side primitive
+
+If you control the producer, you can also rate-limit at the
+source. Token buckets, leaky buckets, fixed-rate scheduling.
+Each language has libraries:
+
+```python
+import asyncio
+sem = asyncio.Semaphore(10)
+
+async def task(item):
+    async with sem:           # at most 10 concurrent in-flight
+        await process(item)
+
+await asyncio.gather(*(task(i) for i in items))
+```
+
+A semaphore limits concurrency. It's not backpressure exactly —
+it's "throttling at the source." Combined with a downstream
+backpressured channel, you get both.
+
+## Cascading backpressure
+
+The real win is **end-to-end backpressure** — pressure at the
+slow consumer propagates all the way back to the original
+producer. In a pipeline:
+
+```
+TCP socket → buffer → JSON parse → process → DB write → TCP ack
+```
+
+If the DB is slow, the writer's queue fills, which makes the
+processor's output channel block, which makes the parser's
+output block, which makes the parser stop reading the buffer,
+which fills, which makes the TCP socket stop draining, which
+makes the OS stop ACKing, which makes the *sender on the other
+machine* slow down. The whole pipeline self-regulates.
+
+This is the magic of Reactive Streams done right. It's also why
+debug logging is dangerous: a `console.log` in the hot path
+can become the bottleneck and silently introduce backpressure
+that shows up as input latency.
+
+## When backpressure isn't enough
+
+Some workloads can't tolerate "slow down." If you're consuming
+a real-time feed (market data, telemetry) and the consumer
+falls behind, slowing the producer isn't an option — you'd
+lose data anyway. The right answer is **drop with awareness**:
+
+- Sample (keep 1 of every N).
+- Coalesce (combine adjacent events).
+- Drop with a counter (so monitoring can show "we lost N
+  events this minute").
+
+A silent drop is the worst possible outcome. Always emit
+metrics for the drops; alert when they exceed a threshold.
+
+## Common bugs
+
+- **Unbounded buffer that "should never fill."** It will.
+  Always cap.
+- **Async write returning a promise that's never awaited.**
+  Each call enqueues another producer; nothing throttles.
+- **Promise.all on too many concurrent ops.** No semaphore
+  means you spawn 100K simultaneously and bring the system
+  down.
+- **`while (true) { producer.send(...) }` without
+  yielding/back-checking.** Tight loops bypass any
+  backpressure mechanism.
+- **Sender holding a lock while waiting for the consumer.**
+  Now you've combined backpressure with deadlock risk.
+
+## The takeaway
+
+Backpressure is the language that flow-controlled concurrent
+systems speak. The producer must learn from the consumer how
+fast to go. Channels and async iterators give you it for free
+when used correctly. Bounded queues let you tune the
+absorb-vs-block trade. Without backpressure, every system is
+one slow consumer away from OOM — usually at the worst time.
+Pick a strategy explicitly, instrument the drops, and propagate
+the signal all the way upstream.

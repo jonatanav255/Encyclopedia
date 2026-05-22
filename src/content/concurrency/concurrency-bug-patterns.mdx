@@ -1,0 +1,333 @@
+export const level = 'staff';
+
+# Concurrency bug patterns
+
+Concurrency bugs are usually treated as one undifferentiated
+mess — "races." A more useful framing comes from Shan Lu et al.'s
+2008 paper *Learning from Mistakes — A Comprehensive Study on
+Real World Concurrency Bug Characteristics*. They studied 105
+randomly selected concurrency bugs from MySQL, Apache, Mozilla,
+and OpenOffice. The taxonomy they found is the one most senior
+people use mentally without knowing the citation.
+
+This page is the taxonomy and what each kind teaches.
+
+## The Lu taxonomy
+
+<Cheatsheet
+  columns={["Class", "Definition", "Share of bugs", "Typical fix"]}
+  rows={[
+    ["Atomicity violation", "An operation that 'should be atomic' interleaves with another", "~65%", "Wrap in mutex; use atomic primitive"],
+    ["Order violation", "A required happens-before is missing", "~25%", "Add explicit synchronization (signal, await, barrier)"],
+    ["Deadlock", "Circular wait on locks", "~6%", "Lock ordering, tryLock with backoff"],
+    ["Other (livelock, starvation, leaks)", "Doesn't fit the three", "~4%", "Backoff, fairness, scoped lifetimes"],
+  ]}
+  caption="Real-world concurrency bugs, by category. Atomicity dominates; deadlock is rare."
+/>
+
+Three big lessons from the data:
+
+1. **Atomicity violations dominate (~65%).** Most concurrency
+   bugs are "we forgot to make this multi-step thing atomic"
+   — read-modify-write without a lock, check-then-act without
+   a single atomic primitive.
+2. **Deadlocks are rare (~6%).** Despite getting the most
+   textbook attention, deadlocks are a small share of real
+   bugs.
+3. **Most bugs involve just two threads.** ~96% of the bugs in
+   the study were caused by interactions of two threads. Bugs
+   that need 3+ threads to manifest are unusual.
+
+The implication: focus your concurrency QA on atomicity
+violations and missing ordering. Deadlock-prevention rituals
+matter, but they catch a minority of real bugs.
+
+## Atomicity violations
+
+A code region the developer treated as atomic, but isn't.
+Three sub-patterns:
+
+### Single-variable atomicity violation
+
+```java
+// Counter
+class Counter {
+    int n = 0;
+    void inc() { n++; }     // not atomic
+}
+```
+
+The lost-update bug. Two `inc()` calls can both read 0 and
+both write 1. Fix: `AtomicInteger`, `synchronized`, or a
+mutex.
+
+### Multi-variable atomicity violation (the invariant bug)
+
+```python
+# Account state
+def deposit(amt):
+    self.balance += amt
+    self.log.append(("deposit", amt))      # not in same crit section
+```
+
+Two related fields. Another thread may see the balance
+updated but the log entry not yet recorded. The two writes are
+each individually atomic; the *pair* should be too. Fix:
+mutex around both, or use a structure that updates them
+together atomically.
+
+### Check-then-act
+
+```js
+if (!cache.has(key)) {       // check
+    cache.set(key, compute(key));      // act
+}
+```
+
+Between the check and the act, another thread can do the
+same thing. Both compute and one's result is overwritten.
+The trickier case is where `compute` has side effects (sends
+an email, writes a row); now you've duplicated the effect.
+Fix: use an atomic compound operation
+(`computeIfAbsent`/`putIfAbsent`/`INSERT … ON CONFLICT`).
+
+## Order violations
+
+The developer assumed an ordering between two events from
+different threads that the runtime doesn't actually guarantee.
+
+### Initialization order
+
+```js
+// Thread A:                 Thread B:
+let cache = null;             function get() {
+function init() {               return cache.get(...);     // crashes if not init
+  cache = new LRU();          }
+}
+```
+
+A reader runs before the writer initialized. Fix: have the
+reader wait on a "ready" signal, or initialize before
+spawning the consumer.
+
+### Publication ordering (the classic memory-model bug)
+
+```c
+// Producer:                  Consumer:
+data = build();               if (ready) use(data);
+ready = 1;                    // ⚠ may see ready=1 with stale data
+```
+
+No happens-before edge between the producer's `data = ` and
+the consumer's `use(data)`. Even when `ready` is observed as
+1, `data`'s contents may be stale. Fix: `volatile`, atomic
+release/acquire, mutex, or initialize-once primitives.
+
+### Signal ordering
+
+```python
+# Worker:
+work()
+result_ready.set()    # event
+
+# Main:
+result_ready.wait()
+read_result()
+```
+
+The order works *if* the worker really sets the event after
+storing the result. If the order is reversed (set first, then
+store), the reader sees nothing or partial data. Fix: have
+the producer store the result *before* the signal; have the
+consumer trust the signal's happens-before semantics.
+
+## Deadlock patterns
+
+Despite their textbook fame, deadlocks are a minority. But
+when they show up, they're nasty. Three patterns:
+
+### Inconsistent lock order
+
+```python
+# Two transfers from different threads
+T1: lock A; lock B; ...      # A → B
+T2: lock B; lock A; ...      # B → A
+```
+
+The Dining Philosophers in disguise. Fix: globally consistent
+ordering by lock identity (address, ID, name).
+
+### Self-deadlock on non-recursive mutex
+
+```python
+def outer():
+    lock(); inner(); unlock()
+
+def inner():
+    lock(); ... ; unlock()   # blocks forever on same thread
+```
+
+Fix: either refactor (split into "external" methods that lock
+and "internal" methods that assume the lock is held) or use a
+recursive mutex (with caution).
+
+### Lock held during callback
+
+```python
+lock()
+listeners.notify(event)        # listener tries to re-acquire something
+unlock()
+```
+
+If `notify` ends up trying to acquire another lock that
+indirectly needs *this* lock, deadlock. Fix: release the lock
+before calling out to user code, or use copy-and-iterate
+patterns.
+
+## Order violations vs atomicity: a subtle distinction
+
+The line isn't always sharp. Consider:
+
+```python
+# Init thread:
+if not config:
+    config = load_config()    # race here
+
+# Worker:
+config.lookup("key")
+```
+
+Is this atomicity (the `if not config; config = load_config()`
+should be one atomic op) or ordering (the init must complete
+before workers use config)? It's both, depending on the lens.
+The Lu paper uses workload patterns to decide; pragmatically,
+the *fix* tells you: if you wrap it in a mutex, you treated
+it as atomicity; if you make workers wait for an init signal,
+you treated it as ordering.
+
+## Beyond the Lu taxonomy: distribution-era patterns
+
+Newer work (Leesatapornwongsa et al. 2016, "Taxdc") extends
+the taxonomy to distributed systems. The two big additions:
+
+### Distributed deadlock
+
+Two services each hold a resource the other needs. Both wait
+indefinitely. Fix: timeouts, distributed lock manager with
+deadlock detection (Spanner-style), or saga-style compensation
+instead of locking.
+
+### Update conflict and the lost-update across services
+
+Service A reads a value at time t; service B writes the value
+at time t+1; service A writes its update at t+2 — clobbering
+B. The single-service analog of in-process lost-update, scaled
+across the network. Fix: optimistic locking (version numbers,
+ETags, `If-Match` headers), CAS at the DB level, or coordinator-
+based serialization.
+
+## Async-era patterns
+
+The shift to async added a few that pre-date the Lu paper.
+None map cleanly to "atomicity vs ordering" because async
+isn't classical threading:
+
+### Forgotten `await`
+
+```js
+async function transfer() {
+    debit(from);          // returns promise; not awaited
+    credit(to);
+}
+```
+
+Two operations that should be sequential are now in flight
+concurrently. The function returns before they finish. ESLint
+rules catch most of these; TypeScript's `--strict` helps.
+
+### Lost cancellation
+
+```python
+async def handler():
+    task = asyncio.create_task(slow_work())
+    # forgot to cancel task on timeout
+    await asyncio.wait_for(task, timeout=5)   # cancels OK
+```
+
+Vs:
+
+```python
+async def handler():
+    task = asyncio.create_task(slow_work())
+    # ... handler returns ...
+    # task keeps running forever
+```
+
+Fix: structured concurrency. TaskGroup ensures the parent's
+scope owns the child's lifetime.
+
+### Promise.all without bounded concurrency
+
+```js
+await Promise.all(urls.map(fetch));     // 10K parallel requests
+```
+
+No bug per se — just resource exhaustion. Fix: bounded
+concurrency via semaphore.
+
+## Why tools help
+
+Concurrency bugs are notoriously hard to find by testing.
+They show up under specific interleavings; even high-volume
+tests miss them. The tools that move the needle:
+
+- **Static type-level enforcement.** Rust's `Send`/`Sync`
+  catches at compile time. The bugs that Rust forbids are
+  bugs that ship in other languages.
+- **Race detectors.** Go's `-race`, Java's
+  ThreadSanitizer/RaceDetector, Helgrind in Valgrind. They
+  catch ~80% of races by instrumenting all memory accesses
+  and checking happens-before.
+- **Model checkers.** SPIN/Promela, TLA+. Used for the algorithm
+  level; finds bugs that the implementation reproduces.
+- **Stress tests with interleavings.** Jepsen for distributed
+  systems; PCT (Microsoft) for in-process. Force unlikely
+  interleavings.
+- **Random schedule fuzzing.** Loom (Rust), CHESS (Microsoft
+  Research), rr's deterministic record/replay.
+
+The big-picture rule: **the bugs that survive review and
+testing are the ones the runtime allowed but the developer
+didn't think of.** Tools that exhaustively explore the
+runtime's options catch what the developer didn't.
+
+## How this changes code review
+
+Reviewing concurrent code with this taxonomy in mind:
+
+1. **Find shared state.** Any field/global accessed by more
+   than one thread.
+2. **For each access, ask "what invariant?"** What's true
+   when no thread is in the middle of changing things? Is the
+   critical section big enough to cover the *whole* invariant?
+3. **For each pair of dependent ops, check the happens-before
+   chain.** Is there an explicit synchronization point
+   between them? Or does it "happen to work in our tests"?
+4. **For each multi-step pattern, look for the atomic
+   compound operation.** Replace `if !contains; put` with
+   `putIfAbsent`.
+5. **For each lock, sketch the global ordering.** If a deadlock
+   diagram is possible (two locks acquired in different
+   orders), it will happen.
+
+## The takeaway
+
+Concurrency bugs aren't homogeneous: ~65% are atomicity
+violations (forgot to make this atomic), ~25% are order
+violations (missing happens-before), ~6% are deadlocks. The
+Lu taxonomy is the practical model; the modern additions
+(async, distributed) extend it without invalidating it. Find
+the bugs by enumerating shared state, identifying invariants,
+checking ordering edges, and using tools that exhaustively
+explore the runtime's options. Reviewing concurrent code
+without this checklist is just guessing.

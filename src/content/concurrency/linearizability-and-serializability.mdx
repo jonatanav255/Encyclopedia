@@ -1,0 +1,233 @@
+export const level = 'staff';
+
+# Linearizability and serializability
+
+If a database row counter is bumped by two transactions
+concurrently, does the final value have to be exactly 2 more
+than the start? What if a queue's `enqueue` and `dequeue` are
+called from many threads — what does "behaves like a queue"
+actually mean under concurrency? These questions are the domain
+of **consistency models**, and the two most important ones are
+**linearizability** and **serializability**. They sound alike,
+they're often confused, and the difference matters when you
+design or pick a concurrent system.
+
+## The pop quiz
+
+Both are *correctness conditions* for concurrent operations.
+Both promise some form of "behaves as if operations happened in
+some serial order." The difference is whether real-time
+ordering is preserved.
+
+<Cheatsheet
+  columns={["", "Linearizability", "Serializability"]}
+  rows={[
+    ["Originated", "Herlihy & Wing, 1990", "Bernstein/Eswaran et al., 1976"],
+    ["Domain", "Concurrent objects / data structures", "Transactions over multiple objects"],
+    ["Unit", "Single operation", "Transaction (multiple ops)"],
+    ["Real-time order preserved?", "Yes — if A completed before B started, A is before B", "No — any equivalent serial order is fine"],
+    ["Composability", "Composes — sub-objects' linearizability gives whole-system linearizability", "Doesn't compose across objects"],
+    ["Typical home", "Concurrent data structures, distributed K/V stores, CAS registers", "Database transaction isolation"],
+  ]}
+  caption="Both say 'looks serial,' but only linearizability insists on the wall-clock order."
+/>
+
+## Linearizability: the strong one
+
+A concurrent execution is **linearizable** if you can pick, for
+each operation, a single instant within its duration (the
+**linearization point**) such that all operations, ordered by
+linearization point, form a valid sequential history of the
+object.
+
+In other words: each operation *appears to take effect
+instantaneously* at some point between its invocation and its
+response. And the global ordering of those linearization points
+respects wall-clock — if op A completed before op B started,
+A's linearization point is before B's.
+
+### A concrete picture
+
+```
+T1: ──[ inc ]────────────────
+T2:         ─────[ inc ]─────
+T3:                  ─[ read = ? ]─
+                       (counter started at 0)
+```
+
+For this to be linearizable, T3's read must see either 1
+(only T1 happened first) or 2 (both happened first), depending
+on which of T1's and T2's `inc` was first. It can't see 0
+(both incs strictly preceded the read invocation).
+
+A non-linearizable but still legal-looking execution:
+
+```
+T1: ─[ inc ]──────────
+T2:                  ─[ read = 0 ]─
+```
+
+T1 completed *before* T2's read started — yet T2 sees 0.
+Allowed under weaker models like eventual consistency (DynamoDB
+quorum reads can do this in failure modes); forbidden under
+linearizability.
+
+### Why linearizability matters
+
+The big property: **linearizable objects compose**. If every
+component of your system is linearizable, the whole system can
+be reasoned about as if everything is sequential. This is the
+foundation of why we can build complex systems from
+concurrent-but-correct building blocks.
+
+The cost: linearizability is the strongest model that's
+implementable without a coordinator the whole system trusts.
+Distributed registers usually require consensus (Paxos, Raft)
+for writes. Local lock-free structures pay it in the form of
+memory fences and helping protocols.
+
+## Serializability: the database one
+
+A concurrent execution of *transactions* is **serializable**
+if the resulting state is equivalent to *some* serial
+execution of those transactions. Note three things:
+
+1. **Multi-operation**. A transaction is a sequence of reads
+   and writes; the unit of comparison is the transaction, not
+   the individual op.
+2. **Some** serial order — *any* serial order that produces
+   the same final state counts. T1-then-T2 and T2-then-T1 are
+   both valid as long as one of them matches.
+3. **No real-time constraint**. T1 may have committed long
+   before T2 started, but if the "as-if serial order" is
+   T2-then-T1, that's fine under pure serializability.
+
+### Snapshot isolation vs. serializability
+
+A common source of confusion. **Snapshot isolation** (Postgres
+default, Oracle default) gives each transaction a consistent
+snapshot of the database. Reads don't block writes; writes
+don't block reads. Most operations look serializable.
+
+But snapshot isolation isn't truly serializable. The classic
+violation is **write skew**:
+
+```
+Initial:  on_call = {Alice, Bob}   -- both on call
+
+T1: read on_call; if at least one other person is on call,
+                  set Alice.on_call = false
+T2: read on_call; if at least one other person is on call,
+                  set Bob.on_call = false
+
+Both see {Alice, Bob}, both think the other is still there,
+both step down. Final: nobody on call.
+```
+
+In any serial execution, the second one would have seen one
+person and refused. Snapshot isolation lets both happen
+because their write-sets don't overlap, even though they
+*read* overlapping data.
+
+**Serializable Snapshot Isolation** (SSI, Postgres
+`SERIALIZABLE` mode since 9.1) detects this by tracking
+read-write conflicts and aborting one transaction.
+
+### Where serializability lives
+
+In databases, "serializable" is the gold standard for
+transaction isolation, sitting above (in strength) READ
+COMMITTED, REPEATABLE READ, and SNAPSHOT ISOLATION.
+
+```
+Read uncommitted < Read committed < Repeatable read < Snapshot isolation < Serializable
+```
+
+Most databases default to a weaker level for performance.
+You opt into SERIALIZABLE when correctness demands it.
+Implementing it requires either strict two-phase locking (lots
+of blocking) or SSI (conflict detection with aborts).
+
+## Strict serializability
+
+The combination of both: **serializable AND
+linearizable-in-real-time**. The serial order must respect
+wall-clock — if T1 committed before T2 began, T1 is before T2
+in the equivalent serial order.
+
+This is what Spanner calls "external consistency" and what
+CockroachDB calls "strict serializable." For distributed
+databases this is the strongest practical model; it requires
+either Spanner-style TrueTime (synchronized clocks with bounded
+uncertainty) or careful coordination.
+
+Most "ACID" databases provide serializable but not strictly
+serializable — without external timestamps, the system can't
+prove A really happened before B.
+
+## Why these distinctions matter
+
+The model decides what bugs you have:
+
+- **Eventual consistency** (DynamoDB default, Cassandra
+  default). Reads may see stale data. A user can update their
+  profile, see it update, then see the old version on a refresh.
+  Acceptable for many domains (social media feeds); broken for
+  others (account balance).
+- **Read committed**. No dirty reads, but two reads in the same
+  transaction can see different values. Forget you assumed
+  consistency; expect surprises.
+- **Snapshot isolation**. Internally consistent reads, but
+  write skew exists. Watch for "both transactions read but
+  neither saw the other's write" patterns.
+- **Serializable**. No anomalies within transactions; correct
+  except for real-time order.
+- **Strict serializable**. The strongest practical guarantee.
+  Use when you need to prove "happens-after" externally.
+
+## The CAP-PACELC angle
+
+In distributed systems, linearizability *forces* a CAP
+trade-off. To provide linearizable reads during a network
+partition, you must reject writes — that's CP. Eventual
+consistency keeps writing during partitions — that's AP. You
+can't have both linearizability and availability in the
+presence of network partitions.
+
+Spanner gets close to "CP with rare unavailability" via TrueTime
+and synchronous replication; the trade-off is high latency on
+commits because they wait for the clock uncertainty window.
+DynamoDB gets "AP at any cost"; the trade-off is reads can be
+stale and "last writer wins" can lose data.
+
+## Picking the model for your system
+
+- **Local concurrent data structures**: linearizable by
+  default. The library should give you it.
+- **In-process transactions across data structures**: STM or
+  database-style serializability.
+- **Distributed K/V store with consensus**: linearizable.
+  Pays in latency.
+- **High-throughput distributed store with low latency
+  requirements**: eventual consistency. Pays in stale reads.
+- **Multi-region database with strong correctness**: strict
+  serializable via Spanner-class infrastructure. Pays in cost
+  and operational complexity.
+
+The choice is fundamentally an engineering trade — stronger
+models cost more (latency, availability, dollars). Most
+production systems use **different models for different data**:
+linearizable counters for billing, eventual consistency for
+display caches, serializable transactions for order processing.
+
+## The takeaway
+
+Linearizability is "single-operation atomicity with real-time
+ordering" — the model for concurrent data structures and most
+distributed K/V stores. Serializability is "multi-operation
+transactions that look serial in some order" — the model for
+database transactions, without the real-time guarantee. Strict
+serializability is both, and it's the gold standard for
+distributed systems that need correctness *and* causal ordering.
+Knowing which model you're using is the difference between a
+system that's eventually consistent and one that's correct.

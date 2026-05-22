@@ -1,0 +1,201 @@
+export const level = 'senior';
+
+# Priority inversion
+
+Priority inversion is when a **high-priority task ends up
+waiting on a low-priority task**, which itself can't run because
+*medium-priority tasks* are preempting it. The high-priority
+task's priority effectively gets inverted — it runs at the
+priority of the lowest-priority lock holder. It is one of the
+classic concurrency bugs and the cause of one of the most
+famous bugs in spacecraft history.
+
+## The minimum recipe
+
+Three threads, one mutex:
+
+```
+H (high priority)   wants mutex M
+M (medium priority) wants CPU
+L (low priority)    holds mutex M
+```
+
+The story:
+
+1. L acquires M, starts the critical section.
+2. H wakes up, tries to acquire M, blocks (L holds it).
+3. M wakes up, has higher priority than L, preempts L.
+4. As long as M (or any task at L < x < H priority) wants to
+   run, L doesn't run. While L doesn't run, it doesn't release
+   M. While M is unreleased, H can't proceed.
+
+H, the highest-priority task, is now effectively running at L's
+priority — because L is the one blocking it, and L is being
+starved by everyone in between.
+
+If M is CPU-bound for a while, H can be stuck for that whole
+time, regardless of its own priority. Real-time deadlines blow.
+Heart monitor freezes. Mars Pathfinder reboots.
+
+## Mars Pathfinder, 1997
+
+The famous case study. Pathfinder lands on Mars; a few days
+into the mission, the lander starts mysteriously rebooting,
+losing science data. The watchdog timer was triggering — some
+task wasn't completing its work fast enough.
+
+The culprit, identified by the JPL team led by Glenn Reeves and
+later told in Mike Jones's writeup:
+
+- VxWorks RTOS, three relevant tasks: a high-priority bus
+  manager (`bc_sched`), a medium-priority comms task, and a low-
+  priority meteorological task.
+- The bus manager and meteorological task shared a mutex on the
+  data bus.
+- The bus manager would occasionally find the bus mutex held
+  by the meteorological task, and block.
+- The medium-priority comms task would then run, preempting
+  the meteorological task.
+- The meteorological task couldn't finish, couldn't release the
+  mutex, the bus manager stayed blocked, the watchdog fired,
+  reboot.
+
+The fix was uploaded by patching a VxWorks parameter remotely
+from Earth: enable **priority inheritance** on that mutex.
+Suddenly the meteorological task ran at the bus manager's
+priority while holding the mutex, finished, released, and the
+inversion vanished.
+
+The lessons: priority inversion is invisible until it bites,
+and the fix is a one-line config — *if you knew it was an
+option*.
+
+## Priority inheritance
+
+The classic fix. While a low-priority task holds a mutex that a
+high-priority task is waiting for, **the low-priority task
+temporarily inherits the high-priority task's priority**. It
+runs at the higher priority until it releases the mutex.
+
+Now in our story:
+
+1. L acquires M.
+2. H tries to acquire M, blocks; OS marks L as "inheriting H's
+   priority."
+3. M wakes up. Compares its priority to L's *inherited*
+   priority. L is now higher. M doesn't preempt.
+4. L finishes the critical section, releases M, reverts to its
+   original priority.
+5. H proceeds.
+
+The medium task no longer starves the lock holder. Inversion
+solved.
+
+Caveats:
+
+- **Cost**: every mutex acquire/release becomes a scheduler
+  decision. Mutex implementations with PI are slower than
+  plain ones.
+- **Transitive PI**: if H1 waits on L1's mutex, and L1 also
+  waits on L2's mutex, L2 should inherit H1's priority too.
+  Real implementations do transitive PI; the bookkeeping is
+  non-trivial.
+- **Implementation-specific**: POSIX has
+  `PTHREAD_PRIO_INHERIT` (set via mutexattr); Linux has it on
+  futex-based mutexes via PI futex. Default on most kernels
+  is "no PI" — you must opt in.
+
+## Priority ceiling
+
+An alternative, used in some real-time systems. Each mutex has
+a static **ceiling priority** — the maximum priority of any
+task that uses it. While a task holds the mutex, it runs at
+the ceiling.
+
+Pros vs PI:
+
+- Statically known. Schedulability analysis is cleaner.
+- Bounded inheritance — no transitive chains.
+- Prevents deadlock as a side effect: a task acquiring a mutex
+  always runs at the ceiling, so no other user can grab a
+  related mutex while it's held.
+
+Cons:
+
+- You need to know all users of a mutex at design time.
+- Tasks may run at unnecessarily high priority — a low-prio
+  task holding a mutex used by a high-prio task always runs at
+  high prio, even when no high-prio task is waiting.
+
+Priority ceiling is mostly seen in hard real-time systems
+(automotive, aerospace) where the static analysis is valuable.
+
+## Where else inversion shows up
+
+Priority inversion isn't only an RTOS thing:
+
+- **Linux real-time threads using `SCHED_FIFO`/`SCHED_RR`**.
+  Same shape; same fix (`PTHREAD_PRIO_INHERIT`). `mutrace`,
+  `perf` reveal it.
+- **Servers with a thread-pool + shared lock.** If a "high
+  priority" request (e.g., health-check) waits behind a "low
+  priority" batch job that's been preempted by other batch
+  work, you have the same shape. Many database systems
+  experience this with workload management policies.
+- **Single-threaded async runtimes**. JS doesn't have OS
+  priority, but "important" tasks (microtasks) can starve out
+  "less important" ones (timers). Same logical shape, different
+  context.
+- **Kernel-level**. `printk` from a kernel thread can be
+  preempted by user threads if not careful. Various subsystems
+  fight this constantly.
+
+## Tools to detect it
+
+There's no "priority-inversion detector" the way there is for
+race conditions. You catch it by:
+
+- **Long unexplained latencies on high-priority work**, where
+  the high-priority thread is in `S` state (waiting) for far
+  longer than the critical section should take.
+- **Latency profiles with very long tails**. P99 latency
+  dramatically worse than P50 is often inversion or lock
+  contention.
+- **`perf sched`, `bpftrace runqlat`** showing high-priority
+  threads sitting in runnable-but-not-running for tens of ms.
+- **`ftrace sched_switch`** showing the holder-of-mutex
+  thread being repeatedly preempted while a waiter sits.
+
+In modern Linux, `kthread`s and `cpu_pri` in `/proc/<pid>` can
+reveal the chain.
+
+## Practical advice
+
+- **In most application code, you don't have explicit
+  priorities, so you don't have classic inversion** — but
+  you can still have the *shape* (slow handler holding a
+  shared lock, blocking other handlers). The fix is the same:
+  reduce critical-section size or use a primitive with
+  inheritance.
+- **In real-time code, always enable PI on mutexes** unless
+  you can prove inversion can't happen. POSIX:
+  `pthread_mutexattr_setprotocol(attr, PTHREAD_PRIO_INHERIT)`.
+- **In server code with priority-like tiers** (best-effort
+  vs guaranteed traffic), keep shared locks away from
+  cross-tier code. The "shared mutex between batch and
+  online" pattern is the production-system analog of
+  Pathfinder's bus mutex.
+- **Beware of `try_lock` retries as a workaround.** They
+  avoid blocking but introduce livelock risk and CPU burn.
+
+## The takeaway
+
+Priority inversion is when a high-priority task is stuck behind
+a low-priority lock holder, which is itself stuck behind
+medium-priority tasks. The classic fix is **priority
+inheritance**: lock holders temporarily inherit the priority of
+the highest-priority waiter. It saved Mars Pathfinder; it saves
+real-time systems everywhere. Even in non-real-time code, the
+shape recurs whenever shared resources mix work classes — and
+the cure is the same: shrink critical sections or use a
+priority-aware primitive.

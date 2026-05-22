@@ -1,0 +1,238 @@
+export const level = 'senior';
+
+# Software transactional memory
+
+Software transactional memory (STM) is "database transactions
+for memory." Instead of locks, you mark a block as a
+transaction; the runtime tracks every read and write inside it;
+on commit, the runtime checks for conflicts and either commits
+atomically or aborts and retries. The promise: composable
+concurrent code without the inversion of lock-ordering rules.
+
+Transactional memory as a concept came from Herlihy & Moss's
+1993 paper on *hardware* TM; the *software* version was
+introduced by Shavit & Touitou (PODC 1995) and was theoretical
+for a long time. Clojure shipped a usable STM in 2007;
+Haskell's GHC has the best-known implementation; Multiverse,
+ScalaSTM, Akka STM followed. STM never became the default concurrency model, but
+it taught the discipline that influenced every modern actor
+framework, persistent-data-structure library, and version-based
+database.
+
+## The pitch
+
+```clojure
+;; Clojure
+(def account-a (ref 100))
+(def account-b (ref 0))
+
+(defn transfer [from to amount]
+  (dosync
+    (alter from - amount)
+    (alter to   + amount)))
+
+;; Concurrent transfers compose:
+(future (transfer account-a account-b 30))
+(future (transfer account-b account-a 50))
+```
+
+`dosync` opens a transaction. Inside, every `alter` is
+provisional — applied to a thread-local copy. On commit, the
+STM checks that all reads still match the current world; if so,
+all writes apply atomically. If not, the transaction aborts and
+retries from the top.
+
+Properties you get for free:
+
+- **Composition**. Two correct STM operations sequenced are a
+  correct STM operation. No lock ordering needed because
+  there are no locks.
+- **Atomicity**. The transaction is all-or-nothing.
+- **Isolation**. Other transactions see either everything or
+  nothing.
+- **No deadlock**. STM never blocks on locks because there
+  aren't any. Conflicts are resolved by abort-and-retry.
+
+This is the entire pitch, and it's a real pitch: you can think
+of a transaction the way you think of a single function.
+
+## How an STM commits
+
+The standard implementation (most STMs converge here):
+
+1. **Begin**. Take a snapshot of the global version counter.
+2. **Read** any ref: record (`ref`, `value-seen`, `version`).
+3. **Write** any ref: record `(ref, new-value)` in the local
+   write set. Don't touch the actual ref yet.
+4. **Commit**:
+   - Lock all written refs (briefly).
+   - Validate: re-check each read's version. If any has
+     changed since the snapshot, abort.
+   - Apply all writes; bump versions.
+   - Release locks.
+5. **Abort**: discard the write set, retry from begin.
+
+The locks in step 4 are very short (just for the write-list
+sweep), so two unrelated transactions almost never block each
+other. Two *conflicting* transactions detect each other at
+validation; one wins, the other retries.
+
+This is essentially **optimistic concurrency** at the language
+level — the same algorithm that runs inside `MVCC` databases
+like Postgres, applied to memory.
+
+## What it actually composes
+
+The argument for STM is composition. Consider:
+
+<Compare
+  badTitle="Mutex-based: composition is fragile"
+  goodTitle="STM-based: composition is the point"
+  language="js"
+  bad={`function transfer(from, to, amt) {
+  from.lock(); to.lock();
+  from.balance -= amt;
+  to.balance   += amt;
+  to.unlock(); from.unlock();
+}
+// Calling two transfers in parallel can deadlock
+// unless you carefully order from/to locks globally.`}
+  good={`function transfer(from, to, amt) {
+  atomically(() => {
+    from.balance -= amt;
+    to.balance   += amt;
+  });
+}
+// Calling two atomically blocks composes trivially:
+atomically(() => {
+  transfer(a, b, 30);
+  transfer(c, d, 50);
+});
+// The whole outer block is one atomic action.`}
+  caption="The composition story is what STM was designed for. Locks lose it."
+/>
+
+In the mutex world, "do A and B atomically" requires acquiring
+all the locks A and B need, in a globally consistent order,
+without missing any. In STM, you just nest the atomic blocks
+and the runtime handles it. This is the property Simon Peyton
+Jones, Herlihy, and Goetz all called out as the win.
+
+## `retry` and `orElse`: STM's superpowers
+
+Haskell's STM adds two operations no lock-based scheme has:
+
+- **`retry`**: "this transaction can't proceed; abort and re-
+  run when something I read has changed."
+- **`orElse t1 t2`**: "try t1; if it retries, try t2 instead."
+
+The `retry` mechanism is a *blocking primitive*:
+
+```haskell
+withdraw :: TVar Int -> Int -> STM ()
+withdraw acc amt = do
+  bal <- readTVar acc
+  when (bal < amt) retry
+  writeTVar acc (bal - amt)
+```
+
+When `withdraw` retries, the runtime doesn't immediately re-
+run it — it waits until one of the TVars it read (here, `acc`)
+changes. That's a condition variable, but built in to the
+transaction system rather than tangled with lock acquisition.
+
+`orElse` composes alternatives:
+
+```haskell
+takeFromEither acc1 acc2 amt =
+  withdraw acc1 amt `orElse` withdraw acc2 amt
+```
+
+"Try the first; if it can't proceed, try the second; if both
+retry, block until either's TVars change."
+
+This level of composition is fundamentally easier than
+lock-based code. No equivalent exists with mutexes.
+
+## Why STM didn't take over
+
+Despite the pitch, STM remains niche. Several reasons:
+
+- **I/O can't be in a transaction.** If your transaction
+  sends an email and then aborts, you've sent the email. STM
+  is for in-memory state only; you need a separate
+  "side-effect" mechanism (Clojure's agents, Haskell's `IO`)
+  for the rest.
+- **Performance overhead.** Every read/write goes through the
+  STM machinery — version checks, write-set tracking. Under
+  low contention, STM is 2–10× slower than a well-chosen
+  mutex. Under high contention with many small transactions,
+  it can be faster, but the crossover is workload-specific.
+- **Pathological retry loops.** A long transaction that
+  conflicts with frequent small ones can retry forever. Some
+  STMs use **contention managers** to bias the winner toward
+  the older transaction; even then, you need a fallback.
+- **Hardware support evaporated.** Intel's TSX (Transactional
+  Synchronization Extensions, 2013) promised hardware STM. It
+  shipped with bugs that needed microcode disabling, then was
+  deprecated. The dream of "hardware-accelerated STM" died.
+- **Actor/channel models are simpler.** "Don't share state at
+  all" turns out to be a more popular answer than "share state
+  through transactions."
+
+The pragmatic result: STM lives on as a feature in a few
+languages (Clojure, Haskell, Scala) where its compositional
+benefits are valued, but mainstream concurrency converged on
+actors, channels, and explicit locks.
+
+## Where STM did win
+
+Even if it didn't take over the world, STM influenced:
+
+- **MVCC databases**. Postgres's MVCC, etcd's optimistic
+  updates, Spanner's transactions all use the same
+  read-snapshot-validate-commit shape, scaled to disk and
+  network.
+- **Persistent data structures**. Clojure's STM works because
+  it sits on top of structural-sharing data structures —
+  Bagwell hash tries that make "snapshot" essentially free.
+  Persistent-data-structure libraries (Immer in JS, Im in
+  Python) inherit the model.
+- **React and "atomic state updates."** Concepts like "render
+  is a pure function of state" with version-tracked re-renders
+  are STM-ish at the framework level.
+- **Optimistic concurrency in distributed systems.** Raft,
+  Spanner, FoundationDB use the same shape: read with version,
+  propose with the version, commit-if-still-current.
+
+## When to use it
+
+STM (or the principles behind it) makes sense when:
+
+- You have many small in-memory transactions that mostly
+  don't conflict.
+- The state is naturally immutable / structurally shared.
+- The composition story matters: you write transactional
+  building blocks that callers combine arbitrarily.
+
+When to skip:
+
+- You have I/O inside the transactional scope. Either move the
+  I/O outside (Clojure's `agent` pattern) or use a real DB
+  transaction.
+- You have a few hot-contended pieces of state. A well-tuned
+  mutex (or a sharded structure) is faster.
+- You want to expose a transactional API to untrusted users
+  who can write loops that abort each other forever.
+
+## The takeaway
+
+STM applies database-transaction semantics to in-process
+memory: open an atomic block, read and write refs, commit
+atomically or retry. Its big win is **composability** —
+nesting atomic blocks Just Works, unlike nesting lock
+acquisitions. Its big loss is that I/O can't participate and
+the runtime overhead is real. Mainstream concurrency settled
+on actors and channels instead, but STM's principles power
+modern databases, persistent data structures, and optimistic
+concurrency everywhere they show up.

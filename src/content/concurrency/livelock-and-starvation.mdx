@@ -1,0 +1,234 @@
+export const level = 'senior';
+
+# Livelock and starvation
+
+Deadlock has the spotlight in concurrency textbooks. Its weirder
+siblings — **livelock** and **starvation** — get less
+attention but are at least as common in real systems, and they
+look superficially like "everything's fine, just slow."
+
+## Three failure modes, side by side
+
+<Cheatsheet
+  columns={["Failure", "What threads do", "CPU usage", "Will it ever recover?"]}
+  rows={[
+    ["Deadlock", "Wait forever on each other", "Idle", "No — must intervene"],
+    ["Livelock", "Keep doing work but make no progress", "100% busy", "Maybe — depends on randomness"],
+    ["Starvation", "One thread waits while others proceed", "Active, but not for the starved one", "Maybe — depends on fairness"],
+  ]}
+  caption="Deadlock is silent. Livelock and starvation look productive but aren't."
+/>
+
+The three relate like this: deadlock = nobody makes progress;
+livelock = everyone's running but nobody makes progress;
+starvation = everyone except one task makes progress.
+
+## Livelock: busy and stuck
+
+Classic example. Two people meet in a corridor; each politely
+steps to one side to let the other pass; they both step the
+same way; they bump; they both step the other way; bump again;
+loop forever. Each is *doing* something — moving, evaluating,
+moving — but the system makes no progress.
+
+In code, the textbook livelock is the **deadlock avoidance via
+backoff** pattern done wrong:
+
+```go
+func transfer(from, to *Account, amount int) {
+    for {
+        if !from.lock.TryLock() { continue }
+        if !to.lock.TryLock() {
+            from.lock.Unlock()         // back off and retry
+            continue                    // ...other thread does the same
+        }
+        // ... transfer ...
+        return
+    }
+}
+```
+
+Threads avoid deadlock by releasing the partially-held lock and
+retrying. But if two threads are doing the same transfer in
+opposite directions, each grabs its first lock, fails on the
+second, releases, retries, succeeds on the first again — in
+perfect lockstep. Both spinning at 100% CPU, no progress.
+
+The fix is **randomized backoff**:
+
+```go
+if !to.lock.TryLock() {
+    from.lock.Unlock()
+    time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+    continue
+}
+```
+
+Randomness desyncs the threads probabilistically. Same trick as
+Ethernet collision detection — both ends back off for a random
+amount of time so they don't keep colliding.
+
+## More subtle livelock patterns
+
+Livelock isn't only "two threads trying to be polite." It
+shows up wherever a system reacts to conflict by retrying:
+
+- **Cache stampede**. The cache for a hot key expires; 1000
+  threads see the miss, all try to recompute, all hit the DB
+  simultaneously. The DB gets crushed, all 1000 fail, all
+  retry, all hit the DB again. The system is at 100% but the
+  cache never repopulates because every attempt times out.
+  Fix: **request coalescing** (one thread refills, others
+  wait) or **probabilistic early refresh**.
+- **Optimistic-concurrency retry storms**. A row that's
+  contested by many writers, each using OCC: read version,
+  update, write-if-version-still-matches. Under high
+  contention, almost every retry sees a conflict and retries.
+  CPU at 100%; throughput near zero. Fix: backoff,
+  partitioning, or fall back to pessimistic locking under
+  load.
+- **Circuit breaker oscillation**. Half-open circuit lets one
+  probe through; probe succeeds; full traffic resumes; one
+  flaky upstream fails again; circuit opens; loop. The
+  service oscillates. Fix: hysteresis, slow ramp-up.
+- **Auto-scaler hunting**. CPU spikes; scaler adds a node;
+  spike subsides; scaler removes the node; spike returns;
+  add; remove. Fix: stabilization windows.
+
+The signature in all of these: **busy but stuck**. Logs show
+activity, CPU is high, but the count of completed operations
+is flat.
+
+## Detecting livelock
+
+Hard, because nothing looks broken. Useful signals:
+
+- **High CPU + flat throughput**. The classic combo. If you
+  see your service pegged but the request rate didn't change,
+  something's spinning.
+- **Long tails in retry counters**. `transaction_retries`
+  climbing without `transaction_commits` keeping pace.
+- **`perf top`** shows hot functions in retry paths (CAS
+  loops, lock-try paths).
+- **Per-thread CPU usage that's distributed evenly across
+  many threads, all doing the same thing**. Healthy parallel
+  work tends to vary; lock-step livelock looks suspiciously
+  uniform.
+
+The fix is usually backoff with jitter, but sometimes the
+right fix is **rate limiting at admission** — if 1000 concurrent
+attempts can't all succeed, accept only 100 and queue the rest.
+Better to fail fast than to consume the cluster.
+
+## Starvation: forgotten and stuck
+
+Starvation is when a task waits forever (or for an
+unboundedly long time) while others proceed. The system is
+making progress, just not for *that* task.
+
+The canonical example is **writer starvation in
+reader-preferring RWLocks**:
+
+```c
+void read_acquire() {
+    lock(&m); readers++; if (readers == 1) lock(&rw); unlock(&m);
+}
+void read_release() {
+    lock(&m); readers--; if (readers == 0) unlock(&rw); unlock(&m);
+}
+void write_acquire() { lock(&rw); }
+```
+
+If readers keep arriving, the count `readers` never reaches 0,
+the writer never gets `rw`. In an update-heavy system with
+constant reads, writers are starved indefinitely.
+
+The fix is **fairness**: either FIFO scheduling (writers and
+readers queued in arrival order) or **writer preference**
+(once a writer is waiting, no new readers can acquire).
+Production RWLocks like `pthread_rwlock_t` with
+`PTHREAD_RWLOCK_PREFER_WRITER_NP` or Java
+`ReentrantReadWriteLock(true)` (fair mode) implement this.
+
+## Other starvation flavors
+
+- **Scheduler starvation**. CFS in Linux is nominally fair but
+  `nice` values matter; a -20 task can starve a 19. Real-time
+  threads (`SCHED_FIFO`) can starve normal threads.
+- **Lock starvation**. With a "barging" mutex (the next
+  acquirer wins, regardless of wait order), the unlucky thread
+  can wait forever. Most modern mutexes are "barging" by
+  default for performance; some platforms offer fair variants.
+- **CV starvation**. With `pthread_cond_signal`, the OS picks
+  *some* waiter. With unlucky scheduling, one specific waiter
+  may never be picked. Use `broadcast` to wake all, or use
+  fair primitives.
+- **Token starvation in token-bucket rate limiters**. If
+  global tokens are pulled by many threads, an unlucky one
+  may get none for long stretches. Per-tenant buckets fix it.
+- **Distributed leader election**. Misconfigured timeouts can
+  let one node always win elections; others never get to be
+  leader. Randomized timeouts (Raft) fix it.
+
+## Detecting starvation
+
+Often easier than livelock — you can count operations per
+*task*:
+
+- **Per-task completion histograms**. If most tasks complete
+  in 10ms but a small fraction stretch into seconds, the long
+  tail is your starvation candidates.
+- **"Oldest pending" gauges**. Track the wait time of the
+  oldest unfinished item in any queue. Starvation drives this
+  to infinity even as throughput looks normal.
+- **`ps -eo pid,stat,wchan,etime`** for processes that have
+  been blocked far longer than makes sense.
+
+## Fairness as a property
+
+The general fix is **fairness**: a primitive that bounds wait
+time for every requester. Fair primitives are usually slower
+than unfair ones — they have to maintain a queue and respect
+arrival order — but they bound the worst case.
+
+Some popular fairness choices:
+
+- **Java `ReentrantLock(true)`**: FIFO queue.
+- **Linux `pthread_mutex_t` with `PTHREAD_PRIO_PROTECT` /
+  scheduling policy**: priority-based.
+- **MCS locks / CLH locks**: FIFO by design, with the queue
+  built into the lock structure.
+- **Ticket locks**: each requester takes a ticket; lock served
+  in number order. Used in some kernel paths.
+
+Fair locks are useful when worst-case latency matters more than
+average. For most application code, an unfair mutex is fine
+because contention doesn't last long enough for starvation to
+matter.
+
+## Engineering rules of thumb
+
+- **If you reach for "retry until it works" anywhere, add
+  randomized backoff.** It's the cheapest insurance against
+  livelock.
+- **If you build an RWLock-like API, decide the fairness
+  policy explicitly** — and document it. Most callers don't
+  realize they need to ask.
+- **For request paths, prefer fail-fast over unbounded retry**.
+  A 500 with a retry header is better than a 60-second wait
+  that may or may not succeed.
+- **Track wait-time, not just throughput**. Throughput hides
+  starvation; tail latency exposes it.
+- **Stress test under contention**, not just "happy path" load.
+  Livelock and starvation only show up when the system is
+  pushed.
+
+## The takeaway
+
+Livelock is "everyone's busy, nobody's making progress" —
+usually from synchronous retries colliding. Add randomized
+backoff. Starvation is "everyone's making progress except this
+one" — usually from unfair primitives. Add fairness, or queue
+explicitly. Both are silent killers: the system looks healthy
+by CPU and throughput metrics until you measure *per-task*
+progress and discover some tasks are sitting forever.

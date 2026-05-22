@@ -1,0 +1,311 @@
+export const level = 'staff';
+
+# Testing concurrent code
+
+Testing concurrent code is hard for a specific reason: bugs
+depend on interleavings, and most test runs hit one or two
+"normal" interleavings. The code can have a bug that fires
+once in 10,000 runs — you'll pass CI for years, then ship the
+bug, then production hits it under load. Strategies for
+actually finding these bugs fall into four buckets.
+
+## The four lenses
+
+<Cheatsheet
+  columns={["Approach", "What it does", "Cost", "Catches"]}
+  rows={[
+    ["Stress testing", "Run real concurrent ops at high volume", "Low effort", "Common races, lost updates, deadlocks under load"],
+    ["Race detectors", "Instrument memory access, check happens-before", "Runtime cost, false negatives", "Most data races, even unobserved ones"],
+    ["Schedule fuzzing", "Force unusual thread interleavings", "Slow, complex", "Rare races, ordering bugs"],
+    ["Formal model checking", "Exhaustive state-space exploration", "Algorithm-level only", "Algorithmic correctness, liveness"],
+  ]}
+  caption="Stack them: stress + race detector for everyday CI; fuzzing/model checking for critical code."
+/>
+
+Each has a role. Use stress + race detector by default; reach
+for schedule fuzzing or model checking when the cost of a bug
+outweighs the cost of the investment.
+
+## Stress testing: the cheap default
+
+The simplest concurrent test is the loop:
+
+```python
+def test_counter_under_contention():
+    counter = Counter()
+    def worker():
+        for _ in range(10_000):
+            counter.inc()
+    threads = [Thread(target=worker) for _ in range(100)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert counter.value == 100 * 10_000
+```
+
+100 threads × 10K increments = 1M ops; if `Counter.inc` is
+broken, the final value is less than 1M. Run it 100 times in
+CI. Maybe 10× of those will hit the race.
+
+Properties:
+
+- **Catches the common bugs.** Lost updates, deadlocks under
+  load, leaked locks. Cheap to write.
+- **Misses subtle races.** A race that only happens with a
+  specific interleaving may not appear in stress at all.
+- **Non-deterministic failures**. The test that *sometimes*
+  fails is your most valuable test — even if it's
+  inconvenient to investigate. Don't silence flaky tests if
+  the underlying flakiness is concurrent.
+
+Best practices:
+
+- Run *parameterized*: vary thread count, op count, hardware.
+  Bugs that need 32 cores to expose are hidden on dev
+  laptops.
+- Run *long enough*: a few seconds isn't enough. Some bugs
+  need minutes of stress to appear.
+- Run *in CI*: laptops typically have 8 cores; CI runners may
+  have more or fewer. Different bugs surface on different
+  topologies.
+- Assert invariants on every cycle, not just at the end. If
+  the invariant should hold throughout, check throughout.
+
+## Race detectors
+
+A runtime instrumentation that watches every memory access and
+flags unsynchronized concurrent accesses. The fundamental
+algorithm: **vector clocks**. Each thread has a timestamp;
+each shared variable remembers the last writer's stamp; access
+without a happens-before edge to the previous writer is a
+race.
+
+The available tools:
+
+<Cheatsheet
+  columns={["Tool", "Language", "Notes"]}
+  rows={[
+    ["go test -race", "Go", "Built-in. ~10× slower than normal. Run in CI."],
+    ["ThreadSanitizer (TSan)", "C/C++/Rust/Swift", "Compile flag. The gold standard for native code."],
+    ["Helgrind", "C/C++ (Valgrind)", "Slower than TSan, fewer false negatives."],
+    ["Java FlightRecorder + JFR Race Detection", "JVM", "Production-safe; sampling-based."],
+    ["loom", "Rust", "Schedule fuzzing rather than race detection; complements TSan."],
+    ["TSAN-RS (Rust)", "Rust", "Wrapper around the C TSan; works for FFI-heavy code."],
+  ]}
+  caption="Race detectors are mostly free during dev / CI; some can run in prod."
+/>
+
+A race detector catches races *even when they didn't cause
+visible problems on this run*. That's the killer feature —
+the bug is reported because the *opportunity* existed, not
+because it fired. You don't need to be lucky to find it.
+
+False negatives exist:
+
+- TSan only watches threads it sees spawn — third-party FFI
+  callbacks may evade it.
+- A race on read-only data that's mutated by a hidden GC may
+  not register.
+- TSan misses some ordering issues that aren't classic data
+  races (atomic-with-wrong-ordering bugs).
+
+But for the bulk of real-world races, race detectors find
+them. Run TSan / `-race` in CI. Always.
+
+## Schedule fuzzing
+
+A more aggressive technique: deliberately force unusual
+interleavings.
+
+### CHESS / PCT (Microsoft Research)
+
+Run the test under a controlled scheduler that imposes a
+random but reproducible schedule. By exploring N interleavings
+explicitly, you can find bugs that *real* scheduling almost
+never produces. PCT (Probabilistic Concurrency Testing) bounds
+the depth — "bugs of depth k" (requiring k scheduling decisions
+to expose) — and explores systematically.
+
+### Loom (Rust)
+
+Loom replaces standard sync primitives with mock ones that
+explore all possible interleavings of the test. Used inside
+Tokio's test suite to verify low-level synchronization code.
+
+```rust
+loom::model(|| {
+    let lock = Arc::new(Mutex::new(0));
+    let l1 = lock.clone();
+    let t = thread::spawn(move || { *l1.lock().unwrap() += 1; });
+    *lock.lock().unwrap() += 1;
+    t.join().unwrap();
+    assert_eq!(*lock.lock().unwrap(), 2);
+});
+```
+
+Loom runs this with every possible thread interleaving. If
+there's a race that any interleaving exposes, Loom finds it.
+
+### Rr (Mozilla)
+
+Deterministic record/replay. Run a concurrent test until it
+fails. `rr` records the exact schedule. Replay it as many
+times as you want; the bug is reproducible. Debugging
+concurrent failures becomes single-threaded debugging.
+
+### Jepsen (distributed)
+
+For distributed systems, Kyle Kingsbury's Jepsen does the
+equivalent: injects network partitions, clock skew, slow
+disks, and other faults; verifies that the system maintains
+its claimed consistency properties. The Jepsen reports
+have exposed major bugs in MongoDB, RabbitMQ, Cassandra,
+Aerospike, FoundationDB — basically every distributed DB on
+the market.
+
+## Formal model checking
+
+The most rigorous approach: write a formal model of your
+algorithm, define safety and liveness properties, exhaustively
+check all reachable states.
+
+### TLA+
+
+Leslie Lamport's formal specification language. Used for
+correctness proofs of distributed protocols. Amazon documented
+in their famous case study that TLA+ found bugs in production
+Dynamo, S3, and Kindle services that years of stress testing
+hadn't.
+
+```
+EXTENDS Naturals
+VARIABLE counter
+
+Init == counter = 0
+
+Inc == counter' = counter + 1
+
+Spec == Init /\ [][Inc]_counter
+
+Safety == counter >= 0
+```
+
+The TLA+ Toolbox model-checks this against finite state
+spaces (your hand-bounded one). If the safety property holds
+across every reachable state, the algorithm is correct *for
+that bound*.
+
+### SPIN/Promela
+
+C-like syntax for finite-state concurrent algorithms. The
+classic tool for verifying mutex algorithms, communication
+protocols, leader election. Heavily used in academia and
+aerospace.
+
+### Coq, Isabelle, Lean
+
+Proof assistants for full mechanical verification. The
+seL4 microkernel and CompCert compiler are verified this way.
+Massive effort; near-total assurance.
+
+For day-to-day code, model checking is overkill. For the core
+of a distributed database, financial settlement system, or
+real-time safety-critical control, it's the standard.
+
+## Property-based testing for concurrency
+
+A pragmatic middle ground. Express the *property* the
+concurrent structure should satisfy, then run randomized
+tests that check it across many inputs and schedules.
+
+```python
+@given(st.integers(min_value=1, max_value=50),
+       st.integers(min_value=1, max_value=10_000))
+def test_concurrent_queue_linearizable(num_threads, num_ops):
+    q = ConcurrentQueue()
+    # Run num_threads doing random ops; record histories;
+    # check that some serial order explains the histories.
+    ...
+```
+
+The point is **linearizability checking**: collect operation
+histories from each thread and check that there's *some*
+serial order consistent with what each thread observed.
+Quickcheck-style libraries: PropEr (Erlang), Hypothesis
+(Python), QuickCheck (Haskell), proptest (Rust).
+
+`porcupine` (Go) and `jepsen.checker.linearizable` are
+production-grade linearizability checkers.
+
+## What to test
+
+A reusable checklist:
+
+<Steps>
+<Step n="1" title="Invariants that hold across critical sections">
+
+"Sum of accounts is constant." "Cache key is in lookup
+iff also in LRU list." Stress-test concurrent ops; assert
+the invariant before and after each op.
+
+</Step>
+<Step n="2" title="Linearizability of the data structure">
+
+For a concurrent queue, stack, map: run randomized ops from
+multiple threads, record histories, verify that they're
+consistent with *some* serial order.
+
+</Step>
+<Step n="3" title="Correctness under cancellation">
+
+Spawn a task; cancel it; verify cleanup. Run with random
+cancellation timing. Verify no leaked resources, no partial
+state, no deadlock.
+
+</Step>
+<Step n="4" title="Behavior under failure">
+
+In distributed: network partition, slow nodes, clock skew.
+In-process: timeouts firing, panics in workers. The Jepsen
+playbook applied at your scale.
+
+</Step>
+<Step n="5" title="No surprises in error paths">
+
+Concurrent code's error paths often hit untested
+interleavings. A retry that conflicts with a parallel retry
+on the same resource. A panic that leaves a lock held.
+Specifically exercise these.
+
+</Step>
+</Steps>
+
+## A real testing pipeline
+
+What a mature concurrent codebase looks like:
+
+1. **Unit tests** for sequential behavior of components.
+2. **Stress tests** with race detector enabled in CI. Loop
+   per-component for tens of seconds.
+3. **Linearizability tests** for shared data structures.
+4. **Loom / CHESS-style fuzzing** for low-level primitives.
+5. **TLA+ model** for algorithmic core (consensus, ordering).
+6. **Jepsen** at the system level if distributed.
+7. **Production canary** with high-fidelity instrumentation
+   that catches anomalies (counter drift, missing updates).
+
+Most teams have #1 and #2. The mature ones have #3 and #4.
+Mission-critical ones have all seven.
+
+## The takeaway
+
+Concurrent bugs hide in unlikely interleavings; testing them
+requires deliberately exploring those interleavings. Stress
+tests catch the common ones; race detectors catch the racy
+ones even when they didn't fire; schedule fuzzing
+(Loom/CHESS) catches the deeply timing-dependent ones; formal
+model checking catches the algorithmic ones. Pick the tools
+that match the cost of being wrong. For most code, stress +
+TSan/`-race` in CI is the minimum. For critical paths, add
+Loom or TLA+. Don't ship concurrent code on hope and
+manual testing alone — the bug is there; the question is
+whether you find it or your users do.

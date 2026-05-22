@@ -1,0 +1,233 @@
+export const level = 'staff';
+
+# Choosing a concurrency model
+
+There's no universal answer. The best concurrency model
+depends on the workload, the language, the team's experience,
+and what failure looks like. This page is a decision framework
+— not "what to pick" but "what to ask" before picking.
+
+## The four mainstream models
+
+<Cheatsheet
+  columns={["Model", "Unit", "Shared state", "Failure unit", "Sweet spot"]}
+  rows={[
+    ["Threads + locks", "OS thread", "Yes, mutex-protected", "Process", "CPU-bound, moderate concurrency, classic OS-level code"],
+    ["Async / event loop", "Future / task", "Optional, often single-threaded", "Task or process", "I/O-bound, high concurrency, low memory"],
+    ["CSP / channels", "Goroutine / fiber", "Through channels, not shared mem", "Goroutine (panic = process unless recovered)", "Pipelines, fan-out workers, Go programs"],
+    ["Actor / share-nothing", "Actor / process", "None — only messages", "Actor (supervised restart)", "Stateful entities, fault tolerance, soft real-time"],
+  ]}
+  caption="Each model is correct for some problems and wrong for others."
+/>
+
+Real systems often mix two or three. A Go service uses
+channels for orchestration *and* mutexes for state. A Tokio
+server uses async tasks *and* Rayon for CPU parallelism. The
+choice is per-component, not per-system.
+
+## Questions to ask
+
+### 1. CPU-bound or I/O-bound?
+
+The single biggest question.
+
+- **CPU-bound**: threads + locks (with proper parallelism),
+  or fork-join frameworks (Rayon, ForkJoinPool, OpenMP). The
+  goal is to use cores; async/event loops don't help.
+- **I/O-bound**: async, channels, or actors. The goal is to
+  have many in-flight operations without spending memory per
+  concurrent op. Threads scale poorly past a few thousand.
+
+Mixed workloads (web server with CPU stages): isolate the CPU
+work in a separate pool. Tokio's `spawn_blocking` exists
+specifically for this. Same pattern in Python (`run_in_executor`),
+Node (`worker_threads`), .NET (`Task.Run`).
+
+### 2. How much state, and who shares it?
+
+- **Stateless**: any model works. Threads are simple; async
+  scales further.
+- **A few shared state pieces**: threads + mutexes. Trivial,
+  fast, well-understood.
+- **Many independent stateful entities**: actors. Each user
+  session, each device, each game NPC = one actor.
+- **Lots of small reads, occasional writes**: RCU,
+  copy-on-write, or read-mostly lock-free.
+- **Large shared mutable graph**: probably restructure. No
+  model handles this well except STM (in Clojure/Haskell), and
+  even then with caveats.
+
+### 3. What's the failure model?
+
+- **Crash on bug**: threads + locks. Classic Unix model. When
+  it fails, restart the process. Acceptable for batch jobs and
+  many servers.
+- **Try to recover in-process**: actors with supervision.
+  Erlang's "let it crash" is structurally correct for this.
+- **Cancel work cleanly under failure**: structured async +
+  cancellation tokens. Modern Python/Swift/Java Loom.
+- **Withstand a process death without losing in-flight work**:
+  externalize state (queue, DB), use distributed locks /
+  leases. Above the concurrency-model layer.
+
+### 4. How many concurrent things?
+
+- **Tens to thousands**: threads work, async works, actors
+  work. Pick on other criteria.
+- **Tens of thousands**: threads start to hurt. Async or
+  goroutines.
+- **Hundreds of thousands to millions**: stackless async
+  (Tokio, Rust futures) for memory density, or stackful
+  goroutines/Erlang processes if you can afford the slightly
+  bigger per-task footprint.
+
+### 5. What's the team's existing expertise?
+
+Often the deciding factor. The team that's never written Erlang
+is going to ship more reliable code in mutex-and-thread Java
+than in unfamiliar OTP. The "right" theoretical model is the
+wrong practical model if the team can't read it.
+
+This goes both ways: if your team is fluent in Go, channels
+will fit even when a mutex would be slightly faster. The cost
+of a less-familiar primitive in code review and on-call is
+non-trivial.
+
+### 6. Tooling, libraries, runtime?
+
+- Async needs a runtime that integrates with your I/O
+  libraries. Mixing libraries built for different runtimes
+  is painful (Tokio vs async-std in Rust; sync DB drivers in
+  asyncio Python).
+- Actor frameworks come with deep ecosystems (Akka, OTP) or
+  none. Building actors from scratch is a substantial
+  undertaking.
+- CSP-style channels work everywhere but the "everything's
+  a channel" ergonomics are best in Go.
+- Threads-and-locks are universally supported; no surprises.
+
+## Worked decisions
+
+### Web API server, 5K req/s, mostly I/O to DB and Redis
+
+- I/O-bound: async or actors.
+- Each request is independent: low shared state.
+- Failure model: per-request errors, recover by returning 500.
+- Concurrent things: ~tens of thousands of connections.
+- Team: standard backend engineers.
+
+Pick: **async runtime in your language of choice.** Node/Express,
+Python/FastAPI, Rust/Axum, Java with virtual threads. Channels
+not needed; actors overkill. Add Rayon or a thread pool for
+any CPU-heavy stages.
+
+### Image processing pipeline, batch
+
+- CPU-bound: threads.
+- Stateless: no shared mutable state.
+- Failure: crash and retry the batch.
+- Concurrent things: hundreds (workers, not requests).
+
+Pick: **fork-join / parallel framework.** Rayon's `par_iter`,
+Java parallel streams, Python's `multiprocessing` (GIL bypass),
+OpenMP/CUDA for vectorized work. Channels and async add
+overhead with no benefit.
+
+### Chat server with millions of online users
+
+- I/O-bound + stateful per-user.
+- Each user is a long-lived entity with private state
+  (presence, conn, queue of pending messages).
+- Failure: per-user recovery; let any one crash without
+  affecting others.
+- Concurrent things: millions.
+
+Pick: **actor model.** Erlang/Elixir if greenfield; Akka on
+JVM; Orleans on .NET. Each user → one actor. Supervisors handle
+crashes. Mailbox handles the per-user message queue
+naturally. WhatsApp's architecture is the case study.
+
+### Real-time market data ingestion
+
+- I/O + CPU mix; latency-critical.
+- Many independent symbols, each with its own state.
+- Failure: drop late ticks, never block live ones.
+- Concurrent things: many thousands.
+
+Pick: **single-writer-per-symbol** (one thread or actor per
+symbol, no cross-symbol sharing) + **lock-free queues** for
+the hot ingest path. CSP-style channels for symbol-to-handler
+fan-out. Mix-and-match.
+
+### Embedded firmware, hard real-time
+
+- Bounded latency mandatory; CPU + I/O.
+- Few tasks, each with priority.
+- Failure: deadlines must not slip; reset on hard fault.
+
+Pick: **threads + locks with priority inheritance + wait-free
+queues** for inter-task communication. RTOS like FreeRTOS,
+Zephyr, VxWorks. Actor model nice but few RTOS implementations.
+
+### Distributed system with strong consistency requirements
+
+- Network I/O dominant.
+- State is shared across nodes.
+- Failure: partitions, slow nodes, crashes.
+
+The concurrency model *inside each node* is one question;
+the *cross-node* concurrency is another. In-node: async +
+shared state with consensus algorithms (Raft, Paxos). Across
+nodes: linearizable K/V (etcd, ZK) or strict-serializable DB
+(Spanner, CockroachDB) handles the hard part.
+
+## Anti-patterns
+
+- **"Async because async is cool"** for CPU-bound work. Adds
+  overhead, no benefit. Threads or fork-join win.
+- **"Actors because they're modular"** for stateless web
+  endpoints. The actor mailbox is a queue you don't need;
+  framework overhead exceeds the win.
+- **"Channels for protecting one variable"** when a mutex
+  would do. Coordination ≠ protection; pick the right tool.
+- **"Lock-free because mutex is slow"** without measuring.
+  The mutex's futex fast path is one CAS; replacing it with
+  a hand-rolled CAS loop just shifts the bug location.
+- **"Threads everywhere because we know threads"** when the
+  load is 100K connections. Memory and scheduling cost will
+  bite.
+- **"Mixing async and sync"** unintentionally. The "function
+  coloring" problem creates deadlocks and hangs at the
+  boundary.
+
+## How to migrate models
+
+You usually can't change everything at once. Pragmatic
+migration paths:
+
+- **Threads → async** (Java's Project Loom path): virtual
+  threads let you keep the threading API but get async-level
+  scaling. The dream of "no rewrite."
+- **Callbacks → async/await**: ESM/JS, Python, C# all went
+  through this. The async/await syntax was specifically
+  designed to wrap existing promise/Task APIs.
+- **Shared-state threads → actors**: extract per-entity state
+  into one actor per entity, replace direct mutation with
+  messages. Gradual; the boundary between "actor world" and
+  "thread world" is OK as long as it's explicit.
+- **Mutex-heavy → channels/CSP**: split shared state into
+  per-goroutine ownership; turn cross-goroutine access into
+  channel sends.
+
+## The takeaway
+
+There's no "best" concurrency model; there's the model that
+matches your workload's structure. The question framework:
+*what's the bottleneck (CPU vs I/O)*, *how much state is
+shared and by whom*, *what does failure look like*, *how many
+concurrent things*, *what does the team know*. The decisions
+compose: a single application can use multiple models in
+different layers. Pick deliberately, mix where it makes
+sense, and revisit when the workload changes — the most
+expensive concurrency mistake is locking in a wrong choice and
+fighting it for years.

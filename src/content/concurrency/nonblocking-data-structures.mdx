@@ -1,0 +1,275 @@
+export const level = 'senior';
+
+# Non-blocking data structures
+
+A non-blocking data structure makes progress regardless of any
+individual thread's state. No matter what one thread is doing
+— blocked, descheduled, slow — the others can keep going.
+The exact progress guarantee can be lock-free, wait-free, or
+obstruction-free; the family is broader than the strictest
+definition.
+
+This page walks through the canonical non-blocking structures —
+Treiber stack, Michael-Scott queue, lock-free hashmap — what
+makes them work, and where they break.
+
+## The Treiber stack revisited
+
+The Treiber stack (1986) is the "hello world" of lock-free
+data structures:
+
+```cpp
+struct Node { T value; Node* next; };
+std::atomic<Node*> head;
+
+void push(T v) {
+  Node* n = new Node{v, nullptr};
+  Node* old;
+  do {
+    old = head.load(std::memory_order_relaxed);
+    n->next = old;
+  } while (!head.compare_exchange_weak(old, n,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed));
+}
+
+std::optional<T> pop() {
+  Node* old;
+  do {
+    old = head.load(std::memory_order_acquire);
+    if (!old) return std::nullopt;
+  } while (!head.compare_exchange_weak(old, old->next,
+                                       std::memory_order_acquire,
+                                       std::memory_order_relaxed));
+  T value = old->value;
+  // delete old; — but when is it safe?
+  return value;
+}
+```
+
+The shape is a CAS loop: read, prepare new state, CAS. On
+failure, the CAS updates `old` to the current head and you
+retry. Lock-free (someone always wins) but not wait-free (one
+thread could lose forever).
+
+The dragons are in `// delete old;`. When is it safe? Another
+thread might have a copy of `old` from before the pop. That's
+the ABA problem and the memory-reclamation problem rolled
+together — covered in detail on the CAS/ABA page in
+memory-low-level. The Treiber stack itself is a one-page
+algorithm; making it safe is a chapter.
+
+## The Michael-Scott queue
+
+A FIFO queue that's lock-free for both enqueue and dequeue
+(Maged Michael and Michael Scott, 1996). The structure:
+
+```
+  head ──→ [dummy] → A → B → C ←── tail
+```
+
+A sentinel dummy node at the front; head points to it; tail
+points to the last node. Enqueue advances tail; dequeue
+advances head. Both use CAS.
+
+```cpp
+struct Node { T value; std::atomic<Node*> next; };
+std::atomic<Node*> head, tail;
+
+void enqueue(T v) {
+  Node* n = new Node{v, nullptr};
+  while (true) {
+    Node* t = tail.load(std::memory_order_acquire);
+    Node* next = t->next.load(std::memory_order_acquire);
+    if (t == tail.load(std::memory_order_acquire)) {     // tail still tail?
+      if (next == nullptr) {
+        // try to link n in
+        if (t->next.compare_exchange_weak(next, n,
+                                          std::memory_order_release,
+                                          std::memory_order_acquire)) {
+          // help advance tail
+          tail.compare_exchange_strong(t, n,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed);
+          return;
+        }
+      } else {
+        // tail was lagging — help advance it
+        tail.compare_exchange_strong(t, next,
+                                     std::memory_order_release,
+                                     std::memory_order_relaxed);
+      }
+    }
+  }
+}
+```
+
+Two ideas worth noting:
+
+1. **Two-step linkage**. Inserting requires two CAS: first
+   link the node in (`t->next = n`); then advance tail.
+   Between the two, the queue is in an "in-between" state.
+2. **Helping**. If a thread sees the tail lagging behind
+   (`tail` doesn't point to the actual last node), it doesn't
+   wait — it helps move `tail` forward. This is a recurring
+   pattern in lock-free algorithms: threads that observe
+   in-between state pitch in to complete it.
+
+This is one of the most-cited concurrent data structures.
+Java's `ConcurrentLinkedQueue` is an MS queue. Tokio's
+unbounded MPSC channel uses an MS-queue variant.
+
+## Lock-free hashmaps
+
+The hardest of the common structures. The key challenge:
+resizing. A hashmap that needs to grow has to migrate all its
+buckets to a bigger array, and you can't lock the world.
+
+Two main approaches:
+
+**Split-ordered list** (Shalev & Shavit, 2003): keep all items
+in one sorted linked list; the "buckets" are just pointers into
+the list. Resizing only adds new bucket pointers without
+moving any items. Used in some research implementations.
+
+**Sharded** (Java's `ConcurrentHashMap`, Rust's `dashmap`):
+divide the keyspace into N independent shards, each with its
+own lock or lock-free structure. Most operations touch one
+shard; lock contention is reduced N-fold. Not fully lock-free
+in the strict sense, but practically equivalent.
+
+For most production needs, sharded is the pragmatic choice:
+much simpler to implement, easier to reason about, and the
+contention is usually fine.
+
+## Read-Copy-Update (RCU)
+
+RCU is the "do nothing on reads" non-blocking pattern, used
+heavily in the Linux kernel. The idea:
+
+1. **Readers** access the data without any synchronization at
+   all. They take a snapshot (a pointer to the current
+   version) and read freely.
+2. **Writers** create a new version, atomically swap the
+   pointer, and **wait for a grace period** before freeing the
+   old version. The grace period ends when all readers that
+   could have seen the old pointer have moved on.
+
+Readers are free; writers pay. The grace period detection is
+the trick: in the kernel, it uses scheduling events (every
+thread eventually context-switches, so after all CPUs have
+context-switched, the old version is unreachable).
+
+User-space RCU libraries (URCU, crossbeam's epoch) implement
+the same idea using explicit "read-side critical section"
+markers. The reads are essentially as fast as plain pointer
+reads.
+
+RCU is the right answer when:
+
+- Reads vastly outnumber writes.
+- Writes can tolerate the latency of waiting for grace
+  periods.
+- The data structure can be cheaply "swapped" (atomic pointer
+  to immutable snapshot).
+
+Use cases: routing tables, configuration that hot-reloads,
+read-mostly caches.
+
+## The double-checked locking pattern (and why it was broken)
+
+A classic attempt at non-blocking lazy initialization:
+
+```java
+class Lazy<T> {
+  private volatile T instance;       // requires volatile!
+
+  T get() {
+    T result = instance;
+    if (result == null) {
+      synchronized(this) {
+        result = instance;
+        if (result == null) {
+          result = create();
+          instance = result;
+        }
+      }
+    }
+    return result;
+  }
+}
+```
+
+Without `volatile`, the writes inside `create()` can be reordered
+relative to the write `instance = result`. Another thread can
+see a non-null `instance` whose internals are still being
+initialized — classic publication race. The Java Memory Model
+revision (JSR-133, 2004) clarified that `volatile` is required;
+before that, double-checked locking was *broken* in mainstream
+JVMs.
+
+Modern Java prefers:
+
+```java
+class Holder { static final T INSTANCE = create(); }
+T get() { return Holder.INSTANCE; }
+```
+
+Class-loading lazy-init is JVM-guaranteed to happen once,
+atomically, with no race possible. Simpler than DCL.
+
+C++ has `std::call_once` and Rust has `std::sync::Once`/`OnceCell`
+for the same job — and they handle the memory model correctly,
+unlike a hand-rolled DCL.
+
+## Performance reality check
+
+The naive expectation: "lock-free is always faster than locked."
+The measured reality:
+
+- **Low-to-moderate contention**: lock-free and well-tuned
+  mutex are similar. The mutex's futex fast-path is one CAS;
+  the lock-free's CAS is one CAS. Same cost.
+- **Many concurrent readers, occasional writers**: lock-free /
+  RCU crushes mutex. Reads are nearly free; mutex serializes
+  them.
+- **Many concurrent writers**: lock-free can lose. CAS retry
+  storms with 32 contending threads can throttle worse than
+  a mutex that lets one in at a time.
+- **Hot cache line with read-modify-write**: both are limited
+  by the cache-coherence protocol (MESI ping-pong). Neither
+  has a magical advantage.
+
+The honest scaling guidance: lock-free shines for **read-heavy
+shared data** (where readers don't even need a CAS) and for
+**many uncontended atomic counters**. For write-heavy
+contended data, sharding or smarter structures usually beat
+both.
+
+## When you should use a non-blocking structure
+
+- **From signal handlers or interrupt contexts** — locks
+  aren't safe.
+- **From real-time threads** — to avoid priority inversion.
+- **As a high-throughput SPSC queue** between producer and
+  consumer threads — wait-free, very fast.
+- **For read-mostly globally-shared data** — RCU or
+  copy-on-write swap.
+
+When you shouldn't:
+
+- **Anywhere a mutex is "fast enough."** Most codebases.
+  Reaching for lock-free for the joy of it is the start of
+  a long debugging journey.
+
+## The takeaway
+
+Non-blocking data structures use atomic operations (CAS, LL/SC,
+fetch-add) and helping protocols to make progress without
+locks. Treiber stacks, MS queues, sharded hashmaps, and RCU
+are the building blocks of modern high-perf libraries. They
+solve real problems — read-mostly contention, signal-safety,
+real-time — but come with serious engineering costs (ABA,
+memory reclamation, subtle ordering). Use the well-tested
+library implementations; don't roll your own unless you've
+read Herlihy & Shavit twice.
