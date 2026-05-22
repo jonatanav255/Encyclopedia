@@ -1,0 +1,307 @@
+export const level = 'junior';
+
+# Memory and pointers
+
+Data structures are about two questions: *where do the bytes
+live*, and *how do you reach them*. Big-O answers neither. If
+you don't know the difference between a stack slot and a heap
+object, you can't explain why an `int[]` crushes an
+`ArrayList<Integer>`, why escape analysis matters, or why your
+p99 just jumped 40ms during a GC pause.
+
+This is the prerequisite page. Everything else in this topic
+assumes it.
+
+## Stack vs heap, in the JVM
+
+Java has two memory regions that matter for data structures:
+
+**The JVM stack.** One per thread. Holds local variables and
+the operand stack of each method call. Grows and shrinks LIFO
+as methods are entered and returned from. Allocation is a
+bump-pointer move — effectively free. Deallocation is
+"decrement the stack pointer when the method returns" — also
+free. No GC ever looks at it.
+
+**The heap.** Shared across all threads. Every object you
+create with `new` lives here. Managed by the garbage collector.
+Allocation is fast (HotSpot uses a per-thread bump-pointer
+region called a TLAB), but every allocation creates work for
+the GC later.
+
+The rule for what goes where:
+
+- **Primitive locals** (`int x = 5;`) — stack slot.
+- **Object references** (`String s = ...;`) — the reference is
+  a stack slot; the object it points to is on the heap.
+- **Primitive fields inside an object** (`class P { int x; }`)
+  — on the heap, *inside* the object. Not separately.
+- **Array contents** — on the heap, contiguous inside the
+  array object.
+
+```java
+void example() {
+  int n = 42;                  // n: stack slot
+  int[] arr = new int[1000];   // arr: stack slot (reference)
+                               // the 1000 ints: heap, contiguous
+  Point p = new Point(1, 2);   // p: stack slot (reference)
+                               // Point object + its two ints: heap
+}
+// On return: stack slots vanish. The heap objects survive
+// until GC notices nothing points to them.
+```
+
+## Values vs references
+
+Java passes everything **by value**. The trap: for objects,
+the *value being passed* is the reference, not the object.
+
+```java
+void zero(int[] a) {
+  a[0] = 0;       // mutates the heap array — caller sees it
+  a = new int[5]; // rebinds the local — caller does NOT see it
+}
+
+int[] arr = {1, 2, 3};
+zero(arr);
+// arr[0] is now 0. arr still points to the original array.
+```
+
+The parameter `a` is a fresh stack slot holding a copy of the
+reference. Two stack slots, one heap object. Writes *through*
+the reference (`a[0] = 0`) hit the shared object. Reassigning
+the slot (`a = new int[5]`) only changes the local copy.
+
+Primitives are the simple case — a pure copy:
+
+```java
+void bump(int x) { x = x + 1; }   // local copy, caller unaffected
+
+int y = 5;
+bump(y);   // y is still 5
+```
+
+This is why a method can't "swap" two `int` arguments in Java,
+but can mutate an array passed in. The reference-vs-value
+distinction is the whole reason.
+
+## `new` is cheap but not free
+
+HotSpot allocation is a bump pointer in a thread-local buffer
+(TLAB). Tens of nanoseconds. So why does allocation-heavy code
+get slow?
+
+Because every object you allocate is future GC work. The
+collector has to decide whether it's still reachable, possibly
+copy it between generations, possibly compact it. Allocation
+*rate* is what GC pressure measures, not heap *size*.
+
+The classic offender:
+
+```java
+// Hot loop. Looks innocent.
+long sum = 0;
+for (Integer x : list) {   // list is List<Integer>
+  sum += x;                // unboxing here
+}
+```
+
+If `list` is `ArrayList<Integer>`, every element is a separate
+`Integer` object on the heap. Building the list autoboxed
+millions of `Integer`s. Each one is 16 bytes (more on layout
+below) and a GC root for its lifetime. The `int[]` version
+allocates *one* object total.
+
+<Callout variant="warn">
+**The autoboxing tax.**
+`ArrayList<Integer>` of N elements is ~5x the memory of
+`int[N]` and creates N+1 heap objects instead of 1. In hot
+paths, this is not a micro-optimization — it's the
+difference between fitting in L2 and thrashing main memory.
+See `arrays-vs-linked-lists.mdx` for the cache-line math.
+</Callout>
+
+## A reference is not a C pointer
+
+Java references and C pointers feel similar but aren't:
+
+| | C pointer | Java reference |
+|---|---|---|
+| What it is | A raw machine address | An opaque, typed handle |
+| Arithmetic | Legal (`p + 1`, `&arr[i]`) | Forbidden |
+| Cast to integer | Yes | No |
+| Points at | Stack, heap, code, anywhere | A heap object (or `null`) |
+| Address stability | Stable — OS won't move it | GC may relocate at any time |
+
+That last point is the important one. A modern GC (G1, ZGC,
+Shenandoah) may relocate live objects to defragment the heap.
+You cannot pin an object's address from pure Java. If you need
+stable addresses — for `mmap`, DMA, FFI — you use off-heap
+memory: `ByteBuffer.allocateDirect`, or the newer
+`java.lang.foreign.MemorySegment` API from Project Panama.
+
+## What an object actually looks like in memory
+
+On HotSpot with compressed oops (the default for heaps under
+~32GB), every object starts with a header:
+
+- **Mark word** — 8 bytes. Holds the identity hash code, GC
+  age, lock state, and a few other bits.
+- **Klass pointer** — 4 bytes (compressed). Points to the
+  class metadata so the runtime knows the type.
+
+That's 12 bytes of overhead before any field. Then your
+fields, packed by type and alignment. Then padding to round
+the whole object to an 8-byte boundary.
+
+So an `Integer` (one `int` field):
+
+```
+12 bytes header
+ 4 bytes int value
+ = 16 bytes total (already aligned)
+```
+
+A 32-bit primitive int wrapped in a 16-byte heap object. That
+4x overhead is paid per element. Then the reference *to* the
+Integer is another 4 bytes inside whatever container holds it.
+
+Contrast with `int[1000]`:
+
+```
+12 bytes header
+ 4 bytes length
+ 4 bytes padding (to align the int payload)
+4000 bytes of ints
+= ~4016 bytes total
+```
+
+One object, one header, contiguous data. 4 bytes per element,
+not 16+ plus a reference.
+
+## Cache lines: why this matters
+
+CPUs read memory in **cache lines** — 64 bytes on every modern
+x86 and ARM chip. When you touch one byte, you get the
+surrounding 63 for free.
+
+An `int[16]` is exactly one cache line. Iterating it costs one
+cache-line fetch and then 16 register reads. Linear,
+prefetcher-friendly, branch-predictable.
+
+An `Integer[16]`? The array itself holds 16 references (64
+bytes — also one line). But each reference points at a
+*separate* 16-byte `Integer` object, allocated whenever it
+happened to be created, scattered across whatever pages the
+allocator handed out. Touching all 16 values is potentially 16
+cache misses. At ~100ns per main-memory miss, that's 1.6
+microseconds of stalls for 16 integers.
+
+This is the locality argument from
+`arrays-vs-linked-lists.mdx`, but generalized. Every "node
+with a pointer to the next thing" data structure pays this
+cost. Every "flat array of primitives" structure avoids it.
+
+## Escape analysis (don't rely on it)
+
+HotSpot's JIT runs an analysis pass that asks: *can this
+object's reference escape the method that created it?* If
+not — no field assigns it to a long-lived object, no return,
+no thread hand-off — the JIT may:
+
+- Allocate it on the stack instead of the heap.
+- **Scalar-replace** it: pretend the object never existed and
+  hold its fields directly in registers.
+- Eliminate it entirely if nothing reads the fields.
+
+```java
+double distance(double x1, double y1, double x2, double y2) {
+  Point a = new Point(x1, y1);   // probably never allocated
+  Point b = new Point(x2, y2);   // probably never allocated
+  return a.distanceTo(b);
+}
+```
+
+This is why "don't allocate in hot loops" is more nuanced than
+it sounds. Sometimes you can, because the JIT erases it.
+
+But: escape analysis is opportunistic. It breaks under
+inlining failures, virtual calls it can't devirtualize,
+megamorphic call sites, debug builds, and the first thousand
+or so iterations before C2 kicks in. **Don't design around
+it.** Treat it as a bonus, not a contract.
+
+## What this means for picking data structures
+
+Every later page in this topic leans on these facts. Reading
+them now saves arguments later:
+
+<Cheatsheet caption="The mental model">
+- `int[]` is fundamentally different from `Integer[]`. One
+  is contiguous primitive data; the other is an array of
+  references to scattered heap objects.
+- "The array lives on the heap. The reference lives on the
+  stack." Say this out loud the next time you draw a
+  diagram.
+- Every `new` is fast but not free — it's future GC work.
+  Hot loops that allocate per iteration create GC pressure
+  even if no single allocation is slow.
+- Following a reference is *potentially* a cache miss.
+  Following a hundred references is *probably* a hundred
+  cache misses. Linked structures pay this; flat arrays
+  don't.
+- Object headers cost 12–16 bytes. Small wrapper objects
+  (`Integer`, `Long`, two-field POJOs) are mostly header by
+  weight. Bulk storage wants primitive arrays.
+- The JVM may move your objects. You don't own their
+  addresses. If you need stable addresses, go off-heap.
+</Cheatsheet>
+
+<QA q="Why does ArrayList<Integer> use so much more memory than int[]?">
+Three reasons stack up. First, every element is a
+separate `Integer` object — 16 bytes of header-plus-field
+versus 4 bytes of raw int. Second, the `ArrayList` holds
+references to those Integers — another 4 bytes per slot.
+Third, the backing array is over-allocated (capacity grows
+in chunks) so there's slack at the end. Net result: roughly
+5x the memory and N+1 heap objects instead of 1. For
+anything performance-sensitive, use `int[]` or a
+primitive-specialized library like Eclipse Collections or
+fastutil.
+</QA>
+
+<QA q="If references aren't pointers, how do they work?">
+At the machine level they *are* pointers — the JIT compiles
+them down to address loads. But the language hides this:
+you can't read the address, do arithmetic on it, or count
+on it staying the same. The GC reserves the right to move
+the object and update every reference to it. So
+*semantically* a reference is a handle, not an address,
+even though the implementation uses an address.
+</QA>
+
+## Cross-references
+
+- `arrays-vs-linked-lists.mdx` — the locality argument in
+  detail, with concrete benchmarks.
+- `hash-tables-internals.mdx` — why open-addressing tables
+  beat chained tables on modern hardware (same cache-line
+  argument).
+
+## The discipline
+
+- Stack holds locals and references; heap holds objects.
+  Primitives inside an object live inside that object on
+  the heap, not separately.
+- Java passes references by value. Mutations through the
+  reference are visible; reassignments of the parameter
+  aren't.
+- Every `new` is a future GC root. Allocation rate, not
+  heap size, drives GC pressure.
+- A reference is a managed handle, not an address. The GC
+  can move objects; for stable addresses, go off-heap.
+- Object headers are 12–16 bytes. `Integer` is 4x the size
+  of `int`. Prefer primitive arrays for bulk storage.
+- Cache lines are 64 bytes. Flat layouts hit one line per
+  access; pointer chases hit one *per hop*. Pick
+  structures accordingly.

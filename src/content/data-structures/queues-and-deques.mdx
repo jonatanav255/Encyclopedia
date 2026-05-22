@@ -1,0 +1,292 @@
+export const level = 'junior';
+
+# Queues and deques
+
+A queue is FIFO: first in, first out. Add at the back, remove from
+the front. Almost every async system has a queue at the heart of it
+— BFS frontiers, scheduler ready-lists, executor work pools, network
+packet buffers, producer-consumer pipelines, message brokers. Get
+the implementation wrong and you turn an O(n) drain into O(n²), or
+OOM the process.
+
+A **deque** ("deck") is a double-ended queue — add and remove at
+either end. It generalizes both a queue and a stack. In Java,
+`ArrayDeque` is the Swiss Army knife: one class, three behaviors,
+all O(1).
+
+## The naive trap
+
+The most common queue bug in Java is using `ArrayList` as a queue:
+
+```java
+List<Task> q = new ArrayList<>();
+q.add(t);                // enqueue — amortized O(1), fine
+Task next = q.remove(0); // dequeue — O(n), shifts everything
+```
+
+`ArrayList.remove(0)` is O(n) — it shifts every remaining element
+one slot left. Drain a million-item list this way and you've done
+O(n²) work; the job that should finish in milliseconds takes
+minutes. Same trap as `arr.shift()` in JS and `list.pop(0)` in
+Python: contiguous arrays can't cheaply remove from the front.
+
+<Callout variant="warn">
+If you're using `ArrayList` as a queue, you have a bug. It might
+not have bitten yet because your queues are small, but it will.
+Reach for `ArrayDeque` instead.
+</Callout>
+
+## Three real implementations
+
+There are three honest ways to build a queue. Each makes different
+trade-offs.
+
+### Linked list
+
+Keep a `head` pointer and a `tail` pointer. Dequeue from head,
+enqueue at tail. Both O(1), no shifting.
+
+```java
+class LinkedQueue<T> {
+  static class N<T> { T v; N<T> next; N(T v){this.v=v;} }
+  private N<T> head, tail;
+
+  public void offer(T x) {
+    N<T> n = new N<>(x);
+    if (tail == null) head = tail = n;
+    else { tail.next = n; tail = n; }
+  }
+  public T poll() {
+    if (head == null) return null;
+    T v = head.v;
+    head = head.next;
+    if (head == null) tail = null;
+    return v;
+  }
+}
+```
+
+`java.util.LinkedList` is exactly this (doubly-linked). It works.
+It's also slower than the next option in almost every realistic
+workload — every enqueue allocates a node and every dequeue chases
+a pointer into scattered memory. Cache locality beats Big-O.
+
+### Circular array (ring buffer)
+
+A fixed-size array with two indices: `head` (next to dequeue) and
+`tail` (next slot to enqueue). Both wrap around modulo capacity.
+
+```java
+class RingQueue<T> {
+  private Object[] buf; private int head, tail, size;
+  RingQueue(int cap) { buf = new Object[cap]; }
+
+  public boolean offer(T x) {
+    if (size == buf.length) return false;   // full
+    buf[tail] = x;
+    tail = (tail + 1) % buf.length;
+    size++;
+    return true;
+  }
+  @SuppressWarnings("unchecked")
+  public T poll() {
+    if (size == 0) return null;
+    T v = (T) buf[head];
+    buf[head] = null;                        // help GC
+    head = (head + 1) % buf.length;
+    size--;
+    return v;
+  }
+}
+```
+
+Both ends O(1). No per-operation allocation. The backing array is
+contiguous, so iteration is cache-friendly. When you fill up you
+reject, resize-and-copy, or block. This is what `ArrayDeque` is
+built on.
+
+### Two-stack queue
+
+Interview classic. Use an "in" stack and an "out" stack. Enqueue
+pushes onto `in`. Dequeue pops from `out`; when `out` is empty,
+drain `in` into `out` (reversing LIFO into FIFO). Each element is
+pushed twice in its lifetime, so total work for `n` operations is
+O(n) — **amortized O(1)** per call. Worst-case one dequeue is
+still O(n). Useful for understanding amortized analysis. Not what
+you'd ship.
+
+## `ArrayDeque` is the answer to almost everything
+
+`java.util.ArrayDeque` is a circular array with power-of-two
+capacity. That detail matters: wrap-around is a bitmask AND
+(`(tail + 1) & (buf.length - 1)`) instead of modulo, which is
+noticeably faster on modern CPUs.
+
+It implements `Deque<E>`, which extends `Queue<E>`, so the same
+object is a queue, a stack, *and* a deque depending on which
+methods you call.
+
+```java
+Deque<Task> q = new ArrayDeque<>();
+q.offer(t1);            // enqueue (add to tail)
+q.offer(t2);
+Task next = q.poll();   // dequeue (remove from head)
+```
+
+Used as a stack: `push` and `pop`, both at the head. Used as a
+deque: `addFirst` / `addLast` / `pollFirst` / `pollLast`.
+
+The one caveat: **`ArrayDeque` doesn't allow `null` elements** — it
+uses `null` as the empty-slot sentinel. If you genuinely need to
+enqueue nulls (rare), use `LinkedList`. Otherwise, encode "no value"
+some other way.
+
+<Callout>
+`ArrayDeque` is the default. Use it when you need a queue. Use it
+when you need a stack (Java's `Stack` class is a synchronized
+legacy `Vector` subclass — don't use it). Use it when you need a
+deque. One class, three jobs.
+</Callout>
+
+## Deques generalize queues and stacks
+
+A deque exposes `addFirst` / `pollFirst` (head) and `addLast` /
+`pollLast` (tail). From these you get:
+
+- **Queue** (FIFO): `offer` = `addLast`, `poll` = `pollFirst`.
+- **Stack** (LIFO): `push` = `addFirst`, `pop` = `pollFirst`.
+- **Deque**: use both ends as needed.
+
+One backing structure, all the LIFO/FIFO behaviors. That's why
+`ArrayDeque` shows up everywhere in modern Java code.
+
+## Bounded vs unbounded
+
+The design decision that separates code-that-works from
+code-that-works-in-production.
+
+**Unbounded** — `ArrayDeque`, `LinkedList`, `LinkedBlockingQueue`
+with no capacity. Grows as long as memory allows. If the producer
+outpaces the consumer, you OOM. Single most common cause of "the
+service was fine for two weeks and then fell over."
+
+**Bounded** — `ArrayBlockingQueue(capacity)`,
+`LinkedBlockingQueue(capacity)`. Fixed maximum size. When full, the
+producer must do *something*: block (`put`), drop new (`offer`
+returns false), drop oldest, or surface backpressure upstream. You
+pick the policy.
+
+The right default for any production queue is **bounded**, with a
+deliberate full-queue policy. An unbounded queue is a latent
+incident.
+
+## Concurrent queues
+
+`java.util.concurrent` ships a family of thread-safe queues. Plain
+`ArrayDeque` is *not* thread-safe — concurrent access without
+external synchronization will corrupt it silently.
+
+<Cheatsheet>
+- **`ArrayBlockingQueue`** — bounded, single-lock, FIFO. Simple and
+  well-tested. The default bounded queue.
+- **`LinkedBlockingQueue`** — optionally bounded, two-lock design
+  (separate head and tail locks for higher throughput).
+- **`ConcurrentLinkedQueue`** — lock-free, unbounded, Michael-Scott
+  algorithm. High throughput, no blocking semantics.
+- **`LinkedTransferQueue`** — like `LinkedBlockingQueue` plus
+  synchronous handoff via `transfer` (producer waits for a consumer).
+- **`SynchronousQueue`** — capacity zero; every `put` must rendezvous
+  with a `take`. Used by `Executors.newCachedThreadPool`.
+- **`PriorityBlockingQueue`** — heap-based, *not* FIFO. See the
+  priority queue page.
+</Cheatsheet>
+
+For most application code, `ArrayBlockingQueue` is the right answer.
+Reach for lock-free or transfer variants only when profiling shows
+the queue is the bottleneck. Don't roll your own — the lock-free
+ones took researchers years to get right.
+
+## Priority queue is not a queue
+
+Common confusion: **a priority queue is not a FIFO queue with
+priorities**. It's a heap. It returns items in order of priority,
+not order of arrival; ties come out in any order. The API looks
+queue-shaped (`offer`, `poll`) but the semantics are heap semantics.
+Java's `PriorityQueue` and `PriorityBlockingQueue` are both heaps —
+see `heaps-and-priority-queues.mdx`. If you need FIFO, use
+`ArrayDeque` or a `BlockingQueue`, not `PriorityQueue`.
+
+## The BFS use case
+
+Queues show up most cleanly in **breadth-first search**. The
+"frontier" — nodes discovered but not yet processed — is a FIFO
+queue. Pop one, enqueue its unvisited neighbors, repeat.
+
+```java
+Deque<Node> frontier = new ArrayDeque<>();
+Set<Node> seen = new HashSet<>();
+frontier.offer(start); seen.add(start);
+while (!frontier.isEmpty()) {
+  Node u = frontier.poll();
+  for (Node v : u.neighbors) if (seen.add(v)) frontier.offer(v);
+}
+```
+
+Swap the queue for a stack and you get DFS. Swap it for a priority
+queue keyed by distance and you get Dijkstra. The algorithm's shape
+is determined by the data structure holding the frontier. See
+`algorithms/bfs-and-dfs.mdx`.
+
+## Real-world: task queues
+
+"Task queue" covers two distinct things:
+
+- **In-process** — Tomcat's request queue, an executor's work
+  queue, an actor's mailbox. `BlockingQueue` instances inside a
+  single JVM. Bounded, in-memory, fast.
+- **Out-of-process** — RabbitMQ, Kafka, SQS, NATS. Network services
+  with persistence, replication, and delivery guarantees.
+  Queue-shaped APIs, whole-storage-system implementations.
+
+The in-process ones use the primitives on this page directly; the
+out-of-process ones are built on top with disk, network, and
+consensus added. Both share the same design question: what happens
+when you fill up?
+
+## The slow-consumer problem
+
+If consumers can't keep up, the queue grows. Two outcomes:
+
+- **Unbounded**: memory grows without limit. Eventually OOM, GC
+  death-spiral, or the kernel kills your process.
+- **Bounded**: you hit the limit and must choose a policy. Block
+  the producer (backpressure), drop new items, drop old ones, or
+  return an error.
+
+A queue without a "what when full" strategy is incomplete. Same
+problem in-process and out-of-process; picking the policy is part
+of the design, not an optimization to defer.
+
+## Cross-references
+
+- `arrays-dynamic-and-static.mdx` — the ring buffer is just a
+  dynamic array with two indices and modular arithmetic.
+- `heaps-and-priority-queues.mdx` — the "priority queue" that
+  isn't really a queue.
+- `algorithms/bfs-and-dfs.mdx` — the canonical algorithmic use of
+  a queue (and the stack twin, DFS).
+
+## The discipline
+
+- FIFO with two operations: `offer` and `poll`. Both must be O(1).
+- Never use `ArrayList.remove(0)` as a dequeue — O(n) per call,
+  O(n²) per drain.
+- `ArrayDeque` is the default: stack, queue, and deque in one class.
+  Don't use `LinkedList` "because it sounds right," and don't use
+  the legacy `Stack` at all.
+- Bounded beats unbounded in production. Decide your full-queue
+  policy before you ship.
+- For concurrent access, reach into `java.util.concurrent`. Don't
+  roll your own.
+- Priority queues are heaps, not FIFO queues. Different shape,
+  different guarantees.

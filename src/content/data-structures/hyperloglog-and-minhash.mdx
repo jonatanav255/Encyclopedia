@@ -1,0 +1,359 @@
+export const level = 'senior';
+
+# HyperLogLog and MinHash
+
+Two probabilistic structures, one page, because they answer the two
+canonical questions about a set when you can't afford to keep the set:
+
+- **HyperLogLog** — how many *distinct* elements have I seen?
+- **MinHash** — how *similar* are these two sets, by Jaccard?
+
+Layer **LSH** on top of MinHash and you also get "find me everything
+similar to this query in sub-quadratic time." That's the production
+shape: HLL for cardinality, MinHash + LSH for near-duplicate search.
+`bloom-filters.mdx` covers membership; this page covers the other two
+columns of the same table.
+
+Exact `count(distinct user_id)` over a billion-row table needs a
+billion-entry hash set or a sort-and-uniq over disk. Exact pairwise
+Jaccard over a million documents is 10^12 set intersections. Both are
+hopeless at the scale where the question matters. The sketch trade is
+the same in both cases: give up exactness and enumeration, keep a few
+KB per stream, get answers in one pass with a standard error that
+depends on sketch size and not input size. The sketches **merge**, so
+shards can compute locally and a coordinator combines without
+rescanning data.
+
+## HyperLogLog — the intuition
+
+Flajolet, Fusy, Gandouet, Meunier (2007). The setup:
+
+- Hash each element to a long uniform-looking bit string.
+- For each hash, count the number of **leading zeros**. Call the max
+  ever seen `r`.
+- A uniformly random bit string has `r` leading zeros with probability
+  `2^-(r+1)`. So if you've seen one string with `r` leading zeros, you
+  have probably drawn around `2^r` distinct strings.
+
+A single max-leading-zero count is high-variance — the answer doubles
+or halves easily. The fix: split the hash into a top-`b`-bits
+**bucket index** (giving `m = 2^b` buckets) and a tail used for
+leading zeros, keep the per-bucket max, then combine the `m` bucket
+values with a **harmonic mean** and a bias-correction constant
+`alpha`. The harmonic mean damps outliers — one bucket that saw
+`r = 30` early doesn't blow up the estimate. `alpha` is empirical;
+trust the constants and move on.
+
+## The headline numbers
+
+For `m = 2^b` buckets: memory is `m * 6 bits` (six bits covers
+leading-zero counts up to 63, enough for cardinalities into the 2^63
+range), and standard error is `~1.04 / sqrt(m)`. At `b = 14`,
+`m = 16384`: **~12 KB packed, ~0.81% standard error**, good for
+billions of distinct items. At `b = 11`, `m = 2048`: ~1.5 KB,
+~2.3% error.
+
+Going from `m = 2048` to `m = 16384` is 8x more memory but only ~3x
+less error, because variance shrinks as `1 / sqrt(m)`. Past
+`m = 16384` you pay real memory for fractional-percent improvements.
+
+## Java — a minimal HLL sketch
+
+```java
+public class HyperLogLog {
+    private final byte[] buckets;
+    private final int b;             // bits for bucket index
+    private final int m;             // = 2^b
+
+    public HyperLogLog(int b) {
+        this.b = b;
+        this.m = 1 << b;
+        this.buckets = new byte[m];
+    }
+
+    public void add(byte[] item) {
+        long h = hash(item);
+        int idx = (int) (h >>> (64 - b));            // top b bits
+        long w = (h << b) | (1L << (b - 1));         // tail, nonzero
+        int leadingZeros = Long.numberOfLeadingZeros(w) + 1;
+        if (leadingZeros > buckets[idx]) buckets[idx] = (byte) leadingZeros;
+    }
+
+    public long estimate() {
+        double sum = 0;
+        int zeros = 0;
+        for (byte v : buckets) { sum += 1.0 / (1L << v); if (v == 0) zeros++; }
+        double alpha = 0.7213 / (1 + 1.079 / m);     // for m >= 128
+        double e = alpha * m * m / sum;
+        // Small-range correction (linear counting) when many buckets are empty
+        if (e <= 2.5 * m && zeros != 0) e = m * Math.log((double) m / zeros);
+        return Math.round(e);
+    }
+
+    private long hash(byte[] item) { /* xxh64 */ return 0; }
+}
+```
+
+`h >>> (64 - b)` pulls the top `b` bits for the bucket index;
+`(h << b) | (1L << (b - 1))` shifts the consumed bucket bits off and
+ORs in a sentinel so `numberOfLeadingZeros` is well-defined even when
+the tail is all zeros. `alpha * m * m / sum` is the harmonic-mean
+estimator, multiplied by `m` to lift it from "average bucket" to
+"cardinality" and corrected by `alpha` for the small bias from the
+leading-zero geometric distribution.
+
+The original 2007 paper has range-based bias corrections (linear
+counting for small cardinalities, exponent correction for large ones).
+**HLL++** (Heule, Nunkesser, Hall — Google, 2013) replaces these with
+a table-based bias correction tuned empirically and adds a **sparse
+representation** for low-cardinality sketches that beats the dense
+layout below ~12,000 distinct items. BigQuery, Presto, and Druid all
+use HLL++.
+
+## The killer property: sketches merge
+
+Two HLL sketches built with the same `b` merge by taking the **max per
+bucket**. The merged sketch is identical to one built directly from the
+union of the input streams, and the error bound is unchanged.
+
+```java
+public void merge(HyperLogLog other) {
+    if (other.m != m) throw new IllegalArgumentException("size mismatch");
+    for (int i = 0; i < m; i++)
+        if (other.buckets[i] > buckets[i]) buckets[i] = other.buckets[i];
+}
+```
+
+This is why distributed analytics work. Every shard computes a local
+HLL, a coordinator merges them, and the cardinality of the global
+union falls out of one harmonic-mean computation. **No data moves,
+nothing is re-scanned.** Same property powers rolling time-window
+cardinality — merge yesterday's sketch with today's, get the two-day
+distinct count, never touch the rows.
+
+<Callout variant="info">
+**Exact vs approximate distinct is one of the biggest performance levers in analytics SQL.** PostgreSQL's `count(distinct col)` is exact but slow on big tables. ClickHouse's `uniqExact` is the same shape; ClickHouse's `uniqHLL12` and `uniq` are HLL-based. Presto/Trino expose `approx_distinct`. BigQuery exposes `APPROX_COUNT_DISTINCT`. Recognize when 1% error is acceptable, because it's often a 10-100x speedup for free.
+</Callout>
+
+## HLL in production
+
+<Cheatsheet caption="HyperLogLog in the wild">
+| System | API | Notes |
+|---|---|---|
+| Redis | `PFADD`, `PFCOUNT`, `PFMERGE` | Dense HLL in 12 KB per key. Sparse mode for small sets. |
+| Presto / Trino | `approx_distinct(col)` | Standard HLL, ~2.3% default error. |
+| ClickHouse | `uniqHLL12(col)`, `uniq(col)` | `uniq` adaptive: linear counting then HLL. |
+| Apache Druid | HLL aggregator | Default distinct-count for OLAP cubes. |
+| Google BigQuery | `APPROX_COUNT_DISTINCT` | HLL++ under the hood. |
+| Apache Spark | `approx_count_distinct` | HLL++ via DataSketches or built-in. |
+| Apache DataSketches | `HllSketch`, `ThetaSketch` | Production Java library, mergeable across systems. |
+</Cheatsheet>
+
+Theta sketches (also in DataSketches) are a related family that
+support **set intersection** and **set difference** with bounded
+error, not just union. If you need `|A ∩ B|` between two large
+streams, reach for theta sketches instead of trying to bend HLL.
+
+## MinHash — Jaccard estimation
+
+Broder (1997), originally for de-duplicating AltaVista's web crawl.
+Jaccard similarity is `J(A, B) = |A ∩ B| / |A ∪ B|`.
+
+The MinHash claim: for a uniform random hash function `h`,
+
+```
+Pr[ min h(A) == min h(B) ] = J(A, B)
+```
+
+The intuition is short. The minimum hash over `A ∪ B` is achieved by
+exactly one element. Because `h` is uniform that element is equally
+likely to be any element of the union, so the probability it lies in
+the intersection is `|A ∩ B| / |A ∪ B|` — the Jaccard.
+
+One coin flip per pair is useless. Fix the variance the same way HLL
+does: pick `k` independent hashes, store the vector of `k` minimums
+per set — the **MinHash signature** — and estimate `J(A, B)` as the
+fraction of positions where the two signatures agree. The estimator
+is unbiased; standard error is `~1 / sqrt(k)`.
+
+## MinHash sizing
+
+| `k` | Standard error | Bytes per signature (int32) |
+|---|---|---|
+| 64 | ~12.5% | 256 |
+| 128 | ~8.8% | 512 |
+| 256 | ~6.3% | 1024 |
+| 512 | ~4.4% | 2048 |
+
+A 10,000-element set as 64-bit hashes is 80 KB. The MinHash signature
+at `k = 128` is **512 bytes** and answers "Jaccard with any other
+set" to within ~9% — a 150x compression that preserves the
+relationship you actually query.
+
+## Java — MinHash signature
+
+```java
+public class MinHash {
+    private final int k;
+    private final long[] seeds;
+    private final long[] mins;
+
+    public MinHash(int k, long seed) {
+        this.k = k;
+        this.seeds = new long[k];
+        this.mins = new long[k];
+        java.util.Random rnd = new java.util.Random(seed);
+        for (int i = 0; i < k; i++) {
+            seeds[i] = rnd.nextLong();
+            mins[i] = Long.MAX_VALUE;
+        }
+    }
+
+    public void add(byte[] item) {
+        for (int i = 0; i < k; i++) {
+            long h = hash(item, seeds[i]);
+            if (h < mins[i]) mins[i] = h;
+        }
+    }
+
+    public double jaccard(MinHash other) {
+        int agree = 0;
+        for (int i = 0; i < k; i++) if (mins[i] == other.mins[i]) agree++;
+        return (double) agree / k;
+    }
+
+    private long hash(byte[] item, long seed) { /* xxh64 */ return 0; }
+}
+```
+
+`k` independent hashes are expensive — `k = 128` is 128 hash
+evaluations per inserted element. The **bottom-k** variant fixes this:
+hash each element once and keep the `k` smallest hash values across
+the set. The collision math is the same asymptotically and you pay
+one hash per element instead of `k`. Mash (genome-similarity tool)
+uses bottom-k MinHash for exactly this reason.
+
+## LSH — find similar items without comparing pairs
+
+You have `N` MinHashed items. Finding all pairs with Jaccard > `t`
+still costs `O(N^2)` signature comparisons — for `N = 10^6` that's
+`10^12`, still hopeless.
+
+**Locality-Sensitive Hashing with banding** turns this into a hash
+lookup. Split each signature of `k` values into `b` **bands** of
+`r = k / b` values each. Hash each band (the `r` integers as one
+tuple) into a hash table. Two items are **candidates** if they
+collide in *any* band — i.e. they agree on all `r` signature values
+in some band. Only candidates get an exact Jaccard check.
+
+For two items with true Jaccard `s`, the probability they collide in a
+given band is `s^r` (all `r` positions must agree), and the
+probability they collide in at least one of `b` bands is approximately
+`1 - (1 - s^r)^b`. That's an **S-curve** — near 0 below a threshold
+and near 1 above — with threshold roughly at `(1/b)^(1/r)`. Tune `b`
+and `r` for a fixed `k = b * r` to steer the curve where you want it.
+
+<Compare
+  bad={`// Brute force all-pairs
+for (int i = 0; i < n; i++)
+  for (int j = i + 1; j < n; j++)
+    if (sigs[i].jaccard(sigs[j]) >= 0.8) report(i, j);
+// 10^6 docs -> 5 * 10^11 comparisons. Hopeless.`}
+  good={`// LSH banding: bucket-and-verify
+Map<Long, List<Integer>> buckets = new HashMap<>();
+for (int i = 0; i < n; i++)
+  for (int band = 0; band < B; band++) {
+    long key = bandHash(sigs[i], band, R);
+    buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+  }
+// Verify only within-bucket pairs.
+for (List<Integer> cand : buckets.values())
+  for (int a = 0; a < cand.size(); a++)
+    for (int b = a + 1; b < cand.size(); b++)
+      if (sigs[cand.get(a)].jaccard(sigs[cand.get(b)]) >= 0.8)
+        report(cand.get(a), cand.get(b));`}
+  language="java"
+  badTitle="Quadratic. Doesn't run."
+  goodTitle="Bucket-and-verify; ~linear in N"
+/>
+
+Worked example: `k = 128`, `b = 32`, `r = 4`. Threshold ~
+`(1/32)^(1/4)` ≈ 0.42. Pairs with Jaccard > ~0.6 are found reliably;
+pairs below ~0.3 almost never become candidates.
+
+## MinHash + LSH in production
+
+- **Near-duplicate web pages.** The original Broder application —
+  AltaVista deduping crawled documents before indexing. Modern search
+  engines still use shingled MinHash for canonicalization.
+- **Plagiarism detection.** Moss and successors fingerprint documents
+  via shingled MinHash + LSH.
+- **Genome and metagenome comparison.** Mash and sourmash estimate
+  sequence Jaccard between gigabase genomes with ~10 KB sketches.
+- **Recommender prefilters.** MinHash + LSH index over user-item sets,
+  then exact scoring on the candidates.
+- **Vector-DB hybrid retrieval.** Some ANN systems use binarized LSH
+  (a sibling family for cosine / Euclidean distance, not Jaccard) as a
+  cheap first-pass filter before exact distance on the candidates.
+
+## HLL vs MinHash vs the rest
+
+| Question | Right structure |
+|---|---|
+| How many distinct things? | HyperLogLog |
+| How similar are these two sets? | MinHash |
+| Find all sets similar to query `S` | MinHash + LSH |
+| How often did event `X` occur? | Count-Min Sketch |
+| Is `X` in this set? | Bloom filter |
+| Set intersection size between two streams | Theta sketch |
+
+They sound alike — "small constant-memory sketches over streams" —
+but answer fundamentally different questions. HLL has no idea whether
+two streams overlap; MinHash has no idea how many distinct elements a
+set contains; neither knows whether a specific element was seen.
+
+## What sketches can't do
+
+- **Enumerate elements.** An HLL has *no list* of what it counted; a
+  MinHash signature stores `k` hash values, not elements. No "for
+  each distinct item" exists.
+- **Give exact answers.** Bounds are tight in expectation. If a
+  regulator needs the exact count, you need the exact count.
+- **Handle deletes cleanly.** Standard HLL is insert-only; once a
+  bucket records a high leading-zero count, you can't safely revert
+  it. Sliding-window and time-decayed variants exist with caveats.
+- **Answer questions they weren't built for.** "Distinct users in the
+  intersection of these two HLLs" — HLL doesn't do intersection
+  cheaply; reach for theta sketches.
+
+## Cross-references
+
+- `hashing-fundamentals.mdx` — HLL's leading-zero argument and
+  MinHash's collision-probability claim both assume uniform output.
+- `hash-tables-internals.mdx` — LSH banding is a hash table whose
+  buckets are candidate lists. Same collision math, different goal.
+- `bloom-filters.mdx` — the membership sibling in the same
+  "constant memory, bounded error, one-pass" family.
+- `count-min-and-frequency-sketches.mdx` — the frequency sibling.
+  CMS for "how often," t-digest for percentiles, Misra-Gries for
+  deterministic heavy hitters.
+
+## The discipline
+
+- HyperLogLog answers "how many distinct?" in roughly 12 KB for
+  billions of items with ~1% error. Standard error shrinks as
+  `1 / sqrt(m)`; doubling `m` does **not** halve error.
+- HLL sketches merge by per-bucket max. That single property makes
+  distributed distinct-count, time-window rollups, and cross-region
+  aggregation work without data movement.
+- MinHash estimates Jaccard similarity. 128 ints per set buys ~9%
+  error and turns 10,000-element sets into 512-byte signatures.
+- MinHash + LSH finds similar pairs in sub-quadratic time. Tune bands
+  `b` and rows `r` to place the S-curve threshold near the similarity
+  floor you care about.
+- Sketches are a family, not interchangeable: HLL for cardinality,
+  MinHash for similarity, Bloom for membership, Count-Min for
+  frequency, theta for set intersection. Pick by the question.
+- In analytics SQL, swapping exact `count(distinct)` for HLL-backed
+  `approx_distinct` is often a 10-100x speedup at fractional-percent
+  error. Recognize when that trade is free and take it.

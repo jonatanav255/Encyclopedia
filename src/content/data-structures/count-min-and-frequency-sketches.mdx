@@ -1,0 +1,372 @@
+export const level = 'senior';
+
+# Count-min and frequency sketches
+
+You have a stream — HTTP requests, ad impressions, network packets,
+tracing spans, IoT telemetry, search queries — and N is huge or
+infinite. You want to answer questions about it without storing it:
+"How often did event X appear?" "What are the top 100 sources?"
+"What's the p99 latency?" Exact answers need O(distinct items) or
+O(N) memory. **Sketches** give approximate answers with proven error
+bounds in O(1) memory. This page covers three production sketches:
+**Count-Min Sketch** (frequency estimation), **Misra-Gries**
+(deterministic heavy hitters), and **t-digest** (quantile estimation).
+They share the same discipline — bounded memory, bounded error,
+mergeable across shards, and a clear statement of what the sketch
+cannot do.
+
+## The shared problem
+
+Three questions show up over and over on production streams:
+
+1. **Frequency** — "How many times did key X appear?"
+2. **Heavy hitters / top-k** — "Which keys appear more than N/100
+   times?" or "Give me the 50 most-frequent keys."
+3. **Quantiles** — "What's the p99 of these latency samples? The p50?
+   The p99.9?"
+
+Exact answers require remembering every distinct key (frequency,
+top-k) or every sample (quantiles). At a few thousand keys, fine —
+use a `HashMap<String, Long>` or a sorted array. At a few billion
+spread across hundreds of shards, you can't. You also can't ship
+every event to a central coordinator. You need a summary each shard
+maintains locally and a way to **merge** summaries without losing
+accuracy. That's what sketches are.
+
+## Count-Min Sketch — Cormode and Muthukrishnan, 2005
+
+Picture a 2D array of counters, `counts[d][w]`, with `d` rows (the
+**depth** — one independent hash function per row) and `w` columns
+(the **width**). Pick `d` hash functions `h_0, ..., h_{d-1}`, each
+mapping items to `[0, w)`.
+
+**Add(x):** for every row `i`, increment `counts[i][h_i(x)]`.
+**Estimate(x):** look up `counts[i][h_i(x)]` for every row and return
+the **minimum**. Every row is a small counter array; every row sees
+collisions (other items' weight added to x's cell), so every row is
+an **overestimate**. The minimum over `d` overestimates is the
+tightest of them.
+
+```java
+public class CountMinSketch {
+    private final long[][] counts;  // [depth][width]
+    private final int depth, width;
+    private final int[] seeds;
+
+    public CountMinSketch(int depth, int width, long seed) {
+        this.depth = depth;
+        this.width = width;
+        this.counts = new long[depth][width];
+        this.seeds = new int[depth];
+        var rng = new java.util.Random(seed);
+        for (int i = 0; i < depth; i++) seeds[i] = rng.nextInt();
+    }
+
+    public void add(byte[] item) {
+        for (int i = 0; i < depth; i++) {
+            int idx = Math.floorMod(hash(item, seeds[i]), width);
+            counts[i][idx]++;
+        }
+    }
+
+    public long estimate(byte[] item) {
+        long min = Long.MAX_VALUE;
+        for (int i = 0; i < depth; i++) {
+            int idx = Math.floorMod(hash(item, seeds[i]), width);
+            min = Math.min(min, counts[i][idx]);
+        }
+        return min;
+    }
+
+    // Merge two same-dimension sketches by elementwise addition.
+    public void merge(CountMinSketch other) {
+        for (int i = 0; i < depth; i++)
+            for (int j = 0; j < width; j++) counts[i][j] += other.counts[i][j];
+    }
+
+    // Any seeded non-cryptographic hash (Murmur, xxHash, ...).
+    private static int hash(byte[] item, int seed) { /* ... */ return 0; }
+}
+```
+
+Two things to notice:
+
+- The estimate is always **≥ the true frequency**. CMS never
+  underestimates. That's a strong guarantee — every count you read is
+  an upper bound, never a missed event.
+- Merge is just elementwise addition. Two sketches with the same
+  dimensions and seeds combine losslessly into one sketch whose
+  counters are exactly what you'd get from feeding the union of both
+  streams into a single sketch. That's why CMS works in a distributed
+  setting.
+
+### Sizing math
+
+The classical bound (Cormode-Muthukrishnan): for error tolerance `ε`
+expressed as an additive fraction of the total weight `N`, with
+confidence `1 − δ`:
+
+- `w = ⌈e / ε⌉`
+- `d = ⌈ln(1/δ)⌉`
+- Total memory: `O((1/ε) · log(1/δ))` counters.
+
+So the estimate satisfies `true(x) ≤ est(x) ≤ true(x) + ε·N` with
+probability at least `1 − δ`. Two worked examples:
+
+| Goal | ε | δ | w | d | Counters |
+|---|---|---|---|---|---|
+| Estimate within 1% of N, 99% confidence | 0.01 | 0.01 | 272 | 5 | ~1,400 |
+| Within 0.01% of N, 99.9% confidence | 0.0001 | 0.001 | 27,183 | 7 | ~190,000 |
+
+190K 8-byte counters is ~1.5 MB. The exact alternative —
+`HashMap<String, Long>` keyed by every distinct string — scales with
+cardinality, and at high-cardinality streams (URL paths, source IPs)
+that's gigabytes. CMS is fixed-size regardless of distinct count.
+
+The error is **additive in N**, not in `true(x)`. CMS is sharp for
+heavy items (slack `ε·N` is small relative to a frequency of, say,
+`N/10`) and noisy for rare items (a key that appeared 3 times has an
+estimate within `±0.0001·N` of 3 — an interval of thousands). Use
+CMS for heavy hitters, not for "did the rare event happen?"
+
+<Callout variant="info">
+**The rule of thumb.** If you can ingest the stream into a database
+and write SQL `GROUP BY` queries, do that. Sketches earn their keep
+when you can't — too much data, too high throughput, too many shards
+to centralize. Treat sketches as the answer to "this would be a great
+`GROUP BY` if I had room for it."
+</Callout>
+
+### Heavy-hitter detection with CMS
+
+Point queries give you a number per item. **Top-k** is different —
+"which items are heavy?" — and you don't know the items in advance;
+they come out of the stream. The standard pattern pairs CMS with a
+size-k min-heap (see `heaps-and-priority-queues.mdx`):
+
+```java
+public void observe(byte[] item) {
+    cms.add(item);
+    long est = cms.estimate(item);
+    if (heap.size() < k) {
+        heap.offer(new Candidate(item, est));
+    } else if (est > heap.peek().estimate) {
+        heap.poll();
+        heap.offer(new Candidate(item, est));
+    }
+}
+```
+
+Memory: `O((1/ε) log(1/δ) + k)`. CMS supplies bounded-memory
+frequency lookups; the heap holds the k candidates with the highest
+observed estimates. Real implementations dedupe (an item already in
+the heap is re-scored, not re-inserted) and re-score periodically so
+stale entries don't jam the heap, but the shape above is the
+algorithm behind **streaming top-N URLs** in HTTP analytics,
+**volumetric DDoS detection** (top source IPs by packet count), and
+**ad-fraud throttling** (top spenders per minute).
+
+### Production CMS
+
+- **Redis** — `CMS.*` commands (`CMS.INITBYDIM`, `CMS.INCRBY`,
+  `CMS.QUERY`, `CMS.MERGE`) ship in **Redis Stack** via the
+  RedisBloom module. Sized in `(width, depth)` directly.
+- **Apache DataSketches** — production-grade Java implementations of
+  CMS, HLL, theta sketches, quantiles. Originated at Yahoo, now an
+  Apache top-level project. Used inside Druid, Pinot, Hive.
+- **Apache Spark** — `Dataset#stat().countMinSketch(...)` builds a CMS
+  over a DataFrame column.
+- **Network telemetry** — sFlow / NetFlow collectors use CMS-like
+  structures to track per-source-IP byte counts across high-throughput
+  links.
+
+## Misra-Gries — the deterministic alternative
+
+Misra and Gries published this in 1982, decades before CMS. It solves
+a narrower problem — "items with true frequency > N/k" — with
+**exactly k−1 counters**, no hash functions, no randomness. After one
+pass every true heavy hitter is in the table, with possibly inflated
+counts; a second verification pass over the stream distinguishes real
+heavy hitters from passengers. The algorithm is comically simple:
+
+```java
+public class MisraGries<T> {
+    private final Map<T, Long> counters = new HashMap<>();
+    private final int k;
+
+    public MisraGries(int k) { this.k = k; }
+
+    public void observe(T item) {
+        if (counters.containsKey(item)) {
+            counters.merge(item, 1L, Long::sum);
+        } else if (counters.size() < k - 1) {
+            counters.put(item, 1L);
+        } else {
+            counters.replaceAll((key, v) -> v - 1);
+            counters.values().removeIf(v -> v == 0);
+        }
+    }
+
+    public Map<T, Long> candidates() { return counters; }
+}
+```
+
+Three cases: match an existing key (increment); free slot (claim it);
+neither (decrement every counter, drop zeros). The last branch is the
+trick — a brand-new item that doesn't fit "cancels out" against
+everyone tracked. Real heavy hitters survive cancellation because
+they show up too often to be erased.
+
+**Guarantee:** after one pass over a stream of length N, the final
+counter for x satisfies `count(x) − N/k ≤ stored(x) ≤ count(x)`.
+Every item with true frequency `> N/k` is in the table. The reverse
+isn't true — entries can be passengers — so a verification pass nails
+down exact counts if you need them.
+
+| | Misra-Gries | CMS |
+|---|---|---|
+| Output | Heavy hitters only | Frequency of any queried key |
+| Randomness | None — deterministic | Hash-based, probabilistic |
+| Memory | k − 1 counters | ~e/ε × ln(1/δ) counters |
+| Merge across shards | Subtle — use Space-Saving variant | Trivial elementwise add |
+
+Misra-Gries shows up in network monitoring (top traffic sources), in
+the heavy-hitter portion of analytics appliances, and as the backbone
+of streaming top-k benchmarks. For distributed deployments, the
+**Space-Saving** algorithm (Metwally, Agrawal, El Abbadi 2005) is the
+standard mergeable variant.
+
+## t-digest — quantiles, not frequencies
+
+Different question, different shape. You don't have keys with counts;
+you have a stream of **numeric samples** (HTTP request durations,
+message sizes, GC pause times) and you want quantiles: p50, p99,
+p99.9. Exact quantiles require sorting all samples — O(N) memory.
+
+**t-digest** (Ted Dunning, 2014) maintains a set of weighted
+**centroids**, each summarizing a contiguous range of values. A
+centroid has a `mean` and a `weight` (samples it absorbed).
+Centroids near the **tails** (q ≈ 0 or q ≈ 1) hold few samples —
+sharp estimates there. Centroids near the **median** hold many —
+coarse estimates where coarseness is acceptable. A **scale function**
+governs how much weight a centroid can absorb as a function of `q`;
+periodic compression keeps the centroid count bounded (typically
+`δ ≈ 100`, giving sketches in the low single-digit kilobytes).
+
+Two properties that make it a production favorite:
+
+1. **Mergeable across shards.** Two t-digests combine by interleaving
+   centroid lists and re-compressing. The merged digest has the same
+   accuracy guarantees as one built over the full stream.
+2. **Tight at the tails by design.** p99.9 and p0.1 are tighter than
+   p50 — the opposite of fixed-bucket histograms. Most production
+   quantile use cases (SLO tracking, anomaly alerts, GC-pause
+   percentiles) care exactly about the tails.
+
+Pure-Java implementation: `com.tdunning:t-digest` (Apache 2.0).
+Apache DataSketches has analogous **quantiles sketches** — KLL, REQ —
+with formal worst-case error bounds (t-digest's bounds are mostly
+empirical).
+
+### Production t-digest
+
+- **DataDog** — backbone of its metric percentile pipeline; each
+  agent ships a digest per metric per shard, the backend merges them.
+- **Elasticsearch** — `percentile` aggregation uses t-digest by
+  default, with HDR-Histogram as an alternative for bounded ranges.
+- **InfluxDB** / **TimescaleDB** — percentile aggregate functions in
+  the SQL/Flux dialects use sketches under the hood.
+- **Apache Kafka Streams** — common choice for stateful quantile
+  aggregations over windowed streams.
+- **Prometheus** — uses **bucketed (classical) histograms** by
+  default; **native histograms** (introduced in 2.40 as experimental)
+  move closer to a sketch-like exponential layout. Native histograms
+  are still maturing; the comparison below assumes classical.
+
+### Histogram vs t-digest
+
+| | Bucketed histogram | t-digest |
+|---|---|---|
+| Memory | Proportional to bucket count, fixed at config time | Compressed, fixed at compression level |
+| Accuracy distribution | Coarse where buckets are wide | Tighter at tails by construction |
+| Bucket layout | Chosen upfront, must guess the range | Adaptive to the data |
+| Mergeable across shards | Only if all replicas use identical buckets | Yes, natively |
+| Used in | Prometheus classic histograms, OpenTelemetry default | DataDog, Elasticsearch, Druid |
+| Native to OS / language | Logically simple — just an array of counters | Requires a library |
+
+Histogram wins on operational simplicity and predictable storage.
+t-digest wins on tail accuracy and mergeability — decisive when each
+shard owns its slice of the data and aggregation happens after the
+fact.
+
+## What sketches cannot do
+
+All three **summarize**; none of them **store**. They cannot answer
+"show me the exact event that happened at 03:47:22 on October 14,"
+or "what was request X's payload?" For those you need raw storage —
+a log pipeline, a full-resolution time-series database, or an OLAP
+store. The production pattern is "sketches on the hot path for
+aggregates, raw storage on the cold path for forensics," with a
+request hitting the metrics pipeline (sketches) and the trace
+pipeline (sampled raw events) in parallel.
+
+They also don't combine across structures. CMS gives frequency;
+t-digest gives quantiles. You can't ask a CMS for p99 or a t-digest
+for the count of key X. If you need both, maintain both — they're
+cheap in memory, and the cost is dwarfed by the bandwidth saved.
+
+## Why sketches compose and exact counters don't
+
+This is the property that makes sketches indispensable in distributed
+systems. Suppose 100 shards each see 1% of the traffic:
+
+1. **Ship every event to a coordinator** — bandwidth blows up, the
+   coordinator becomes the bottleneck. Doesn't scale.
+2. **Each shard ships a `HashMap<Key, Long>` of exact counts** — fine
+   at low cardinality. At billions of distinct keys, the per-shard
+   map is too big to ship and merging 100 of them blows the
+   coordinator's memory.
+3. **Each shard ships a sketch** — fixed size, mergeable, same error
+   bound as a single sketch over all the data. The coordinator merges
+   100 small sketches into one and queries it.
+
+Option 3 is the only one that scales. The error you accept is the
+price of admission to bounded-memory distributed analytics.
+
+## Cross-references
+
+- `hashing-fundamentals.mdx` — CMS depends on multiple independent
+  hash functions; the same uniformity / avalanche concerns from
+  hash-table design apply (and seeds matter for the same reason).
+- `hash-tables-internals.mdx` — Misra-Gries is a `HashMap` with three
+  rules. The hash-table cost model carries straight over.
+- `heaps-and-priority-queues.mdx` — the top-k heavy-hitter pattern is
+  a CMS plus a size-k min-heap; the heap discipline is the one from
+  the heaps page.
+- `bloom-filters.mdx` — the membership sibling in the same
+  "constant memory, bounded error, one-pass" family.
+- `hyperloglog-and-minhash.mdx` — the cardinality and similarity
+  siblings; together with CMS and Bloom, these are the four canonical
+  streaming sketches.
+
+## The discipline
+
+- Count-Min Sketch is a `d × w` counter array with `d` hashes;
+  estimate is the **min** over rows. It **always over-estimates,
+  never under**. Error is additive in `N`, so it's sharp for heavy
+  items and noisy for rare ones.
+- Pair CMS with a size-k min-heap to do top-k heavy hitters in
+  bounded memory — that's the algorithm behind streaming top-N URLs,
+  volumetric DDoS detection, and ad-fraud throttling.
+- Misra-Gries is the deterministic, hash-free alternative for "items
+  with frequency > N/k" — simpler and smaller when k is small and you
+  don't need arbitrary point queries.
+- t-digest answers any percentile in fixed memory with sharp accuracy
+  at the tails, and merges losslessly across shards — which is why
+  every distributed metrics pipeline reaches for it.
+- Sketches **summarize**; they don't **store**. Use them when exact
+  counts can't fit in memory or budget, and pair with raw storage for
+  "what was the exact event?" forensics.
+- Production stacks: Apache DataSketches (Druid, Hive, Pinot),
+  RedisBloom `CMS.*` commands, Elasticsearch percentile aggregations,
+  DataDog metric pipelines, Spark `countMinSketch`.

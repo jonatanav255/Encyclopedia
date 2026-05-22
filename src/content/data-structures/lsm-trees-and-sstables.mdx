@@ -1,0 +1,415 @@
+export const level = 'senior';
+
+# LSM trees and SSTables
+
+A B+ tree gives you fast point and range reads, but every write
+ends up as a random write to some page in the tree. SSDs absorb
+that — at a cost in write amplification and flash wear. Spinning
+disks really don't. The Log-Structured Merge tree (O'Neil et al.,
+1996) rearranges the deal: **every write is a sequential append;
+reads pay the cost.** Compaction sweeps the mess up in the
+background.
+
+That single trade is why every modern OLTP storage engine outside
+the B+ tree camp — RocksDB, LevelDB, Cassandra, ScyllaDB, HBase,
+CockroachDB (Pebble), TiKV, Yugabyte — picked this shape.
+
+## The three layers
+
+A working LSM tree is three pieces glued together by one
+background process.
+
+- **Memtable** — an in-memory ordered structure. Receives every
+  write. Almost always a skip list (RocksDB, LevelDB), sometimes
+  a balanced BST. The structure has to be **ordered** (so a
+  flush produces an already-sorted file) and **concurrent** (so
+  many threads can write). That's exactly the niche `skip-lists.mdx`
+  describes.
+- **Write-Ahead Log (WAL)** — an append-only file on disk. Every
+  write is written to the WAL *before* the memtable is updated.
+  If the process dies mid-write, replaying the WAL reconstructs
+  the memtable. The WAL is throwaway — once a memtable is
+  flushed, the WAL covering that memtable can be deleted.
+- **SSTables** — Sorted String Tables. Immutable files on disk,
+  key-sorted, with a small index at the end. When the memtable
+  fills (~64 MB is typical for RocksDB), it's frozen, flushed to
+  a new SSTable, and a fresh memtable replaces it.
+- **Compaction** — a background process that merges overlapping
+  SSTables, drops shadowed/deleted keys, and keeps the file
+  count bounded. Without compaction, the SSTable list grows
+  forever and reads slow to a crawl.
+
+```
+   writes
+     |
+     v
+  +--------+      +----------+
+  | WAL    |<---->| Memtable |   (in RAM, skip list)
+  +--------+      +----------+
+                       |
+                       | flush when full
+                       v
+                  +---------+
+                  | SSTable |     L0  (newest, may overlap)
+                  +---------+
+                       |
+                       | compaction
+                       v
+                  +---------+
+                  | SSTable |     L1, L2, ...   (older, sorted)
+                  +---------+
+```
+
+## Why immutable SSTables are the killer move
+
+The immutability is not a side detail. It's the whole reason the
+shape works.
+
+- **Writes never overwrite existing files.** No in-place page
+  mutation, no fsync amplification per write. The OS gets one
+  big sequential write at flush time and that's it.
+- **Compression is cheap.** You know the file's size and contents
+  before you write it, so block-level compression (Snappy, LZ4,
+  ZSTD) is straightforward — no "what if this block grows on
+  update" problem.
+- **Per-SSTable Bloom filters.** Each SSTable ships with a Bloom
+  filter answering "is key K possibly in this file?" — see
+  `bloom-filters.mdx`. Without them, a point lookup might touch
+  every SSTable on every level.
+- **No reader/writer conflicts.** Files don't change. Readers
+  open an SSTable and read; the file goes away only when no
+  reader holds it and compaction has replaced it. The structure
+  is append-only plus reference-counted GC, not lock-protected
+  mutation.
+
+## Reads — why LSM is read-heavier than B+ trees
+
+To find key K, the engine walks the layers from newest to oldest:
+
+1. Check the active memtable.
+2. Check any immutable memtables waiting to flush.
+3. For each SSTable, newest to oldest: consult its Bloom filter;
+   if it says "maybe present," read the SSTable's index, then
+   the data block.
+4. Stop at the first match (which may be a tombstone — see below).
+
+Each SSTable visit is one Bloom check + (if maybe) one index
+lookup + one block read. **Read amplification** is the number of
+files (and disk reads) you touch per lookup. Without Bloom filters
+it's `O(files)`. With good Bloom filters and small fanout, point
+lookups typically settle to **1–3 disk reads** even with hundreds
+of SSTables on disk.
+
+Range scans are worse. There's no single sorted list to walk —
+the engine opens an iterator over every SSTable that overlaps the
+range plus the memtable, then **merges them on the fly** (a
+k-way merge, smallest key wins, tombstones suppress older
+values). The per-key cost is small but constant overhead per
+overlapping file is real.
+
+## Tombstones — how deletes work
+
+You can't delete from an immutable file. Instead, a delete writes
+a special "tombstone" entry: `(key, deleted, timestamp)`. Reads
+walking from newest to oldest see the tombstone before any older
+live value of K and return "not found."
+
+Compaction eventually drops the tombstone *and* any older
+shadowed values once it can prove no older SSTable holds a value
+for that key. Until then, the tombstone has to stick around.
+
+**Long-lived tombstones poison range scans.** This is a famous
+Cassandra production gotcha: if you delete a million rows from a
+single partition and don't compact, a range query over that
+partition has to scan a million tombstones to find the few live
+rows in between. The query times out long before it returns. The
+operational fix is to compact aggressively, raise the tombstone
+threshold alarm, and design the schema so partitions don't
+accumulate deletes faster than compaction can drop them.
+
+## Compaction strategies — the central design choice
+
+Compaction is where LSM engines differ. The choice is a
+write/read/space-amplification triangle and there is no free
+lunch.
+
+### Leveled compaction (LevelDB, RocksDB default)
+
+Files are organized into levels L0, L1, ..., L_max.
+
+- **L0** holds freshly flushed memtables. Files at L0 may have
+  **overlapping** key ranges.
+- **L1 and above** have files with **non-overlapping** key
+  ranges within each level. A key's L_n file is uniquely
+  determined by the key.
+- Each level is roughly 10× the size of the level above it.
+- When L_n exceeds its budget, the engine picks one file from
+  L_n, finds all overlapping files in L_{n+1}, merges them, and
+  writes the result back to L_{n+1}.
+
+Each key passes through every level on its way down, and each
+level rewrites the key once. With ~7 levels, **write
+amplification** ends up at 10–30× — every logical write becomes
+10–30 bytes of physical write over the key's lifetime.
+
+The payoff is low **read amplification** (at most one SSTable
+per level above L0, since within a level files don't overlap) and
+low **space amplification** (~1.1× the live data — there are
+never many copies of the same key sitting around).
+
+### Tiered / size-tiered compaction (Cassandra default historically)
+
+Files are grouped by size. When N (typically 4) files of similar
+size accumulate, they're compacted into one larger file. That
+larger file joins the next size tier.
+
+- **Write amplification**: lower than leveled — each key gets
+  rewritten log_N(total / memtable) times, fewer passes than
+  leveled.
+- **Read amplification**: higher — multiple overlapping files at
+  the same logical tier, all of which a point lookup may need to
+  check.
+- **Space amplification**: higher — during compaction you have
+  the N old files *plus* the new file, briefly doubling that
+  tier's footprint.
+
+Cassandra historically defaulted to size-tiered and now offers
+leveled, size-tiered, **time-window** (for time-series data with
+TTL-based retention), and unified strategies. ScyllaDB exposes
+the same family.
+
+### Universal compaction
+
+A RocksDB-specific variant of tiered designed to keep space
+amplification predictable. Useful when disk space is the
+constraint and write throughput dominates reads.
+
+<Cheatsheet caption="LSM vs B+ tree tradeoff">
+
+| | B+ tree | LSM tree |
+|---|---|---|
+| Write throughput | Lower (random I/O, page splits) | High (sequential append) |
+| Read latency | Predictable, often 1–2 reads | Variable, 1–N reads plus bloom checks |
+| Range scans | Excellent (leaf-level linked list) | Need to merge across SSTables |
+| Space amplification | Low (~1.0×) | 1.1–2× depending on strategy |
+| Write amplification | Low (~1×) | High (10–30× leveled) |
+| Used by | InnoDB, Postgres, Oracle, SQLite | RocksDB, Cassandra, HBase, ScyllaDB, CockroachDB, TiKV |
+
+</Cheatsheet>
+
+## The RUM conjecture
+
+Athanassoulis et al. (2016) named the trade explicitly: you
+cannot simultaneously minimize **R**ead amplification, **U**pdate
+amplification, and **M**emory (space) amplification. Pick two;
+the third gives.
+
+- **LSM trees** minimize update amplification (fast writes) at
+  the cost of read and space amplification.
+- **B+ trees** minimize read amplification (predictable reads,
+  great locality) at the cost of update amplification (random
+  page writes, splits).
+- **Sorted arrays** minimize read amplification at the cost of
+  catastrophic update amplification (rewrite half the array).
+
+Compaction strategies inside the LSM family are sub-choices on
+the same triangle: leveled trades more writes for fewer reads,
+tiered trades more reads for fewer writes. The conjecture is
+useful because it kills the "can we make it faster on all axes"
+conversation. The answer is no. Pick which axis your workload
+can afford to be bad on.
+
+## Production users
+
+The list is long enough that "modern write-heavy database" and
+"LSM tree" are nearly synonymous.
+
+- **RocksDB** (Meta, forked from LevelDB) — the C++ embeddable
+  engine inside **MyRocks**, **CockroachDB** (originally),
+  **TiKV**, **Yugabyte**, **Kafka Streams** state stores,
+  **Flink**'s default state backend, MongoDB Atlas Stream
+  Processing. If a JVM service needs an embedded ordered KV
+  store with crash safety, it is almost certainly using
+  `org.rocksdb:rocksdbjni`.
+- **LevelDB** (Google) — the original public LSM engine, the
+  conceptual ancestor of RocksDB.
+- **Pebble** (Cockroach Labs) — a Go-native LSM engine designed
+  to replace RocksDB inside CockroachDB. Same shape, different
+  language, fewer JNI hops.
+- **Cassandra / ScyllaDB / HBase** — distributed LSM databases.
+  Cassandra and HBase are JVM-based; ScyllaDB is a C++ rewrite
+  of Cassandra targeting one-thread-per-core.
+- **InfluxDB IOx** uses TSM, an LSM cousin tuned for time-series.
+- **Lucene / Tantivy segments** — search engines write small
+  immutable segments and merge them in the background. The
+  shape is philosophically LSM-flavored, though the per-segment
+  data structure is an inverted index, not a sorted KV map.
+- **MongoDB WiredTiger** — defaults to a B-tree, but offers an
+  LSM option for write-heavy workloads.
+
+## Java in the wild — and why most LSM code isn't Java
+
+The two big pure-Java LSM implementations are **Apache
+Cassandra** and **Apache HBase** (HFile is the SSTable
+equivalent). Both are mature production systems running at scale.
+
+For everything else, the Java path is **JNI into RocksDB**:
+
+```java
+import org.rocksdb.RocksDB;
+import org.rocksdb.Options;
+
+public class KvStore {
+    static { RocksDB.loadLibrary(); }
+
+    private final RocksDB db;
+
+    public KvStore(String path) throws Exception {
+        Options opts = new Options().setCreateIfMissing(true);
+        this.db = RocksDB.open(opts, path);
+    }
+
+    public void put(byte[] key, byte[] value) throws Exception {
+        db.put(key, value);
+    }
+
+    public byte[] get(byte[] key) throws Exception {
+        return db.get(key);
+    }
+}
+```
+
+Kafka Streams, Flink, Apache Pinot, and Apache Druid all use
+RocksDB through this binding for local state.
+
+The reason most production LSM engines are C++ or Go rather
+than Java is GC pressure. Compaction copies millions of small
+key/value pairs through short-lived buffers; the same workload
+that runs LSM compaction *also* sits on the GC's hot path. The
+escape hatch is either off-heap memory plus careful pooling (the
+Cassandra approach, decades of tuning) or a language without a
+GC (RocksDB in C++, Pebble in Go with very careful allocation
+discipline). For new code that needs embedded LSM storage from a
+JVM service, **call RocksDB through JNI**. The years of
+engineering behind production-grade compaction, manifest
+atomicity, and crash recovery are not worth reproducing.
+
+## Bloom filters per SSTable — the read-amp killer
+
+A point lookup with no Bloom filter touches every SSTable that
+could plausibly contain the key. With dozens to hundreds of
+SSTables on disk, that's an I/O catastrophe for keys that
+aren't there (and most absent-key lookups in real workloads are
+common — every cache miss looks like one).
+
+A 1%-false-positive Bloom filter per SSTable means **~99% of
+SSTables are skipped immediately** for any absent key. The
+filter is ~10 bits per key and lives at the start of the file (or
+in memory) so the check is one hash and one bit-vector read.
+
+This is why the existence of `bloom-filters.mdx` and this page
+are so tightly coupled. Bloom filters in isolation are a cute
+data structure. Bloom filters next to SSTables are the reason
+read amplification is bounded.
+
+## Block cache and the OS page cache
+
+RocksDB and LevelDB keep an in-process **block cache** —
+decompressed SSTable data blocks held in RAM, typically sized to
+25–50% of the host's memory. The OS **page cache** independently
+caches the underlying SSTable files at the filesystem level.
+
+These two caches partially overlap. RocksDB defaults to
+**direct I/O off** (so the OS caches the same blocks RocksDB
+caches) on some platforms and **direct I/O on** (block cache
+only) on others. The right setting depends on workload: large
+sequential scans benefit from the page cache; small hot working
+sets benefit from RocksDB's decompressed block cache.
+
+This is one of the trickier tuning knobs in production. The
+short version: read the docs for your engine, measure, don't
+guess.
+
+## When LSM wins — and when it doesn't
+
+**Wins**:
+
+- Write-heavy workloads — log ingestion, time-series, event
+  stores, append-mostly KV.
+- Workloads where the hot working set fits in RAM (block cache
+  absorbs reads; compaction soaks up writes off the hot path).
+- Workloads with TTL / time-bounded retention — time-window
+  compaction throws away whole SSTables once they're past TTL,
+  which is much cheaper than deleting rows from a B+ tree.
+
+**Loses**:
+
+- Read-heavy random workloads where every read hits disk and
+  read amplification matters. A B+ tree's predictable 1–2 page
+  reads beats an LSM's variable 1–N file checks.
+- Workloads with many small range scans that span multiple
+  poorly-compacted SSTables — every overlapping file costs an
+  iterator open and merge.
+- Workloads where space amplification matters and disk is
+  expensive (LSM at 1.5–2× live data is real money at scale).
+
+<Callout variant="warn">
+**Don't roll your own LSM tree.** The high-school version (write
+to a file, occasionally merge files) is a weekend project. The
+production version — Bloom filters, leveled compaction, manifest
+atomicity, crash recovery, block compression, encryption at rest,
+snapshots, iterators, transactions, column families — is years
+of engineering. Use RocksDB. Read its source if you want to
+understand. Reach for "I'll write my own" only if you're building
+a database company.
+</Callout>
+
+## LSM is not an append-only log
+
+This conflation is common enough to call out. An append-only log
+is a single file you write to the end of and read sequentially
+(Kafka segments, WAL, audit logs). An LSM tree uses an
+append-only WAL as one component, but the on-disk state is
+**sorted SSTables organized into levels, with background
+compaction merging them**. Reads are not scans of an append-only
+file — they're point lookups and range scans across a sorted
+hierarchy. The "log-structured" in the name refers to the
+write-side discipline (always append, never mutate), not to the
+on-disk shape.
+
+## Cross-references
+
+- `b-trees.mdx` — the other half of the storage-engine
+  dichotomy. B+ trees are read-optimized; LSM trees are
+  write-optimized. The RUM conjecture is the bridge.
+- `skip-lists.mdx` — the standard memtable substrate. The
+  concurrent-ordered-no-rotations property is exactly what a
+  memtable needs.
+- `bloom-filters.mdx` — the per-SSTable filter that bounds read
+  amplification. The two pages are best read together.
+- `arrays-dynamic-and-static.mdx` — the sorted-array end of the
+  RUM triangle: minimum read amp, maximum update amp. LSM
+  trees exist because that point is uninhabitable for live data.
+- `hash-tables-internals.mdx` — the alternative for
+  point-lookup-only embedded KV stores. LSM wins when you also
+  need range scans and ordered iteration.
+
+## The discipline
+
+- LSM tree = memtable (skip list) + WAL + immutable SSTables +
+  background compaction. Sequential writes; reads merge across
+  files.
+- Tombstones implement delete. Long-lived tombstones poison
+  range scans; compaction has to drop them on a schedule the
+  workload can afford.
+- Pick a compaction strategy: leveled (read-friendly, more
+  write amp) or tiered (write-friendly, more read amp). The
+  RUM conjecture says you can't have everything.
+- Bloom filters per SSTable cut read amplification by ~10–100×
+  for absent keys — they are the reason LSM read latency is
+  tractable.
+- For embedded LSM storage in a JVM service, use RocksDB via
+  JNI. Don't reimplement; the engineering depth is decades.
+- LSM beats B+ trees on write-heavy workloads. B+ trees beat
+  LSM on read-locality-dominated workloads. Pick based on
+  write/read ratio and how much of the working set fits in RAM.

@@ -1,0 +1,366 @@
+export const level = 'mid';
+
+# Graphs: representations
+
+A graph is nodes and edges. That's it. The interesting question is
+not *what* a graph is, it's *how you store one in RAM* — because the
+storage choice quietly decides whether traversal is a tight loop or
+a cache-miss parade, whether a million-node graph fits in 400 MB or
+needs a terabyte, and whether `Dijkstra` is fast or just
+asymptotically-fast.
+
+This page is about representations. The **algorithms** that run on
+top — BFS, DFS, Dijkstra, topological sort — live in the
+`algorithms/` topic and assume you've already picked something
+sensible here:
+
+- `algorithms/bfs-and-dfs.mdx`
+- `algorithms/dijkstra-and-shortest-paths.mdx`
+- `algorithms/topological-sort.mdx`
+
+## The four canonical representations
+
+There are roughly four ways to store a graph that have stood the
+test of time. Pick by the workload, not by what feels familiar.
+
+### Adjacency list
+
+For each node, a list of its neighbors.
+
+```java
+// V nodes labeled 0..V-1
+List<List<Integer>> adj = new ArrayList<>(n);
+for (int i = 0; i < n; i++) adj.add(new ArrayList<>());
+adj.get(u).add(v);
+if (undirected) adj.get(v).add(u);
+```
+
+Memory is O(V + E): one entry per vertex, one entry per edge. To
+iterate u's neighbors you walk one list. To check if a specific
+edge `(u, v)` exists you scan u's neighbor list — O(deg(u)).
+
+This is the default. Reach for something else only when you can
+explain why.
+
+### Adjacency matrix
+
+A V×V grid where `mat[u][v]` says whether the edge exists (or
+stores its weight).
+
+```java
+boolean[][] mat = new boolean[n][n];
+mat[u][v] = true;
+if (undirected) mat[v][u] = true;
+```
+
+Memory is O(V²). Edge existence is a single array lookup — O(1).
+Iterating u's neighbors is O(V), because you scan the whole row,
+even if u has only two neighbors. Adding or removing an edge is
+O(1).
+
+The win is constant-time edge queries. The cost is that V² grows
+explosively: V = 100,000 is already 10 billion entries.
+
+### Edge list
+
+A flat list of edges, no per-node index.
+
+```java
+record Edge(int u, int v, double weight) {}
+List<Edge> edges = new ArrayList<>();
+edges.add(new Edge(u, v, w));
+```
+
+Memory is O(E). There's no way to ask "what are u's neighbors?"
+without scanning every edge — O(E). But for the algorithms that
+just want to *enumerate edges in some order* (Kruskal's MST, graph
+generation, serialization to disk or to the wire), this is
+exactly the shape you want.
+
+### CSR — Compressed Sparse Row
+
+Two flat arrays. `xadj[V+1]` holds offsets; `adj[E]` holds the
+concatenated neighbor lists.
+
+```java
+// CSR — built once from an edge list, then read-only
+int[] xadj = new int[n + 1];
+int[] adj  = new int[2 * m];   // *2 if undirected
+
+// Build: count degrees, prefix-sum into xadj, then place neighbors.
+for (Edge e : edges) {
+    xadj[e.u() + 1]++;
+    if (undirected) xadj[e.v() + 1]++;
+}
+for (int i = 1; i <= n; i++) xadj[i] += xadj[i - 1];
+
+int[] cursor = xadj.clone();
+for (Edge e : edges) {
+    adj[cursor[e.u()]++] = e.v();
+    if (undirected) adj[cursor[e.v()]++] = e.u();
+}
+
+// Iterate u's neighbors
+for (int e = xadj[u]; e < xadj[u + 1]; e++) {
+    int v = adj[e];
+    // visit edge u -> v
+}
+```
+
+Same asymptotics as an adjacency list — O(V + E) memory, O(deg(u))
+neighbor iteration — but the neighbor data is one contiguous `int[]`
+instead of a `List<List<Integer>>` of pointer-chased objects. That's
+the entire pitch: cache-friendly, compact, predictable. The trade is
+that adding or removing edges means rebuilding both arrays. CSR is
+the format every serious static-graph library uses — METIS,
+ParMETIS, SciPy's `csr_matrix`, GraphBLAS, cuSPARSE, the partitioned
+storage inside Pregel-style systems.
+
+## The picker
+
+| | Memory | Edge query (u,v)? | Iterate u's neighbors | Add/remove edge | Best for |
+|---|---|---|---|---|---|
+| Adjacency list | O(V+E) | O(deg(u)) | O(deg(u)) | O(1) add / O(deg(u)) remove | Sparse, mutable graphs. The default. |
+| Adjacency matrix | O(V²) | O(1) | O(V) | O(1) | Dense graphs (E ≈ V²); fast edge-existence checks. |
+| Edge list | O(E) | O(E) | O(E) | O(1) | Kruskal's MST input; graph generation; serialization. |
+| CSR | O(V+E) | O(deg(u)) | O(deg(u)) cache-friendly | Immutable (rebuild) | Large static graphs, scientific computing, GPU work. |
+
+## Sparse vs dense, and why it matters
+
+For V vertices, the number of possible edges ranges from 0 to V²
+(roughly V²/2 for undirected, simple graphs). The graph is **sparse**
+if E grows like O(V) or O(V log V), and **dense** if E approaches
+O(V²).
+
+Real graphs are almost all sparse:
+
+- A social network with a billion users averages a few hundred
+  friends each. E ≈ a few × 10¹¹, not 10¹⁸.
+- The US road graph has ~20 million intersections and ~50 million
+  road segments. Average degree under 3.
+- The web hyperlink graph has trillions of pages and edges, but
+  average out-degree is in the tens.
+
+Dense graphs do exist — dense correlation matrices in scientific
+computing, complete or near-complete bipartite matchings, the
+all-pairs distance table in operations research — but they're the
+exception, not the rule.
+
+The rule is simple: **default to adjacency list (or CSR for static
+graphs)**. Use the matrix only when you can prove the graph is dense
+or you genuinely need O(1) edge-existence checks on a small V.
+
+## Directed vs undirected
+
+Both representations handle both. The difference is bookkeeping:
+
+- **Adjacency list / matrix / CSR** — for an undirected edge `(u,
+  v)`, store it twice: once in u's neighbors, once in v's. For a
+  directed edge, store it once.
+- **Edge list** — store once and carry an "is this undirected?"
+  interpretation at the algorithm level.
+
+The classic bug: building an undirected graph and forgetting the
+symmetric entry. BFS from `u` reaches `v`; BFS from `v` never
+reaches `u`. Tests pass on toy graphs and silently break at scale.
+
+```java
+// Wrong for an undirected graph
+adj.get(u).add(v);
+
+// Right
+adj.get(u).add(v);
+adj.get(v).add(u);
+```
+
+## Weighted edges
+
+Adjacency list gets a small Edge record (or parallel arrays):
+
+```java
+record WEdge(int to, double weight) {}
+List<List<WEdge>> adj = new ArrayList<>(n);
+```
+
+Adjacency matrix becomes `double[V][V]` with `Double.POSITIVE_INFINITY`
+(or a sentinel) for missing edges:
+
+```java
+double[][] w = new double[n][n];
+for (double[] row : w) Arrays.fill(row, Double.POSITIVE_INFINITY);
+w[u][v] = weight;
+```
+
+CSR adds a parallel `weight[E]` array indexed the same way as
+`adj[E]` — so `weight[e]` is the weight of the edge whose endpoint
+is `adj[e]`. Parallel arrays keep the cache-friendliness.
+
+## Memory math, concrete
+
+Take a 1-million-node social graph with average degree 100. That's
+100 million edges (200 million directed entries if you store both
+directions).
+
+- **Adjacency list, `int[]` per node** — about 800 MB just for the
+  neighbor ints (200M × 4 bytes), plus the outer array of references
+  and per-`int[]` headers. Tight, walkable, mutable.
+- **Adjacency list, `List<List<Integer>>`** — five times worse,
+  roughly 2 GB. Each `Integer` is a boxed heap object (~16 bytes)
+  plus a reference. The autoboxing tax bites at exactly the wrong
+  scale.
+- **Adjacency matrix, `boolean[][]`** — 10¹² entries. Around 1 TB.
+  Not happening.
+- **CSR** — two `int[]` arrays summing to about 800 MB. Same total
+  as the primitive adjacency list, but contiguous and roughly 2×
+  faster to traverse because the prefetcher can do its job.
+
+The lever that matters most in practice isn't picking matrix vs
+list — it's avoiding boxing.
+
+<Callout variant="warn">
+**Don't use `List<List<Integer>>` for a graph with millions of
+edges.** Each `Integer` is a boxed heap object (~16 bytes) plus a
+reference (~4 bytes with compressed oops). Five times the memory and
+shredded cache behavior compared to `int[]`. Use `int[][]`, parallel
+`int[]` arrays in CSR form, or a primitive-int collections library
+like Eclipse Collections (`IntArrayList`) or fastutil
+(`IntArrayList`, `Int2ObjectMap`). The autoboxing tax is real and it
+shows up in every benchmark.
+</Callout>
+
+## Java in the wild
+
+`java.util` has no graph type. You either roll your own or pull in a
+library.
+
+| What | Use it for |
+|---|---|
+| `java.util` collections | Roll-your-own adjacency list. `ArrayList<ArrayList<Integer>>` is fine for prototypes, `int[][]` or CSR for production. |
+| **JGraphT** | The most popular Java graph library. Pluggable representations (sparse / sparse-int / matrix), bundled algorithms (Dijkstra, A*, max-flow, Kruskal). |
+| **Eclipse Collections** | Primitive `IntList`, `IntIntMap`, etc. The right way to do adjacency lists without boxing. |
+| **fastutil** | Same idea, different API, comparable performance. Heavy on dependencies but fast. |
+| **Apache Giraph / Spark GraphX** | Distributed graph processing. CSR-like internal layouts; partitioning by vertex. |
+| **Neo4j / JanusGraph / TigerGraph** | Graph databases. You don't implement representations here — you query via Cypher / Gremlin and the DB does the storage. |
+
+## CSR is what scientific computing and GPUs want
+
+The reason CSR shows up everywhere outside of "general Java code" is
+that **graph traversal in CSR is just sequential array access**. The
+hot loop is:
+
+```java
+for (int e = xadj[u]; e < xadj[u + 1]; e++) {
+    int v = adj[e];
+    // ...
+}
+```
+
+Two array reads per neighbor, both contiguous. The CPU prefetcher
+loves it. The GPU loves it more — coalesced memory access is the
+entire performance model on a GPU. And the same layout is what SpMV
+(sparse matrix-vector multiply) needs, which is the workhorse kernel
+behind PageRank, GNN message passing, finite-element solvers, and a
+big chunk of scientific computing. cuSPARSE, GraphBLAS, SciPy's
+`csr_matrix`, and NetworkX-via-SciPy all converge on CSR for exactly
+this reason.
+
+If you're writing a one-shot static-graph computation in Java that
+has to be fast — PageRank over a hyperlink dump, shortest paths over
+a road network — building CSR once from an edge list and iterating
+on `int[]` arrays will outrun any pointer-based representation
+without a fight.
+
+## Special cases worth knowing
+
+A few graph shapes don't fit cleanly into the four representations
+above and have their own idioms.
+
+- **Implicit graphs.** Sometimes you don't store the graph at all —
+  you compute neighbors on demand from a successor function. State
+  spaces for puzzles (8-puzzle, Rubik's cube), chess positions
+  during search, web crawl frontiers, and grid pathfinding all work
+  this way. The "graph" is a function `State → List<State>`. BFS
+  and Dijkstra work fine on implicit graphs; you just don't
+  materialize the edges.
+- **Bipartite graphs.** Two disjoint vertex sets `L` and `R`, edges
+  only between them. Often stored as two parallel adjacency lists
+  (one indexed by `L`, one by `R`) — avoids the redundancy of a
+  single combined list that would have empty entries.
+- **Multigraphs** — parallel edges between the same pair of nodes.
+  Adjacency list with duplicates works; if you need to identify
+  specific edges (e.g., for removing one of several parallel
+  edges), store edge IDs alongside neighbors.
+- **Hypergraphs** — an edge connects more than two nodes. Standard
+  representations are an incidence matrix (nodes × hyperedges) or a
+  list of node-sets, one per hyperedge.
+
+## When NOT to design your own
+
+Rolling your own representation is the right move when you're
+in-process and performance-critical. It's the wrong move for
+several common needs:
+
+- **ACID storage, persistence, transactional updates** → use a graph
+  database. Neo4j, JanusGraph, TigerGraph. They own the on-disk
+  format; you query Cypher or Gremlin.
+- **Distributed processing across many machines** → Spark GraphX,
+  Apache Giraph, Pregel-style frameworks. They handle partitioning
+  and message passing; you write vertex-centric code.
+- **Rich algorithm support with reasonable defaults** → JGraphT in
+  Java, NetworkX in Python. You get Dijkstra, A*, max-flow,
+  matching, community detection out of the box.
+- **In-process, sub-millisecond latency, billion-edge scale** →
+  roll your own CSR. The win over libraries is real — typically 2×
+  to 10× — because you can pick exactly the layout your access
+  pattern needs.
+
+<Cheatsheet caption="Which representation when">
+
+| Workload | Representation |
+|---|---|
+| Generic backend graph, mutable, sparse | Adjacency list. `int[]` or fastutil for hot paths. |
+| Dense graph, small V (≲ few thousand) | Adjacency matrix. O(1) edge queries are worth the V². |
+| MST, edge enumeration, serialization | Edge list. Kruskal expects this shape. |
+| Static graph, performance-critical, in-process | CSR. Build once, traverse fast. |
+| Implicit state space (puzzles, search) | No storage; successor function. |
+| Persisted, transactional, multi-user | Graph database. Don't roll your own. |
+
+</Cheatsheet>
+
+## Cross-references
+
+- `arrays-dynamic-and-static.mdx` — `int[]` vs `ArrayList<Integer>`
+  is the same argument as CSR vs `List<List<Integer>>`.
+- `linked-lists.mdx` — what an adjacency list's inner list *is*
+  when you don't use a dynamic array.
+- `maps-and-sets.mdx` — for sparse graphs with non-integer node IDs
+  (`Map<String, List<String>>`) or visited-set bookkeeping.
+- `n-ary-trees-and-traversals.mdx` — tree traversals generalize to
+  graph traversals once you add a visited set.
+- `union-find.mdx` — the data structure behind connected-components
+  and Kruskal's MST, both of which consume edge lists.
+- `algorithms/bfs-and-dfs.mdx` — the traversal algorithms that run
+  on top of any of these representations.
+- `algorithms/dijkstra-and-shortest-paths.mdx` — weighted shortest
+  paths; adjacency list with `WEdge` records is the canonical
+  input.
+- `algorithms/topological-sort.mdx` — DAG ordering; adjacency list
+  with in-degree counters.
+
+## The discipline
+
+- Default to adjacency list. Sparse graphs are everywhere; dense
+  graphs are rare.
+- Matrix wins only when V is small (a few thousand) or the graph
+  is genuinely dense. Don't reach for it because the math feels
+  cleaner.
+- Edge list is for input/output, MST algorithms, and serialization
+  — not for repeated queries.
+- CSR is what serious static-graph code uses: contiguous,
+  cache-friendly, GPU-ready. Build it once from an edge list,
+  traverse forever.
+- Don't box. `List<List<Integer>>` is 5× too much memory and
+  shreds cache behavior. Use primitive arrays, fastutil, or
+  Eclipse Collections.
+- Java has no built-in graph type. JGraphT for general work; your
+  own CSR + `int[]` when performance is the requirement.

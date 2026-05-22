@@ -1,0 +1,337 @@
+export const level = 'mid';
+
+# Maps and sets
+
+Before you pick `HashMap` or `TreeMap` or `ConcurrentHashMap`, decide
+what you actually need. "Map" is an abstract data type — a shape with
+three operations. The Java zoo is a menu of *implementations* of that
+shape, each making a different tradeoff about ordering, concurrency,
+memory, and equality semantics. This page is about the choice. The
+bucket internals live in `hash-tables-intuition.mdx` and
+`hash-tables-internals.mdx`.
+
+## The map ADT
+
+Three operations and nothing else, conceptually:
+
+- `put(k, v)` — associate key `k` with value `v`. Overwrites any
+  previous value for `k`.
+- `get(k)` — return the value for `k`, or absent.
+- `remove(k)` — drop the entry for `k`.
+
+Optional, but universal: `containsKey(k)` and iteration over entries.
+
+That's it. Every "lookup table," "in-memory cache," "secondary index,"
+"dictionary," "memoization table," "config bag," "session store"
+collapses to those three calls. The shape doesn't tell you how the
+data is stored, whether keys are ordered, whether reads are safe
+across threads, or whether `null` is allowed. Those are
+implementation choices.
+
+## The set ADT
+
+Same idea, one column narrower:
+
+- `add(e)` — ensure `e` is in the collection.
+- `contains(e)` — is `e` in the collection?
+- `remove(e)` — drop `e`.
+
+Mathematically, a set is a map from elements to **unit** — the value
+column carries no information, only the presence of the key does.
+Java's `HashSet` makes this literal. The source is roughly:
+
+```java
+public class HashSet<E> implements Set<E> {
+  private transient HashMap<E, Object> map;
+  private static final Object PRESENT = new Object();
+
+  public boolean add(E e) {
+    return map.put(e, PRESENT) == null;
+  }
+  public boolean contains(Object o) {
+    return map.containsKey(o);
+  }
+}
+```
+
+One sentinel `Object`, reused for every entry. `TreeSet` wraps
+`TreeMap` the same way, `LinkedHashSet` wraps `LinkedHashMap`. When
+you understand maps, you understand sets — there's nothing else to
+learn.
+
+## Two big choices
+
+When you pick a map implementation, you're answering two questions:
+
+**Ordered or not?**
+
+- **Unordered (hashed)** — `HashMap`, `HashSet`. Average O(1) for
+  put/get/remove. No iteration order guarantee at all. The default.
+- **Sorted (tree)** — `TreeMap`, `TreeSet`. O(log n) for the same
+  operations. Keys iterate in sorted order (natural ordering or a
+  `Comparator`). Red-black trees underneath.
+- **Insertion-ordered** — `LinkedHashMap`, `LinkedHashSet`. A hash
+  table plus a doubly-linked list threaded through the entries.
+  Average O(1) operations, predictable iteration order, slight
+  memory and time overhead per entry.
+
+**Equality or identity?**
+
+- `HashMap` uses `equals` and `hashCode` to compare keys. Two keys
+  that are `.equals()` collapse to one entry.
+- `IdentityHashMap` uses `==` and `System.identityHashCode`. Two
+  references collapse only if they point at the exact same object.
+  Almost always a code smell — used for serializers that have to
+  track "have I already written this object?", graph visitors that
+  need to detect cycles by reference, and not much else.
+
+These two axes are independent. Most picks reduce to "unordered +
+equality," which is `HashMap`. Everything else is a deliberate
+deviation.
+
+## The `equals`/`hashCode` contract
+
+The single load-bearing rule of using objects as keys. Two clauses:
+
+1. If `a.equals(b)`, then `a.hashCode() == b.hashCode()`.
+2. The reverse does **not** hold — two unequal objects can share a
+   hash. That's a collision, and it's expected.
+
+If you override `equals` you must override `hashCode`, and vice versa.
+If they disagree, the map will put a key in one bucket and look for
+it in another, and `get` will return null for a key that is "in" the
+map. This is one of the classic Java bugs.
+
+```java
+class BadKey {
+  final String name;
+  BadKey(String n) { this.name = n; }
+  @Override public boolean equals(Object o) {
+    return o instanceof BadKey b && b.name.equals(name);
+  }
+  // Forgot hashCode — inherits Object.hashCode (identity)
+}
+
+var m = new HashMap<BadKey, Integer>();
+m.put(new BadKey("a"), 1);
+m.get(new BadKey("a"));  // null — different identity hash, wrong bucket
+```
+
+The other failure mode is mutating a key after `put`. The map indexed
+it by the old hash; now `key.hashCode()` returns something else, and
+the entry is unreachable through normal lookup. It's still *in* the
+map — iteration finds it — but `get(key)` lies. Treat anything you
+hand to `put` as immutable.
+
+Java records (14+) generate correct `equals` and `hashCode` from the
+declared components automatically. They're the right default for
+keys:
+
+```java
+record CacheKey(long userId, LocalDate day) {}
+
+var cache = new HashMap<CacheKey, Result>();
+cache.put(new CacheKey(42, today), result);
+cache.get(new CacheKey(42, today));  // same value, hits
+```
+
+## The Java zoo
+
+| Map type | Order | Concurrency | Memory | Use when |
+|---|---|---|---|---|
+| `HashMap` | None | Not safe | Lowest | Default. No iteration order required. |
+| `LinkedHashMap` | Insertion (or access) | Not safe | +2 refs/entry | LRU caches, predictable iteration, deterministic JSON output. |
+| `TreeMap` | Sorted by key | Not safe | More per node | Range queries, ordered iteration, floor/ceiling lookups. |
+| `EnumMap` | Enum declaration order | Not safe | Dense array | Keys are an enum. Much faster than `HashMap` here. |
+| `IdentityHashMap` | None | Not safe | Same as Hash | Reference identity. Serializers, graph visitors. Rare. |
+| `WeakHashMap` | None | Not safe | Hash + reclaim cost | Keys whose presence shouldn't prevent GC. Listener registries. |
+| `ConcurrentHashMap` | None | Lock-striped writes, lock-free reads | Higher than `HashMap` | Concurrent access. The right concurrent map. |
+| `ConcurrentSkipListMap` | Sorted | Lock-free | Highest | Concurrent **and** ordered. |
+| `Collections.synchronizedMap(...)` | Wraps anything | One coarse lock | Wrapper | Almost never the right answer — `ConcurrentHashMap` beats it. |
+
+The same pattern applies to sets: `HashSet`, `LinkedHashSet`,
+`TreeSet`, `EnumSet`, `ConcurrentHashMap.newKeySet()`,
+`ConcurrentSkipListSet`.
+
+## `LinkedHashMap` as an LRU cache
+
+`LinkedHashMap` has two iteration modes. The default is insertion
+order. Pass `accessOrder=true` to the protected constructor and
+every `get` moves the entry to the tail. Override
+`removeEldestEntry` and you have a bounded LRU cache in three lines:
+
+```java
+class LRU<K, V> extends LinkedHashMap<K, V> {
+  private final int max;
+  LRU(int max) {
+    super(16, 0.75f, true);  // accessOrder = true
+    this.max = max;
+  }
+  @Override protected boolean removeEldestEntry(Map.Entry<K, V> e) {
+    return size() > max;
+  }
+}
+```
+
+That's the entire cache. `lru-cache.mdx` covers the design tradeoffs
+(why not LFU, why a doubly-linked list, when to reach for Caffeine
+instead) in depth.
+
+## `TreeMap`'s superpower
+
+`HashMap` can't answer "what's the smallest key greater than X?" in
+less than O(n) — it would have to scan the whole table. `TreeMap`
+answers it in O(log n) by walking the red-black tree:
+
+```java
+NavigableMap<Long, Request> byTimestamp = new TreeMap<>();
+byTimestamp.put(1700000000_000L, req);
+// ...
+
+// Everything in the last minute:
+long cutoff = now - 60_000;
+SortedMap<Long, Request> recent = byTimestamp.tailMap(cutoff);
+
+// The next scheduled job after now:
+Map.Entry<Long, Request> next = byTimestamp.higherEntry(now);
+```
+
+`floorEntry`, `ceilingEntry`, `higherEntry`, `lowerEntry`,
+`subMap`, `headMap`, `tailMap` are how you do range queries on a
+sorted map. They show up in rate limiters keyed by timestamp, in
+sliding-window aggregations, in routing tables, in scheduled-task
+runners keyed by next-fire-time.
+
+If your only goal is "iterate in sorted order once," sort a list.
+`TreeMap` earns its overhead when you need range queries
+*alongside* point lookups.
+
+## `EnumMap`: the under-used one
+
+When keys are an enum, `EnumMap` is dramatically better than
+`HashMap`. It stores values in a dense array indexed by the enum's
+ordinal — no hashing, no buckets, no per-entry objects:
+
+```java
+enum Status { PENDING, RUNNING, DONE, FAILED }
+
+EnumMap<Status, Integer> counts = new EnumMap<>(Status.class);
+counts.put(Status.PENDING, 0);
+counts.merge(Status.DONE, 1, Integer::sum);
+```
+
+One backing array, ordinal indexing, predictable order. Treat
+"keys are an enum → `EnumMap`" as a reflex.
+
+## The composite-key trap
+
+Using a record or value object as a key is the right move, *if*:
+
+- `equals` and `hashCode` reflect what you mean by "the same key."
+  Records do this for you; hand-written classes need both methods.
+- You don't mutate the key after `put`. Records are immutable —
+  another reason to prefer them.
+- The fields are themselves stable. A `HashMap` keyed by another
+  `HashMap` is legal but cursed: mutate the inner map and the outer
+  loses the entry.
+
+The stringification trap is worth one line. Don't build composite
+keys by `JSON.stringify`-style serialization unless field order is
+canonical — `{"a":1,"b":2}` and `{"b":2,"a":1}` are different keys
+even though they mean the same thing. `hash-tables-intuition.mdx`
+has the full latency-trap story; the short version is "use a record,
+or sort fields before stringifying."
+
+## `ConcurrentHashMap`: reads are lock-free
+
+`ConcurrentHashMap` is what you reach for when multiple threads
+touch the same map. The contract:
+
+- Reads (`get`, `containsKey`, iteration) never block. They see a
+  recent, consistent snapshot of each entry — but iteration is
+  weakly consistent: it won't throw `ConcurrentModificationException`,
+  and it may or may not reflect writes that happened during the
+  iteration.
+- Writes use **lock striping**: the table is partitioned into many
+  bins, and writers contend only with other writers touching the
+  same bin. Throughput scales close to linearly with cores until
+  you hit a hot key.
+- `computeIfAbsent`, `compute`, `merge`, `putIfAbsent`, `replace`
+  are atomic. Use them — the obvious two-step pattern is a race:
+
+<Compare
+  bad={`if (!m.containsKey(k)) {
+  m.put(k, expensiveLoad(k));
+}
+// Two threads can both see "absent" and both load.`}
+  good={`m.computeIfAbsent(k, key -> expensiveLoad(key));
+// At most one thread runs the loader for a given key.`}
+  language="java"
+  badTitle="Race: check-then-act"
+  goodTitle="Atomic: compute-style"
+/>
+
+One more rule with teeth: **`ConcurrentHashMap` forbids null keys
+and null values.** Both throw `NullPointerException`. The reason is
+ambiguity in a concurrent setting — if `get(k)` returned `null`, you
+couldn't tell "key absent" from "key present with null value"
+without a follow-up `containsKey` call, and another thread could
+remove the key between those calls. Disallowing null collapses the
+ambiguity into a single check. (`HashMap` allows both, which is why
+mixing the two implementations as a refactor sometimes breaks at
+runtime.)
+
+`ConcurrentSkipListMap` is the sorted sibling — when you need
+`TreeMap`'s range queries plus thread safety. It uses a skip list
+(probabilistic O(log n)) rather than a red-black tree, because
+balancing a tree concurrently is painful and a skip list isn't.
+
+## When *not* to use a map
+
+A map is the right tool more often than it isn't, but some cases
+have better answers:
+
+- **Tiny fixed key sets.** Two or three keys known at compile time
+  — an `if`/`else` chain or a `switch` is faster and clearer than
+  spinning up a map.
+- **Keys are dense integers in a known range.** Use a plain array.
+  Indexing is one instruction; hashing is dozens.
+- **Keys are an enum.** Use `EnumMap`, not `HashMap`. The ordinal
+  *is* the index.
+- **You only need "have I probably seen this?" with bounded false
+  positives.** A Bloom filter is much smaller. Not a map at all.
+- **Read-mostly with cheap recomputation.** Sometimes recomputing
+  is cheaper than the cache, especially under GC pressure.
+
+## Cross-references
+
+- `hash-tables-intuition.mdx` — the mental model for hashing,
+  collisions, and what hash functions have to do.
+- `hash-tables-internals.mdx` — chaining vs open addressing, load
+  factor, resize cost, and what the JVM's `HashMap` actually does.
+- `lru-cache.mdx` — the `LinkedHashMap`-based bounded cache in full,
+  plus when to graduate to Caffeine.
+- `binary-search-trees.mdx` — what's under `TreeMap`, and why
+  red-black trees are the practical choice for in-memory ordered
+  maps.
+- `b-trees.mdx` — the disk-friendly relative of the BST, and why
+  databases use B-trees where Java uses red-black trees.
+
+## The discipline
+
+- Pick by need, in this order: ordered? concurrent? identity?
+  Then pick the implementation.
+- Default to `HashMap`. Reach for `LinkedHashMap` only when
+  iteration order is part of the contract.
+- Override `equals` and `hashCode` together. Prefer records — they
+  remove the entire failure mode.
+- Never mutate a key after `put`. Treat keys as immutable; records
+  enforce it.
+- For concurrent code, use `ConcurrentHashMap`, not
+  `Collections.synchronizedMap`. Use the atomic compute-style
+  methods instead of check-then-act.
+- `TreeMap` is for range queries, not just "I want sorted
+  iteration." If you only need the latter once, sort a list.
+- A set is a map from elements to unit. `HashSet`, `TreeSet`, and
+  `LinkedHashSet` are literally that — one sentinel value per
+  entry, all the logic lives in the corresponding map.

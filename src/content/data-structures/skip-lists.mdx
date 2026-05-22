@@ -1,0 +1,375 @@
+export const level = 'senior';
+
+# Skip lists
+
+A sorted linked list gives you O(1) insert *given the node*, but
+O(n) search. A balanced BST gives you O(log n) search, but the
+price is rotations — fiddly, hard to make lock-free, and (for
+delete) the part of `balanced-bsts.mdx` where the code length
+explodes. A skip list reaches the same O(log n) expected time by a
+different route: **random express lanes over a linked list**, no
+rotations, no balance invariant to repair.
+
+Pugh published it in 1990 as "a probabilistic alternative to
+balanced trees." Thirty-five years later it's still the structure
+inside `ConcurrentSkipListMap`, Redis sorted sets, and RocksDB's
+memtable — places where ordered access collides with concurrency.
+
+## The premise
+
+| Structure | Search | Write | Pain |
+|---|---|---|---|
+| Sorted linked list | O(n) | O(1) given the node | Walking the chain |
+| Balanced BST (RB/AVL) | O(log n) | O(log n) | Rotations, especially under contention |
+
+The skip-list bet: **layer extra sorted linked lists on top, each
+roughly half the size of the one below.** Search drops through the
+layers like an elevator. Inserts pick a random height with a
+geometric distribution. No balance invariant — the expected balance
+falls out of the probabilities.
+
+## The shape
+
+Sorted linked lists stacked on top of each other. The bottom level
+(L0) holds every element. Each higher level holds roughly half the
+elements of the level below, chosen at random when an element is
+inserted. The top level is sparse.
+
+```
+L3:  HEAD --------------------------> 30 ---------------> NULL
+L2:  HEAD ------------> 12 ---------> 30 -------> 50 ---> NULL
+L1:  HEAD ----> 6 ----> 12 -> 19 ---> 30 -> 41 -> 50 ---> NULL
+L0:  HEAD -> 3 -> 6 -> 9 -> 12 -> 19 -> 30 -> 41 -> 50 -> NULL
+```
+
+A node at level `k` has forward pointers at levels 0 through `k`.
+The head sentinel has one at every level. There's no parent/child
+relationship between layers — the same node simply appears at
+multiple heights, with each level's `next` independent.
+
+## Search
+
+Start at the top-left. At each node: if `next.value < target`,
+**move right**; otherwise **drop down** one level. When you can't
+drop further, the answer is `next` (if it matches) or "not present."
+
+```java
+public boolean contains(int x) {
+    Node cur = head;
+    for (int i = level; i >= 0; i--) {
+        while (cur.next[i] != null && cur.next[i].value < x) {
+            cur = cur.next[i];
+        }
+    }
+    cur = cur.next[0];
+    return cur != null && cur.value == x;
+}
+```
+
+The express lanes do the long-distance work; the bottom lane does
+the final landing.
+
+## Insertion
+
+Search to find the L0 position. On the way down, remember the last
+node visited at each level — call this the `update` array. Then
+flip a fair coin; while heads, promote the new node up a level.
+Splice in at each level using `update[i]`.
+
+```java
+public void insert(int x) {
+    Node[] update = new Node[MAX_LEVEL + 1];
+    Node cur = head;
+    for (int i = level; i >= 0; i--) {
+        while (cur.next[i] != null && cur.next[i].value < x) {
+            cur = cur.next[i];
+        }
+        update[i] = cur;
+    }
+    int newLevel = randomLevel();
+    if (newLevel > level) {
+        for (int i = level + 1; i <= newLevel; i++) update[i] = head;
+        level = newLevel;
+    }
+    Node node = new Node(x, newLevel);
+    for (int i = 0; i <= newLevel; i++) {
+        node.next[i] = update[i].next[i];
+        update[i].next[i] = node;
+    }
+}
+```
+
+`update[i]` is the rightmost node at level `i` whose value is still
+`< x` — exactly the node whose level-`i` forward pointer needs to
+be rewired to the new node. Without that array, you'd re-search
+from the head for every level — O(level × log n) instead of O(log n).
+
+Most nodes stay at L0. Half go to L1, a quarter to L2, an eighth to
+L3. **No rotations. No balance invariant. No fix-up walk back up
+the tree.** Every write touches a constant number of pointers per
+level: rewire `update[i].next[i]`, set `node.next[i]`.
+
+## Why this gives O(log n) expected
+
+The informal argument is enough; don't try to derive the variance.
+With promotion probability `p = 1/2`:
+
+- Expected number of levels in a list of `n` items: `log₂(n)`.
+- Expected list length at level `k`: `n / 2^k`.
+- At each level, search visits a small expected number of nodes
+  before dropping (geometric expectation `1/p = 2`).
+- Total expected work: `log₂(n)` × constant = **O(log n)**.
+
+The worst case is genuinely O(n) — every coin flip heads forever
+and the structure degenerates. The probability is so small for any
+reasonable `n` that nobody bounds memory on it; cap `MAX_LEVEL` at
+~32 and the worst case becomes "a few extra hops."
+
+<Callout variant="info">
+**Why p = 1/2.** Other values work — `p = 1/4` gives sparser levels
+and fewer rewrites per insert at the cost of more nodes visited per
+level. `p = 1/2` is what Pugh used, what every textbook
+implementation uses, and what `ConcurrentSkipListMap` uses. Don't
+tune it unless you've profiled.
+</Callout>
+
+## Why concurrency is easier than balanced BSTs
+
+Balanced BSTs rebalance with rotations. A rotation rewires three
+pointers locally and changes where the rotated subtree's parent
+points — propagating up. A lock-free RB tree has to make the whole
+bundle atomic. It's been done, but the published implementations
+are hundreds of lines and most have had subtle bugs.
+
+A skip-list insert rewires a constant number of pointers **per
+level**, and the levels are independent. Lock-free skip lists
+(Herlihy/Shavit, *The Art of Multiprocessor Programming*) use a CAS
+per level to splice in the new node bottom-up. Readers stay
+lock-free; writers contend only on the specific pointers they're
+rewiring.
+
+That asymmetry is why Java ships `ConcurrentSkipListMap` and not
+`ConcurrentTreeMap`. The skip list lets a concurrent ordered map be
+written in code humans can audit.
+
+## Java in the wild: `ConcurrentSkipListMap`
+
+`java.util.concurrent.ConcurrentSkipListMap<K, V>` and its set
+sibling `ConcurrentSkipListSet<E>` are the standard library's
+answer to "I need a `TreeMap` but with multiple threads hitting it."
+
+- **Sorted** — entries iterate in key order; `floorKey`,
+  `ceilingKey`, `firstKey`, `lastKey`, `subMap` all work.
+- **Concurrent** — lock-free reads, lock-free-with-CAS writes.
+  Reads never block; writes contend only on the pointers they
+  rewire.
+- **Weakly consistent iterators** — no
+  `ConcurrentModificationException`. They may or may not reflect
+  modifications made after the iterator was created. If you needed
+  snapshot semantics, you needed a different tool.
+
+When to pick it over `ConcurrentHashMap`:
+
+| Need | Pick |
+|---|---|
+| Ordered iteration, range queries, `floorKey` / `ceilingKey` under concurrency | `ConcurrentSkipListMap` |
+| Unordered point lookups, maximum throughput | `ConcurrentHashMap` |
+| Single-threaded ordered map | `TreeMap` (red-black, smaller per-entry overhead) |
+
+Don't bother comparing `ConcurrentSkipListMap` to
+`Collections.synchronizedSortedMap(new TreeMap<>())`. The wrapper
+serializes every operation through one monitor; the skip-list map
+scales with cores. Under contention the gap is large enough that
+the comparison is uninteresting.
+
+<Callout variant="warn">
+`ConcurrentSkipListMap` has higher per-entry memory and a higher
+single-threaded constant than `TreeMap`. If your map is
+single-threaded, use `TreeMap`. The skip list earns its keep under
+contention, not in micro-benchmarks with one writer.
+</Callout>
+
+## Redis sorted sets (ZSET)
+
+`ZADD myset 1.5 alice` lands in a sorted set keyed by score. Redis
+needs two access patterns on the same data: **by member**
+(`ZSCORE`) — needs a hash from member to score — and **by rank /
+score range** (`ZRANGE`, `ZRANGEBYSCORE`, `ZRANK`) — needs an
+ordered structure.
+
+The implementation in `t_zset.c` keeps **both**: a hash map for
+member-to-score, a skip list for ordered access. Every member
+appears in both.
+
+For small sets Redis uses a compact contiguous representation (a
+`listpack` in modern versions, formerly a `ziplist`) — one array,
+linear scans, cache-friendly. Above configurable thresholds the set
+converts to the hash + skip-list pair. Tiny sets pay for structure
+in pointer overhead; big sets win once log-time access dominates.
+Same calculus that turns Java `HashMap` buckets into red-black trees
+at length 8.
+
+## RocksDB / LevelDB memtable
+
+In an LSM-tree storage engine, incoming writes hit an in-memory
+buffer called the **memtable** before being flushed to immutable
+on-disk sorted files. The memtable has to accept concurrent
+writers, stay sorted (so flushes produce already-ordered tables),
+and support range scans for reads whose key isn't on disk yet.
+
+The default memtable in RocksDB (inherited from LevelDB) is a skip
+list. Concurrent inserters splice in without locking the whole
+table — the same property that makes `ConcurrentSkipListMap` work.
+RocksDB ships alternatives (hash skip list, vector), but the skip
+list is the default for the same reason as everywhere else:
+ordered, concurrent, no rotations.
+
+## Memory cost
+
+Each node carries an array of forward pointers, one per level it
+lives at. Expected pointers per node is a geometric sum:
+`1 + 1/2 + 1/4 + 1/8 + ... = 2`. **Two pointers per node on
+average** — competitive with a balanced-BST node (left, right, plus
+color/balance), slightly more if you count tree parent pointers,
+slightly less if you don't.
+
+A single unlucky node could land at a very high level — geometric
+tails are exponentially thin, but not zero. Production
+implementations cap `MAX_LEVEL` at ~32 (enough for `2^32` items at
+`p = 1/2`); above the cap, more flips don't grow the node.
+
+## A minimal int skip list
+
+```java
+public class SkipList {
+    private static final int MAX_LEVEL = 32;
+    private static final double P = 0.5;
+
+    static class Node {
+        final int value;
+        final Node[] next;
+        Node(int value, int level) {
+            this.value = value;
+            this.next = new Node[level + 1];
+        }
+    }
+
+    private final Node head = new Node(Integer.MIN_VALUE, MAX_LEVEL);
+    private int level = 0;
+    private final java.util.Random rng = new java.util.Random();
+
+    public boolean contains(int x) {
+        Node cur = head;
+        for (int i = level; i >= 0; i--) {
+            while (cur.next[i] != null && cur.next[i].value < x) {
+                cur = cur.next[i];
+            }
+        }
+        cur = cur.next[0];
+        return cur != null && cur.value == x;
+    }
+
+    public void insert(int x) {
+        Node[] update = new Node[MAX_LEVEL + 1];
+        Node cur = head;
+        for (int i = level; i >= 0; i--) {
+            while (cur.next[i] != null && cur.next[i].value < x) {
+                cur = cur.next[i];
+            }
+            update[i] = cur;
+        }
+        int newLevel = randomLevel();
+        if (newLevel > level) {
+            for (int i = level + 1; i <= newLevel; i++) update[i] = head;
+            level = newLevel;
+        }
+        Node node = new Node(x, newLevel);
+        for (int i = 0; i <= newLevel; i++) {
+            node.next[i] = update[i].next[i];
+            update[i].next[i] = node;
+        }
+    }
+
+    private int randomLevel() {
+        int lvl = 0;
+        while (rng.nextDouble() < P && lvl < MAX_LEVEL) lvl++;
+        return lvl;
+    }
+}
+```
+
+Roughly fifty lines for a working skip list — random level choice,
+`update` bookkeeping, level-grow case included. Compare mentally to
+a from-scratch red-black tree with delete fix-up (CLRS Ch. 13: ~50
+lines for insert alone, ~50 more for delete plus the double-black
+abstraction).
+
+Delete is the exercise: search with an `update` array, rewire
+`update[i].next[i] = node.next[i]` for each level the node
+occupies, decrement `level` while the top levels go empty.
+
+## Compared to balanced BSTs and B-trees
+
+|  | Balanced BST (RB/AVL) | B/B+ tree | Skip list |
+|---|---|---|---|
+| Worst-case | O(log n) | O(log_B n) | O(log n) expected, O(n) worst |
+| Concurrency | Hard (rotations) | Hard (page splits) | Tractable lock-free |
+| Memory locality | Bad (node-per-element) | Excellent (page-packed) | Bad |
+| Range scan | Tree walk | Leaf-level linked list | Linked-list walk at L0 |
+| Used for | In-memory ordered map | Disk/SSD indexes | Concurrent ordered map; memtables |
+
+The trade is clean: skip lists give up worst-case guarantees and
+memory locality in exchange for a concurrent ordered structure you
+can implement and trust. In-memory single-threaded: RB wins. Paged
+disk storage: B+ wins. Concurrent ordered access: skip list wins.
+
+## When not to pick a skip list
+
+- **On disk.** Skip lists scatter nodes across the heap; every
+  pointer hop is a potential page miss. B+ trees were invented for
+  this — see `b-trees.mdx`.
+- **Single-threaded, worst-case-sensitive.** A balanced BST gives
+  O(log n) *guaranteed*, not expected. Real-time systems and
+  tail-latency-bound workloads want the deterministic bound;
+  `TreeMap` is the right tool.
+- **Tiny maps.** Below `n ≈ 100`, per-node array overhead and RNG
+  cost dominate. `TreeMap` or even a sorted array wins.
+- **Unordered lookups only.** No ordering, no range, no `floor` /
+  `ceiling`? Use a hash map. Skip lists pay for ordering you
+  aren't using.
+
+## Cross-references
+
+- `binary-search-trees.mdx` — the BST mental model the skip list
+  is competing with. The unbalanced-trap section explains why
+  any O(log n) ordered structure has to do work on writes.
+- `balanced-bsts.mdx` — RB and AVL, the rotation-based path to
+  O(log n). The contrast with skip lists is the whole point of
+  this page.
+- `b-trees.mdx` — what wins on disk. Skip lists are the in-RAM
+  concurrent answer; B+ trees are the on-disk answer.
+- `linked-lists.mdx` — the layered substrate. A skip list is, at
+  every level, a sorted singly linked list.
+- `maps-and-sets.mdx` — the API-level view, where
+  `ConcurrentSkipListMap` first appears as one of the four
+  standard Java map flavors.
+
+## The discipline
+
+- Skip list = sorted linked list + random levels. Expected
+  O(log n) per operation, no rotations, no balance invariant.
+- Pick it when you need a **concurrent ordered** map.
+  `ConcurrentSkipListMap` is the Java answer; `ConcurrentHashMap`
+  is the unordered answer; `TreeMap` is the single-threaded
+  ordered answer.
+- Redis ZSETs and RocksDB memtables both run on skip lists —
+  same reason in both: concurrent ordered access without
+  rotation pain.
+- Memory: ~2 forward pointers per node on average. Larger than a
+  tree node by a small constant, not by a factor.
+- Cap `MAX_LEVEL` at ~32 to bound the worst-case node height.
+  Beyond that the geometric tail is irrelevant.
+- On disk, B+ trees beat skip lists every time — locality wins.
+  Skip lists shine in RAM under contention, which is exactly
+  what `ConcurrentSkipListMap`, ZSETs, and the RocksDB memtable
+  needed.

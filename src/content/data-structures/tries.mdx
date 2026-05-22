@@ -1,0 +1,347 @@
+export const level = 'mid';
+
+# Tries
+
+A trie is a tree where each edge is labeled with a character and a
+path from the root to a marked node spells a key. Lookup, insert, and
+delete are all O(k) where k is the key length — **independent of how
+many keys are stored**. That last clause is the whole point.
+
+<Callout variant="info">
+**Pronunciation.** Edward Fredkin coined "trie" from re-**trie**-val
+in his 1960 *CACM* paper and pronounced it "tree." Knuth used and
+popularized the term in *TAOCP*. Industry mostly settled on "try"
+to distinguish it from "tree" in conversation. Both are accepted.
+</Callout>
+
+## Why O(k) beats O(1)
+
+A hash table is O(1) average for "find this key," but that "1" hides
+the cost of hashing the key itself, which is O(k). A balanced BST is
+O(k · log n) — each comparison along the log-n path walks up to k
+characters. A trie is O(k), period.
+
+| | Hash table | Balanced BST | Trie |
+|---|---|---|---|
+| Lookup of a length-k key | O(k) hash + O(1) probe | O(k · log n) | O(k) |
+| Depends on n | No (amortized) | Yes | **No** |
+| Prefix queries | No | Awkward | Native |
+| Sorted iteration | No | Yes | Yes (DFS) |
+| Per-key memory | Low | Medium | High (naive) / Medium (radix) |
+
+For very large key sets — an English dictionary of ~470,000 words, a
+URL routing table, every domain in a CDN — the trie can be faster
+than a hash table, because the hash function doesn't get cheaper as n
+grows but the trie's per-character work is just an array index. Plus
+you get prefix queries for free.
+
+## The three operations
+
+```java
+class Trie {
+  static class Node {
+    Node[] children = new Node[26]; // lowercase ASCII
+    boolean isEnd;
+  }
+
+  private final Node root = new Node();
+
+  public void insert(String s) {
+    Node n = root;
+    for (int i = 0; i < s.length(); i++) {
+      int c = s.charAt(i) - 'a';
+      if (n.children[c] == null) n.children[c] = new Node();
+      n = n.children[c];
+    }
+    n.isEnd = true;
+  }
+
+  public boolean contains(String s) {
+    Node n = walk(s);
+    return n != null && n.isEnd;
+  }
+
+  public boolean hasPrefix(String prefix) {
+    return walk(prefix) != null;
+  }
+
+  private Node walk(String s) {
+    Node n = root;
+    for (int i = 0; i < s.length() && n != null; i++) {
+      n = n.children[s.charAt(i) - 'a'];
+    }
+    return n;
+  }
+}
+```
+
+`contains` walks character by character and returns true only if the
+final node is marked. `insert` lazily creates nodes. `hasPrefix` is
+the same walk skipping the `isEnd` check — the feature hash tables
+can't match.
+
+Delete is the annoying one. Walk down, unset `isEnd`, then unwind:
+free any node that has no children and isn't an end-of-key. Most
+production tries skip true deletion and just unmark `isEnd` — the
+memory cost of orphaned subtrees rarely justifies the code.
+
+## Array vs map for children
+
+The Node above used `Node[26]` because we assumed lowercase English.
+That choice is the entire memory story for naive tries.
+
+<Compare
+  badTitle="Map children (flexible but expensive per node)"
+  goodTitle="Array children (fast but fixed-cost per node)"
+  language="java"
+  bad={`static class Node {
+  Map<Character, Node> children = new HashMap<>();
+  boolean isEnd;
+}
+// ~50 bytes overhead per entry plus boxing.
+// Each child lookup: hash + probe + unbox.
+// Good for full Unicode or sparse alphabets.`}
+  good={`static class Node {
+  Node[] children = new Node[26];
+  boolean isEnd;
+}
+// Fixed 26 * 4 = 104 bytes per node, even when empty.
+// Each child lookup: one array index.
+// Bad for full Unicode (256 bytes per node, mostly null).`}
+/>
+
+Variants you'll see in real code:
+
+- **`Node[26]` or `Node[256]`** for ASCII/byte alphabets. Cache
+  friendly, wasteful on sparse data.
+- **`HashMap<Character, Node>`** for full Unicode or sparse fan-out.
+  Slower per character, but proportional memory.
+- **Sorted small array of `(char, Node)`** with linear search. Common
+  compromise for small fan-out.
+
+In practice, most production tries dodge this by using a radix trie.
+
+## Radix / Patricia tries
+
+Same idea as a standard trie, but each edge holds a **substring**
+instead of a single character. Any node with exactly one child gets
+collapsed into its parent.
+
+```
+Standard trie storing "car" and "card":
+     c
+     |
+     a
+     |
+     r (end)
+     |
+     d (end)
+
+Radix trie:
+     "car" (end)
+       |
+      "d" (end)
+```
+
+For sparse keys — most strings don't share long prefixes with each
+other — this saves enormous memory. Typical compression is **5–10x**
+over the naive trie.
+
+Where you'll meet radix tries in production:
+
+- **Linux kernel FIB** (IPv4 routing) uses an LC-trie
+  (level-compressed trie), a radix variant.
+- **httprouter** (Go) and **fastify**'s `find-my-way` (Node) route
+  URLs with radix tries — `GET /users/:id/posts/:postId` is just a
+  path in the tree.
+- **Redis** uses a radix tree (`rax`) internally — cluster slot map,
+  stream consumer groups, and keyspace notifications all run on it.
+- **HashiCorp Consul and Vault** use `armon/go-radix` for path-based
+  policy and KV indexing.
+
+The implementation is meaningfully more complex: insert can require
+**splitting** an edge when a new key diverges mid-substring. You
+won't write one in an interview, but you use one every HTTP request.
+
+## Ternary search tries
+
+A different memory tradeoff: each node stores **one** character plus
+**three** pointers — `less`, `equal`, `greater`. Children are organized
+as a BST on the character; the `equal` pointer is the "next character"
+link.
+
+```java
+class TSTNode {
+  char c;
+  TSTNode lo, eq, hi;
+  boolean isEnd;
+}
+```
+
+Lookup walks down: compare the query character to `c`; go `lo` or
+`hi` if it differs, or step to `eq` and advance to the next query
+character if it matches.
+
+TSTs are memory-efficient for sparse alphabets while staying simple.
+Sedgewick promotes them heavily; CLRS doesn't cover them. You'll see
+them in spellcheckers and older C codebases — newer systems pick
+radix tries instead.
+
+## IP routing: longest-prefix match
+
+The trie use case to remember, because it runs on every network
+packet you send.
+
+An IP routing table maps CIDR prefixes (`10.0.0.0/8`, `10.1.0.0/16`,
+`10.1.5.0/24`) to next-hop interfaces. When a packet arrives for
+`10.1.5.7`, the router must find the **longest matching prefix** —
+multiple prefixes match, only the most specific wins.
+
+<Steps>
+<Step>
+Build a bitwise trie over each CIDR prefix. A `/16` prefix ends at
+depth 16; mark that node with the next-hop interface.
+</Step>
+<Step>
+For a lookup, walk the destination IP bit by bit. Each time you pass
+a marked node, remember it.
+</Step>
+<Step>
+When you can't descend further, the most recently passed marked node
+is the longest-prefix match.
+</Step>
+</Steps>
+
+In Linux this is the **LC-trie** in `net/ipv4/fib_trie.c` —
+level-compressed so dense subtrees collapse into wider nodes.
+High-end hardware routers use **TCAM** (ternary content-addressable
+memory) for O(1) longest-prefix-match in silicon, but TCAM is
+expensive; every software fallback runs trie lookups.
+
+## URL routers
+
+Web frameworks register routes like `/users/:id`,
+`/users/:id/posts/:postId`, `/api/v1/*`. A trie indexes these so
+dispatch is O(URL length), not O(number of routes).
+
+Each path segment is one edge. Static segments win over parameter
+segments, which win over wildcards — most routers resolve ambiguity
+by prioritizing specificity at each node. **httprouter** (Go) and
+**fastify**'s `find-my-way` (Node) are both radix tries. Spring's
+path-pattern matcher is a less aggressive variant of the same idea.
+A router with 10,000 routes still dispatches in microseconds.
+
+## Autocomplete
+
+The canonical user-facing trie. The user types three characters; you
+return ten suggestions before they type the fourth.
+
+<Steps>
+<Step>
+Walk the trie to the prefix node — O(k) where k is the prefix length.
+</Step>
+<Step>
+DFS or BFS the subtree to collect all keys with that prefix.
+</Step>
+<Step>
+Rank by a frequency counter stored per node (search-log popularity,
+edit distance, recency) and return the top-k.
+</Step>
+</Steps>
+
+Production autocomplete (Google, your IDE, your phone's keyboard)
+uses a frequency-weighted trie, often compiled into a **DAWG**
+(Directed Acyclic Word Graph) that merges equivalent subtrees. DAWGs
+shrink a dictionary trie by another order of magnitude but are
+read-only — you rebuild when the word list changes.
+
+## Memory and when not to pick a trie
+
+Naive tries are **expensive**. A trie over 100,000 English words with
+26 child pointers per node can easily run 30–50 MB. Mitigations in the
+order you'd reach for them:
+
+- **Use a radix trie.** Path compression cuts memory 5–10x.
+- **Pack children sparsely.** Small sorted `(char, Node)` arrays
+  instead of fixed `Node[26]`.
+- **Use a DAWG** for read-only dictionaries — merges identical
+  subtrees. Big wins for word lists; useless once you need updates.
+- **Move to `Map<String, T>`** if you don't actually need prefix
+  queries. The trie was the wrong call.
+
+Skip the trie when:
+
+- **Tiny key sets** — per-node overhead dominates. `HashSet` is
+  smaller and faster up to a few hundred keys.
+- **Numeric keys with no prefix structure** — `HashMap<Long, T>` is
+  fine. Bitwise tries on integers exist (IP routing), but most
+  numeric workloads don't need prefix or longest-match.
+- **No prefix or range queries** — the defining feature is wasted.
+- **Short keys, huge alphabet** — a trie of millions of UUIDs is
+  mostly nulls.
+
+If you can't articulate why O(k) independent of n matters for your
+workload, you don't need a trie.
+
+## Aho-Corasick
+
+Worth knowing the name. Aho-Corasick is a trie augmented with
+**failure links** that finds all matches of a **set** of patterns in
+a text in O(n + m + z) — n is text length, m is total pattern length,
+z is the number of matches. Construction is a trie plus a BFS-built
+failure function (KMP's failure function, generalized to multiple
+patterns).
+
+You'll meet it in:
+
+- **Network intrusion detection** — Snort and Suricata scan packet
+  payloads for thousands of signatures simultaneously.
+- **Web application firewalls** — same pattern, HTTP body instead of
+  packet payload.
+- **`fgrep -f patterns.txt`** — multi-pattern grep is Aho-Corasick.
+- **Antivirus engines** — scanning files against thousands of
+  signatures in one pass.
+
+The data structure is "trie plus failure links" — the algorithm
+itself is a separate topic.
+
+<Cheatsheet caption="Trie variants at a glance">
+
+| Variant | Per-edge data | Best for |
+|---|---|---|
+| Standard trie | One character | Teaching, small alphabets, simplicity |
+| Radix / Patricia trie | Substring (path-compressed) | Production routing tables, URL routers, key indexes |
+| LC-trie | Bit groups with level compression | Linux IPv4 FIB |
+| Ternary search trie | One char, BST on chars | Sparse alphabets, simple to implement |
+| DAWG | Char, merged subtrees | Read-only dictionaries, spellcheck |
+| Aho-Corasick automaton | Char + failure links | Multi-pattern matching (IDS, WAF, fgrep) |
+
+</Cheatsheet>
+
+## Cross-references
+
+- `hash-tables-internals.mdx` — the comparison point. Tries win on
+  prefix queries and when O(k) without the hash beats O(k) with one.
+- `binary-search-trees.mdx` — the other ordered structure. BSTs sort
+  by whole-key comparison; tries sort by character.
+- `b-trees.mdx` — wide-branching trees for disk pages. Radix tries
+  are the in-memory analog of "fan out wide, stay shallow."
+- `n-ary-trees-and-traversals.mdx` — general traversal patterns; trie
+  walks are specialized DFS.
+
+## The discipline
+
+- Trie = O(k) lookup, k = key length, independent of n. Beats hash
+  tables for very large key sets and gives prefix queries for free.
+- Radix / Patricia = trie with edge-substring compression. 5–10x
+  memory savings. Production tries are almost always radix tries.
+- Longest-prefix match on IP addresses is a bitwise trie. Linux's
+  FIB uses an LC-trie; hardware routers use TCAM.
+- URL routers and autocomplete are trie problems. httprouter,
+  fastify's `find-my-way`, Redis's `rax`, and your phone's
+  keyboard all run them.
+- Aho-Corasick = trie + failure links. Used by IDS, WAFs, virus
+  scanners, and `fgrep` for multi-pattern matching.
+- Don't reach for a trie unless you have many keys with shared
+  prefixes or need prefix queries. Otherwise a hash set is simpler,
+  smaller, and faster.
