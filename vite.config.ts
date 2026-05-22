@@ -68,6 +68,7 @@ const SHIKI_LANGS = [
   'html',
   'http',
   'ini',
+  'java',
   'js',
   'json',
   'jsx',

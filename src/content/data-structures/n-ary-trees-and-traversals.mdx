@@ -1,0 +1,329 @@
+export const level = 'mid';
+
+# N-ary trees and traversals
+
+A tree where each node can have any number of children — not just
+0, 1, or 2. This is the shape of almost every recursive structure
+you'll deal with in real code: the DOM, the filesystem, JSON and
+YAML, abstract syntax trees, the internals of B-trees, tries. BSTs
+and heaps are special cases that constrain the shape; the n-ary
+tree is the unconstrained baseline.
+
+## Tree, not graph
+
+A tree is a graph with three extra properties:
+
+- **Single root.** One node has no parent; everything else is
+  reachable from it.
+- **No cycles.** You can never walk back to a node you've already
+  visited by going downward.
+- **Unique path.** Between any two nodes there is exactly one path.
+
+Drop any of these and you have a general graph, which needs
+visited-set bookkeeping during traversal. A tree doesn't.
+
+An n-ary tree drops the binary-tree restriction that each node
+has at most two children. A node can have zero, one, two, or two
+hundred. Nothing in the definition cares.
+
+## Three representations
+
+Pick one based on the access pattern. There is no "right"
+representation.
+
+### 1. List of children (the default)
+
+```java
+class Node<T> {
+    T value;
+    List<Node<T>> children = new ArrayList<>();
+}
+```
+
+Simple, variable arity, fast iteration over children, easy to
+mutate. What you'll use 90% of the time. The DOM, JSON parsers,
+AST nodes — all this shape.
+
+### 2. Left-child / right-sibling (LCRS)
+
+```java
+class Node<T> {
+    T value;
+    Node<T> firstChild;
+    Node<T> nextSibling;
+}
+```
+
+Two pointers per node regardless of how many children it
+conceptually has. The children form a singly-linked list through
+`nextSibling`. The shape is literally a binary tree, which is
+useful when you want uniform fixed-size node memory, or when
+you're applying algorithms designed for binary trees to a general
+tree. Insertion at the front is O(1); finding a specific child is
+O(k) in the sibling count.
+
+### 3. Parent-pointer only
+
+```java
+class Node<T> {
+    T value;
+    Node<T> parent;
+}
+```
+
+Each node knows only its parent. Walking *up* is O(depth);
+walking *down* is impossible. This is the shape of disjoint-set
+forests (see `union-find.mdx`) where the only operation is "find
+the root of my set." Cheapest possible representation when
+ancestor walks are all you need.
+
+## The four traversals
+
+Every tree algorithm boils down to one of these.
+
+### Preorder (NLR)
+
+Visit the node, then each child in order.
+
+```java
+<T> void preorder(Node<T> n, Consumer<T> visit) {
+    if (n == null) return;
+    visit.accept(n.value);
+    for (Node<T> c : n.children) preorder(c, visit);
+}
+```
+
+Used for: serializing a tree (parent before children), emitting an
+AST as source, "print the directory name before its contents."
+
+### Postorder (LRN)
+
+Each child first, then the node.
+
+```java
+<T> void postorder(Node<T> n, Consumer<T> visit) {
+    if (n == null) return;
+    for (Node<T> c : n.children) postorder(c, visit);
+    visit.accept(n.value);
+}
+```
+
+Used for: freeing memory bottom-up, evaluating expression trees
+(operands before operator), computing subtree sizes or hashes,
+running cleanup actions safely. Anything where children must be
+done before the parent.
+
+### Inorder (LNR)
+
+Only well-defined for **binary** trees: left subtree, node, right
+subtree. For a general n-ary tree the question "between which
+children do I visit the node?" has no canonical answer, so the
+term doesn't apply. In-order on a BST yields sorted keys (see
+`binary-search-trees.mdx`); on an n-ary tree it's undefined.
+
+### Level-order (BFS)
+
+Root first, then all depth-1 nodes, then all depth-2 nodes, and so
+on. A queue, not a stack.
+
+```java
+<T> void levelOrder(Node<T> root, Consumer<T> visit) {
+    if (root == null) return;
+    Deque<Node<T>> queue = new ArrayDeque<>();
+    queue.add(root);
+    while (!queue.isEmpty()) {
+        Node<T> n = queue.poll();
+        visit.accept(n.value);
+        for (Node<T> c : n.children) queue.add(c);
+    }
+}
+```
+
+Used for: serializing a tree level-by-level, printing
+organizational charts, finding the shortest path in an unweighted
+tree, and as the canonical example of BFS itself (see
+`algorithms/bfs-and-dfs.mdx`).
+
+## Recursive vs iterative
+
+Every recursive traversal can be rewritten iteratively with an
+explicit data structure:
+
+- **Preorder / postorder / inorder** → stack.
+- **Level-order** → queue.
+
+The recursive version is shorter and clearer. The iterative
+version doesn't blow the JVM call stack. On a default `-Xss` of
+512KB to 1MB, recursive traversal hits `StackOverflowError`
+somewhere between 5,000 and 20,000 levels deep — well within the
+range of pathological JSON or filesystem input.
+
+Iterative preorder, for reference:
+
+```java
+<T> void preorderIter(Node<T> root, Consumer<T> visit) {
+    if (root == null) return;
+    Deque<Node<T>> stack = new ArrayDeque<>();
+    stack.push(root);
+    while (!stack.isEmpty()) {
+        Node<T> n = stack.pop();
+        visit.accept(n.value);
+        // Push children in reverse so leftmost is processed first.
+        List<Node<T>> kids = n.children;
+        for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+    }
+}
+```
+
+See `stacks.mdx` for the stack itself and `queues-and-deques.mdx`
+for the queue side.
+
+## Parent pointers and back-references
+
+A `parent` field on every node costs 4 to 8 bytes and turns a
+class of operations from O(n) into O(depth):
+
+- **Ancestor walks** — "find the nearest enclosing function" in an
+  AST, "find the closest `<form>` element" in the DOM.
+- **Detach / move-to-front** — splice a subtree out without
+  re-walking the whole parent.
+- **Root-to-node path** — walk up collecting nodes, then reverse.
+
+The cost isn't memory, it's mutation discipline. Every rewire
+touches four pointers (old parent's child list, new parent's child
+list, the node's old parent, its new parent) instead of two.
+Forget one and you have a broken back-pointer that won't crash
+until something tries to walk up.
+
+Real parent-pointered trees in the wild: the DOM (every `Node` has
+`parentNode`), jQuery's `.parent()`, Java's `Component.getParent()`,
+every AST library worth using.
+
+## The Euler tour
+
+List nodes in the order DFS visits them, recording each one every
+time you touch it — both when you enter it and when you leave a
+child and return to it. The result is a sequence of length
+`2n - 1` for a tree with `n` nodes: every one of the `n - 1` edges
+contributes two appearances (going down, coming back up), plus one
+initial visit to the root.
+
+```
+       A
+      / \
+     B   C
+    / \
+   D   E
+
+Euler tour: A B D B E B A C A
+Length:     9  =  2*5 - 1
+```
+
+Two things fall out of it:
+
+- **LCA (lowest common ancestor)** in O(1) per query after
+  O(n log n) preprocessing, by reducing LCA to range-minimum on
+  the depth array of the tour.
+- **Subtree-as-range** — each node's subtree corresponds to a
+  contiguous slice of the tour, turning "operate on this subtree"
+  into "operate on this array range."
+
+Both are segment-tree-shaped problems. Remember the shape, look
+up the algorithm when you need it.
+
+## Trees that aren't BSTs or heaps
+
+The trees you'll actually deal with in backend work:
+
+| Tree | Children | Notes |
+|---|---|---|
+| DOM | Ordered, variable | Every element has `parentNode`; layout cares about order. |
+| Filesystem | Ordered (by entry order), variable | Mutations are file operations; depth varies wildly. |
+| JSON / YAML | Objects = unordered, arrays = ordered | Recursive containers. |
+| AST | Type-specific | `if` has condition/then/else; `binop` has lhs/rhs. |
+| B-tree internal node | Ordered, bounded by order m | Disk-page-sized; see `b-trees.mdx`. |
+| Trie | Indexed by character | Strings as paths from root. |
+
+The traversal API is identical for all of these. The
+representation differs.
+
+## Recursion depth as a DoS vector
+
+A deeply nested JSON document — say, 100,000 opening braces in a
+row — will crash a naive recursive parser with a
+`StackOverflowError`. This is a documented class of vulnerability,
+with bugs of this shape filed against older versions of Jackson,
+Gson, and most other parsers. The fix is either to parse
+iteratively with an explicit stack, or to impose a depth limit and
+reject anything beyond it. Jackson's
+`StreamReadConstraints.maxNestingDepth` (default 1,000 in recent
+versions) is exactly this defense. Treat unbounded recursion over
+attacker-controlled structure as a bug, not a feature.
+
+## Pretty-printing as a traversal
+
+The kind of code that ends up in every CLI you ever write — a
+preorder with depth-aware indentation:
+
+```java
+record Node<T>(T value, List<Node<T>> children) {}
+
+void print(Node<?> n, String indent, boolean isLast) {
+    System.out.println(indent + (isLast ? "└─ " : "├─ ") + n.value());
+    String childIndent = indent + (isLast ? "   " : "│  ");
+    for (int i = 0; i < n.children().size(); i++) {
+        print(n.children().get(i), childIndent, i == n.children().size() - 1);
+    }
+}
+```
+
+Run it on a directory listing and you get the `tree` command.
+Almost every developer tool that prints hierarchical output is
+this function with different node types.
+
+<Cheatsheet caption="Which traversal when">
+
+| Traversal | When to use |
+|---|---|
+| Preorder | Serialization, "print parent before children", AST emit. |
+| Postorder | Cleanup, expression evaluation, subtree size / hash. |
+| Inorder (binary only) | Sorted iteration of a BST. Not defined for n-ary. |
+| Level-order (BFS) | Layer-by-layer output, shortest-path-in-tree. |
+
+</Cheatsheet>
+
+## Cross-references
+
+- `binary-search-trees.mdx` — the special-case shape where order
+  matters and in-order traversal yields sorted keys.
+- `b-trees.mdx` — n-ary trees specialized for page-sized nodes;
+  the underlying tree is exactly the structure on this page.
+- `stacks.mdx` — what iterative DFS uses; rewrite recursive
+  traversals here when you can't trust the JVM stack.
+- `queues-and-deques.mdx` — what level-order uses; `ArrayDeque`
+  is the right choice in Java.
+- `union-find.mdx` — the parent-pointer-only tree taken to its
+  logical conclusion.
+- `algorithms/bfs-and-dfs.mdx` — the graph generalization of
+  preorder and level-order, with visited-set bookkeeping for
+  cycles.
+
+## The discipline
+
+- Default representation is `List<Node<T>> children`. Use LCRS for
+  uniform node size, parent-only when you only walk up.
+- Memorize the four traversals. Know that preorder/postorder use
+  a stack (explicit or implicit) and level-order uses a queue.
+- Iterative traversals don't `StackOverflowError`. Recursive ones
+  do, and parsers of untrusted input have learned this the hard
+  way more than once.
+- Postorder for cleanup and bottom-up summary. Preorder for
+  serialization and "parent before children." Level-order when
+  the *layer* is the thing that matters.
+- Parent pointers cost 4-8 bytes per node and make mutation
+  fiddlier. Pay for them only when ancestor walks are in your
+  hot path.
+- The Euler tour is the gateway to LCA and subtree-as-range
+  tricks. Remember the shape — length `2n - 1`, each subtree is
+  a contiguous slice — and look up the algorithm when the problem
+  calls for it.

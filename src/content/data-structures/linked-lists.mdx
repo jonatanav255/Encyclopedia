@@ -1,0 +1,407 @@
+export const level = 'junior';
+
+# Linked lists
+
+A linked list is the data structure everyone learns first and uses
+last. `arrays-vs-linked-lists.mdx` covers why arrays usually win.
+This page is about the list itself — what's really inside, the three
+variants, the patterns interviewers test, and why `java.util.LinkedList`
+is almost never the right tool even when "linked list" is the right
+*idea*.
+
+## The shape
+
+A linked list is a chain of small heap objects. Each one holds a
+value and one or two references to its neighbors. There's no
+contiguous backing array — every node lives wherever the allocator
+happened to put it.
+
+```java
+class Node<T> {
+    T value;
+    Node<T> next;
+
+    Node(T value) { this.value = value; }
+}
+```
+
+That's the entire structure. A list is just a `head` reference (and
+maybe a `tail`) pointing at the first node. Traversal is "follow
+`next` until you hit `null`."
+
+The thing to internalize: a list of N elements is N separate heap
+objects, each with its own object header and its own cache line.
+That fact drives every interesting tradeoff below.
+
+## Three variants
+
+### Singly linked
+
+One `next` pointer per node. Cheapest in memory. Prepend is O(1) —
+allocate a node, point its `next` at the current head, replace the
+head. Append is O(n) **unless you keep a tail pointer**, in which
+case it's O(1). Deleting a node you've already found is still O(n)
+unless you remember its predecessor (you usually don't), because you
+need the previous node to rewire `prev.next`.
+
+```java
+class SinglyLinked<T> {
+    private Node<T> head;
+    private Node<T> tail;
+    private int size;
+
+    public void prepend(T v) {
+        Node<T> n = new Node<>(v);
+        n.next = head;
+        head = n;
+        if (tail == null) tail = n;
+        size++;
+    }
+
+    public void append(T v) {
+        Node<T> n = new Node<>(v);
+        if (tail == null) head = n;
+        else tail.next = n;
+        tail = n;
+        size++;
+    }
+}
+```
+
+### Doubly linked
+
+Each node has `next` and `prev`. Removal *given a node* is O(1)
+without traversal — that's the whole reason to pay for the extra
+pointer:
+
+```java
+node.prev.next = node.next;
+node.next.prev = node.prev;
+```
+
+The cost is one extra reference per node. On a 64-bit JVM with
+compressed oops (default up to ~32GB heaps) that's 4 bytes;
+without compressed oops it's 8. Plus alignment padding eats any
+savings smaller than 8 bytes anyway, so in practice "doubly linked"
+costs you about 8 bytes per node.
+
+### Circular
+
+The last node's `next` points back to the head (or in the doubly
+linked case, `head.prev` is the tail and `tail.next` is the head).
+Useful when you want round-robin traversal without an "am I at the
+end?" check — schedulers cycling through ready tasks, ring buffers,
+token-ring style topologies. Less common in application code than
+the other two.
+
+## Sentinel nodes
+
+A *sentinel* (or *dummy*) is a node that exists only to remove the
+"is this the first/last node?" special case. Real lists need a
+branch every time they touch the boundary. Sentinel lists don't.
+
+Without sentinels, doubly linked insert at head looks like:
+
+```java
+void addFirst(T v) {
+    Node<T> n = new Node<>(v);
+    n.next = head;
+    if (head != null) head.prev = n;   // edge case
+    else tail = n;                     // edge case
+    head = n;
+}
+```
+
+With a permanent dummy `head` and `tail` whose only job is to flank
+the real data:
+
+```java
+void addFirst(T v) {
+    Node<T> n = new Node<>(v);
+    n.prev = head;
+    n.next = head.next;
+    head.next.prev = n;                // no null check needed
+    head.next = n;
+}
+```
+
+The body is branch-free. Every "real" node has a non-null `prev`
+and `next`, always. This is the trick that makes the LRU cache
+implementation in `lru-cache.mdx` ~30 lines instead of ~50. It's
+also the kind of thing that makes interview-grade list code roughly
+30% shorter. Memorize the pattern.
+
+## `java.util.LinkedList` is almost never the answer
+
+`java.util.LinkedList` is a doubly-linked list. It implements both
+`List` and `Deque`. It looks plausible. It is, on basically every
+realistic workload, slower than `ArrayList` and slower than
+`ArrayDeque`.
+
+The per-node overhead is the first problem. On a 64-bit JVM with
+compressed oops, each `Node` is roughly:
+
+- 12-byte object header
+- 4 bytes for `item` (the value reference)
+- 4 bytes for `next`
+- 4 bytes for `prev`
+- 4 bytes of alignment padding
+
+That's ~24-32 bytes of bookkeeping per element, separate from the
+element itself. An `ArrayList<T>` pays ~4 bytes per element plus
+some slack capacity.
+
+The second problem is cache behavior. Every `next` hop is a load
+from a different cache line. An `ArrayList` iteration prefetches
+linearly and runs at memory bandwidth. A `LinkedList` iteration
+stalls on misses. One sentence on the locality argument; see
+`arrays-vs-linked-lists.mdx` for the full version.
+
+The third problem is that `LinkedList` doesn't even win the
+operations the textbook says it should. Front insertion?
+`ArrayDeque` beats it — it's a circular array, also O(1) at both
+ends, with no per-element node allocation. Middle insertion?
+You still have to traverse to find the index, so it's O(n) anyway,
+and the constants are worse. Stuart Marks (OpenJDK collections
+maintainer) has given conference talks essentially recommending
+that `LinkedList` not be used; the Java team has discussed
+deprecation but kept it for compatibility. The Javadoc itself
+nudges you toward `ArrayDeque`.
+
+<Callout variant="warn">
+If you find yourself reaching for `LinkedList<T>` in Java, stop.
+Use `ArrayList` for sequential access and `ArrayDeque` for queue
+or stack semantics. The only reason to use `LinkedList` is if
+you've measured and the specific node-handle operations below
+genuinely pay off — almost never the case through the `List`
+interface.
+</Callout>
+
+## When linked lists actually win
+
+The wins aren't in `java.util.LinkedList`. They're in custom
+structures where you control the nodes.
+
+**O(1) splice given a node.** Concatenating two linked lists is
+"point tail of A at head of B" — constant time, regardless of
+size. `ArrayList.addAll` is O(n). If you're building a structure
+that frequently moves runs of elements between containers, this is
+the property you want.
+
+**O(1) move-to-front given a node handle.** The LRU cache trick
+in `lru-cache.mdx`: a hash table gives you a node reference in
+O(1), and a doubly linked list lets you splice that node to the
+head in O(1). Neither structure alone can do this. An array
+indexed by hash can't move-to-front cheaply; a list alone can't
+look up by key cheaply.
+
+**Intrusive lists.** In C and C++, the "node" is usually a field
+embedded in the data itself, not a wrapper around it:
+
+```
+struct task {
+    int pid;
+    /* ... fields ... */
+    struct list_head run_queue;   // embedded list node
+};
+```
+
+The Linux kernel's `list_head` is the canonical example — every
+kernel object that needs to live in a list embeds one (or several)
+`list_head` fields, and traversal macros recover the containing
+struct via `container_of`. No per-element allocation, no separate
+wrapper objects, and one object can simultaneously be in multiple
+lists by embedding multiple `list_head` fields. Java can't do this
+cleanly because every class has a single object header and the GC
+doesn't love foreign pointers into the middle of objects — but the
+*idea* explains why C-level linked lists pay off where Java ones
+don't.
+
+**Persistent / functional structures.** A singly linked cons list
+lets you prepend without copying — the new list shares its tail
+with the old one. This is the foundation of Lisp, Clojure's
+sequence operations, and Okasaki's `Purely Functional Data
+Structures`. Not relevant in idiomatic Java, but worth knowing
+exists.
+
+Skip lists are linked lists with extra forward pointers at higher
+levels — Redis uses them for sorted sets. Mentioned for context;
+the deep dive isn't here.
+
+## The pointer-rewiring patterns
+
+Interview lists test the same handful of patterns. Each one is
+about not losing track of the chain while you mutate it.
+
+### Reverse a singly linked list (iteratively)
+
+Three pointers: `prev`, `cur`, `next`. Walk forward, flipping each
+`next` backward as you go.
+
+```java
+Node<T> reverse(Node<T> head) {
+    Node<T> prev = null, cur = head;
+    while (cur != null) {
+        Node<T> next = cur.next;
+        cur.next = prev;
+        prev = cur;
+        cur = next;
+    }
+    return prev;
+}
+```
+
+That's the pattern. Memorize it — it shows up under a dozen
+disguises (reverse in groups of K, palindrome check, reorder list).
+
+### Floyd's cycle detection
+
+Two pointers walk the list; one moves one step at a time, the
+other moves two. If there's a cycle, fast eventually laps slow.
+If there isn't, fast hits `null`.
+
+```java
+boolean hasCycle(Node<T> head) {
+    Node<T> slow = head, fast = head;
+    while (fast != null && fast.next != null) {
+        slow = slow.next;
+        fast = fast.next.next;
+        if (slow == fast) return true;
+    }
+    return false;
+}
+```
+
+O(n) time, O(1) space. A small extra dance after the meeting point
+locates the cycle's entry node — useful but not always asked.
+
+### Middle of the list
+
+Same trick. When fast reaches the end, slow is at the middle.
+
+```java
+Node<T> middle(Node<T> head) {
+    Node<T> slow = head, fast = head;
+    while (fast != null && fast.next != null) {
+        slow = slow.next;
+        fast = fast.next.next;
+    }
+    return slow;
+}
+```
+
+For even-length lists, decide whether you want the lower-middle or
+upper-middle by adjusting the loop condition. Mergesort on a
+linked list uses this to find the split point.
+
+### Merge two sorted lists
+
+The merge step of mergesort. Use a sentinel head to avoid
+special-casing the first append.
+
+```java
+Node<T> merge(Node<T> a, Node<T> b, Comparator<T> cmp) {
+    Node<T> dummy = new Node<>(null), tail = dummy;
+    while (a != null && b != null) {
+        if (cmp.compare(a.value, b.value) <= 0) { tail.next = a; a = a.next; }
+        else                                    { tail.next = b; b = b.next; }
+        tail = tail.next;
+    }
+    tail.next = (a != null) ? a : b;
+    return dummy.next;
+}
+```
+
+The dummy is the sentinel trick again. Without it the first
+iteration needs a separate "is the result empty?" branch.
+
+## Why `LinkedList<Integer>` is a memory disaster
+
+This is the one number that's worth burning in. A `LinkedList<Integer>`
+of N ints, on a 64-bit JVM with compressed oops:
+
+- Per node: ~24 bytes (header + `item`, `next`, `prev` + padding).
+- Per boxed `Integer`: ~16 bytes (12-byte header + 4-byte int).
+- Total per element: ~40 bytes.
+
+So roughly **~40 bytes per `int`** in a `LinkedList<Integer>`. An
+`int[]` is **4 bytes per `int`**. That's a 10x memory ratio, and
+the GC consequences are worse than the raw number suggests:
+
+- Two separate heap allocations per insert (node + box).
+- N+N objects participating in GC scans instead of one array.
+- Nodes and boxes are scattered across the heap, so iteration
+  cache-misses constantly.
+
+If you have a million ints, that's ~40 MB in a `LinkedList<Integer>`
+versus ~4 MB in an `int[]`. Numbers vary slightly with JVM flags
+(compressed oops on/off, alignment), but the order of magnitude is
+real. Don't do it.
+
+## Concurrency
+
+Mutating a linked list under concurrent access is harder than
+mutating an array. Inserting between two nodes requires updating at
+least `prev.next` and `next.prev` (doubly linked), plus the new
+node's pointers — multiple writes that need to appear atomic to
+readers, or readers can observe a half-spliced node.
+
+The simple answer is to wrap the list in a lock. The clever answers
+exist but are infamous:
+
+- **Harris's lock-free linked list** (2001) uses a "marked" bit on
+  the `next` pointer to logically delete a node before physically
+  unlinking it, so concurrent readers can recognize and skip
+  half-removed nodes.
+- **The Michael-Scott queue** is a lock-free FIFO queue built on
+  CAS over a singly linked list, used inside
+  `ConcurrentLinkedQueue` in `java.util.concurrent`.
+
+These work, and they're correct, but the invariants are subtle
+enough that nobody writes one from memory in an interview. If you
+need concurrent FIFO/LIFO, reach for `ConcurrentLinkedQueue` or
+`ConcurrentLinkedDeque`; if you need a concurrent list, you
+probably want a different structure entirely (a skip list, a
+ring buffer, a per-thread shard).
+
+## Unrolled linked lists
+
+An *unrolled* linked list stores N items per node — usually a small
+array — instead of one. It bridges arrays and lists: fewer nodes,
+better cache behavior, still O(1) splice at node boundaries.
+
+Some C++ standard libraries used this internally (GCC's old rope
+implementation, certain `deque` backings). In Java you won't see
+them in the standard library, and you're unlikely to write one. The
+name is worth knowing so the term doesn't surprise you.
+
+## Cross-references
+
+- `arrays-vs-linked-lists.mdx` — the comparison; the cache-locality
+  argument lives there in full.
+- `lru-cache.mdx` — the canonical "linked list actually pays off"
+  example: hash table + doubly linked list with sentinels.
+- `memory-and-pointers.mdx` — why scattered heap objects are slow
+  in the first place.
+- `arrays-dynamic-and-static.mdx` — the other side of the tradeoff,
+  including how `ArrayList` and `ArrayDeque` are implemented.
+
+## The discipline
+
+- Default to `ArrayList` for sequential storage and `ArrayDeque`
+  for queue or stack semantics. Reach for `LinkedList` only after
+  measuring, and almost never.
+- If a linked list is genuinely the right tool, it's because you
+  need a *specific property*: O(1) splice, intrusive nodes, or
+  O(1) move-to-front given a node handle.
+- Doubly linked nodes buy O(1) delete-given-node at the cost of
+  one extra pointer per node. Singly linked saves the pointer and
+  forces traversal to find the predecessor.
+- Sentinel head/tail nodes remove the boundary special cases.
+  Every well-written list implementation uses them.
+- Memorize the iterative reverse — three pointers, prev/cur/next.
+  Most other interview list questions are variations on it or on
+  the slow/fast pointer trick.
+- A `LinkedList<Integer>` of a million ints is ~10x the memory of
+  an `int[]`, plus GC pressure, plus cache scatter. Boxed
+  primitives in node-based structures are the worst case.

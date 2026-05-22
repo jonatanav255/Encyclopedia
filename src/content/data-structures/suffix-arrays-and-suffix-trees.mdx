@@ -1,0 +1,341 @@
+export const level = 'senior';
+
+# Suffix arrays and suffix trees
+
+Suffix arrays and suffix trees index the **text**, not the
+**pattern**. Preprocess `T` of length `n` once, then every
+substring query — does `P` occur, how many times, where —
+runs in time proportional to `|P|` rather than `|T|`. That's
+what makes genome alignment, code search, and bzip2 possible.
+
+## The problem they solve
+
+Given text `T` of length `n` and pattern `P` of length `m`:
+
+- "Does `P` occur in `T`?" — substring search.
+- "How many times does `P` occur?" — count.
+- "Where are all occurrences?" — locate.
+- "Longest substring that appears twice in `T`?"
+- "Longest common substring of `T1` and `T2`?" —
+  bioinformatics, plagiarism, diff.
+
+Naive scanning is O(n·m). KMP, Boyer-Moore, Rabin-Karp drop
+that to O(n + m), but they build a **pattern index** —
+preprocess `P`, then walk through `T`. Right tradeoff when you
+scan a new text each time.
+
+Suffix trees and suffix arrays invert this. Preprocess `T`
+once in O(n), then every query is O(m + occ), independent of
+`n`. For repeated searches over the same text (logs, genomes,
+source code), that's the difference between "responsive" and
+"impossible."
+
+## Suffix tree: a compressed trie of all suffixes
+
+Append a sentinel `$` that doesn't appear elsewhere in `T`,
+then list every suffix. For `T = "banana$"`, the suffixes are
+`banana$, anana$, nana$, ana$, na$, a$, $`.
+
+A suffix tree is the radix-compressed trie of these strings.
+Each leaf corresponds to one suffix; the root-to-leaf path
+spells it.
+
+Properties:
+
+- `n + 1` leaves, one per suffix.
+- At most `n` internal nodes (each has ≥2 children by
+  compression). Total O(n) nodes.
+- Edges store **references** into `T` (a start index and a
+  length), not copies. Memory is O(n) ints, not O(n²) chars.
+
+Substring search for `P` walks from the root, matching
+characters along edges. If you exhaust `P` without falling
+off, the subtree below tells you all occurrences. Query
+time: **O(m)**, plus O(occ) to enumerate matches.
+
+## Suffix tree construction is hard
+
+Ukkonen's 1995 algorithm builds a suffix tree **online** in
+O(n); McCreight's 1976 algorithm is offline but also O(n).
+Both are notoriously tricky: 200+ lines, with subtle
+invariants around suffix links, active points, and edge
+splits. Most "I wrote a suffix tree" repos on GitHub have
+bugs that surface only on adversarial inputs.
+
+The value of a suffix tree is the **result**, not the
+construction code. If you reach for one in production, reach
+for a library.
+
+<Callout variant="warn">
+**Don't implement Ukkonen's algorithm in production.** Every
+"I wrote a suffix tree" repo on GitHub has subtle bugs around
+suffix links, edge splits, or the active-point invariants. Use
+a maintained library (SA-IS for arrays, libsais; FM-index via
+Bowtie/BWA bindings for genomes; Lucene for general search).
+</Callout>
+
+## Suffix array: same content, less memory
+
+A suffix array is the same set of suffixes, **sorted
+lexicographically**, stored as an array of their **start
+indices** in `T`. No tree nodes, no edge labels — just ints.
+
+For `T = "banana$"`, sorting the suffixes:
+
+```
+i  SA[i]  suffix
+0   6     $
+1   5     a$
+2   3     ana$
+3   1     anana$
+4   0     banana$
+5   4     na$
+6   2     nana$
+```
+
+`SA = [6, 5, 3, 1, 0, 4, 2]`. Just `n + 1` integers.
+
+A suffix tree typically costs ~20·n bytes; a suffix array
+~4·n bytes. **A quarter to a fifth the memory**, with
+comparable query power once you add the LCP array.
+
+## Substring search on a suffix array
+
+Suffixes starting with `P` form a **contiguous range** in
+`SA` (because `SA` is sorted). Find the range with two binary
+searches:
+
+```java
+// Leftmost i in SA such that suffix at SA[i] >= P.
+int lowerBound(char[] T, int[] SA, char[] P) {
+  int lo = 0, hi = SA.length;
+  while (lo < hi) {
+    int mid = (lo + hi) >>> 1;
+    if (compare(T, SA[mid], P) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+// compare(T, start, P): lex compare T[start..] with P,
+// O(m) per call.
+```
+
+Two binary searches with O(m) comparisons gives **O(m · log
+n)** naive; with LCP, **O(m + log n)**. Slower per query than
+a suffix tree's O(m), but memory and cache behavior win in
+practice. Production text indexes are almost always
+suffix-array-based.
+
+## LCP array: the missing piece
+
+`LCP[i]` = length of the longest common prefix between the
+suffix at `SA[i]` and the suffix at `SA[i-1]`. For `banana$`,
+`LCP = [-, 0, 1, 3, 0, 0, 2]` — between `ana$` and `anana$`
+the shared prefix is `"ana"` (length 3); between `na$` and
+`nana$` it's `"na"` (length 2).
+
+Given `SA` and `T`, Kasai's algorithm builds `LCP` in O(n).
+With `SA + LCP`:
+
+- **O(m + log n) substring search.**
+- **O(n) longest repeated substring** — max value in `LCP`.
+  Here `LCP[3] = 3`, so `"ana"` is the longest substring
+  appearing twice.
+- **O(n + m) longest common substring of two texts** —
+  concatenate `T1 + '#' + T2 + '$'` with unique separators,
+  build `SA + LCP`, find the max `LCP[i]` where `SA[i]` and
+  `SA[i-1]` come from different originals.
+
+Almost every classical suffix-tree algorithm translates
+cleanly to `SA + LCP`. Don't ship one without the other.
+
+## Construction algorithms
+
+| Algorithm | Time | Notes |
+|---|---|---|
+| Naive sort | O(n² log n) or O(n log² n) | Fine up to n ~ 10⁵. |
+| DC3 / Skew (2003) | O(n) | First practical linear-time SA. ~150 lines. |
+| SA-IS (2009) | O(n) | Fastest in practice. ~200 lines. The default. |
+
+Industrial implementations: **libdivsufsort** and **libsais**
+in C, **SDSL-lite** in C++. Java has no widely used
+equivalent — ship a small SA-IS (jSuffixArrays from Carrot²
+is the most known), call libsais via JNI/FFI, or reframe and
+use Lucene.
+
+## Production use cases
+
+- **Bioinformatics.** The hg38 human genome reference (~3 GB)
+  is queried trillions of times daily. **BWA**, **Bowtie /
+  Bowtie2**, **STAR**, **Salmon** all use FM-indexes (built on
+  suffix arrays) for read alignment. Microsecond lookups;
+  brute force would make modern genomics impossible.
+- **Source-code search.** Nelson Elhage's **livegrep** indexes
+  source repositories with a suffix array so that regex queries
+  hit in interactive time. Google's old Code Search and
+  Sourcegraph's Zoekt take a different path — they use **trigram
+  indexes** (closer to inverted indexes than to the structures
+  on this page). The contrast is the lesson: suffix arrays buy
+  you arbitrary-substring regex; trigrams buy you smaller index
+  + cheaper updates.
+- **Plagiarism detection.** Moss computes longest-common-
+  substring via suffix arrays.
+- **Compression.** The **Burrows-Wheeler Transform** (heart
+  of `bzip2`) is derived from the suffix array — the BWT of
+  `T` is the last column of the sorted rotation matrix.
+
+## FM-index: the bridge to what actually ships
+
+The Ferragina-Manzini index combines the BWT with rank tables
+and sampled SA values. You get **substring search on
+compressed text** (no decompression), **memory often less than
+the original text** (typical bioinformatics FM-indexes are
+30-60% the size of `T`), and **O(m) per query** plus O(occ ·
+sample) to recover positions.
+
+This is what makes 3 GB genome indexes fit in a few hundred
+MB of RAM. **Most production text-index code in 2026 ships an
+FM-index, not a raw suffix array.** The build uses SA-IS
+internally, so understanding SA is the prerequisite.
+
+## Decision sheet
+
+<Cheatsheet caption="Text-index decision">
+
+| Structure | Memory | Query | Build | Use |
+|---|---|---|---|---|
+| Suffix tree | ~20·n bytes | O(m) | O(n), hard | Education; rarely shipped raw. |
+| Suffix array | ~4·n bytes | O(m + log n) with LCP | O(n) via SA-IS | The default plain text index. |
+| LCP array | +4·n bytes | Constant per step | O(n) via Kasai | Always pair with SA. |
+| FM-index | Often < n bytes | O(m) + O(occ · sample) | O(n) (builds SA inside) | What you actually ship for big text. |
+
+</Cheatsheet>
+
+## Suffix tree vs suffix array
+
+<Compare badTitle="Suffix tree" goodTitle="Suffix array + LCP" language="java" bad={`// Node with children, suffix link, edge label
+// as (start, end) references into T.
+class Node {
+  Map<Character, Node> children;
+  Node suffixLink;
+  int edgeStart, edgeEnd;
+}
+// Pros: O(m) query.
+// Cons: ~20n bytes, painful to build correctly,
+//       pointer chasing kills cache locality.`} good={`// Two int arrays plus the text.
+int[] SA;   // SA[i] = start of i-th smallest suffix
+int[] LCP;  // LCP[i] = lcp(SA[i], SA[i-1])
+char[] T;
+// Pros: ~4-8n bytes, cache friendly,
+//       construction is a library call.
+// Cons: substring search is O(m + log n), not O(m).
+//       Rarely the bottleneck in practice.`} />
+
+"Less memory, cache-friendly, library exists" beats "tighter
+asymptotic per query" almost every time in real systems.
+
+## Kasai's LCP in Java
+
+For shape; pair with a real SA-IS in production.
+
+```java
+static int[] kasai(String t, int[] sa) {
+  int n = t.length();
+  int[] rank = new int[n];
+  for (int i = 0; i < n; i++) rank[sa[i]] = i;
+  int[] lcp = new int[n];
+  int h = 0;
+  for (int i = 0; i < n; i++) {
+    if (rank[i] > 0) {
+      int j = sa[rank[i] - 1];
+      while (i + h < n && j + h < n
+          && t.charAt(i + h) == t.charAt(j + h)) h++;
+      lcp[rank[i]] = h;
+      if (h > 0) h--;
+    } else h = 0;
+  }
+  return lcp;
+}
+```
+
+O(n) total — `h` only ever decreases by 1 per outer
+iteration, so the inner `while` is amortized O(n).
+
+## When NOT to use these
+
+- **Single-query workloads.** "Find `P` in `T` once" — KMP,
+  Boyer-Moore, or `String.indexOf`. The O(n) build is wasted.
+- **Mutable text.** Every edit invalidates the index. For
+  small texts, rebuild. For an editor buffer, use a rope.
+- **Tiny texts.** Linear scan is O(n) and constants beat any
+  suffix structure under a few KB.
+- **Approximate or fuzzy matching.** Different problem —
+  q-gram indexes, BLAST-style seed-and-extend, MinHash,
+  Levenshtein automata.
+
+## Java in the wild
+
+Java's standard library has no suffix array or suffix tree.
+Apache Lucene ships FSTs and inverted indexes for tokenized
+search — **a different problem.** Lucene indexes words and
+n-grams, not arbitrary substrings of an unstructured blob.
+
+Honest guidance for backend Java:
+
+- "Search a corpus of documents for terms" → Lucene /
+  Elasticsearch / OpenSearch.
+- "Substring search over one big blob, scanning works" →
+  `String.indexOf` or a regex engine.
+- "Substring search, scanning too slow" → real SA workload.
+  Reach for libsais via JNI/FFI; rolling your own SA-IS in
+  Java is a project.
+- "Genome alignment" → bioinformatics tooling (BWA, Bowtie,
+  minimap2). It exists for a reason.
+
+The page is here so you can **recognize** these structures
+and understand what BWA or livegrep is doing — not so you
+can implement Ukkonen tomorrow.
+
+## Common misconceptions
+
+- **"Suffix tree and Aho-Corasick are the same."** No.
+  Aho-Corasick indexes a **set of patterns** and scans a text
+  once. Suffix trees index a **single text** and query
+  arbitrary patterns against it. Different problems.
+- **"Suffix arrays are slower than suffix trees in
+  practice."** Asymptotically yes; in wall-clock time, suffix
+  arrays usually win — cache behavior and a smaller working
+  set.
+- **"FM-index is separate from suffix array."** It's built on
+  the BWT, which is built on the SA. Can't understand
+  FM-indexes without SA first.
+
+## Cross-references
+
+- `tries.mdx` — the uncompressed cousin, indexed by key
+  prefix. Suffix tree = compressed trie of suffixes.
+- `b-trees.mdx` — the other "standard library doesn't have
+  this but databases do" structure.
+- `hash-tables-internals.mdx` — the alternative when you need
+  exact-match-only.
+- `binary-search-trees.mdx` — the ordered-map ancestor;
+  suffix arrays are "sorted things you binary search."
+- `arrays-dynamic-and-static.mdx` — a suffix array is just an
+  `int[]` and a `char[]`. Cache friendliness comes from that.
+
+## The discipline
+
+- Suffix tree = compressed trie of all suffixes. O(n) build,
+  O(m) query, big memory, hard to implement correctly.
+- Suffix array = sorted suffix start indices. O(n) build via
+  SA-IS, O(m + log n) query with LCP, ~1/4 the memory.
+- LCP array unlocks the suffix-tree algorithms on top of a
+  suffix array. Pair them; don't ship one without the other.
+- For real production text indexing (genomes, code search),
+  ship an FM-index via a maintained library. Don't implement
+  Ukkonen from scratch.
+- Java has no built-in suffix index — use Lucene for
+  tokenized search, native libraries (libsais, BWA, Bowtie)
+  for raw substring work over big blobs.
+- These structures index the **text**, not the **pattern**.
+  Preprocess once in O(n), then every query is O(m).

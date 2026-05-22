@@ -1,0 +1,338 @@
+export const level = 'mid';
+
+# Hashing fundamentals
+
+`hash-tables-intuition.mdx` and `hash-tables-internals.mdx` cover the
+table — buckets, chaining, open addressing, load factor. This page is
+about the **function** that turns a key into a bucket index. When that
+function isn't doing its job, your O(1) lookup is O(n) and you usually
+don't notice until production tells you.
+
+## What a hash function has to do
+
+Take an input of arbitrary shape — string, int, object, byte array,
+4KB blob — and produce a fixed-size integer. The contract is four
+properties:
+
+1. **Deterministic.** `h(x)` always returns the same number for the
+   same `x`, in this process, on this machine. Otherwise nothing you
+   put in a hash table is ever findable again.
+2. **Uniformly distributed.** The output range is used evenly across
+   the input distribution. If you bucket N items into M buckets via
+   `h(x) % M`, you want roughly N/M per bucket with low variance.
+3. **Avalanche.** Flipping one bit of input flips roughly half the
+   bits of output. Without this, near-identical keys (`"user_1"`,
+   `"user_2"`, ...) cluster into a handful of buckets.
+4. **Cheap.** A few nanoseconds per call. A hash table that lookups
+   "in O(1)" but spends 5µs computing the hash is not winning.
+
+Notably *not* in the contract: secrecy, authentication, or "you cannot
+find two inputs with the same output." That last one is what
+cryptographic hashes give you, and it's exactly the property you do
+not need (and cannot afford) for a hash table.
+
+## What hashes get used for
+
+Different uses tolerate different tradeoffs, which is why there's a
+zoo rather than One True Hash:
+
+- **Hash-table indexing** — cheap + uniform + avalanche. SipHash,
+  Murmur, xxHash; Java strings use a polynomial.
+- **Deduplication** — cheap + collision-resistant enough for the
+  corpus. xxHash64/128, BLAKE3.
+- **Bloom filters** — multiple independent-looking hashes from one
+  function. Murmur or xxHash, salted.
+- **Consistent hashing** for partitioning across servers — Murmur,
+  xxHash; no crypto needed.
+- **Content addressing** (Git, IPFS, Docker) — adversary-resistant.
+  SHA-1 (Git, grudgingly), SHA-256, BLAKE3.
+- **Checksums** — error detection. CRC32.
+
+A hash that's perfect for one of these is wrong for another.
+
+## Java's `Object.hashCode` — weak by design
+
+The default `Object.hashCode()` is **identity-based** — derived from
+the object's memory location plus a per-process randomized salt,
+cached in the object header's mark word. Two distinct `new Object()`
+instances get different hash codes even if they're "logically equal,"
+because at the `Object` level there's no notion of "equal" beyond
+identity.
+
+```java
+String a = new String("hello");
+String b = new String("hello");
+
+a == b;                  // false — different objects
+a.equals(b);             // true  — String overrides equals
+a.hashCode() == b.hashCode();  // true — String ALSO overrides hashCode
+```
+
+That third line works because `String` overrides `hashCode`. Without
+that override, `a` and `b` would hash to different buckets and a
+`HashMap<String, ?>` built with `new String(...)` keys would silently
+behave like a slow `List` lookup.
+
+The contract you inherit: **if you override `equals`, you must override
+`hashCode` so that `a.equals(b)` implies
+`a.hashCode() == b.hashCode()`.** Records do this for you. Hand-written
+classes that forget are a classic source of "my cache never hits" bugs
+covered in `maps-and-sets.mdx`.
+
+## `String.hashCode` — what a "good enough" hash looks like
+
+Java's `String.hashCode` is a textbook **polynomial hash**:
+
+```java
+// Effectively what String.hashCode does
+int h = 0;
+for (int i = 0; i < length; i++) {
+    h = 31 * h + charAt(i);
+}
+return h;
+```
+
+Three things to notice:
+
+- **31 is a small odd prime.** Primes mix bits better than composite
+  multipliers (which leave structure in the low bits). Odd matters
+  because `even * h` zeroes the top bit on overflow and loses entropy.
+- **`31 * h` compiles to `(h << 5) - h`** on every reasonable JIT. The
+  choice is partly historical, partly this micro-optimization.
+- **Position matters.** Because each character is folded into a shifted
+  accumulator, `"ab"` and `"ba"` produce different hashes — unlike a
+  naive `sum(charAt(i))`.
+
+Not the strongest hash in the world. Weak avalanche for short strings,
+and an attacker who knows you use it can craft colliding inputs in
+seconds (see HashDoS below). But it's deterministic, decent on natural
+data, and cheap. For a default language-level string hash, that was the
+right tradeoff in 1995. It's still the default today.
+
+<Callout variant="warn">
+**Don't use length() as a hash.** A common beginner trick is `int hash = s.length();`. It is
+deterministic and cheap, but a million 12-character usernames all
+hash to 12. Every lookup is a full scan of that bucket. This pattern
+shows up in custom `hashCode()` overrides written in a hurry — it
+compiles, the tests pass, production dies.
+</Callout>
+
+<Compare
+  bad={`@Override
+public int hashCode() {
+  return name.length();   // every same-length name collides
+}`}
+  good={`@Override
+public int hashCode() {
+  return Objects.hash(name, id);   // mixes all the fields
+}`}
+  language="java"
+  badTitle="Looks deterministic. Isn't uniform."
+  goodTitle="Mixes every component"
+/>
+
+## What "uniform" actually means
+
+Formal: `h : K -> [0, 2^n)` is uniform if outputs are indistinguishable
+from random for inputs drawn from a reasonable distribution over `K`.
+
+Operational: stuff N keys into M buckets via `h(x) % M`. With a uniform
+hash, each bucket holds ~N/M keys with variance also ~N/M (Poisson).
+A **bad** hash piles 80% of keys into 10% of buckets and "O(1) lookup"
+becomes a linear scan through a long chain.
+
+Uniformity is a property of the hash *and the key distribution
+together*. A hash that's perfect on random bytes can be terrible on
+URLs that all share a common prefix. Real hash functions are designed
+to spread structured inputs, not just random ones.
+
+## Avalanche
+
+Flip one bit of input. Count how many output bits flip. A hash with
+good avalanche flips ~50% — the **strict avalanche criterion**.
+
+Why this matters concretely: tables size to powers of two because
+`h & (M-1)` is faster than `h % M`. That means *only the low bits pick
+the bucket*. If `hash(x)` and `hash(x+1)` differ only in their high
+bits, the low bits collide and every adjacent key lands together.
+
+Java's `HashMap` knows `String.hashCode` has weak avalanche and
+scrambles before indexing:
+
+```java
+// java.util.HashMap, paraphrased
+static int hash(Object key) {
+    int h = key.hashCode();
+    return h ^ (h >>> 16);   // mix high bits into low
+}
+```
+
+That one XOR-and-shift folds the high 16 bits into the low 16, so the
+modulo-pick uses information from across the whole word. Without it,
+`HashMap<Integer, V>` would cluster catastrophically for sequential
+integer keys, since `Integer.hashCode(i) == i`.
+
+## Composite keys: don't XOR
+
+The most popular wrong way to combine two field hashes:
+
+```java
+// WRONG
+@Override
+public int hashCode() {
+  return field1.hashCode() ^ field2.hashCode();
+}
+```
+
+XOR is commutative and self-inverse, so:
+
+- `hash(a, b) == hash(b, a)` — symmetric pairs collide.
+- `hash(a, a) == 0` for any `a`.
+- `hash(a, b) == hash(a ^ c, b ^ c)` — easy to construct collisions.
+
+The right pattern (what records and `Objects.hash` use internally) is
+the same 31-multiply-and-add as `String`:
+
+```java
+@Override
+public int hashCode() {
+  int result = 1;
+  result = 31 * result + Objects.hashCode(field1);
+  result = 31 * result + Objects.hashCode(field2);
+  result = 31 * result + Objects.hashCode(field3);
+  return result;
+}
+```
+
+`Objects.hash(f1, f2, f3)` wraps this exact pattern but allocates a
+varargs `Object[]` per call. In a hot inner loop the inline version
+is sometimes worth it; in ordinary code, use records or `Objects.hash`.
+
+## HashDoS — the 2011-2012 attacks
+
+In late 2011, Klink and Wälde presented at 28C3 showing that nearly
+every major web framework — PHP, Python, Java/Tomcat, Rails, ASP.NET,
+Node — had the same bug. They all parsed POST bodies and query strings
+into hash tables using deterministic, well-documented hash functions.
+An attacker could precompute thousands of strings that all hashed to
+the same bucket, send them in one POST body, and force the server into
+an O(n²) parse. One ~1MB request pinned a CPU core for **seconds**.
+
+The fixes that shipped over the next year or two:
+
+- **Randomized seeds.** The hash takes a per-process secret key the
+  attacker can't observe. Same hash, but collision sets aren't
+  precomputable across processes.
+- **Better hash functions.** Specifically **SipHash** — a
+  cryptographically-keyed PRF fast enough for hash tables. Python 3.4+,
+  Rust, Perl, Ruby, and most JS engines switched.
+- **Worst-case-bounded buckets.** Java 8's `HashMap` keeps chaining,
+  but when a chain exceeds 8 entries (with a table of ≥64 buckets) the
+  chain converts to a red-black tree. Worst-case lookup becomes
+  O(log n) per bucket. Mitigation, not prevention.
+
+Crypto hashes — SHA-256, BLAKE2 — were ruled out: 10-50× too slow, and
+not what's needed anyway. You want an attacker unable to *guess
+collisions before observing the seed*, not mathematical collision
+resistance. SipHash is the sweet spot.
+
+## The hash function zoo
+
+<Cheatsheet caption="Pick by use case, not by name recognition">
+| Name | Type | Speed | Use it for |
+|---|---|---|---|
+| `String.hashCode` (Java) | Polynomial | Very fast | Java strings by default. Not DoS-resistant. |
+| FNV-1a | Multiplicative | Fast | Tiny code, weak avalanche. Old C/C++ habits. |
+| MurmurHash3 | Mixing | Fast | Cassandra, Lucene, Bloom filters. The classic. |
+| xxHash (XXH3) | Mixing | Fastest non-crypto | Bulk hashing, file dedupe, Zstd. ~30 GB/s. |
+| CityHash / FarmHash | Mixing | Very fast | Google internal, largely superseded by xxHash. |
+| SipHash | Keyed PRF | Fast | DoS-resistant hash tables. Rust, Python 3.4+. |
+| CRC32 | Polynomial over GF(2) | Very fast | Error detection. **Not** for hash tables. |
+| MD5 | Cryptographic (broken) | Slow | Legacy checksums. Do not trust for anything. |
+| SHA-1 | Cryptographic (deprecated) | Slow | Git history (grandfathered in). Not for new code. |
+| SHA-256 | Cryptographic | Slow | Content addressing, signatures. Wrong for hash tables. |
+| BLAKE3 | Cryptographic | Surprisingly fast | Modern crypto hash, parallel-friendly. |
+</Cheatsheet>
+
+Rough ordering: for a hash-table hash, **xxHash** or **Murmur**
+(no adversary), **SipHash** (untrusted input). For content addressing
+or adversary-resistant work, **SHA-256** or **BLAKE3**. The middle
+ground doesn't exist — there's no hash that's both crypto-strong and
+table-fast, and you shouldn't try to find one.
+
+## 32 vs 64 vs 128 bits
+
+`hashCode()` returns an `int` — 32 bits. Fine for an in-process
+`HashMap` of a few million entries. Not fine for:
+
+- **Partitioning across many shards.** 32 bits gives ~4 billion
+  values, and by the birthday paradox you hit 50% collision probability
+  at √(2^32) ≈ 65,536 distinct hashes.
+- **Deduplication of large corpora.** A petabyte of files at 4KB each
+  is ~256 billion blobs. 32 bits collides constantly; 64 bits collides
+  at ~4 billion; 128 bits is where you stop worrying.
+
+For these, use `xxh64`, `xxh3-128`, or a real crypto hash if adversaries
+are in scope. Note that `Long.hashCode` collapses its 64-bit value into
+32 bits via `(int)(value ^ (value >>> 32))` — `HashMap<Long, ?>` is
+still constrained by 32-bit collision math however distinct your longs.
+
+## Cryptographic vs non-cryptographic, sharp version
+
+| | Non-cryptographic | Cryptographic |
+|---|---|---|
+| Goal | Uniform spread | Collision resistance vs. adversaries |
+| Speed | 1-30 GB/s | 0.3-3 GB/s |
+| Examples | Murmur, xxHash, SipHash | SHA-256, BLAKE3, SHA-3 |
+| Wrong for | Content addressing | Hash tables, Bloom filters |
+| Password hashing | No | **Also no** — use Argon2/scrypt/bcrypt |
+
+The last row matters: raw SHA-256 is wrong for password storage. Use a
+*deliberately slow* KDF (Argon2id, scrypt, bcrypt) tuned to ~100ms per
+guess. "Cryptographic hash" isn't synonymous with "right for passwords."
+
+## Universal hashing (the brief version)
+
+The theoretical foundation behind DoS-resistant tables: instead of one
+fixed hash `h`, choose a **family** `H = { h_k : k ∈ K }` parameterized
+by a key `k`, with the property that for any two distinct inputs
+`x ≠ y`, the probability over random `k` that `h_k(x) = h_k(y)` is at
+most `1/M`. Such a family is called **2-universal**.
+
+At runtime, pick `k` randomly and stick with it. An adversary who
+chooses inputs *before* seeing `k` can't reliably force collisions —
+the math guarantees they get unlucky. SipHash is essentially a
+2-universal family with a 128-bit key; randomized per process, it's
+unbreakable in practice for hash tables.
+
+Takeaway: **the defense against HashDoS isn't a stronger hash, it's a
+keyed hash with the key chosen after the attacker commits to inputs.**
+
+## Cross-references
+
+- `hash-tables-intuition.mdx` — the mental model of a hash table.
+- `hash-tables-internals.mdx` — chaining vs open addressing, load
+  factor, resize cost. The downstream effects of the hash function
+  this page covers.
+- `lru-cache.mdx` — hash-table-plus-doubly-linked-list. Same hash
+  function concerns apply to the lookup side.
+- `b-trees.mdx` — when you need ordered keys and range queries, you
+  abandon hashing entirely. Different structure, different tradeoffs.
+
+## The discipline
+
+- A hash function is **deterministic + uniform + avalanche + cheap**.
+  Skip any one and your hash table degrades.
+- Records and key classes **must** override `hashCode` consistently
+  with `equals`. Use records, `Objects.hash`, or the
+  31-multiply-and-add pattern. Never XOR composite-key hashes.
+- **Cryptographic hashes are too slow for hash tables. Non-crypto
+  hashes are too weak for content addressing.** Match function to use;
+  no middle hash is good at both.
+- For **untrusted input** as a hash-table key, you want a keyed/seeded
+  hash — SipHash or equivalent. Java 8+ `HashMap` partly mitigates
+  HashDoS via tree-bucket fallback; don't rely on that alone.
+- **32-bit hashes collide via the birthday paradox at ~65K items.**
+  For partitioning or dedup at scale, move to 64-bit or 128-bit early.
+- Passwords aren't "things you hash." They're things you put through a
+  KDF (Argon2, scrypt, bcrypt) with deliberate slowness as a feature.

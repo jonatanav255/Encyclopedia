@@ -1,0 +1,365 @@
+export const level = 'senior';
+
+# Fenwick and segment trees
+
+You have an array of N numbers. Two operations need to be fast:
+**point update** (change `a[i]`) and **range query** (sum, min, max,
+or any associative fold over `a[l..r]`). A plain array gives O(1)
+update and O(N) query. A prefix-sum array flips it: O(1) query,
+O(N) update. The moment your workload mixes both, the naive answers
+fall over. Fenwick trees and segment trees are the two canonical
+fixes: O(log N) for both ops, in production-tolerable code size.
+
+## The shared problem
+
+```java
+// Three workloads, three structures:
+//
+//   query-heavy, no updates       -> prefix sums
+//   update-heavy, no queries      -> plain array
+//   both at once                  -> Fenwick or segment tree
+```
+
+Both structures have a competitive-programming reputation — ICPC,
+IOI, Codeforces — but they also turn up in production:
+matching-engine depth queries, leaderboards, time-series rollups,
+computational geometry sweep lines. Same shape of problem.
+
+## Fenwick tree (BIT): the implicit tree in an array
+
+Peter Fenwick described it in 1994 under the name Binary Indexed
+Tree. The trick: a tree shape encoded entirely in the bits of the
+index, with no parent or child pointers.
+
+- Stored as a 1-indexed array of length N+1.
+- Each position `i` is "responsible for" exactly `i & -i` elements
+  ending at index `i`. `i & -i` is the lowest set bit of `i`.
+- **Update**: walk upward by `i += i & -i` until you fall off the
+  end. Add `delta` at every stop.
+- **Prefix-sum query**: walk downward by `i -= i & -i` until you
+  hit zero. Sum the values at every stop.
+- Range sum `[l..r]` = `prefixSum(r) - prefixSum(l - 1)`.
+
+```java
+public class FenwickTree {
+    private final long[] bit;
+
+    public FenwickTree(int n) {
+        this.bit = new long[n + 1];
+    }
+
+    public void update(int i, long delta) {          // 1-indexed
+        for (; i < bit.length; i += i & -i) bit[i] += delta;
+    }
+
+    public long prefixSum(int i) {                    // sum of a[1..i]
+        long sum = 0;
+        for (; i > 0; i -= i & -i) sum += bit[i];
+        return sum;
+    }
+
+    public long rangeSum(int l, int r) {              // inclusive
+        return prefixSum(r) - prefixSum(l - 1);
+    }
+}
+```
+
+Twenty lines, no allocation, no recursion. That is the entire data
+structure.
+
+## Why the low-bit trick works
+
+Skip the formal derivation; just look at N=8.
+
+```
+index i :  1  2  3  4  5  6  7  8
+i & -i  :  1  2  1  4  1  2  1  8   <- count of a[] elements
+                                       summed at bit[i]
+```
+
+`bit[8]` covers all eight elements. `bit[4]` covers four
+(`a[1..4]`). `bit[6]` covers two (`a[5..6]`). `bit[7]` covers one
+(`a[7]`). To compute `prefixSum(7)`, you visit `bit[7]`, then
+`bit[6]`, then `bit[4]` — three stops, no overlap, no gaps. The
+walk is O(log N) because each step strips one bit off `i`. The
+update walk is the mirror.
+
+<Callout variant="tip">
+**1-indexed by convention.** Index 0 is reserved as the walk's
+terminator (`for (; i > 0; ...)`) and the unused slot at
+`bit[0]`. Mixing 0-indexed arrays with a Fenwick is the #1 source
+of off-by-one bugs. Pick a convention at the boundary and stick to
+it.
+</Callout>
+
+## Fenwick limitations
+
+The structure depends on the aggregate having an **inverse** so
+that range = `prefixSum(r) - prefixSum(l - 1)` makes sense. Sum
+works (subtraction). XOR works (self-inverse). Product over a
+field works in principle; overflow and zero kill it in practice.
+**Min and max do not work** — you cannot "subtract" a minimum to
+recover the rest. Fenwick is the wrong tool there.
+
+The other limit is updates. A plain Fenwick handles point updates
+plus range queries naturally. Range updates exist (two-BIT trick),
+but at that point the code starts looking like a half-built
+segment tree. If you need range update + range query together,
+skip ahead.
+
+## Segment tree: the general answer
+
+A segment tree is an explicit binary tree where each node stores
+the aggregate over a range of the underlying array.
+
+- Root aggregates `[0..N-1]`.
+- Each internal node splits its range in half: left child takes
+  the first half, right child takes the second.
+- Leaves are individual elements.
+- Stored as an array of size ~4N (round N up to the next power of
+  two internally; the 4N upper bound covers the worst case).
+
+Point update walks from root to the relevant leaf, recomputing
+aggregates on the way back up: O(log N). Range query splits the
+query range into O(log N) canonical subranges along the tree's
+existing boundaries and combines their precomputed values.
+
+```java
+public class SegmentTreeSum {
+    private final long[] tree;
+    private final int n;
+
+    public SegmentTreeSum(long[] a) {
+        this.n = a.length;
+        this.tree = new long[4 * n];
+        build(1, 0, n - 1, a);
+    }
+
+    private void build(int node, int lo, int hi, long[] a) {
+        if (lo == hi) { tree[node] = a[lo]; return; }
+        int mid = (lo + hi) >>> 1;
+        build(2 * node,     lo,      mid, a);
+        build(2 * node + 1, mid + 1, hi,  a);
+        tree[node] = tree[2 * node] + tree[2 * node + 1];
+    }
+
+    public void update(int i, long value) {
+        update(1, 0, n - 1, i, value);
+    }
+
+    private void update(int node, int lo, int hi, int i, long v) {
+        if (lo == hi) { tree[node] = v; return; }
+        int mid = (lo + hi) >>> 1;
+        if (i <= mid) update(2 * node,     lo,      mid, i, v);
+        else          update(2 * node + 1, mid + 1, hi,  i, v);
+        tree[node] = tree[2 * node] + tree[2 * node + 1];
+    }
+
+    public long rangeSum(int l, int r) {
+        return query(1, 0, n - 1, l, r);
+    }
+
+    private long query(int node, int lo, int hi, int l, int r) {
+        if (r < lo || hi < l) return 0;               // disjoint
+        if (l <= lo && hi <= r) return tree[node];    // fully covered
+        int mid = (lo + hi) >>> 1;
+        return query(2 * node,     lo,      mid, l, r)
+             + query(2 * node + 1, mid + 1, hi,  l, r);
+    }
+}
+```
+
+Three times the code of a Fenwick. In exchange, the aggregate is
+no longer restricted to invertible operations.
+
+## Any associative aggregate
+
+Segment trees work for any associative monoid. Swap the combiner
+and the identity:
+
+| Aggregate | Combine | Identity |
+|---|---|---|
+| sum | `a + b` | 0 |
+| min | `Math.min(a, b)` | `Long.MAX_VALUE` |
+| max | `Math.max(a, b)` | `Long.MIN_VALUE` |
+| gcd | `gcd(a, b)` | 0 |
+| OR / AND / XOR | `a | b` etc. | 0 (OR/XOR) / all-ones (AND) |
+| count satisfying predicate | `a + b` | 0 |
+
+Even non-commutative aggregates work if they're associative —
+matrix products for affine transforms in computational geometry
+are the classic example. The combiner just has to respect order:
+`combine(left, right)`, never the reverse.
+
+## Lazy propagation: the killer feature
+
+Point updates are fine for many workloads, but the moment you want
+**range updates** ("add 5 to every element in `[l..r]`") combined
+with range queries, a naive segment tree degrades to O(N log N)
+per range update — touching every leaf. Lazy propagation fixes
+this:
+
+- When an update fully covers a node's range, **don't recurse**.
+  Update the node's aggregate and stash a pending tag ("+5 owed
+  to my subtree").
+- When a later query descends into a tagged node, **push the tag
+  down** first — apply it to the children's aggregates,
+  accumulate it into their tags, clear the parent's.
+
+```java
+// Sketch, not full code:
+void rangeAdd(int node, int lo, int hi, int l, int r, long delta) {
+    if (r < lo || hi < l) return;
+    if (l <= lo && hi <= r) {
+        tree[node] += delta * (hi - lo + 1);          // apply
+        lazy[node] += delta;                          // remember
+        return;
+    }
+    pushDown(node, lo, hi);                           // flush before recursing
+    int mid = (lo + hi) >>> 1;
+    rangeAdd(2 * node,     lo,      mid, l, r, delta);
+    rangeAdd(2 * node + 1, mid + 1, hi,  l, r, delta);
+    tree[node] = tree[2 * node] + tree[2 * node + 1];
+}
+```
+
+Both operations stay O(log N) — each root-to-leaf path visits
+O(log N) nodes and `pushDown` is O(1) per visit. Full
+implementations balloon to 80+ lines once you handle interacting
+update kinds (range-assign vs. range-add is the tricky bit).
+Implement it once, then copy. Lazy propagation is what turns
+segment trees from "fancy prefix sums" into the workhorse behind
+sweep-line algorithms and interval scheduling.
+
+## Fenwick vs segment tree
+
+<Compare
+  badTitle="Fenwick (BIT)"
+  goodTitle="Segment tree"
+  language="java"
+  bad={`// ~20 lines total.
+// Tiny constant factor.
+// Only point update + range query.
+// Aggregate needs an inverse:
+//   sum / xor — yes
+//   min / max — no
+// 1-indexed; off-by-one risk.
+// 2D variant is clean and standard.`}
+  good={`// ~60-100 lines (more with lazy prop).
+// Larger constant factor — index math, recursion.
+// Any associative aggregate:
+//   sum, min, max, gcd, custom monoid.
+// Range update + range query via lazy propagation.
+// Persistent variant is standard (functional updates).
+// 2D version exists but is heavy.`}
+/>
+
+The rule of thumb: **default to Fenwick when sum-with-point-update
+is the whole job.** Reach for a segment tree the moment you need
+min/max, range updates, or any aggregate Fenwick can't express.
+For interview prep, know both — they get asked together precisely
+because the trade-off is the lesson.
+
+| | Fenwick | Segment tree |
+|---|---|---|
+| Code size | ~20 lines | ~60-100, more with lazy prop |
+| Memory | N+1 longs | ~4N nodes |
+| Constant factor | Tiny — best in class | Larger |
+| Supports min/max | No (no inverse) | Yes |
+| Range updates | Awkward (two-BIT trick) | Easy with lazy prop |
+| Persistent | Hard | Standard pattern |
+| Multidim | 2D BIT is famous | 2D possible, heavy |
+
+## Production use cases
+
+These structures escape competitive programming wherever you have
+**bounded-domain integers indexed by an array-like coordinate** and
+need fast range queries.
+
+- **Order books.** Equity and crypto matching engines maintain
+  price-indexed depth ("how much total volume between $100.00 and
+  $101.00?"). Sub-microsecond budgets push some implementations
+  to Fenwick trees over the tick grid; the cache-friendly array
+  layout is part of the appeal.
+- **Leaderboards with rank queries.** If scores live in a bounded
+  integer range, a Fenwick over the score axis answers "how many
+  players have score > X?" faster than an augmented BST (see
+  `augmenting-trees.mdx`). Pick the augmented BST when scores are
+  unbounded or sparse; pick the Fenwick when they aren't.
+- **Time-series rollups.** Pre-aggregated buckets queried over
+  arbitrary windows. The segment-tree-shaped lookup — combine the
+  O(log N) canonical buckets that cover the window — shows up in
+  analytical engines like Druid and Pinot. The shape is the point;
+  don't read it as a claim about a specific code path.
+- **Computational geometry sweep lines.** "How many intervals are
+  active right now?" as the sweep moves. Active count = a range
+  sum maintained in a Fenwick or segment tree keyed by event
+  coordinate.
+- **Resource scheduling.** "Is any slot in `[t1..t2]` free?"
+  Segment tree with `min`, where 0 means free.
+- **Log query engines.** Range-count and range-sum over
+  time-bucketed event streams. Same shape as the order book.
+
+## What this is NOT
+
+- **Not a substitute for a B+ tree on disk.** Both structures
+  assume RAM-resident arrays. For paged storage indexed by an
+  ordered key, see `b-trees.mdx`.
+- **Not an interval tree.** Interval trees match overlapping
+  intervals against a query interval (see `augmenting-trees.mdx`).
+  Segment trees aggregate an associative fold over a fixed index
+  space. The names sound alike; the problems differ.
+- **Not concurrent-friendly.** Both update and query touch O(log
+  N) nodes on a write path. There is no easy lock-free version.
+  For concurrent ordered statistics in Java, look at
+  `ConcurrentSkipListMap`, shard the index by key, or maintain
+  per-thread Fenwicks and merge periodically.
+- **Not a generic priority queue.** A segment tree with `min` can
+  answer "what's the minimum over `[l..r]`?", but it's not a
+  replacement for a binary heap. See
+  `heaps-and-priority-queues.mdx` for that problem shape.
+
+<Callout variant="warn">
+Both structures sit on a fixed coordinate axis sized at
+construction. If your domain is unbounded or sparse, coordinate-
+compress upfront (sort distinct keys, map to dense indices) or
+pick a different structure. Resizing a segment tree mid-stream is
+possible but defeats the constant-factor reason you chose one in
+the first place.
+</Callout>
+
+## Cross-references
+
+- `arrays-dynamic-and-static.mdx` — the underlying storage. Both
+  structures are arrays at the bottom.
+- `augmenting-trees.mdx` — order-statistic and interval trees,
+  the BST-side approach to range and rank queries. Reach for
+  these when scores are unbounded or intervals are first-class
+  objects.
+- `heaps-and-priority-queues.mdx` — heaps are array-implicit
+  trees too. Same trick: tree shape encoded in indices.
+- `binary-search-trees.mdx` — the explicit-pointer ancestor.
+  Understanding range queries on BSTs is the prerequisite for
+  understanding why segment trees are a different shape.
+- `n-ary-trees-and-traversals.mdx` — the more general tree shape.
+  Segment trees are a constrained binary case; the traversal
+  intuition transfers.
+
+## The discipline
+
+- Fenwick = "range sum + point update, O(log N) both ways, tiny
+  code." If that's the whole job, write the Fenwick and move on.
+- Segment tree = general associative range queries, and with lazy
+  propagation, range updates too. Larger code, more flexible.
+- Both are array-implicit trees, like binary heaps. Internalize
+  the index math once and you stop reinventing it.
+- Fenwick can't do min/max — no inverse to subtract. Reach for a
+  segment tree the moment you need them.
+- Lazy propagation is what makes range-update + range-query
+  simultaneously O(log N). Implement it once, then template it.
+- These aren't only interview structures. Order books,
+  leaderboards over bounded scores, sweep-line geometry, and
+  time-series rollups all use them in production.
+- 1-indexed Fenwick by convention. Off-by-one at the
+  array-Fenwick boundary is the #1 bug; pick a convention and
+  stick to it.

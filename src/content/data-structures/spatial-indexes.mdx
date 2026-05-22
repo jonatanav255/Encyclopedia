@@ -1,0 +1,340 @@
+export const level = 'senior';
+
+# Spatial indexes
+
+A B-tree turns "find the row where `id = 42`" into a handful of
+page reads. That's a **1D query** — one totally-ordered axis. The
+moment the question becomes "all points inside this rectangle" or
+"five closest restaurants to me," a B-tree stops working. That's
+what `WHERE ST_Within(...)` solves under the hood.
+
+## The problem
+
+Given N points or shapes in 2D (or 3D), answer queries like:
+
+- **Point query** — what's at `(x, y)`?
+- **Window / range query** — all points inside this rectangle or
+  polygon.
+- **k-nearest neighbors (k-NN)** — five closest restaurants to me.
+- **Radius query** — all GPS pings within 500 meters of a point.
+- **Overlap query** — every bounding box that intersects this query
+  box.
+
+The 1D versions are easy — BST, B-tree, sorted array. The 2D
+versions are not. A spatial index is any structure that indexes two
+or more dimensions **together**, so a range query in (x, y) doesn't
+have to scan every row that matches on x just to filter by y.
+
+## Why a B-tree on (lat, lng) doesn't work
+
+A B-tree indexes a **single total order**. Concatenating lat and
+lng into one composite key destroys locality on the second
+dimension. `(40.71, -74.00)` and `(40.72, -74.00)` are neighbors
+lexicographically, but so are `(40.71, -74.00)` and
+`(40.71, 12.50)`, and those are in different countries.
+
+A multi-column index on `(lat, lng)` filters by `lat` first and
+then, *within* a fixed `lat`, by `lng`. Useful for narrow latitude
+bands, useless for square windows. You need a structure that
+treats both dimensions as first-class.
+
+## k-d trees
+
+Bentley's k-d tree (1975) is the simplest answer: a binary tree
+where each level splits along **one** dimension, cycling through
+all `k` dimensions. In 2D, level 0 splits by x, level 1 by y, level
+2 by x. Each node is a splitting hyperplane perpendicular to its
+axis.
+
+- **Lookup / nearest-neighbor**: O(log n) average on a balanced
+  tree.
+- **Range query**: O(n^(1-1/k) + r) — so √n + r in 2D, n^(2/3) + r
+  in 3D. Fast in low dimensions, ugly as dimensions grow.
+
+Pros: trivial to implement, low constant factor, cache-friendly on
+static data. Cons: doesn't index polygons (only points), rebalancing
+on insert is awkward, and the tree degrades on skewed data unless
+you rebuild.
+
+```java
+record Point(double x, double y) {}
+
+final class KdNode {
+    Point p;
+    int axis;       // 0 = split by x, 1 = split by y
+    KdNode left, right;
+}
+
+// Search a static k-d tree for the nearest neighbor of `q`.
+// `best[0]` holds the running best distance squared.
+void searchNearest(KdNode n, Point q, Point[] hit, double[] best) {
+    if (n == null) return;
+    double d = sq(n.p.x - q.x) + sq(n.p.y - q.y);
+    if (d < best[0]) { best[0] = d; hit[0] = n.p; }
+
+    double diff = (n.axis == 0 ? q.x - n.p.x : q.y - n.p.y);
+    KdNode near = diff < 0 ? n.left  : n.right;
+    KdNode far  = diff < 0 ? n.right : n.left;
+    searchNearest(near, q, hit, best);
+    if (diff * diff < best[0]) searchNearest(far, q, hit, best);
+}
+```
+
+The `diff * diff < best[0]` check is the load-bearing line — it
+prunes the entire far subtree when the splitting plane is farther
+than the current best.
+
+Production users: `scipy.spatial.KDTree`, FLANN, libnabo, NMSLIB.
+Static or near-static point sets are where k-d trees shine.
+
+## R-trees and the R-tree family
+
+Guttman's R-tree (1984) is the production default for general
+spatial data. Shape-wise it's a B-tree: balanced, page-sized nodes,
+log-depth. The difference is what each node stores.
+
+Every node holds the **minimum bounding rectangle (MBR)** of all
+geometries in its subtree. Internal nodes store MBRs of children;
+leaves store MBRs of actual geometries (points, polygons,
+polylines). A query descends into any child whose MBR overlaps the
+query region and skips entire subtrees whose MBR doesn't.
+
+R-trees are designed for **disk pages**, like B-trees. Each node
+fits one page, so fanout is in the hundreds.
+
+| | k-d tree | R-tree |
+|---|---|---|
+| Indexes | Points only | Any geometry (via MBR) |
+| Shape | Binary, splits on hyperplanes | B-tree-shaped, MBR per node |
+| Update | Awkward; rebuilds common | Designed for it |
+| On-disk | Mediocre fit | Native fit (page-sized nodes) |
+| Sibling MBRs | Disjoint half-planes | Can overlap (the hard part) |
+
+The reason R-tree **variants** exist is that sibling MBRs can
+overlap, and the quality of an R-tree depends entirely on the
+heuristic used to split a full node. A bad split forces queries
+into multiple subtrees and erodes the log-depth promise.
+
+- **R\* tree** (Beckmann et al. 1990) — better split heuristics:
+  minimize MBR overlap *and* dead space, plus periodic **forced
+  reinsertions** to fix accumulated imbalance. The dominant variant
+  in production.
+- **R+ tree** — partitions space so sibling MBRs don't overlap, at
+  the cost of duplicating objects that straddle a boundary.
+- **Hilbert R-tree** — orders inserts along a Hilbert space-filling
+  curve so spatially-close objects share pages.
+
+You don't need to write the R\* split heuristic; you need to know
+it's the reason production R-trees work.
+
+## Who actually ships R-trees
+
+- **PostGIS** — `geometry` and `geography` are indexed via **GiST**
+  (or SP-GiST); the default GiST opclass for geometry is
+  R-tree-flavored. `CREATE INDEX ... USING GIST (geom)` is the
+  workhorse.
+- **SQLite R\*Tree module** — opt-in
+  `CREATE VIRTUAL TABLE idx USING rtree(id, minX, maxX, minY, maxY)`.
+  Common in mobile mapping and geofencing apps.
+- **JTS Topology Suite** (Java) and **GeoTools** — STR-tree
+  (Sort-Tile-Recursive) R-trees for in-memory spatial joins.
+- **Boost.Geometry** — header-only C++ R-tree.
+- **MongoDB** — older `2d` indexes used geohash buckets; modern
+  `2dsphere` indexes are built on **S2 cells**, not classical
+  R-trees, though queries still use a filter/refine pipeline.
+
+## The MBR trick — why it's load-bearing
+
+Real spatial data is polygons, polylines, multipolygons with holes.
+Testing "does polygon A intersect polygon B" exactly is expensive —
+O(n·m) on vertex counts, with floating-point edge cases the
+geometry libraries spend most of their code budget on.
+
+The MBR trick splits every spatial query into two phases:
+
+1. **Filter (broad phase)** — "which MBRs overlap the query?" One
+   R-tree descent; MBR overlap is four comparisons. Returns a
+   superset of the true answer.
+2. **Refine (narrow phase)** — "of those candidates, which
+   geometries *really* intersect?" Exact polygon math, only on the
+   survivors.
+
+PostGIS exposes both halves: `&&` is **filter-only** (MBR overlap)
+and uses the index; `ST_Intersects` is **filter + refine** and
+gives the correct answer. EXPLAIN shows the index condition as
+`&&` and the recheck as `ST_Intersects`.
+
+<Callout variant="info">
+**Filter then refine.** Spatial joins on millions of rows are
+tractable only because the filter step is cheap and prunes
+aggressively. If you see a slow PostGIS query, check the planner is
+actually using the GiST index — without it, every row gets the
+expensive `ST_Intersects` and the query collapses.
+</Callout>
+
+## Quadtrees and octrees
+
+A quadtree recursively partitions 2D space into four quadrants;
+an octree does the same in 3D with eight octants. A node
+subdivides when it holds too many points or covers too large an
+area. Two flavors:
+
+- **Point quadtree** — each internal node holds one point, and the
+  four quadrants are defined relative to it.
+- **Region quadtree** — fixed grid subdivision regardless of where
+  points fall. Common in raster and image processing.
+
+Where you see them: image processing (region quadtrees compress
+uniform regions); game engines (dynamic quadtrees and octrees as
+the broad phase of collision detection); GIS raster tiling
+(slippy-map tile pyramids in Google Maps, OpenStreetMap, Mapbox
+are region quadtrees, each zoom level a subdivision); sparse voxel
+octrees in renderers.
+
+Quadtrees are easy to implement but don't compete with R-trees for
+general GIS — they work best on uniform distributions and degrade
+on skew.
+
+## Geohashing — the cheat code for plain RDBMSes
+
+If your database has no spatial index, just B-trees, you can still
+get usable geo queries by encoding `(lat, lng)` as a single
+alphanumeric string where **shared prefixes mean nearby points**.
+That's geohashing.
+
+The encoding interleaves bits of lat and lng, then base32-encodes
+the result. `"u4pruydqqvj"` is a real geohash; truncating it to
+`"u4pruyd"` covers a larger area containing the original. You store
+the geohash in a `VARCHAR` column with a normal B-tree index, and
+queries become prefix range scans.
+
+Production uses:
+
+- **Redis GEO commands** (`GEOADD`, `GEORADIUS`, `GEOSEARCH`) —
+  encode points as 52-bit geohash integers stored in a sorted set,
+  then expand the query to surrounding geohash cells.
+- **Pre-S2 MongoDB** — early `2d` indexes were geohash-bucketed.
+- Ad-hoc geo on every RDBMS without a spatial extension.
+
+Two known issues: **edge artifacts** (points on opposite sides of
+a prefix boundary look maximally far apart even if they're
+millimeters apart) and **variable cell shape** (geohash cells
+aren't square in real-world units away from the equator). You
+handle both by querying neighboring prefixes and filtering by true
+distance afterward.
+
+**S2 cells** (Google) and **H3** (Uber) generalize the idea into
+hierarchical cell systems with better numerical properties. S2
+covers the sphere with a hierarchy indexed by a single 64-bit
+integer; H3 uses hexagons with uniform neighbor distance. Both let
+a regular B-tree host a real spatial index. MongoDB's modern
+`2dsphere` indexes are S2-based.
+
+## Lucene's BKD tree
+
+Elasticsearch and Solr index numeric ranges and geo points using a
+**BKD tree** (block k-d tree), added to Lucene in version 6 (2016)
+and the default ever since for numeric, date, and geo fields.
+
+BKD is a k-d tree adapted for paged, append-only storage — the
+B-tree treatment applied to k-d. Internal nodes route on
+axis-aligned splits, but the structure is packed into fixed-size
+blocks and bulk-loaded from sorted data, which lines up with
+Lucene's segment-and-merge write model. Append-friendly, indexes
+up to ~8 dimensions cleanly. That's how Elasticsearch's
+`geo_point` filtering stays cheap on millions of documents.
+
+## The landscape, in one table
+
+| Index | Native shape | Update story | Best for |
+|---|---|---|---|
+| k-d tree | Points | Awkward; rebuilds common | Static point sets, k-NN |
+| R-tree / R\* tree | MBRs (any geometry) | Designed for it | General GIS, indexed updates |
+| Quadtree / octree | Points (or regions) | Easy, cheap | Game engines, raster tiling |
+| Geohash + B-tree | Points (lat/lng) | Standard B-tree | Cheap geo on any RDBMS |
+| S2 / H3 cells | Points / regions | Standard sorted index | Hierarchical cell coverage |
+| BKD tree (Lucene) | Numeric / geo points | Append-friendly | Elasticsearch geo + numeric range |
+
+## A minimal R-tree shape in Java
+
+Don't write a real R-tree from scratch in production. The value of
+seeing the bones is understanding what a query actually does.
+
+```java
+record MBR(double minX, double minY, double maxX, double maxY) {
+    boolean overlaps(MBR q) {
+        return !(maxX < q.minX || minX > q.maxX
+              || maxY < q.minY || minY > q.maxY);
+    }
+    MBR union(MBR o) {
+        return new MBR(
+            Math.min(minX, o.minX), Math.min(minY, o.minY),
+            Math.max(maxX, o.maxX), Math.max(maxY, o.maxY));
+    }
+}
+
+abstract sealed class RNode permits RLeaf, RInternal { MBR bounds; }
+final class RLeaf extends RNode     { List<Geometry> items; }
+final class RInternal extends RNode { List<RNode> children; }
+```
+
+A query: at each internal node, walk `children` and recurse into
+every child whose `bounds.overlaps(query)` is true. At a leaf,
+return items whose own MBR overlaps. That's the filter step; the
+refine step calls the geometry library on the survivors.
+
+The hard parts — which child to descend into on insert, when to
+split a full node, how to split it — are what the R\*-tree paper
+is about, and they're what separates a working production index
+from a worse-than-linear-scan implementation. Use a library.
+
+## When NOT to use a spatial index
+
+- **Tiny datasets** — a few thousand points fit in a flat array,
+  and a linear scan with a distance test beats any index. Build the
+  index when N starts to hurt.
+- **Pure 1D queries** — timestamps, prices, heights. A B-tree wins.
+- **High-dimensional vectors** — embeddings from language and
+  vision models live in 256, 768, 1536 dimensions. Spatial indexes
+  degrade to linear scan well before that — the "curse of
+  dimensionality" kicks in around k ≈ 20, where the volume ratio
+  between a query ball and its bounding box collapses and MBR
+  pruning stops pruning. Reach instead for **approximate nearest
+  neighbor** structures (HNSW, IVF, ScaNN, FAISS) and the vector
+  databases (Pinecone, Weaviate, Milvus, Qdrant) built on top.
+  Different page, different problem.
+
+## Cross-references
+
+- `b-trees.mdx` — the 1D ancestor. R-trees borrow B-tree's
+  page-sized-node, balanced-by-construction shape and apply it to
+  MBRs instead of scalar keys.
+- `balanced-bsts.mdx` — the in-memory cousin. k-d trees split on
+  alternating axes; rotations don't generalize cleanly, which is
+  why k-d updates are awkward.
+- `binary-search-trees.mdx` — the conceptual root. Every spatial
+  index is an answer to "BSTs index one dimension; what about two?"
+- `arrays-dynamic-and-static.mdx` — geohashes, S2 cell IDs, and
+  Hilbert curve indices all linearize 2D into a 1D key that lives
+  in a sorted array or B-tree.
+- `augmenting-trees.mdx` — interval trees augment a BST with
+  subtree-max-endpoint, which is "spatial indexing in 1D." The
+  mental bridge to MBRs in R-trees is short.
+
+## The discipline
+
+- A B-tree on `(lat, lng)` doesn't work. The second dimension
+  loses locality. You need a 2D-aware index.
+- R-trees (R\* in practice) are the production default for general
+  geometries — MBRs index any shape, queries filter on MBR
+  overlap, then refine with exact polygon math.
+- k-d trees are great for static point sets and k-NN; mediocre at
+  inserts and useless for non-point geometry.
+- Geohash + B-tree is the cheap-and-cheerful version that runs on
+  any RDBMS. S2 and H3 are the principled versions of the same
+  idea.
+- Lucene/Elasticsearch geo runs on BKD trees — a k-d tree shaped
+  for paged, append-only storage. Different bones, same job.
+- Above ~20 dimensions, every spatial index loses to linear scan.
+  Reach for ANN (HNSW, IVF, FAISS); vector databases are that
+  story, and it's a different topic.

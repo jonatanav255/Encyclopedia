@@ -1,0 +1,315 @@
+export const level = 'senior';
+
+# Balanced binary search trees
+
+A BST's operations are O(h) where h is the tree's height. A balanced
+tree has h ≈ log₂(n); a maliciously-ordered (or just plain sorted)
+insert sequence into a naive BST gives h = n — the structure
+degrades to a linked list with extra steps. `binary-search-trees.mdx`
+covered that trap. This page is how production trees prevent it,
+why `TreeMap`, `std::map`, the Linux CFS scheduler, and epoll all
+landed on the same answer (red-black), and what the alternatives
+look like.
+
+## Why "balance" matters
+
+The whole pitch of a BST is "O(log n) lookup, insert, delete *plus*
+sorted iteration and range queries." That promise only holds when
+the tree's height stays near log₂(n). Real data trends partially
+sorted — event logs by time, IDs in order, alphabetical names — so
+the worst case isn't adversarial, it's *typical*.
+
+A balanced BST is any BST that re-shapes itself on every write to
+guarantee O(log n) height. Two ideas appear in every variant:
+
+- A **local invariant** on each node (color, height, weight) that
+  can be checked in O(1) by looking at the node and its neighbors.
+- A **repair procedure** — almost always **rotations** — that
+  restores the invariant after an `insert` or `delete` in O(log n)
+  steps.
+
+Different trees pick different invariants and trade strictness for
+write cost.
+
+## Rotations: the only legal local rewrite
+
+Rotations are the geometric primitive both AVL and red-black use.
+A left rotation around `x`:
+
+```
+    x               y
+   / \             / \
+  A   y    -->    x   C
+     / \         / \
+    B   C       A   B
+```
+
+`y` (originally `x`'s right child) is pulled up; `x` becomes `y`'s
+left child; `y`'s old left subtree `B` becomes `x`'s new right
+subtree. A right rotation is the mirror image.
+
+The reason rotations are legal is that **in-order traversal is
+preserved**. Before the rotation: `A, x, B, y, C`. After: `A, x, B,
+y, C`. Same sorted sequence, different shape. Any rewrite that
+preserves in-order keeps the BST property intact, and rotations are
+the simplest such rewrite that changes a node's depth.
+
+```java
+// Left-rotate around x; pulls x.right up to take x's place.
+void rotateLeft(Node x) {
+    Node y = x.right;
+    x.right = y.left;
+    if (y.left != null) y.left.parent = x;
+    y.parent = x.parent;
+    if (x.parent == null) root = y;
+    else if (x == x.parent.left) x.parent.left = y;
+    else x.parent.right = y;
+    y.left = x;
+    x.parent = y;
+}
+```
+
+Six pointer assignments plus a root-update check. `rotateRight` is
+the same code with `left` and `right` swapped. Every balanced-BST
+fix-up is some sequence of these.
+
+## AVL trees
+
+The original (1962) self-balancing BST. Invariant:
+
+> For every node, the heights of its left and right subtrees differ
+> by at most 1.
+
+Each node caches its subtree height (or just the balance factor
+`-1, 0, +1`). After an insert or delete, walk back up to the root;
+if any node violates the invariant, rotate to fix it. A single
+"line" violation needs one rotation; a "zig-zag" needs two (a
+double rotation).
+
+The strict invariant gives a tighter height bound than red-black —
+about `1.44 · log₂(n)` worst case, vs. `2 · log₂(n)` for RB.
+Lookups walk slightly shallower trees, so AVL wins on read-heavy
+workloads.
+
+The cost: rebalancing after a delete can require up to `log n`
+rotations as the imbalance propagates upward. Inserts cap at one
+rotation, but deletes don't, and the per-write constant is higher
+than RB.
+
+AVL trees show up in interview questions, in older C++ codebases,
+and in a few specialty databases. They're rare in modern standard
+libraries because the workloads stdlibs care about have non-trivial
+write rates.
+
+## Red-black trees
+
+Invented (1978) as a binary encoding of 2-3-4 trees. Each node is
+colored red or black; five invariants together bound the height:
+
+1. Every node is red or black.
+2. The root is black.
+3. Every leaf (the NIL sentinel) is black.
+4. If a node is red, both its children are black. (No two reds in
+   a row on any root-to-leaf path.)
+5. Every path from a node to its descendant NILs contains the same
+   number of black nodes. (The "black height" property.)
+
+Together these force the longest root-to-leaf path to be at most
+twice the shortest: the shortest is all black, the longest
+alternates red-black, and they have equal black-height. That
+ceiling gives `h ≤ 2 · log₂(n+1)`.
+
+That's looser than AVL — RB lookups touch ~40% more nodes in the
+worst case — but the rebalancing is cheaper:
+
+- **Insert** needs at most **two rotations** plus some recoloring,
+  regardless of tree size.
+- **Delete** needs at most **three rotations** plus recoloring.
+
+Recoloring is O(1) per step and may propagate up the tree, but
+rotation count is bounded by a small constant. Amortized over a
+sequence of operations, RB does noticeably less rewriting than
+AVL.
+
+### Insert fix-up at a glance
+
+After a normal BST insert, color the new node red and walk up. Three
+cases by the new node's **uncle** (its parent's sibling):
+
+1. **Uncle is red** — recolor parent and uncle black, grandparent
+   red, recurse on grandparent. No rotation.
+2. **Uncle is black, "triangle"** (new node is the inner
+   grandchild) — rotate the parent to convert to case 3.
+3. **Uncle is black, "line"** (new node is the outer grandchild) —
+   rotate the grandparent and swap parent/grandparent colors. Done.
+
+That's a sketch, not a working implementation. The full code with
+mirror cases and NIL handling is ~50 lines. CLRS Chapter 13 has
+the canonical version with the proof; read it once if you want to
+understand *why* it works, but don't try to memorize it.
+
+### Delete is the hard part
+
+Insert has three cases. Delete has six, plus mirror images, plus a
+"double-black" abstraction to handle the case where deleting a
+black node violates invariant 5. Most engineers who say they've
+"implemented a red-black tree" have implemented insert. Deletion
+fix-up is where the textbook code length explodes and where the
+off-by-one bugs live.
+
+If you ever need to write one: don't. Port the Linux kernel's
+`lib/rb_tree.c` (battle-tested, BSD/GPL-licensed depending on
+version) or trust your standard library.
+
+<Callout variant="warn">
+If you find yourself implementing a red-black tree from scratch in
+production, stop and explain why. Either use `TreeMap` /
+`std::map`, or — if you genuinely need a custom one (intrusive
+nodes, no allocator, kernel-style) — adapt the Linux kernel's
+`rb_tree.h` and `lib/rb_tree.c`. They've been hammered on by
+millions of machines for two decades and the API is intentionally
+intrusive, so embedding them in your own structs is straightforward.
+</Callout>
+
+## Why production picks red-black
+
+The list is long enough to be unambiguous:
+
+- **`java.util.TreeMap`, `java.util.TreeSet`** — red-black.
+- **C++ `std::map`, `std::set`, `std::multimap`, `std::multiset`**
+  — red-black. The C++ standard mandates `O(log n)` worst-case
+  ordered operations *plus* iterator stability across insertions,
+  and RB is the only common balanced BST that fits cleanly.
+- **Linux kernel `rb_tree`** — the in-kernel ordered map. Used by:
+  - **CFS** (the Completely Fair Scheduler, pre-EEVDF) keyed tasks
+    by virtual runtime; the leftmost node was the next task to
+    run.
+  - **epoll** indexes registered file descriptors in an RB tree so
+    add/remove/lookup are O(log n) per `epoll_ctl` call.
+  - Virtual memory area (VMA) trees, network packet queue
+    indexes, and many other subsystems all use the same
+    `rb_tree.h` macros.
+- **Java 8+ `HashMap`** — when a single bucket's collision chain
+  exceeds the `TREEIFY_THRESHOLD` (8), the chain converts into a
+  red-black tree to bound worst-case lookup at O(log k) instead of
+  O(k). It un-treeifies back to a list below `UNTREEIFY_THRESHOLD`
+  (6). See `hash-tables-internals.mdx`.
+
+The common thread: every one of those workloads has a non-trivial
+write rate. CFS reinserts a task on every scheduler tick. epoll's
+fd set churns constantly. `TreeMap` and `std::map` are
+general-purpose. For *any* of these, the lower constant on
+rebalancing wins.
+
+### AVL vs RB at a glance
+
+|  | AVL | Red-black |
+|---|---|---|
+| Height bound | ~1.44 · log₂(n) | ~2 · log₂(n) |
+| Lookup speed | Slightly faster | Slightly slower |
+| Insert rotations | At most 1, but the walk-up does balance-factor updates | At most 2, recoloring may propagate |
+| Delete rotations | Up to O(log n) | At most 3 |
+| Per-node overhead | 1-2 bytes (height/balance) | 1 bit (color) |
+| Best for | Read-mostly, lookup-dominated | Mixed read/write, general purpose |
+| Stdlib presence | Rare in modern languages | Java, C++, Linux kernel, Java HashMap fallback |
+
+If you remember one comparison: **AVL trades write cost for read
+speed; RB does the opposite, and the world picked RB.**
+
+## Related variants — the brief honest take
+
+The balanced-BST design space has dozens of entries. A few worth
+knowing by name:
+
+- **Splay tree** — no balance invariant at all; instead, every
+  access (read or write) rotates the touched node up to the root
+  via "splay" operations. Amortized O(log n) per op, but a single
+  op can be O(n). The win is automatic caching: recently-touched
+  keys stay near the root. Used in some allocators (jemalloc had
+  splay-tree variants), the WIRE encoding library, and academic
+  caches. Niche in app code because individual ops have no
+  worst-case bound.
+- **Treap** — a BST keyed by your data and *also* a heap keyed by
+  a per-node random priority. Because priorities are random, the
+  tree is balanced **in expectation**. Insert and delete use
+  rotations to maintain the heap property. ~40 lines of code; very
+  popular in competitive programming. Rare in production because
+  expected-time guarantees feel uncomfortable next to RB's
+  worst-case ones.
+- **Scapegoat tree** — no per-node metadata. After each insert,
+  check whether the tree is "α-weight-balanced"; if not, find a
+  scapegoat ancestor and rebuild its subtree as a perfectly
+  balanced BST. Amortized O(log n) writes, occasional O(n) worst
+  case. Simple to implement; almost no one ships one.
+- **AA tree** — a simplified red-black variant with a single
+  "level" field and two operations (`skew`, `split`). Same big-O
+  as RB, fewer cases, easier to memorize. Used in a few
+  filesystems (FUSE-style); didn't displace RB.
+- **2-3 and 2-3-4 trees** — these aren't binary trees; nodes hold
+  1-2 (or 1-3) keys and have 2-3 (or 2-4) children. Crucial mental
+  model: **a red-black tree is isomorphic to a 2-3-4 tree.** Every
+  black node together with its red children forms one 2-3-4 node;
+  a red child is a "horizontal" pointer inside its parent's node.
+  Once that clicks, RB invariants stop feeling arbitrary and the
+  bridge to B-trees (see `b-trees.mdx`) becomes obvious — B-trees
+  are 2-3-4 trees generalized for paged storage with a higher
+  branching factor.
+
+<Callout variant="info">
+The RB ≅ 2-3-4 isomorphism is the single most useful mental
+picture for these trees. The five RB invariants are bookkeeping;
+the 2-3-4 picture is what they actually *mean*.
+</Callout>
+
+## What to remember vs what to look up
+
+| Remember | Look up when needed |
+|---|---|
+| Rotations preserve in-order; that's why they're legal. | The exact pointer dance in `rotateLeft` / `rotateRight`. |
+| AVL: heights differ by ≤ 1. RB: five invariants, longest path ≤ 2× shortest. | The five RB invariants verbatim. |
+| AVL strict → faster reads, more rotations. RB looser → cheaper writes. | The three RB insert cases. |
+| Production stdlibs use RB. So does the Linux kernel. | The six RB delete cases. Don't try to memorize them. |
+| Java 8 `HashMap` upgrades collision chains to RB at length 8. | TREEIFY / UNTREEIFY thresholds — they've changed across JDKs. |
+| RB ≅ 2-3-4 tree. | The formal proof from CLRS Ch. 13. |
+
+The honest answer is: you will not implement a balanced BST in
+production. You will use `TreeMap` or `std::map`. The reason to
+understand them is to read kernel code and stdlib internals
+without flinching, and to know which trade-offs your map-of-choice
+made on your behalf.
+
+## Cross-references
+
+- `binary-search-trees.mdx` — the prerequisite: BST basics, the
+  unbalanced trap, the basic insert/delete code this page assumes.
+- `b-trees.mdx` — RB is the binary encoding of 2-3-4; B-trees are
+  the same idea generalized for paged storage with a high
+  branching factor.
+- `hash-tables-internals.mdx` — Java 8 `HashMap`'s tree-bucket
+  fallback uses red-black to bound worst-case bucket lookup.
+- `maps-and-sets.mdx` — the API-level view: when to pick an
+  ordered map (backed by RB) vs. a hash map.
+
+## The discipline
+
+- Balanced BSTs exist to preserve O(log n) height under
+  adversarial — or just-plain-sorted — input. Without rebalancing,
+  the worst case is a linked list.
+- Rotations preserve in-order traversal; that's the only legal
+  local rewrite, and every fix-up algorithm is built from them.
+- AVL keeps the tree strictly balanced (more rotations, faster
+  lookups). Red-black keeps it loosely balanced (fewer rotations,
+  slightly slower lookups). Production overwhelmingly picks RB —
+  `TreeMap`, `std::map`, Linux `rb_tree`, Java 8 `HashMap`
+  fallback.
+- A red-black tree is isomorphic to a 2-3-4 tree. Internalize that
+  picture and both RB's invariants and B-trees stop looking
+  exotic.
+- You will not implement one. You will use the standard library,
+  or port the kernel's `rb_tree.h` if you genuinely need an
+  intrusive variant. Reading that header is a better use of time
+  than writing your own.
+- For range queries, predecessor/successor, sorted iteration: a
+  balanced BST (in memory) or a B-tree (on disk). For
+  exact-match-only lookups, a hash table. The ordered-vs-unordered
+  axis is the one that actually matters.

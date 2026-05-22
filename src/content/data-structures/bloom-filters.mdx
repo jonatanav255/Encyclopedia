@@ -1,0 +1,342 @@
+export const level = 'senior';
+
+# Bloom filters
+
+A Bloom filter answers one question: **have I seen this element?** —
+with two possible answers, **probably yes** or **definitely no**. It
+trades correctness on the "yes" side for memory savings so absurd they
+don't sound real until you do the math: membership in a billion-element
+set in roughly 1.2 GB, with a 1% false-positive rate. Burton Bloom
+published it in 1970. Half a century later, every LSM-tree storage
+engine you've heard of ships one in every SSTable.
+
+You reach for a Bloom filter when you have an expensive lookup you'd
+love to skip, but can't afford a real hash set of the keys.
+
+## The structure
+
+A bit array of `m` bits, all initialized to 0, plus `k` independent
+hash functions, each producing an index in `[0, m)`.
+
+**Add** an element: hash it with each of the `k` hash functions, set
+the corresponding `k` bits to 1.
+
+**Query** an element: hash it `k` times, check all `k` bits.
+
+- If **any** bit is 0 → the element was definitely never added.
+- If **all** `k` bits are 1 → the element was probably added. Could
+  also be that other elements collectively set those bits.
+
+The asymmetry is the whole point. A "no" is always truthful — the
+filter remembers everything it has been told to remember, in the
+weak sense that any element it has seen will pass the query. A
+"yes" might be a coincidence of other insertions painting bits.
+
+## No false negatives, ever
+
+This property carries the design. Once you set a bit to 1, nothing in
+a standard Bloom filter ever sets it back. So if you add `x` and
+later query `x`, the same `k` bits you set are still 1 — query
+returns "probably yes." False negatives are mathematically impossible.
+
+That's what makes it useful as a **gatekeeper** in front of an
+expensive operation:
+
+- "Is this key in any SSTable?" — if the Bloom says no, skip the
+  disk read with confidence.
+- "Has this URL been flagged malicious?" — if the Bloom says no, let
+  the request through without contacting the blocklist server.
+- "Did we already process this event?" — if the Bloom says no,
+  process it; we know we haven't.
+
+The "probably yes" path is the slow path — fall back to the real
+data structure or remote service. The filter just earns you the
+right to skip work on the negative case, which is usually the
+common case.
+
+## A minimal Java implementation
+
+```java
+public class BloomFilter {
+    private final java.util.BitSet bits;
+    private final int m;          // size in bits
+    private final int k;          // number of hashes
+
+    public BloomFilter(int m, int k) {
+        this.bits = new java.util.BitSet(m);
+        this.m = m;
+        this.k = k;
+    }
+
+    public void add(byte[] item) {
+        long h1 = hash1(item);
+        long h2 = hash2(item);
+        for (int i = 0; i < k; i++) {
+            int idx = Math.floorMod(h1 + (long) i * h2, m);
+            bits.set(idx);
+        }
+    }
+
+    public boolean mightContain(byte[] item) {
+        long h1 = hash1(item);
+        long h2 = hash2(item);
+        for (int i = 0; i < k; i++) {
+            int idx = Math.floorMod(h1 + (long) i * h2, m);
+            if (!bits.get(idx)) return false;
+        }
+        return true;
+    }
+}
+```
+
+Two things to notice. First, `mightContain` returns `false` as soon
+as it sees a single 0 bit — the negative case is fast, often
+bailing on the first probe. Second, we compute only **two** hashes,
+not `k`.
+
+That's **Kirsch-Mitzenmacher double hashing** (2006). Their result:
+for Bloom filters, deriving `k` hash values as `h_i = h1 + i · h2`
+from two independent hashes gives the same false-positive rate as
+`k` truly independent hashes. So you pay for two hash computations,
+not `k`. Guava and most production implementations do this. With
+xxHash or MurmurHash producing a 128-bit value, the upper 64 bits
+become `h1`, the lower 64 become `h2`, and you've computed both in
+one pass over the input.
+
+See `hashing-fundamentals.mdx` for what `h1` and `h2` actually need
+to be. Cheap, uniform, good avalanche — the usual list.
+
+## Sizing: m, k, and p
+
+Given `n` expected elements and a target false-positive rate `p`,
+the optimal allocation is:
+
+- `m = -(n · ln p) / (ln 2)²` bits
+- `k = (m / n) · ln 2 ≈ 0.7 · m / n` hash functions
+
+Don't memorize the derivation. Memorize the **bits-per-element**
+table — the constant that comes out is independent of `n`:
+
+| False-positive rate | Bits per element | Optimal k |
+|---|---|---|
+| 10% | ~4.8 | 3 |
+| 1% | ~9.6 | 7 |
+| 0.1% | ~14.4 | 10 |
+| 0.01% | ~19.2 | 13 |
+| 0.001% | ~24.0 | 17 |
+
+The headline number engineers carry around: **~10 bits per element
+for 1% FPR, with k = 7.** Everything else is a tweak.
+
+The interesting property: tightening `p` is logarithmically cheap.
+Each factor-of-10 reduction in FPR costs only ~4.8 more bits per
+element. Going from 1% to 0.1% — a 10× tighter filter — adds 50%
+more memory, not 10×.
+
+<Callout variant="info">
+**Why ten bits per element is the magic number.** For a 1% false-positive rate you need ~9.6 bits per element regardless of `n`. The constant is independent of dataset size. Double the elements, double the bits. Tighten the FPR by ~10×, add another 4.8 bits per element. That's what makes Bloom filters scale to billions: memory grows linearly in `n` with a small constant, not in any function of `n` × the size of an element.
+</Callout>
+
+## Sizing examples
+
+<Cheatsheet caption="Memory budgets across realistic sizes — n is element count, m is filter size in bits.">
+| n (elements) | FPR target | m (bits) | k | Memory |
+|---|---|---|---|---|
+| 1M | 1% | 9.6M bits | 7 | ~1.2 MB |
+| 1M | 0.1% | 14.4M bits | 10 | ~1.8 MB |
+| 1B | 1% | 9.6B bits | 7 | ~1.2 GB |
+| 1B | 0.01% | 23B bits | 16 | ~2.9 GB |
+</Cheatsheet>
+
+Test 1-billion-element membership in 1.2 GB. A `HashSet<String>` of
+a billion 32-byte URLs would be tens of gigabytes minimum, dominated
+by JVM object headers and the hash-table overhead from
+`hash-tables-internals.mdx`. The Bloom filter is the same lookup
+question, two orders of magnitude smaller.
+
+## Production use cases
+
+**LSM-tree SSTables — the canonical use.** Cassandra, RocksDB,
+LevelDB, HBase, and ScyllaDB store data in sorted, immutable files
+called SSTables. A single key may live in any of dozens of SSTables
+across the levels of the LSM tree. Without a filter, every read
+checks every relevant SSTable — O(levels) disk reads even when the
+key doesn't exist. Every SSTable ships with a small Bloom filter of
+its keys, kept in memory. The read path probes the filter first; a
+"no" skips the entire file. This is why most engineers ever meet a
+Bloom filter in production at all.
+
+**Bitcoin SPV (Simplified Payment Verification) clients.** Light
+wallets that don't store the full chain send a Bloom filter of their
+addresses to full nodes, which forward transactions matching the
+filter. The wallet doesn't reveal its exact address set; the
+operator doesn't have to scan with the wallet's full key list.
+
+**CDN edge caches.** Before forwarding a miss to the origin, an edge
+node can check a Bloom filter of what the regional cache holds. If
+the filter says no, fetch directly from origin and skip the
+regional hop.
+
+**Malicious URL filtering.** Chrome's Safe Browsing originally
+shipped a Bloom filter of malicious URLs to clients, so most "is
+this URL safe?" checks resolved locally without a network round
+trip. (It has since moved to other structures, but the original
+design was Bloom-based.)
+
+**Database query optimization.** Spark, Snowflake, BigQuery and
+similar systems use Bloom filters for **join filtering** — also
+called Bloom filter pushdown. The small side of a join builds a
+filter of its keys, ships it to the scan of the large side, and
+the scanner discards rows whose join key the filter rejects.
+Massively reduces the volume crossing the join.
+
+**Distributed deduplication.** "Does any partition already have a
+record for this key?" — a per-partition Bloom filter answers
+without a round trip to every shard.
+
+## Counting Bloom filters — supporting delete, sort of
+
+Standard Bloom filters can't delete: clearing a bit might also
+"delete" some other element that shares that bit. Counting Bloom
+filters replace each bit with a small **counter** (typically 4
+bits). Add increments the `k` counters; delete decrements them. A
+zero counter means "definitely not in the set."
+
+Drawbacks:
+
+- **~4× the memory** (4 bits per slot vs 1).
+- **Counter overflow** — at 4 bits a counter saturates at 15. After
+  enough hash collisions, it stops incrementing and you lose the
+  ability to delete cleanly. You can clamp at the max, but then
+  delete-after-many-adds underflows.
+- **You technically lose "no false negatives"** the moment you accept
+  that deleting an element you never added (or one that was already
+  underflowed) corrupts the filter.
+
+Used historically. Mostly superseded by cuckoo filters.
+
+## Scalable / partitioned Bloom filters
+
+What if you don't know `n` in advance? Allocate the filter in
+**chunks**. Start with a Bloom filter sized for some expected `n0`.
+When it fills (you can estimate fill by counting inserts, since the
+filter itself won't tell you), allocate a second filter and start
+adding to it. A query checks all chunks; a "no" requires every chunk
+to say no. Common in long-running stream-processing dedup where the
+key set grows unboundedly.
+
+The downside is real: FPR compounds across chunks, so the math
+needs each chunk sized tighter than the overall target. Almost
+nobody implements this by hand — use Guava's `BloomFilter` (one
+shot) for known `n`, or a stream-processing library's scalable
+variant for unbounded streams.
+
+## Cuckoo filter — the modern alternative
+
+Fan, Andersen, Kaminsky, and Mitzenmacher published cuckoo filters
+in 2014 as a Bloom replacement that supports delete cleanly. The
+structure:
+
+- A hash table using **cuckoo hashing** (two candidate buckets per
+  key).
+- Each bucket holds small **fingerprints** of the inserted keys,
+  typically 8 or 16 bits — not the keys themselves.
+- Lookup hashes the key to both candidate buckets and compares
+  fingerprints.
+
+Properties versus Bloom:
+
+| | Bloom filter | Cuckoo filter |
+|---|---|---|
+| Membership | Probably-yes / definitely-no | Probably-yes / definitely-no |
+| Delete | Not safely | Yes (remove a fingerprint) |
+| Memory at 1% FPR | ~9.6 bits/element | ~7 bits/element (lower) |
+| Insert at high load | Always succeeds | May fail when both buckets full and kick-out chain too long |
+| Locality | k random bit probes | Two bucket probes (cache-friendlier) |
+
+Cuckoo filters are usually a slight win on both memory and lookup
+speed at moderate load factors, with the bonus of safe delete. The
+catch is the insert path: at high load (>~95% full), kick-out
+chains can run out of retries and the insert genuinely fails. You
+must either resize or accept the loss.
+
+**Production**: RedisBloom (the Redis Stack module) ships `CF.*`
+commands alongside `BF.*`. ScyllaDB exposes them as an option.
+Classical Bloom filters still dominate legacy storage engines for
+the boring reason that they predate cuckoo filters by 44 years.
+
+This page doesn't include a full cuckoo-filter implementation —
+the kick-out loop and fingerprint-XOR trick deserve their own
+treatment. The structural idea is what to take away.
+
+## Limits to remember
+
+- **You can't enumerate the elements** that were added. The filter
+  doesn't store them — it stored *bits implied by their hashes*.
+  There's no `iterator()`.
+- **Standard Bloom filters can't delete.** If you need delete, use a
+  counting variant or a cuckoo filter.
+- **FPR rises beyond the design point.** The math assumes you insert
+  `n` elements into a filter sized for `n`. Insert 10n and the
+  filter saturates — eventually every bit is 1 and the FPR
+  approaches 100%. Size for the actual workload, with headroom.
+- **Don't use it for cardinality estimates.** "Roughly how many
+  unique elements have I seen?" is a separate problem with a
+  separate structure (HyperLogLog). A Bloom filter knows membership,
+  not count.
+- **It's a filter, not a source of truth.** A "probably yes" must be
+  verified against the real data structure. Treat the filter as a
+  hint that lets you skip work on negatives, never as the answer.
+
+## Java in the wild
+
+- **Guava's `com.google.common.hash.BloomFilter`** — production-grade,
+  uses Kirsch-Mitzenmacher double hashing internally, takes a
+  `Funnel<T>` for arbitrary types, has `expectedInsertions` and
+  `fpp` (false-positive probability) constructor arguments.
+  Use this; don't roll your own.
+- **Cassandra, HBase, RocksDB** — Bloom filters are built into the
+  SSTable read path. You don't construct them, but you can usually
+  tune the target FPR in table options
+  (`bloom_filter_fp_chance` in Cassandra).
+- **Redis Stack (RedisBloom module)** — `BF.ADD`, `BF.EXISTS`,
+  `BF.MEXISTS`, `BF.RESERVE` for Bloom; `CF.ADD`, `CF.EXISTS`,
+  `CF.DEL` for cuckoo. Useful when the filter needs to be shared
+  across services rather than per-process.
+
+For a one-process JVM application, Guava is the answer 95% of the
+time. The remaining 5% is either "I'm using Redis already and want
+this shared" (RedisBloom) or "I'm writing a storage engine"
+(implement it yourself, carefully).
+
+## Cross-references
+
+- `hashing-fundamentals.mdx` — what `h1` and `h2` should be (uniform,
+  avalanche, cheap). The double-hashing trick is downstream of this.
+- `hash-tables-internals.mdx` — the alternative when you need exact
+  membership and can afford the memory.
+- `hash-tables-intuition.mdx` — the prerequisite mental model for
+  why hashing into buckets works at all.
+- `maps-and-sets.mdx` — the Java-level abstraction a Bloom filter is
+  replacing (memory-wise) on the negative path.
+- `b-trees.mdx` — what Bloom filters guard in LSM-tree storage
+  engines (and what classical row stores use instead of LSM trees).
+
+## The discipline
+
+- Bloom filter = bit array + `k` hashes. Two answers: **probably
+  yes** or **definitely no**. The no is truthful; the yes is a
+  hint that demands verification.
+- Sizing: **~10 bits per element for 1% FPR**, ~15 for 0.1%, ~23 for
+  0.01%. The constant is independent of `n` — that's why this
+  structure scales to billions.
+- Use **Kirsch-Mitzenmacher double hashing** — compute two hashes
+  per element, derive `k` indices as `h1 + i · h2`. Not `k` separate
+  hash calls.
+- The canonical production use is **LSM-tree SSTable lookups** —
+  Cassandra, RocksDB, HBase all probe a per-SSTable Bloom filter
+  before touching the file.
+- For delete support, use a **cuckoo filter** (RedisBloom `CF.*`).
+  Counting Bloom filters work but waste memory and overflow.
+- Don't reach for a Bloom filter for cardinality estimation —
+  that's HyperLogLog's job, and it's a different structure.

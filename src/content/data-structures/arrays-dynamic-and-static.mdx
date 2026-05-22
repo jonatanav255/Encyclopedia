@@ -1,0 +1,302 @@
+export const level = 'junior';
+
+# Arrays: dynamic and static
+
+The array is the workhorse data structure. Almost every other container
+either *is* an array internally (heaps, hash tables, ring buffers) or
+*was an array before someone needed something it couldn't do*. Get
+arrays right and everything downstream gets cheaper. This page is the
+deep dive; `arrays-vs-linked-lists.mdx` is the head-to-head.
+
+## Two flavors, one idea
+
+There are two flavors of array in practice:
+
+- **Static array** — fixed length, set at allocation. In Java:
+  `int[] a = new int[100]`. The length is part of the object and
+  never changes. Run out of room and you allocate a new one yourself.
+- **Dynamic array** — a resizable wrapper around a static backing
+  array. When the backing array fills up, the wrapper allocates a
+  bigger one and copies the elements over. In Java: `ArrayList<E>`.
+
+The unifying property is **contiguous memory**. Both flavors lay out
+their elements one after another in a single block. That's what
+makes indexing fast and what makes everything else in this page
+work.
+
+## Indexing is the whole pitch
+
+`a[i]` is one multiply (`i * elementSize`) plus one load from
+`base + offset`. That's it. O(1) with the smallest possible
+constant — fewer instructions than almost any other operation a
+high-level program does.
+
+A linked structure has to follow `i` pointers, each one a fresh
+memory load from some arbitrary address. The arrays-vs-linked-lists
+page covers why that's slow; for this page, just remember: when you
+index by integer position, you want an array.
+
+## The Java zoo
+
+There are more "array-ish" types in Java than people remember. They
+are not interchangeable.
+
+| Type | What it is | Boxing? | Resizable? |
+|---|---|---|---|
+| `int[]`, `long[]`, `double[]` etc. | Primitive array | No | No |
+| `Object[]`, `String[]` | Reference array | N/A | No |
+| `ArrayList<E>` | Dynamic wrapper around `Object[]` | Yes, always | Yes |
+| `ArrayDeque<E>` | Dynamic circular array | Yes | Yes |
+| `Arrays.asList(...)` | Fixed-size *view* over a varargs array | Yes | No |
+| `List.of(...)` | Immutable list (Java 9+) | Yes | No (throws on mutate) |
+
+A few things worth burning in:
+
+- **`ArrayList<Integer>` is not `int[]`.** It's a `Object[]` of
+  pointers to boxed `Integer` objects on the heap. Five times the
+  memory and far worse cache behavior. Hot paths use `int[]`.
+- **`Arrays.asList(arr)` is not a real `ArrayList`.** It's a
+  fixed-size view. `add()` and `remove()` throw
+  `UnsupportedOperationException`. If you want a real list, wrap
+  it: `new ArrayList<>(Arrays.asList(arr))`.
+- **`List.of(...)` is immutable.** Even better than a real list when
+  you never mutate — smaller, safer, faster.
+
+## Amortized append
+
+This is the most important data-structures proof a junior sees, and
+it's worth doing in your head once.
+
+When you `add()` to an `ArrayList`:
+
+1. If the backing array has room, write to the next slot. O(1).
+2. If it's full, allocate a new backing array of `1.5 * oldCapacity`,
+   copy every existing element over, then write. O(N).
+
+A single `add()` can be O(N). But across N adds, the **total** work
+is bounded by a geometric series: the last resize copies ~N
+elements, the one before ~N/1.5, the one before that ~N/1.5², and so
+on. The sum is O(N). So the *amortized* cost per `add()` is O(1).
+
+In other words: every once in a while you pay a big bill, but spread
+across all the cheap appends it averages out to constant time.
+
+Here's what OpenJDK's `ArrayList.grow` actually does:
+
+```java
+// From java.util.ArrayList, simplified
+private Object[] grow(int minCapacity) {
+    int oldCapacity = elementData.length;
+    int newCapacity = oldCapacity + (oldCapacity >> 1); // 1.5x
+    if (newCapacity < minCapacity) newCapacity = minCapacity;
+    return elementData = Arrays.copyOf(elementData, newCapacity);
+}
+```
+
+`oldCapacity >> 1` is integer divide-by-2, so `oldCapacity +
+(oldCapacity >> 1)` is 1.5x. That's the growth factor. Don't
+memorize the bit-shift; memorize the number.
+
+## Growth factor tradeoffs
+
+The growth factor is a tunable, and the tradeoff is real:
+
+- **Too small (say 1.1x)** — you resize and copy almost every
+  insert. Append degrades from amortized O(1) toward O(N).
+- **Too big (say 3x)** — fewer copies, but every backing array is
+  mostly empty. Wasted memory adds up across many lists.
+
+Java's `ArrayList` picks **1.5x**. Java's `ArrayDeque` picks **2x**
+(its capacity is always a power of two — when it fills, it doubles).
+C++'s `std::vector` typically picks **2x** on GCC's libstdc++ and
+LLVM's libc++; MSVC famously picks 1.5x. There's a long-running
+folklore argument that 2x is suboptimal because a freed block can
+never be reused to satisfy the next allocation (each new block is
+bigger than the sum of all previous ones), but in practice both
+1.5x and 2x are fine. Don't relitigate it.
+
+## ensureCapacity — the cheap production lever
+
+If you know you're about to append N items, allocate the right size
+up front:
+
+```java
+// Bad: log(N) resizes, each copying everything
+List<String> rows = new ArrayList<>();
+for (Row r : results) rows.add(r.toString());
+
+// Good: zero resizes
+List<String> rows = new ArrayList<>(results.size());
+for (Row r : results) rows.add(r.toString());
+
+// Also fine: tell an existing list to grow once
+ArrayList<String> rows2 = new ArrayList<>();
+rows2.ensureCapacity(results.size());
+```
+
+This is a free win in any code path that loads a known number of
+items into a list — query results, file lines, batch sizes. The
+amortized argument says it doesn't matter asymptotically, but the
+constant factor (avoiding `log₁.₅(N)` calls to `Arrays.copyOf`) is
+real, and the GC pressure from throwing away intermediate arrays is
+worse than the copy itself.
+
+<Callout variant="tip">
+`new ArrayList<>(n)` doesn't *set* the size to `n` — it sets the
+*capacity*. `list.size()` is still 0 until you `add()`. If you want
+a pre-filled list, use `new ArrayList<>(Collections.nCopies(n,
+defaultValue))`.
+</Callout>
+
+## Memory layout
+
+Here's where primitive arrays earn their keep.
+
+An `int[10]` in HotSpot is **one** heap object:
+
+```
+[ header (~16 bytes) | length (4 bytes) | 10 × 4 bytes payload | padding ]
+≈ 64 bytes total, one allocation
+```
+
+An `Integer[10]` (or `ArrayList<Integer>` of size 10) is the outer
+array — one heap object holding **ten pointers** — plus **ten
+separate `Integer` boxes**, each its own heap object with its own
+header. Order of 5x the memory, scattered across the heap. Every
+read of an element is a pointer chase to a possibly cold cache
+line.
+
+This is why hot paths use `int[]`, `long[]`, `double[]`, or one of
+the primitive specializations in libraries like Eclipse Collections
+or fastutil. It's also why Project Valhalla (value types in the
+JVM) is a big deal — it lets generic collections hold primitives
+without boxing.
+
+## The delete-from-the-middle problem
+
+`ArrayList.remove(i)` for `i` not equal to the last index is O(N).
+Every element after position `i` shifts down by one. The JDK uses
+`System.arraycopy` to do the shift, so it's as fast as memmove can
+be, but it's still O(N) work.
+
+Patterns that handle this:
+
+- **Mark-and-sweep.** Set deleted entries to a sentinel (or null),
+  then periodically rebuild the array without them. Good when
+  deletes cluster.
+- **Swap-with-last.** If order doesn't matter, `arr[i] =
+  arr[arr.length - 1]; arr.length--`. O(1) delete. The standard
+  trick for unordered collections.
+- **Use a different structure.** A `LinkedList` does O(1) splice
+  *if* you already hold the node. A `HashSet` does O(1) delete by
+  value. `ArrayDeque` does O(1) at both ends.
+
+If your workload is "remove arbitrary elements from a list,
+frequently," an `ArrayList` is the wrong tool.
+
+## System.arraycopy and Arrays.copyOf
+
+When you shift, copy, or grow an array, do not write the loop
+yourself.
+
+```java
+// Slow — the JIT can sometimes vectorize this, but not always
+for (int i = 0; i < src.length; i++) dst[i] = src[i];
+
+// Fast — HotSpot intrinsifies this to an optimized memmove
+System.arraycopy(src, 0, dst, 0, src.length);
+
+// Convenience wrapper — allocates the destination for you
+int[] dst = Arrays.copyOf(src, src.length * 2);
+```
+
+`System.arraycopy` is an **intrinsic**: HotSpot recognizes the call
+and replaces it with hand-tuned native code (SIMD where available).
+It also correctly handles overlapping ranges. `Arrays.copyOf` is a
+thin wrapper around it. Both are dramatically faster than the
+hand-rolled loop on anything but tiny arrays. The `ArrayList.grow`
+snippet above uses `Arrays.copyOf` for exactly this reason.
+
+## What about 2D arrays?
+
+`int[][]` in Java is **not** a true 2D contiguous block. It's an
+**array of arrays**: the outer array holds pointers, and each row is
+a separate heap allocation.
+
+```java
+int[][] grid = new int[1000][1000];
+// 1 outer array of 1000 pointers
+// + 1000 inner arrays of 1000 ints each
+// = 1001 heap allocations, scattered
+```
+
+Two consequences:
+
+1. **Row-major iteration is faster.** `for i { for j { grid[i][j] }
+   }` walks one row's contiguous memory, then the next. Cache lines
+   stay hot. Column-major (`for j { for i { grid[i][j] } }`) jumps
+   to a new row's allocation on every step — every access is a
+   potential cache miss.
+2. **Rows can be different lengths.** Java has no jagged-array
+   complaint — `grid[0]` could have length 10 and `grid[1]` length
+   100. Sometimes useful, often a footgun.
+
+For true 2D contiguous storage, use a 1D array and index by hand:
+
+```java
+int width = 1000, height = 1000;
+int[] grid = new int[width * height];
+
+int get(int x, int y) { return grid[y * width + x]; }
+void set(int x, int y, int v) { grid[y * width + x] = v; }
+```
+
+One allocation, perfect locality, predictable size. Image
+processing, game grids, and numerical code all do this.
+
+## When NOT to reach for a dynamic array
+
+A dynamic array is the right default, not the right answer for
+everything:
+
+- **Front-insert-heavy workloads.** `ArrayList.add(0, x)` shifts
+  every element. Use `ArrayDeque` (O(1) at both ends) or
+  `LinkedList`.
+- **Lookup by key, not by position.** Use `HashMap`.
+- **Sorted-on-insert with frequent updates.** Use `TreeMap` or a
+  skip list.
+- **Top-K / next-smallest semantics.** Use a `PriorityQueue` —
+  which, see `heaps-and-priority-queues.mdx`, is itself a dynamic
+  array underneath.
+
+Each of those has its own page. The point here is: an array is a
+*great* default. It's not a universal one.
+
+## Cross-references
+
+- `arrays-vs-linked-lists.mdx` — head-to-head with linked
+  structures, cache effects, the insertion myth.
+- `memory-and-pointers.mdx` — stack vs heap, what a "reference"
+  actually is.
+- `heaps-and-priority-queues.mdx` — heaps are array-backed; the
+  contiguous-array argument carries over.
+
+## The discipline
+
+- Default to a dynamic array (`ArrayList` / `ArrayDeque`). Reach
+  for something else only when the workload demands it.
+- For primitives in hot paths, use `int[]` / `long[]` — never
+  `ArrayList<Integer>`. Boxing is real and it shows up in
+  benchmarks.
+- Pre-size your lists when you know the count. `new ArrayList<>(n)`
+  is the cheapest performance win in Java code.
+- Use `System.arraycopy` / `Arrays.copyOf` for any bulk move.
+  Hand-rolled loops lose to the intrinsic.
+- Don't remove from the middle of a list in a loop. Either filter
+  into a new list, swap-with-last (if unordered), or use a
+  different structure.
+- Java's `int[][]` is not contiguous — iterate row-major, or flatten
+  to `int[width * height]` for real locality.
+- 1.5x is `ArrayList`'s growth factor; 2x is `ArrayDeque`'s and
+  most C++ vectors'. Either is fine. The geometric series doesn't
+  care.

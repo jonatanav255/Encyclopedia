@@ -1,0 +1,322 @@
+export const level = 'senior';
+
+# Augmenting trees
+
+Take a balanced BST. Attach an extra field to each node that
+summarizes its subtree. Maintain it through rotations. You now have
+new O(log n) operations for almost free. That is the entire pattern,
+and it is the most underrated data-structures idea in backend
+interviews and production systems — the engineers who internalize
+CLRS Ch. 14 tend to be the ones writing rate-limiters, calendar
+systems, and time-series indexes that actually scale.
+
+## The pattern in one sentence
+
+Augmentation = balanced BST + an extra per-node field that summarizes
+the node's subtree, kept in sync through rotations. Each rotation
+does O(1) extra work; asymptotic cost is unchanged.
+
+## The CLRS methodology
+
+CLRS lays out four steps. Every augmentation you'll ever do follows
+this script:
+
+1. **Pick the underlying structure.** Almost always a red-black tree.
+   AVL works too. The point is balanced, with rotation as the
+   rebalancing primitive.
+2. **Pick the extra information per node.** A subtree size, a max,
+   a sum, a count by predicate. Whatever your new operation needs.
+3. **Verify rotation can maintain it.** This is the deciding test.
+   After a rotation, can the two affected nodes recompute their
+   field from their (new) children's fields in O(1)? If yes, the
+   pattern fits. If no, you need a different structure.
+4. **Implement the new operations.** Using the field, you usually
+   get a tree walk in O(log n).
+
+Step 3 is the gate. The other steps are paint-by-numbers.
+
+## Augmentation #1: order-statistic tree
+
+Take a red-black tree. Add one integer per node:
+
+```java
+class Node {
+  int key;
+  Node left, right, parent;
+  boolean red;
+  int size; // 1 + size(left) + size(right); size(null) == 0
+}
+```
+
+`size` is the number of nodes in the subtree rooted at this node.
+With it, you gain two operations:
+
+- **`select(k)`** — return the k-th smallest key. O(log n).
+- **`rank(x)`** — return the rank (1-indexed position) of key x in
+  the sorted order. O(log n).
+
+`select` walks down the tree, using `size(left)` as a coordinate:
+
+```java
+Node select(Node x, int k) {
+  int r = sizeOf(x.left) + 1; // rank of x within its subtree
+  if (k == r) return x;
+  if (k < r)  return select(x.left, k);
+  return select(x.right, k - r);
+}
+
+static int sizeOf(Node n) { return n == null ? 0 : n.size; }
+```
+
+`rank` is the mirror image — walk down counting "items definitely
+smaller than the target."
+
+**Maintenance.** On insert and delete, `size` propagates up from the
+modified leaf to the root: O(log n) updates of one integer each.
+On rotation, only the two rotated nodes need recomputation, and
+each is a constant-time lookup of its children:
+
+```java
+void recomputeSize(Node x) {
+  x.size = 1 + sizeOf(x.left) + sizeOf(x.right);
+}
+
+// after left-rotate(x) producing y as new parent of x:
+recomputeSize(x); // x now has y's old left as its right child
+recomputeSize(y); // y inherits x's old size structure
+```
+
+Two assignments per rotation. That is the entire augmentation tax.
+
+**Where this earns its keep.**
+
+- **Leaderboards with rank queries** — "what's player 42's
+  rank?" and "who is rank 100?" both in O(log n) over millions of
+  scores.
+- **Percentile calculations** — `select(n * 0.95)` is the p95 in
+  O(log n). No sorting, no sketches.
+- **Median-of-stream** — the textbook answer is two heaps (see
+  `heaps-and-priority-queues.mdx`). An order-statistic tree
+  generalizes it: any percentile, not just the median, with the
+  same O(log n) insert.
+- **Rate-limiters** keyed by timestamp where you want "am I in the
+  top 100 requests this second?" — that's a rank query.
+
+## Augmentation #2: interval tree
+
+Take a red-black tree keyed by **interval low endpoint**. Add one
+field per node:
+
+```java
+class IntervalNode {
+  int low, high;        // this interval
+  IntervalNode left, right, parent;
+  boolean red;
+  int max;              // max high over this subtree
+}
+```
+
+`max` is the largest `high` endpoint anywhere in the subtree. With
+it, you gain:
+
+- **`overlap(qLow, qHigh)`** — return any interval that overlaps
+  `[qLow, qHigh]`, or null. O(log n).
+- **`overlapAll(qLow, qHigh)`** — all overlapping intervals.
+  O(k log n) where k is the number of results.
+
+The search exploits the `max` field. Two intervals overlap iff
+`a.low <= b.high && b.low <= a.high`. Walk the tree, and at each
+node decide which child can possibly contain an overlap:
+
+```java
+IntervalNode overlap(IntervalNode x, int qLow, int qHigh) {
+  while (x != null) {
+    if (x.low <= qHigh && qLow <= x.high) return x; // hit
+    if (x.left != null && x.left.max >= qLow) {
+      x = x.left;  // overlap, if any, lives in left subtree
+    } else {
+      x = x.right; // otherwise it can only be on the right
+    }
+  }
+  return null;
+}
+```
+
+The key insight: if the left subtree's `max` is below `qLow`, every
+interval there ends before the query begins — they can't overlap.
+So we go right without backtracking. That's how O(log n) emerges
+from what looks like a 2-D problem.
+
+**Maintenance on rotation.** Same shape as the order-statistic
+tree. After a rotation, recompute `max` for the two affected
+nodes from their new children:
+
+```java
+void recomputeMax(IntervalNode x) {
+  int m = x.high;
+  if (x.left  != null) m = Math.max(m, x.left.max);
+  if (x.right != null) m = Math.max(m, x.right.max);
+  x.max = m;
+}
+```
+
+O(1) per rotation. Insert and delete propagate the `max` up the
+tree at O(log n) total.
+
+**Where this earns its keep.**
+
+- **Calendar systems** — "which meetings overlap `[start, end]`?"
+  is a textbook `overlapAll`. Google Calendar, Outlook, every
+  scheduling system reaches for this primitive.
+- **Network policy / firewall rules** — CIDR ranges are intervals
+  over the integer IP space. "Which rules match this packet?"
+  reduces to interval overlap.
+- **Genomic data** — gene and exon intervals on a chromosome.
+  "Which annotations overlap region X?" is the bread-and-butter
+  query in bioinformatics pipelines.
+- **Time-series and observability** — span and trace overlap
+  queries in distributed tracing backends.
+
+`java.util.NavigableMap.subMap` is a degenerate special case: the
+intervals are points and the query is itself an interval. The full
+interval tree generalizes both endpoints.
+
+## Augmentation #3: position-by-weight
+
+Same shape as the order-statistic tree, but `size` is replaced with
+a weighted sum: `subtreeWeight = weight + subtreeWeight(left) +
+subtreeWeight(right)`. `select(k)` now finds the element at
+*weighted* position k. Text editors use this for "the character at
+screen-position 100,000 across all line breaks" — each line
+contributes its character count as weight, and `select` jumps to
+the right line in O(log n) without scanning. Same trick shows up in
+piece tables and rope implementations. Mechanics are identical to
+the order-statistic tree with `+1` replaced by `+weight`.
+
+## Why "rotation can maintain it?" is the gate
+
+A rotation is a strictly local edit. It touches exactly two nodes,
+and it reshuffles three subtrees in O(1):
+
+```
+    left-rotate(x):
+         x                   y
+        / \                 / \
+       a   y      -->      x   c
+          / \             / \
+         b   c           a   b
+```
+
+After the rotation, the new summary fields on `x` and `y` must be
+recomputable **purely from their new children's fields**. For
+`size`: `x.size = 1 + size(a) + size(b)`. For `max`: same shape.
+
+If your augmentation needs to look at *grandchildren* (or further)
+to recompute itself, rotation can't keep it valid in O(1), and the
+pattern doesn't fit. At that point you've outgrown it — segment
+trees, treaps with explicit subtree aggregation, or in the worst
+case link-cut trees are the next stop. Don't try to force the
+augmentation; the asymptotics will quietly break.
+
+CLRS Ch. 14 has the full algebra for red-black rotations; this page
+intentionally doesn't reproduce it. The takeaway is the test, not
+the cases.
+
+## Java in the wild
+
+`java.util.TreeMap` is a red-black tree. It exposes `firstKey`,
+`lastKey`, `floorKey`, `ceilingKey`, `subMap`, `headMap`, `tailMap`.
+What it does **not** expose: `select(int k)` or `rank(K key)`. There
+is no built-in order-statistic operation.
+
+There has been long-standing demand for it; verify the current state
+of any JEP/issue before quoting one. As of mainline Java 21, if you
+need `select(k)`/`rank(x)` over a dynamic ordered set, your options
+are: implement an order-statistic tree yourself on top of a
+red-black tree; use Guava's `TreeMultiset`, which tracks counts but
+doesn't expose `select(k)` directly (confirm against your version);
+or step outside Java — C++'s `__gnu_pbds::tree` with
+`find_by_order` and `order_of_key` is the canonical reference.
+
+This gap shows up in interview prompts dressed as "find the k-th
+score" or "running median of a stream." The two-heaps trick handles
+the median; order-statistic trees handle the general case.
+
+<Callout variant="warn">
+Augmenting a tree means every rotation now does an extra O(1)
+maintenance step, and every insert/delete propagates the field up
+to the root. The big-O is unchanged, but the constant on writes
+goes up by a modest factor. Worth it if you actually use the new
+operations; wasted work if the augmentation sits idle on a
+write-heavy index.
+</Callout>
+
+## When to reach for an augmented tree in production
+
+- **Rate-limiters keyed by time** — "what's this request's rank
+  among recent requests?" "how many in the last second exceed
+  this priority?"
+- **Percentile-based throttling** — drop the top 1% of latencies.
+- **Top-K maintenance where K varies at query time** — a sized
+  heap fixes K; an order-statistic tree lets the caller ask for
+  any K cheaply.
+- **Multi-tenant queues** — "which tenant has the median backlog?"
+- **Calendar / scheduling backends** — interval-tree territory.
+
+The shape: ordered set with frequent inserts and deletes, new
+question is *positional* or *aggregative* over the order.
+
+## What this is NOT
+
+- **Not segment trees or Fenwick trees.** Those are different
+  structures specialized for range queries over fixed-size arrays
+  (or coordinate-compressed domains). They overlap in use cases
+  but the mechanics and trade-offs differ.
+- **Not treaps.** Treaps can be augmented similarly, and often are
+  in competitive programming. The pattern transfers; the
+  underlying balance discipline is different (random priorities,
+  not RB invariants).
+- **Not the right answer under heavy write contention.** A
+  single-threaded augmented red-black tree under multiple writers
+  needs locking. For lock-free ordered structures with high
+  concurrency, `ConcurrentSkipListMap` is Java's answer — but
+  augmenting a skip list is harder, and you typically end up
+  shard-by-key instead.
+- **Not a substitute for a database.** If your data is durable and
+  shared across processes, you want an index inside the DB, not an
+  augmented tree in app memory.
+
+## Cross-references
+
+- `binary-search-trees.mdx` — the underlying ordered map and why
+  balance matters. Prerequisite for this page.
+- `balanced-bsts.mdx` — red-black and AVL: the balanced substrate
+  this pattern augments. Rotations are the operation augmentation
+  has to survive.
+- `b-trees.mdx` — the on-disk cousin. B-trees can also be
+  augmented (per-page summaries) but the engineering shape is
+  different and most databases keep it minimal.
+- `heaps-and-priority-queues.mdx` — the two-heaps median trick is
+  the special-case predecessor to order-statistic trees.
+
+## The discipline
+
+- Augmentation = balanced BST + extra subtree-summary fields,
+  maintained on rotation in O(1) per rotation. Constants go up
+  modestly; asymptotics don't.
+- The test is rotation: can the two rotated nodes recompute their
+  field from their new children in O(1)? If not, this pattern
+  doesn't fit and you need a different structure.
+- Order-statistic trees give you `select(k)` and `rank(x)` in
+  O(log n). Interview gold; rate-limiter and percentile gold.
+- Interval trees with a `max` field give O(log n) overlap queries.
+  Calendar, firewall, and genomics use this directly.
+- Java does not ship an order-statistic tree. `TreeMap` stops short
+  of `select`/`rank`. If you need them, augment a red-black tree
+  yourself or step outside the standard library.
+- If your augmentation needs to peek at grandchildren on update,
+  you've outgrown the pattern. Reach for segment trees, treaps
+  with explicit aggregation, or a specialized structure.
+- The methodology is the lasting lesson, not any one example: pick
+  the structure, pick the field, verify rotation, implement the
+  operation. CLRS Ch. 14 if you want the algebra.
