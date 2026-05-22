@@ -12,6 +12,13 @@ rationale, and conventions live in `PROJECT.md`.
   fine but not urgent.
 - **No `pnpm-workspace.yaml`.** pnpm sometimes writes a broken stub for
   it during the "ignored builds" prompt. If you see it, delete it.
+- **Do not touch `src/content/system-design/`.** That topic is finished
+  and frozen. No edits, no additions, no "fixes" to its MDX files or
+  its question bank (`src/content/questions/system-design.ts`) unless
+  the user explicitly asks for changes to system-design specifically.
+  When adding adjacent topics (e.g., data-structures), it's fine to
+  *reference* system-design pages from new content, but don't rewrite
+  them.
 
 ## How content discovery works (so you don't try to register things)
 
