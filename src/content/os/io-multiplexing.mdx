@@ -1,0 +1,334 @@
+export const level = 'mid';
+
+# I/O multiplexing — select, poll, epoll, kqueue, io_uring
+
+A server handling thousands of clients can't have a thread per
+connection (too much memory, too many context switches). The
+fix is one thread watching many file descriptors and waking on
+"any of these is ready to read/write." That's **I/O
+multiplexing**. Linux shipped four flavors over forty years
+(select, poll, epoll, io_uring); BSDs shipped one good one
+(kqueue) and skipped the rest. Knowing the differences
+explains why Nginx feels different from Apache.
+
+## The problem they solve
+
+You're running a TCP server. 10,000 client connections, mostly
+idle, occasionally one sends data. You want one thread to:
+
+- Sleep until any FD has incoming data.
+- Wake up.
+- Handle just the FDs that became ready.
+- Go back to sleep.
+
+The kernel knows which FDs have data; the question is *how do
+you ask?*
+
+## select — the original (1983)
+
+```c
+fd_set rfds;
+FD_ZERO(&rfds);
+for (int fd : fds) FD_SET(fd, &rfds);
+
+struct timeval tv = {5, 0};   // 5s timeout
+int n = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+
+for (int fd : fds)
+    if (FD_ISSET(fd, &rfds)) handle(fd);
+```
+
+API:
+
+- Pass three bitmaps: read-ready, write-ready, exception.
+- Pass `maxfd + 1` — the kernel scans bits 0..maxfd.
+- Returns number of ready FDs; modifies bitmaps in place.
+
+Problems:
+
+1. **`FD_SETSIZE` is 1024**. On most Unix, you can't watch
+   FD 1025 with select. Recompiling the world to raise it is
+   ugly.
+2. **O(N) every call**. The kernel scans every bit in your
+   bitmap, your user code scans every bit to find the
+   ready ones.
+3. **Bitmaps are destroyed** each call. You rebuild them every
+   time.
+4. **Bad for cancellation**. No way to add/remove an FD from
+   another thread without re-issuing the call.
+
+For tiny FD counts (≤1024) it works. For real servers it
+doesn't.
+
+## poll — the slightly better one (1986)
+
+```c
+struct pollfd pfds[10000];
+for (int i = 0; i < N; i++) {
+    pfds[i].fd = fds[i];
+    pfds[i].events = POLLIN;
+}
+int n = poll(pfds, N, 5000);   // 5s timeout
+for (int i = 0; i < N; i++)
+    if (pfds[i].revents & POLLIN) handle(pfds[i].fd);
+```
+
+Fixes select's main complaints:
+
+- No `FD_SETSIZE` limit.
+- Array-based instead of bitmap. Slightly nicer.
+
+Still O(N) per call (scan all N pollfds), and you re-submit
+the full array every call. For 10K connections of which 5 are
+ready, that's 10K of work to find 5.
+
+## epoll — Linux's solution (2002)
+
+epoll **separates registration from polling**. You tell the
+kernel once what you're interested in; it maintains a kernel-
+side data structure (a red-black tree of FDs and a ready
+list). Each `epoll_wait` returns only the FDs that are
+actually ready, in O(ready).
+
+```c
+int ep = epoll_create1(0);
+
+struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
+epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+
+struct epoll_event events[64];
+int n = epoll_wait(ep, events, 64, 5000);
+for (int i = 0; i < n; i++)
+    handle(events[i].data.fd);
+```
+
+Three syscalls now:
+
+- `epoll_create1` — make an epoll instance.
+- `epoll_ctl(ADD/MOD/DEL)` — register/update/unregister.
+- `epoll_wait` — collect ready events.
+
+Performance: O(ready), not O(watched). 10K connections, 5
+ready → 5 events returned. Scales gracefully to hundreds of
+thousands of connections per thread.
+
+This is what every high-perf Linux server runs on. Nginx,
+Redis, libuv, Tokio, Netty.
+
+## Edge-triggered vs level-triggered
+
+epoll's killer subtlety. Two modes:
+
+**Level-triggered (LT, default)** — same as select/poll. As
+long as the FD is readable (has data buffered), every
+`epoll_wait` returns it.
+
+**Edge-triggered (ET, `EPOLLET`)** — only returns the FD when
+its readiness state **changes** (transition from "no data" to
+"data available"). Once you get an ET event for a socket, you
+must `read` until you get `EAGAIN`. Miss it, and the FD will
+not be reported again until *new* data arrives.
+
+```c
+// ET-mode read loop:
+while (true) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n == 0)            // closed
+        break;
+    if (n < 0) {
+        if (errno == EAGAIN) break;   // drained; wait for next event
+        // real error
+    }
+    // process buf[0..n]
+}
+```
+
+ET is more efficient (fewer wake-ups) but easier to misuse.
+Most application code uses LT; high-perf frameworks use ET
+internally with careful loop discipline.
+
+## EPOLLONESHOT — for thread pools
+
+`EPOLLONESHOT` makes the FD "armed" for exactly one event;
+after that, it stops being polled until you re-arm with
+`EPOLL_CTL_MOD`. Useful in thread pools — one worker takes a
+ready FD without worrying that another worker will be handed
+the same FD before the first finishes processing.
+
+## kqueue — BSD's solution (2000)
+
+FreeBSD, macOS, OpenBSD. Predates epoll, arguably better
+designed.
+
+```c
+int kq = kqueue();
+struct kevent change = { fd, EVFILT_READ, EV_ADD, 0, 0, NULL };
+kevent(kq, &change, 1, NULL, 0, NULL);     // register
+
+struct kevent events[64];
+int n = kevent(kq, NULL, 0, events, 64, NULL);   // wait
+for (int i = 0; i < n; i++)
+    handle((int)events[i].ident);
+```
+
+Same general shape as epoll. Differences:
+
+- **More event types** out of the box. `EVFILT_VNODE` (file
+  modifications), `EVFILT_PROC` (process exits), `EVFILT_SIGNAL`,
+  `EVFILT_TIMER`. epoll requires separate fds (signalfd,
+  timerfd, inotify) for these.
+- **Atomic batch register + wait**: one kevent call can both
+  add filters and wait for events.
+- **Per-filter flags** are cleaner: `EV_CLEAR` is ET, `EV_ONESHOT`
+  is one-shot.
+
+Worth knowing if you write cross-platform code (libuv has
+kqueue and epoll backends; libevent wraps both).
+
+## IOCP — Windows's model
+
+Windows takes a different approach: **completion-based**
+instead of readiness-based. You **start an async op** (with
+`ReadFile`, `WriteFile` + `OVERLAPPED`); when it completes,
+the kernel posts a completion to an **I/O Completion Port**.
+
+```cpp
+HANDLE iocp = CreateIoCompletionPort(handle, NULL, key, threads);
+// later, in worker thread:
+DWORD bytes; ULONG_PTR key; OVERLAPPED *ov;
+GetQueuedCompletionStatus(iocp, &bytes, &key, &ov, INFINITE);
+// process the completion
+```
+
+The kernel does the I/O on your behalf and tells you when it's
+done. You don't poll readiness; you submit and wait.
+
+Logically equivalent to io_uring (Linux). Both are the right
+shape for kernel-side async.
+
+## io_uring — Linux's completion-based async (2019)
+
+epoll tells you "this FD is ready"; you still call `read`.
+io_uring lets you submit the `read` itself and get the result
+when it's done. **Real async I/O on Linux.**
+
+```c
+struct io_uring ring;
+io_uring_queue_init(64, &ring, 0);
+
+// submit a read
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, sizeof(buf), 0);
+io_uring_submit(&ring);
+
+// wait for completion
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+// cqe->res is bytes read (or -errno)
+io_uring_cqe_seen(&ring, cqe);
+```
+
+Plus:
+
+- Works for files (unlike epoll, which is socket-only and was
+  always weird about disk files).
+- Batch submission — submit dozens of ops in one syscall.
+- Optional kernel polling thread (`SETUP_SQPOLL`) for zero-
+  syscall operation.
+- Linked SQEs (do A, then B if A succeeded).
+- Provides timeouts, signals, accept, splice, send/recv,
+  close, openat — basically the whole syscall surface as
+  async.
+
+For high-throughput Linux servers in 2026, io_uring is the
+new state of the art. epoll is still ubiquitous (and fine for
+most servers).
+
+## When each is right
+
+| Tool | Use |
+|---|---|
+| `select` | Don't. Pedagogy or extreme portability only. |
+| `poll` | OK for moderate FD counts on Linux/BSD. |
+| `epoll` | Linux servers, network-heavy, 10K+ connections. |
+| `kqueue` | BSD/macOS equivalent of epoll. |
+| `IOCP` | Windows servers. |
+| `io_uring` | Modern Linux, high-throughput, file + network mixed. |
+
+Cross-platform: most frameworks (libuv, mio in Rust, Tokio,
+Java NIO, .NET) abstract all of these.
+
+## Hidden cost: thundering herd
+
+If you have N worker threads all blocked on the *same listening
+socket* via `accept`, an incoming connection wakes them all,
+they race to accept, one wins, the rest go back to sleep.
+That's the **thundering herd**: lots of wake-ups for one
+event.
+
+`SO_REUSEPORT` (Linux 3.9+) lets each worker have its own
+listening socket on the same port; the kernel load-balances
+across them. Each worker wakes for *its* share, no herd.
+
+For epoll-shared FDs, `EPOLLEXCLUSIVE` (Linux 4.5+) tells the
+kernel to wake only one waiter when the FD becomes ready.
+
+## The other side: write readiness
+
+Everything above is about read readiness. Write readiness
+matters too:
+
+- For a TCP socket, `EPOLLOUT` fires when the send buffer has
+  room. Use it when you've gotten `EAGAIN` on `write` and need
+  to wait for room.
+- Don't watch `EPOLLOUT` continuously — for most sockets, write
+  is always ready, and you'll busy-loop.
+
+Typical pattern: write until `EAGAIN`, then watch `EPOLLOUT`
+until ready, then write more.
+
+## A complete pattern (Linux, epoll, LT)
+
+```c
+int ep = epoll_create1(0);
+int srv = make_listening_socket(8080);
+add_epoll(ep, srv, EPOLLIN);
+
+while (true) {
+    struct epoll_event evs[64];
+    int n = epoll_wait(ep, evs, 64, -1);
+    for (int i = 0; i < n; i++) {
+        int fd = evs[i].data.fd;
+        if (fd == srv) {
+            int c = accept(srv, NULL, NULL);
+            set_nonblocking(c);
+            add_epoll(ep, c, EPOLLIN | EPOLLET);
+        } else if (evs[i].events & EPOLLIN) {
+            handle_read(fd);
+        } else if (evs[i].events & EPOLLOUT) {
+            handle_write(fd);
+        }
+    }
+}
+```
+
+That's the bones of an event loop. Every async runtime is a
+variation on this with task scheduling, timer wheels, and
+backpressure layered on.
+
+## The mental model
+
+I/O multiplexing is "one thread, many FDs, sleep until any is
+ready." select/poll re-scan all FDs every call; epoll/kqueue
+maintain kernel-side state and report only what's ready.
+Edge-triggered is more efficient but requires drain-until-
+EAGAIN discipline.
+
+io_uring (Linux) and IOCP (Windows) go further: submit the
+*operation*, get the *result* later. True async, no
+"readiness" middle step.
+
+For 2026 Linux servers: epoll is the safe default; io_uring is
+where the wind is blowing. For BSD/macOS: kqueue. For
+portability: use a runtime (libuv, Tokio, mio, Java NIO) and
+let it pick.

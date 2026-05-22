@@ -1,0 +1,319 @@
+export const level = 'mid';
+
+# Virtual memory and paging
+
+Every process thinks it owns the full address space — `0` to
+`2^64-1` on x86-64. They don't. The kernel and the MMU together
+hand each process a **virtual address space** mapped onto
+physical RAM (and disk) via page tables. The illusion is the
+single most important abstraction in modern systems: it
+underlies process isolation, shared libraries, copy-on-write
+fork, `mmap`, and demand paging.
+
+## The page is the unit
+
+Memory is managed in fixed-size **pages** — 4KB on most x86 and
+ARM systems (huge pages: 2MB, 1GB; ARM also has 16KB and 64KB
+options). Physical memory is divided into the same-sized
+**page frames**.
+
+Every virtual address splits into:
+
+```
+64-bit virtual address (x86-64, 48 bits used):
+┌──────────────────────────────────────────────┬───────────────┐
+│            virtual page number (VPN, 36 bit) │ offset (12 b) │
+└──────────────────────────────────────────────┴───────────────┘
+
+The MMU translates VPN → PFN (physical frame number) via the page table.
+The offset is unchanged.
+
+Result:
+┌──────────────────────────┬───────────────┐
+│ physical frame number    │ offset        │
+└──────────────────────────┴───────────────┘
+```
+
+## The page table
+
+For each VPN, the kernel maintains a **page table entry (PTE)**:
+
+```
+PTE format (x86-64, simplified):
+┌───────────────────┬──────────┬────────┬────────┬───┬───┬───┬───┐
+│  physical addr    │ unused   │ NX  D  │ A   PCD│PWT│U/S│R/W│ P │
+│  (52 bits)        │          │        │        │   │   │   │   │
+└───────────────────┴──────────┴────────┴────────┴───┴───┴───┴───┘
+
+P    = present (page actually in physical memory)
+R/W  = writable
+U/S  = user-accessible (vs supervisor only)
+A    = accessed (set by HW on first access; for replacement algos)
+D    = dirty (set by HW on first write)
+NX   = no-execute
+PCD/PWT = caching policy
+```
+
+A flat page table (one entry per page) for 48-bit VAs at 4KB
+pages would need 2^36 entries × 8 bytes = 512 GB *per process*.
+Obviously broken.
+
+## Multilevel page tables — what x86-64 actually uses
+
+Split the VPN into segments and use **nested tables**. x86-64
+uses a 4-level scheme (5-level since Ice Lake for >48-bit VAs):
+
+```
+Virtual address:
+┌─────┬─────┬─────┬─────┬─────────────┐
+│PML4 │ PDP │ PD  │ PT  │ page offset │
+│  9b │  9b │  9b │  9b │     12b     │
+└─┬───┴─┬───┴─┬───┴─┬───┴─────────────┘
+  │     │     │     │
+  │     │     │     └─→ PTE → physical page
+  │     │     └────────→ PT
+  │     └──────────────→ PD
+  └────────────────────→ PDP
+       (PML4 root pointed to by CR3)
+```
+
+Each table has 512 entries (2^9), each 8 bytes = 4KB. A
+process only needs page tables for the address ranges it
+actually uses, so sparse 64-bit address spaces cost almost
+nothing.
+
+Translating one address: 4 memory loads from page tables, plus
+the final access. That'd be 5× slowdown for every memory
+reference if not for the TLB.
+
+## The TLB
+
+The **Translation Lookaside Buffer** caches recent VPN→PFN
+translations. Typical sizes:
+
+- L1 dTLB: 64 entries (4KB pages), 32 entries (2MB), 4 (1GB).
+- L1 iTLB: 64 entries.
+- L2 unified: 1500–2000 entries.
+
+A TLB hit: ~1 cycle. A TLB miss: 10–100 cycles for the page
+walk (less if PMD/PUD/PML4 entries are in L1/L2 cache).
+
+The TLB is the reason huge pages matter. A 4KB-page TLB
+covers 64 × 4KB = 256KB. A 2MB-page TLB covers 32 × 2MB =
+64MB. For workloads with large working sets (databases, JIT
+runtimes), 4KB-page TLB miss rates can be the top performance
+killer.
+
+## TLB shootdown
+
+The TLB caches translations *per CPU*. When the kernel unmaps
+a page (or changes its permissions), it has to invalidate the
+TLB entry on every CPU that might have cached it:
+
+```
+CPU 0:                          CPU 1, 2, 3:
+unmap page (free PTE)
+send IPI to others ─────────→ run handler:
+                                invlpg <addr>
+                                ack
+wait for all acks ←──────────
+continue
+```
+
+This is the **TLB shootdown** — slow (microseconds per
+shootdown × many shootdowns) and gets worse with core count.
+The cost of `munmap`, `mprotect`, `madvise(DONTNEED)`, and
+many allocator returns on big machines.
+
+Mitigations:
+
+- **PCID** (x86) — tag TLB entries with a process ID; switching
+  CR3 doesn't have to flush. Switching back finds entries
+  still there.
+- **ASID** (ARM) — same idea.
+- **Lazy TLB** — don't shoot down if the CPU isn't actually
+  using that mm.
+- **Batch invalidations** — combine many small shootdowns into
+  one IPI.
+
+## Page faults — the magic that makes VM work
+
+When the CPU translates a virtual address and the PTE is not
+"present" (or violates permissions), it raises a **page fault**
+(exception #PF on x86). The fault handler decides what to do:
+
+```
+read CR2 (fault address) → find the VMA covering it →
+    if no VMA covers it: SIGSEGV
+    if VMA exists but PTE missing:
+        allocate page, fill it (zero / from disk / from swap), install PTE, retry
+    if PTE writable in VMA but cleared (COW):
+        copy the page, mark writable, install PTE, retry
+    if PTE missing because stack growth area:
+        extend the VMA, allocate, install
+    if permission mismatch (write to RO, exec to NX):
+        SIGSEGV
+```
+
+Classes of page fault:
+
+- **Minor** — no I/O needed (zero page, COW, freshly-mapped
+  anonymous). Microseconds.
+- **Major** — needs disk I/O (swap-in, demand-load from a
+  file). Milliseconds.
+
+`ps -o min_flt,maj_flt -p <pid>` and `vmstat`'s `pgmajfault`
+report these.
+
+## VMAs — the kernel's view of a process's address space
+
+Each process's `mm_struct` holds a list (and red-black tree)
+of **Virtual Memory Areas** (`vm_area_struct`). Each VMA
+describes a contiguous range of virtual addresses with:
+
+- Address range [start, end).
+- Permissions (R/W/X).
+- Backing: anonymous (zero-fill), file-backed (`mmap` of a
+  file), or device.
+- Flags (shared/private, growable for stack, etc.).
+
+Look at any running process:
+
+```
+$ cat /proc/$$/maps
+55b8e3b96000-55b8e3b97000 r--p 00000000 ... /usr/bin/bash
+55b8e3b97000-55b8e3c30000 r-xp 00001000 ... /usr/bin/bash
+55b8e3c30000-55b8e3c52000 r--p 0009a000 ... /usr/bin/bash
+55b8e3c52000-55b8e3c56000 r--p 000bc000 ... /usr/bin/bash
+55b8e3c56000-55b8e3c5f000 rw-p 000c0000 ... /usr/bin/bash
+7f...                     [heap]
+7f...                     [stack]
+7f...                     [vdso]
+7f...                     /lib/x86_64-linux-gnu/libc.so.6
+...
+```
+
+Each line is one VMA. `r-xp` = read/execute, private. `[heap]`
+grows via `brk()`. `[stack]` grows down on access. Shared
+libraries are file-backed mappings.
+
+A process that touches a virtual address with no VMA: SIGSEGV.
+
+## Memory protection — what the PTE bits buy you
+
+- **R/W bit** lets the kernel make `.text` (code) read-only;
+  any attempt to write triggers SIGSEGV. Catches bugs that try
+  to modify code.
+- **U/S bit** keeps user code from touching kernel pages even
+  if the address translation works.
+- **NX bit** lets the kernel mark non-code pages
+  non-executable. Stack and heap are NX by default since
+  ~2005. Defeats classic stack-injected shellcode (you can
+  still ROP — see *security/buffer-overflow-mitigations* in the
+  security topic).
+
+These bits are checked **in hardware** during every
+translation. There's no syscall for "is this access allowed";
+the MMU rejects bad accesses by raising a fault.
+
+## Address space layout — what's mapped where
+
+On x86-64 Linux:
+
+```
+0x0000000000000000 ─┐
+                    │  user space (128 TB)
+                    │  ├─ code (.text)
+                    │  ├─ data + bss
+                    │  ├─ heap (grows up via brk)
+                    │  ├─ mmap region (libraries, anon mmaps)
+                    │  └─ stack (grows down)
+0x00007FFFFFFFFFFF ─┘
+                       ← canonical hole (unused; address must be sign-extended)
+0xFFFF800000000000 ─┐
+                    │  kernel space (128 TB) — same in every process
+                    │  ├─ direct-map of all physical RAM
+                    │  ├─ vmalloc area
+                    │  └─ kernel code, modules
+0xFFFFFFFFFFFFFFFF ─┘
+```
+
+The kernel is in every process's address space (in the upper
+half), but the U/S bit keeps user code out. This is what
+makes a syscall just a privilege change, not an address-space
+change — the kernel is already "there."
+
+KPTI (Meltdown mitigation) actually does map kernel space out
+of user CR3, switching CR3 on syscall entry. Costs ~30% on
+syscall-heavy workloads.
+
+## ASLR — randomizing the layout
+
+**Address Space Layout Randomization** picks random base
+addresses for the heap, stack, libraries, and (with PIE) the
+executable itself. Defeats attacks that need to know where
+specific code lives (return-to-libc, ROP gadget chains).
+
+On Linux, controlled via `/proc/sys/kernel/randomize_va_space`:
+
+- 0 = off.
+- 1 = randomize stack + libraries.
+- 2 = also randomize heap (default).
+
+Each `mmap` of a library lands at a different address per
+process. Restart the program, different addresses. Attackers
+need an info leak to discover the layout first.
+
+## Demand paging — laziness as a feature
+
+When you `exec` a binary, the kernel doesn't load all 50MB.
+It sets up VMAs for the code, data, and a stack — all PTEs
+"not present." First access faults; handler reads just that
+page from disk; installs PTE; retries.
+
+Same for anonymous memory: `malloc(1GB)` allocates the VMA
+(virtual range) but no physical pages. First write to each
+page faults to a fresh zero page. If you never write to it, it
+costs zero physical RAM.
+
+This is why `ps`'s VSZ (virtual size) and RSS (resident set
+size) differ so much. VSZ counts what's in the VMA list; RSS
+counts pages actually backed.
+
+## Huge pages
+
+Two flavors on Linux:
+
+- **THP** (Transparent Huge Pages) — the kernel opportunistically
+  combines 4KB pages into 2MB ones when possible. Off/on/madvise.
+  Default `madvise` on most distros. Cuts TLB pressure for
+  large working sets but can cause latency spikes during
+  compaction.
+- **HugeTLB** — explicit. You reserve huge pages via
+  `/proc/sys/vm/nr_hugepages` and `mmap` with `MAP_HUGETLB`.
+  Used by databases (Oracle, Postgres `huge_pages=on`) and HFT
+  apps that need predictable performance.
+
+For most apps you don't need to think about it. For large-
+working-set workloads, 1–2 GB hugepages can cut p99 latency by
+removing TLB misses from the hot path.
+
+## The mental model
+
+Virtual memory is a level of indirection: every process sees
+its own address space, the MMU translates accesses through
+page tables, the TLB caches the translations. Pages are the
+unit of allocation, protection, and sharing.
+
+The kernel uses the indirection to give you: process isolation
+(separate page tables), shared libraries (same physical pages
+mapped into many processes), demand loading (don't allocate
+until touched), copy-on-write fork (share until written),
+swap (move cold pages to disk), and `mmap` (treat a file like
+memory).
+
+Every one of those is "the kernel manipulates page tables on
+your behalf." Most performance problems labeled "memory" are
+actually "TLB pressure" or "page fault rate." If you understand
+the translation pipeline, you have the vocabulary to debug
+them.

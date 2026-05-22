@@ -1,0 +1,284 @@
+export const level = 'mid';
+
+# mmap and copy-on-write
+
+`mmap` lets you treat a file (or a chunk of anonymous memory)
+as if it were a region of your address space — load/store
+instructions touch the file. **Copy-on-write** lets two
+processes share a page until one of them tries to write, at
+which point the kernel transparently duplicates it. Both are
+applications of the same trick: lying with the page tables.
+
+## What mmap does
+
+```c
+void *p = mmap(addr, length, prot, flags, fd, offset);
+```
+
+The kernel:
+
+1. Picks a virtual address range (or uses the one you hinted).
+2. Creates a VMA covering it.
+3. Returns the pointer.
+4. **Does not load any data.** Pages are not present.
+
+When you access `p[100]`, you take a page fault. The handler:
+
+- Reads the relevant 4KB from the file at `offset + (100/4096)*4096`.
+- Allocates a physical page, copies the data in.
+- Installs the PTE.
+- Retries your instruction. Now `p[100]` is a normal memory
+  access.
+
+The first read of each page is the page-fault penalty; after
+that it's at memory speed.
+
+## Flags that matter
+
+```c
+mmap(NULL, len, PROT_READ | PROT_WRITE, FLAGS, fd, offset);
+```
+
+| Flag | Meaning |
+|---|---|
+| `MAP_PRIVATE` | Writes don't go back to the file; COW from the file. |
+| `MAP_SHARED` | Writes go back to the file; visible to other mappers. |
+| `MAP_ANONYMOUS` | No file backing; pages zero-filled on first touch. |
+| `MAP_FIXED` | Use this exact address (rare; mostly for runtimes). |
+| `MAP_POPULATE` | Pre-fault all pages now (no demand paging). |
+| `MAP_HUGETLB` | Use huge pages. |
+| `MAP_NORESERVE` | Don't reserve swap space (can OOM on first write). |
+
+Combinations you see:
+
+| Combo | What it is |
+|---|---|
+| `MAP_PRIVATE` + file | Loading shared libraries; reading a file as if memory. |
+| `MAP_SHARED` + file | Writing a file via memory; persistent data structures. |
+| `MAP_PRIVATE | MAP_ANONYMOUS` | Standard heap chunks (what `malloc` uses for big allocs). |
+| `MAP_SHARED | MAP_ANONYMOUS` | Shared memory between forked children. |
+
+## mmap vs read/write
+
+A `read(fd, buf, n)`:
+
+```
+disk ──→ kernel page cache ──→ copy ──→ user buffer
+```
+
+Two-step: kernel reads into page cache, then **copies** to
+your buffer.
+
+A `mmap` access of a file:
+
+```
+disk ──→ kernel page cache ──→ direct map into your address space
+```
+
+Zero copy. The same physical page is in the page cache and in
+your address space. Cheaper for large files, more flexible
+(random access without seeks).
+
+But `mmap` isn't always better:
+
+- Page-fault overhead for the first access of each page.
+- Translating "fault on access" into your error handling is
+  harder than "read returned -1."
+- Memory pressure can evict cached pages, so subsequent reads
+  re-fault.
+- Doesn't work for streaming (pipes, sockets — you can't mmap
+  a socket).
+
+Rule of thumb:
+
+- **Streaming sequential reads** → `read` is fine, faster
+  because of readahead optimization.
+- **Random access, big file** → `mmap` is great.
+- **Modifying a file in place, often** → `mmap` + `MAP_SHARED`.
+- **Inter-process shared memory** → `mmap` + `MAP_SHARED` +
+  `MAP_ANONYMOUS` (or `shm_open` + `mmap`).
+
+## How madvise tunes mmap
+
+`madvise(addr, len, advice)` gives the kernel hints:
+
+| Hint | Meaning |
+|---|---|
+| `MADV_SEQUENTIAL` | I'll access in order; prefetch more, evict early. |
+| `MADV_RANDOM` | Random access; don't bother prefetching. |
+| `MADV_WILLNEED` | Pre-fault these pages soon. |
+| `MADV_DONTNEED` | Free the pages now (re-fault on next access). |
+| `MADV_HUGEPAGE` | Try to use huge pages here. |
+| `MADV_NOHUGEPAGE` | Don't combine into huge pages. |
+| `MADV_FREE` | Lazy free — kernel can reclaim when needed. |
+
+`MADV_DONTNEED` is the classic "I'm done with this section,
+take it back." Allocators use it to return memory to the OS.
+
+## Copy-on-write fork — the big payoff
+
+When you `fork`, the kernel doesn't copy the parent's memory.
+It:
+
+1. Copies the page tables.
+2. Marks **all writable pages read-only in both parent and
+   child**.
+3. Returns.
+
+The child sees the same data, instantly, regardless of
+process size. A 10GB process forks in microseconds.
+
+What happens on first write:
+
+```
+child writes to page P:
+  CPU: page is read-only → page fault
+  Handler: notice this is a COW page (flag in VMA)
+    → allocate new frame, copy data
+    → mark new frame writable, install in child's PTE
+    → if parent was the last sharer, mark parent's PTE writable too
+  Retry the write
+```
+
+Cost: one page fault per page first-written. If child immediately
+`exec`s (the common case), almost no copies happen — `exec`
+unmaps everything and starts fresh.
+
+## When COW backfires
+
+A 10GB Redis process forks for BGSAVE. Initially the child uses
+~0 extra memory. Then writes start happening — every write to a
+unique page makes a copy. By the time the snapshot finishes,
+the child can have copied **a large fraction of the working
+set**, briefly doubling memory use.
+
+This is the classic "Redis fork OOM" story: fine 99% of the
+time, OOM-killed during a bursty write window. Mitigations:
+
+- Disable transparent huge pages — THP makes COW copy 2MB at a
+  time, amplifying the issue.
+- Use `vm.overcommit_memory=1` so the fork doesn't fail.
+- Tune `maxmemory` to leave headroom.
+
+Postgres uses the same pattern (fork-per-connection). Java's
+old "CMS GC + fork heap snapshot" interaction had the same
+class of problem.
+
+## fork + exec is COW + tear-down
+
+`fork` shares everything via COW. `exec` then:
+
+1. Unmaps the entire old address space (most of which was
+   still shared with parent — no copies happened).
+2. Maps the new binary's segments.
+3. Sets new stack/heap.
+4. Jumps to the new entry point.
+
+Cost: cheap if the child fork-then-exec's quickly. Expensive
+if the child runs a while before exec (each touched page
+copies).
+
+Shells, build systems, Python's `subprocess` all do this all
+day.
+
+## Anonymous mmap as a malloc backend
+
+For allocations larger than a threshold (~128KB on glibc),
+malloc uses `mmap(MAP_ANONYMOUS)` directly instead of growing
+the heap via `brk`. Two reasons:
+
+- Independent munmap — free a big allocation right back to the
+  OS.
+- No fragmentation in the central heap.
+
+Try it:
+
+```c
+void *p = malloc(1024 * 1024);  // probably mmap'd
+free(p);                          // probably unmapped back to OS
+
+void *q = malloc(64);            // probably from heap
+free(q);                          // stays in heap (free list)
+```
+
+`strace -e brk,mmap ./your_prog` shows the split.
+
+## Shared memory via mmap
+
+Two processes can share memory via `mmap` of a common file:
+
+```c
+// Process A: create
+int fd = shm_open("/myshm", O_CREAT|O_RDWR, 0600);
+ftruncate(fd, 4096);
+void *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+
+// Process B: attach
+int fd = shm_open("/myshm", O_RDWR, 0);
+void *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+
+// Both see the same memory. Synchronize externally.
+```
+
+`shm_open` is POSIX shared memory; backed by a special tmpfs
+mount (`/dev/shm`). Same idea as SysV `shmget` but with a
+saner API.
+
+Use for IPC where you need bulk data flow without syscalls per
+message. Add a futex on a shared word for signaling. This is
+how things like database shared buffer pools work.
+
+## Memory-mapped files in production
+
+**Use cases:**
+
+- Loading large datasets that don't fit in RAM (read partial
+  via page faults).
+- Read-only data structures shared across processes (e.g.,
+  Bloom filters, dictionaries).
+- Append-only logs that survive crashes (LevelDB, RocksDB use
+  this).
+- Persistent data structures (sqlite's mmap mode).
+
+**Pitfalls:**
+
+- A truncated file under your mmap causes SIGBUS on access to
+  the truncated range. Don't truncate mapped files.
+- A write to a `MAP_SHARED` file may not hit disk until
+  `msync` or `fsync`. Use `msync(MS_SYNC)` to flush.
+- Page-cache eviction can re-fault pages you thought were
+  cached. Use `mlock` to pin if needed.
+- On 32-bit, address-space exhaustion is real (4GB total).
+
+## Use COW deliberately, with caveats
+
+Beyond fork, **explicit COW** is a powerful technique:
+
+- Copy a versioned snapshot of a data structure by mapping the
+  same pages read-only and writing in a new VMA on change.
+  Implemented in `liburing`'s `IORING_OP_MMAP` and in some
+  persistent data structures.
+- Filesystems do it: ZFS, Btrfs, APFS all use COW at the block
+  layer. Snapshot is cheap; modifications write to a new block.
+
+The cost is always paid on the first write to the shared
+page/block. If your access pattern is read-many-write-rare,
+COW is essentially free.
+
+## The mental model
+
+`mmap` is "treat this file (or empty memory) as if it were
+RAM." Page faults bring in pieces on demand; writes can be
+private (COW from file) or shared (back to file).
+
+Copy-on-write is "two address spaces share a page; we'll only
+duplicate it when somebody tries to change it." Same page-
+table-lying trick — different motivation. fork uses it to make
+process creation cheap, file mmap uses it for private
+modifications without dirtying the file.
+
+Both are why `fork()` is microseconds and why a 10GB process
+can mmap a 1TB file and only pay for the bits you read. The
+unifying theme: **the page table is the only ground truth; the
+kernel can rewrite it to say whatever it wants, and the
+hardware enforces the consequences.**

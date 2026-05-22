@@ -1,0 +1,324 @@
+export const level = 'senior';
+
+# Page replacement algorithms
+
+You have 16GB of RAM, 64GB of process address spaces, and a
+20GB hot working set. Pages have to come in and out of physical
+memory all day. The choice of **which page to evict** when a
+new one needs a frame is the whole game — pick the right one
+and the program runs at memory speed; pick wrong and it grinds
+on disk.
+
+## The setup
+
+Each frame in physical memory holds one virtual page. When a
+page fault wants to bring in a new page and **no free frame
+exists**, the kernel must pick a **victim** to evict:
+
+- If the victim is **clean** (matches the file or swap on
+  disk), just toss it — no I/O.
+- If **dirty**, write it back first.
+
+The algorithms below differ in how they pick the victim. The
+goal: minimize **page faults**.
+
+## OPT — the optimal (impossible) baseline
+
+Belady, 1966. Evict the page that will be referenced **farthest
+in the future**. Provably minimizes page faults.
+
+Requires knowledge of future accesses. **You can't implement
+it.** It's the yardstick: how close does your real algorithm
+get to OPT?
+
+## FIFO — the bad baseline
+
+Keep a queue of pages in load order. Evict the oldest. Simple.
+
+```
+Pages: 1 2 3 4 1 2 5 1 2 3 4 5     (3 frames)
+Faults:F F F F F F F     F F F      → 9 faults
+
+       1 2 3 4 1 2 5 1 2 3 4 5     (4 frames)
+       F F F F     F     F F F F   → 10 faults
+```
+
+Notice: **more frames produced more faults** (9 → 10). That's
+**Belady's anomaly** — FIFO can get worse with more memory.
+
+Unused in modern systems. Listed for pedagogy and as a warning.
+
+## LRU — the workhorse
+
+Least Recently Used. Evict the page not touched for the
+longest. Reasoning: temporal locality says recent accesses
+predict future accesses.
+
+Provably never suffers Belady's anomaly. Performs close to OPT
+in practice.
+
+**The implementation problem**: tracking exact LRU order
+requires updating a per-page "last used" timestamp on **every
+memory access**. Not feasible at hardware speeds. So real
+systems approximate LRU.
+
+## Clock (second chance) — the practical LRU
+
+The MMU sets an **access bit** in the PTE on first access.
+That's the only per-access cost. The OS reads it periodically.
+
+Organize frames in a circular list. Maintain a "hand" pointer.
+
+```
+                  ┌──────┐
+                  │  P1  │ A=1
+                  └──────┘
+                ▲           ▼
+          ┌──────┐         ┌──────┐
+          │  P0  │ A=0     │  P2  │ A=1
+          └──────┘         └──────┘
+                ▲           ▼
+                  ┌──────┐
+                  │  P3  │ A=0 ← hand here, evict candidate
+                  └──────┘
+```
+
+Replace algorithm:
+
+```
+while (true) {
+    p = page at hand
+    if (p.access_bit == 0) {
+        evict p; install new page; advance hand; return
+    } else {
+        p.access_bit = 0  // give it a second chance
+        advance hand
+    }
+}
+```
+
+Hot pages keep getting their access bit set before the hand
+reaches them; cold pages don't. The hand evicts the first
+cold page it finds.
+
+Excellent approximation of LRU at near-zero overhead.
+
+## Two-handed clock and Linux's two-list
+
+The basic clock can evict popular pages if the hand moves slow
+enough that they don't get re-touched in time. **Two-handed
+clock**: one hand clears access bits, the other (lagging)
+evicts. Tunable gap.
+
+**Linux uses a two-list approximation of LRU**:
+
+- **Active list** — pages recently used.
+- **Inactive list** — candidates for eviction.
+
+Page lifecycle:
+
+```
+new mapping ───→ inactive (head)
+                       │
+            on access  ▼
+                  inactive (still)
+            two accesses (or first access if file-cache)
+                       ▼
+                  active list
+                       │
+        page age-out   ▼
+                  inactive (head)
+                       │
+                       ▼
+                  eviction candidate (tail of inactive)
+```
+
+A page must be "inactive for a while" before it gets evicted —
+prevents a single access from rescuing a page that's been cold
+for hours. `kswapd` (or direct reclaim under memory pressure)
+scans the inactive list tail.
+
+## NRU — Not Recently Used
+
+A coarser cousin. Every page has an access bit (set by HW on
+read) and a dirty bit (set on write). Periodically, the OS
+clears all access bits. Pages get categorized:
+
+| Class | Accessed | Dirty | Cost to evict |
+|---|---|---|---|
+| 0 | no | no | cheapest |
+| 1 | no | yes | write back |
+| 2 | yes | no | low-medium |
+| 3 | yes | yes | highest |
+
+Evict a random page from the lowest non-empty class.
+
+Crude but cheap. Not used by mainstream OSes anymore (clock
+dominates).
+
+## WSClock — the working set + clock combo
+
+Track each page's **last reference time** in addition to the
+access bit. Define the **working set** as pages referenced in
+the last τ (tau) time units.
+
+Modified clock: when hand hits a page, if access bit is 0 AND
+page is outside the working set (current_time - last_ref > τ),
+evict. If access bit was 1, clear it AND record current_time
+as last_ref.
+
+Combines locality info (working set) with the cheap clock
+mechanism. Used in 4.4BSD; influenced subsequent designs.
+
+## Working set model
+
+Peter Denning, 1968. The **working set** WS(t, τ) is the set
+of pages a process has referenced in the last τ time units.
+Properties:
+
+- The working set changes slowly relative to individual
+  references (locality).
+- A program runs efficiently iff its working set fits in
+  physical memory.
+- The OS should allocate ≥ |WS(t,τ)| frames to each process.
+
+If the sum of working sets exceeds RAM → **thrashing**: every
+process is constantly faulting in pages that get evicted before
+it can use them. CPU utilization plummets; disk is saturated.
+
+## Thrashing — when it all goes wrong
+
+Symptoms:
+
+- CPU utilization low (often `<10%`) but everything feels slow.
+- Disk light always on.
+- High `pgmajfault` rate.
+- `iostat` shows the swap device saturated.
+
+Causes:
+
+- More processes than RAM can hold.
+- A process whose working set exceeds RAM (e.g., random-access
+  on a 200GB dataset with 16GB RAM).
+- Misconfigured Java heap > physical RAM minus other tenants.
+
+Recovery:
+
+- Kill or suspend processes (admission control).
+- Add RAM.
+- Reduce working set (smaller heap, working with smaller
+  chunks of data).
+- Sequential I/O instead of random (helps page cache, hurts
+  less than swap).
+
+Linux's `vm.swappiness` (0–100) tunes the trade-off between
+swapping anonymous memory and dropping file-cache. Lower =
+prefer dropping cache. Default 60. Some workloads (databases
+managing their own cache) set it to 1 or 10.
+
+## Frame allocation across processes
+
+How many frames does each process get?
+
+- **Equal allocation** — each process gets N/k frames. Unfair
+  (small program wastes, large program thrashes).
+- **Proportional** — frames in proportion to virtual size.
+  Better, still ignores working-set dynamics.
+- **Priority-based** — high-prio processes get more; low-prio
+  donate frames when pressured.
+
+**Global vs local** replacement:
+
+- **Local** — each process replaces only its own frames. Other
+  processes are unaffected by its faults. Predictable per
+  process; bad utilization if one process is idle.
+- **Global** — any process's fault can evict any other
+  process's page. Better utilization; worse isolation. Real
+  systems use this with hints (cgroups limit who can take
+  whose pages).
+
+Linux is global with cgroup memory controllers as the
+isolation knob.
+
+## Real-OS replacement summary
+
+| OS | Algorithm |
+|---|---|
+| Linux | Two-list LRU approximation; aging, refault distance |
+| FreeBSD | Two-handed clock (vm pageout) |
+| Windows | Working set with manager threads per process |
+| macOS | Clock + working set; LZ4 page compression before swap |
+
+Modern Linux is significantly more sophisticated than
+textbook clock — it tracks **refault distance** (if a page is
+evicted then re-faulted soon, the inactive list was too short
+for the working set; adjust). Multi-Gen LRU (MGLRU, since
+6.1) further generalizes the two-list approach with N
+generations.
+
+## Pre-paging, swap, and zswap
+
+**Demand paging** brings pages in one fault at a time.
+**Pre-paging** brings in several adjacent pages on a fault
+(speculative). Works for sequential file reads (readahead);
+worse for random access.
+
+**Swap** = backing store for anonymous pages (heap, stack,
+anonymous mmaps). When the kernel evicts a dirty anonymous
+page with no file backing, it writes to swap.
+
+**zswap / zram** = compressed swap in RAM. Use a chunk of
+RAM as a compressed cache for swapped pages. Faster than
+disk swap; useful on memory-constrained systems (Android,
+Chromebooks, low-RAM servers).
+
+## Belady's anomaly
+
+We saw it above with FIFO: adding frames can *increase* page
+faults. Algorithms that don't satisfy the **stack property**
+(if memory size grows, the set of in-memory pages includes
+the smaller-memory set) can exhibit it.
+
+FIFO doesn't satisfy stack property. LRU does — adding frames
+to LRU can only help. This is one reason LRU and its
+approximations dominate.
+
+## How to inspect
+
+```bash
+# Page fault rates
+sar -B 1                          # major/minor faults per sec
+vmstat 1                          # 'si' swap-in, 'so' swap-out
+
+# Per-process resident vs virtual
+ps -eo pid,rss,vsz,maj_flt,min_flt,cmd --sort -rss | head
+
+# Detailed memory usage of a process
+cat /proc/<pid>/status            # VmRSS, VmSwap, VmData, ...
+cat /proc/<pid>/smaps             # per-VMA pages
+
+# Whole-system page cache and slab usage
+cat /proc/meminfo
+free -h
+```
+
+High `pgmajfault` + high `si`/`so` rate = thrashing or
+heavy swap traffic. Drop caches (`echo 3 > /proc/sys/vm/drop_caches`,
+careful in prod) and watch behavior — clears file-cache pressure
+to see if the problem persists.
+
+## The mental model
+
+You can't keep everything in RAM. The OS picks pages to evict
+based on a clock-walk that approximates "least recently
+used." The active/inactive split keeps recently-used pages
+safe. The working set has to fit in memory or you thrash.
+
+For application performance: **shrink your working set**.
+Smaller data structures, streaming I/O, locality of access. If
+your working set is fundamentally bigger than RAM, you're in
+swap, and the only fix is more RAM or smaller chunks of work.
+
+For systems work: tune `vm.swappiness`, watch refault
+distance, use cgroups to bound memory per service. The OS does
+the rest.

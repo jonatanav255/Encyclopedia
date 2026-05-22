@@ -1,0 +1,238 @@
+export const level = 'mid';
+
+# Context switching
+
+A context switch is the kernel changing which thread is running
+on a CPU. It happens millions of times a second on a busy
+server. It looks simple — save these registers, load those — but
+the indirect costs (cache, TLB, branch predictor) often dominate
+the direct ones, and "minimize context switches" is the entire
+design driver behind async runtimes, batched I/O, and CPU
+pinning.
+
+## The mechanics
+
+Steps the kernel takes to switch from thread A to thread B:
+
+1. **Save A's CPU state** to A's kernel stack: general-purpose
+   registers, RIP, RFLAGS, SP. (FPU/SIMD state is saved lazily
+   in some kernels.)
+2. **Update A's scheduling info**: time slice used, accumulated
+   vruntime.
+3. **Pick B** from the runqueue (this is "the scheduler").
+4. **Switch address spaces** if B is in a different process:
+   write B's page table root to CR3. Costs a TLB flush (mostly —
+   PCID tags help).
+5. **Restore B's CPU state** from B's kernel stack.
+6. **Return to user mode** with B's RIP / RFLAGS.
+
+On Linux this is `__schedule` → `context_switch` → `switch_to`
+(arch-specific assembly). The arch-specific part is ~20
+instructions; the rest is bookkeeping.
+
+## Direct cost — the obvious part
+
+On a modern x86-64 with PCID and no Spectre mitigations, the
+direct switch is ~1–3µs:
+
+| Step | Cost |
+|---|---|
+| Save/restore GPRs | ~50 cycles |
+| Switch CR3 (same process — no-op) | 0 |
+| Switch CR3 (cross-process) | ~100 cycles + TLB cost |
+| KPTI: switch CR3 in/out of kernel | ~200 cycles |
+| Spectre v2 IBPB / IBRS barriers | +500–2000 cycles |
+
+3µs sounds tiny. At 100,000 switches/sec per core (a chatty
+event loop) that's 30% of one core spent on switching alone,
+before counting indirect costs.
+
+## Indirect cost — the cache
+
+The thread you switched away from was probably hot in cache:
+
+- **L1d** (~32KB): its recent stack frames, hot variables.
+- **L1i** (~32KB): its recent instructions.
+- **L2** (~1MB): more of the same.
+- **TLB** (~64–1500 entries): its recent virtual address
+  translations.
+- **Branch predictor**: trained on its branches.
+- **Return stack buffer**: the chain of return addresses it's
+  about to use.
+
+The thread you switched *to* sees a cold cache. Its first
+million instructions will hit L3 or main memory — 100x slower
+than L1. This **cache pollution penalty** can be 10–100µs of
+effective slowdown after a switch, depending on working set
+size.
+
+This is why **CPU affinity** matters. If thread A runs on CPU 0,
+gets switched out, and runs again on CPU 7, it inherits CPU 7's
+cache (which is full of someone else's data). Same CPU = some
+warmth left over.
+
+## When the kernel switches
+
+Three reasons:
+
+1. **Voluntary**: thread calls a blocking syscall (read on
+   socket with no data, mutex acquire when contended, sleep).
+   The kernel marks the thread as not-runnable and picks
+   someone else.
+2. **Involuntary preemption**: the thread used up its time
+   slice. The timer interrupt fires, the scheduler decides
+   somebody else's turn.
+3. **Wake-up**: a higher-priority thread became runnable
+   (interrupt-driven wakeup) and the kernel preempts the
+   current one to run it.
+
+`vmstat 1` reports both `cs` (context switches/sec) and `in`
+(interrupts/sec). High cs with low in suggests blocking
+syscalls; high both suggests interrupt-driven wakeups (network
+traffic, disk completions).
+
+## Voluntary vs involuntary — what `pidstat` shows
+
+```bash
+$ pidstat -w 1
+   PID  cswch/s nvcswch/s  Command
+  1234   3200.0     12.0   my-server  # voluntary: blocking on something
+  5678     5.0   2000.0     hot-loop  # involuntary: hitting time slice
+```
+
+- `cswch/s` — voluntary. The thread blocked (waiting on I/O,
+  lock, sleep). Usually fine.
+- `nvcswch/s` — involuntary. The thread was forced off the CPU
+  because its slice expired or a higher-priority thread woke.
+  High value means CPU contention.
+
+A CPU-bound thread should have ~0 voluntary switches. A network
+service should have many voluntary switches and few involuntary
+ones. Anomalies are clues.
+
+## Why thread pools and async runtimes help
+
+Async runtimes (Tokio, Go) cut context switches by running many
+**logical** tasks on a few kernel threads. When a task awaits an
+I/O, the runtime parks it (no kernel context switch — just
+update a pointer in user space) and picks another task on the
+same kernel thread.
+
+```
+Thread-per-request (1000 active reqs):
+  1000 kernel threads × O(switches per request) → millions of switches
+
+Async (1000 active tasks, 8 kernel threads):
+  8 kernel threads each looping through queued tasks → few thousand switches
+```
+
+The remaining switches are between kernel threads, IRQs, and
+GC threads. The application's "context switches" are pointer
+updates inside the runtime.
+
+This is why a Go server can hit 200K req/s on a few cores while
+a naive "thread per request" Java server caps at 5K.
+
+## CPU pinning and `taskset`
+
+Pin a thread to specific CPUs to keep its cache warm:
+
+```bash
+taskset -c 2,3 ./my-server         # only run on CPUs 2 and 3
+taskset -c -p 2,3 12345            # change pinning of running PID
+```
+
+Or in code:
+
+```c
+cpu_set_t mask;
+CPU_ZERO(&mask);
+CPU_SET(2, &mask);
+sched_setaffinity(0, sizeof(mask), &mask);
+```
+
+Pinning trades flexibility for predictability. Used heavily in
+network appliances (DPDK pins per-queue threads), high-frequency
+trading, and game engines.
+
+## NUMA — when "the cache" is on another socket
+
+On a NUMA system (multi-socket server), memory is attached to a
+specific socket. Accessing memory on the "remote" socket is
+~1.5–2x slower than "local."
+
+A context switch that moves a thread to a different NUMA node
+penalizes every subsequent memory access until the working set
+migrates. The Linux scheduler tries to keep threads on their
+"home" node via NUMA balancing, but it's heuristic. For
+performance-critical work, pin threads and memory together:
+
+```bash
+numactl --cpunodebind=0 --membind=0 ./my-app
+```
+
+## Process-to-process is more expensive than thread-to-thread
+
+Switching between threads in the **same process** doesn't change
+page tables — CR3 stays the same, TLB stays warm. Same-process
+switches are the cheap ones.
+
+Switching between **different processes** changes CR3, which on
+pre-PCID hardware flushed the entire TLB. PCID (Linux 4.14+) tags
+TLB entries by process so they survive — but cache lines from the
+old process are still cold.
+
+This is part of why fork-then-thread (Apache prefork → worker)
+beats fork-then-fork (pure prefork): inside one process, switches
+are cheap.
+
+## Cooperative vs preemptive
+
+Most kernel schedulers (Linux CFS, Windows, macOS) are
+**preemptive**: the timer can switch you off at any instruction.
+You don't choose.
+
+User-space schedulers tend to be **cooperative**: a task runs
+until it `await`s. The runtime can't switch a task in the middle
+of a synchronous block of code. This is fast (no preemption
+machinery) but a bug-prone footgun:
+
+```go
+// Pre-Go 1.14: this could starve every other goroutine on the same OS thread.
+for {
+    // CPU-bound, no I/O, no Gosched
+}
+```
+
+Go 1.14+ added preemption based on function preludes
+(signal-based). Tokio still asks you to call `tokio::task::yield_now()`
+periodically inside long compute loops.
+
+## How to measure
+
+```bash
+vmstat 1                  # cs column
+pidstat -w 1              # per-process voluntary/involuntary
+perf stat -e context-switches,cpu-migrations ./prog
+perf sched record / report  # detailed scheduler tracing
+```
+
+For "is this app context-switching itself to death," `perf stat
+-e context-switches sleep 10` while it runs gives you the rate.
+>100K/sec on a small machine is usually a sign of bad
+synchronization (cache-line ping-pong between threads, or a
+mutex contended too hard).
+
+## The mental model
+
+A context switch is cheap directly (microseconds) and expensive
+indirectly (cache misses for milliseconds afterward). The kernel
+does what you asked; the cost is in what the *next* memory
+access does after the switch.
+
+Reduce switches by: keeping work on the same CPU (pinning,
+affinity), batching I/O (io_uring, vDSO), and using async
+runtimes for high-concurrency I/O instead of one kernel thread
+per task. Most performance problems labeled "the OS is slow" are
+actually "we're context-switching faster than we're getting work
+done."

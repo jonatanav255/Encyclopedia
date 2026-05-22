@@ -1,0 +1,261 @@
+export const level = 'senior';
+
+# NUMA and memory bandwidth
+
+A single-socket server is a UMA (Uniform Memory Access)
+machine: every core sees memory at the same latency. A two-
+or four-socket server is **NUMA** (Non-Uniform): each socket
+has its own memory controller, and accessing memory across
+sockets is meaningfully slower. Once you have 32+ cores, you
+are on a NUMA box, and ignoring it costs you 20-50% of your
+performance.
+
+## The topology
+
+```
+┌────────────── Node 0 ──────────────┐    ┌────────────── Node 1 ──────────────┐
+│  ┌─────────┐  ┌─────────┐         │    │  ┌─────────┐  ┌─────────┐         │
+│  │ Core 0  │  │ Core 1  │  ...    │    │  │ Core 16 │  │ Core 17 │  ...    │
+│  └─────────┘  └─────────┘         │    │  └─────────┘  └─────────┘         │
+│            L3 cache                │    │            L3 cache                │
+│            └── Memory Ctrl ────────┼────┼──── Memory Ctrl ─┘                │
+│                    │               │UPI │              │                    │
+│            ┌───────┴───────┐       │←───→       ┌───────┴───────┐           │
+│            │  DDR DDR DDR  │       │    │       │  DDR DDR DDR  │           │
+│            └───────────────┘       │    │       └───────────────┘           │
+└────────────────────────────────────┘    └────────────────────────────────────┘
+
+Local access (Node 0 → Node 0 memory): ~80 ns
+Remote access (Node 0 → Node 1 memory): ~140 ns
+```
+
+Intel uses UPI (Ultra Path Interconnect, formerly QPI). AMD
+uses Infinity Fabric. The interconnect has bandwidth limits and
+adds latency.
+
+```bash
+$ numactl --hardware
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+node 0 size: 128842 MB
+node 1 cpus: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+node 1 size: 128977 MB
+node distances:
+node   0   1
+  0:  10  21    ← relative latencies (10 = local)
+  1:  21  10
+```
+
+The `21` vs `10` says cross-socket access costs ~2× the
+latency of local. Real bandwidth measurements often show
+1.5–2× ratio.
+
+## First-touch policy
+
+When you allocate memory on Linux (and most OSes), no physical
+pages are allocated yet. **The first CPU to touch the page
+gets to allocate it on its local NUMA node.** This is the
+"first-touch" policy.
+
+Consequence: if thread T0 (on node 0) does `memset(buf, 0, n)`
+to initialize a buffer, every page lands on node 0 — even if
+T1 (on node 1) will be the main user. T1's accesses are then
+all remote.
+
+Fix: parallel initialization, where each thread touches the
+range it'll later use:
+
+```c
+#pragma omp parallel for
+for (int i = 0; i < N; i++) {
+    buf[i] = 0;   // each thread touches "its" pages on its own node
+}
+```
+
+This is a real bug in numerics codes; ignoring it can halve
+performance.
+
+## numactl — pinning memory and CPUs
+
+```bash
+# Run process on node 0 CPUs, allocate from node 0 only:
+numactl --cpunodebind=0 --membind=0 ./myapp
+
+# Spread allocations across all nodes (interleave):
+numactl --interleave=all ./myapp
+
+# Inspect: how much of a process's memory is on which node?
+numastat -p <pid>
+
+# Per-node memory stats:
+numastat -m
+```
+
+For databases and big servers, `--interleave=all` is a common
+default — it sacrifices local-locality for bandwidth (you get
+the sum of all memory controllers' bandwidth) and removes the
+risk of one node's memory filling up while another has free.
+
+For HFT/low-latency, pin everything to one node — you take the
+single-node bandwidth and capacity hit in exchange for
+predictable latency.
+
+## libnuma — programmatic control
+
+```c
+#include <numa.h>
+
+if (numa_available() < 0) { /* not a NUMA system */ }
+
+// Allocate explicitly on node 0:
+void *p = numa_alloc_onnode(SIZE, 0);
+
+// Bind current thread to a node's CPUs:
+struct bitmask *mask = numa_allocate_cpumask();
+numa_node_to_cpus(0, mask);
+numa_sched_setaffinity(0, mask);
+
+// Move pages between nodes:
+move_pages(pid, count, pages, nodes, status, MPOL_MF_MOVE);
+```
+
+Used by databases (Postgres, MySQL when configured) and
+in-memory data grids.
+
+## When NUMA hurts the most
+
+- **Memory-bandwidth-bound** kernels (matrix multiply, BLAS).
+  If you have all threads pulling from one node's memory
+  controller, you bottleneck there even though other
+  controllers are idle.
+- **Lock contention** on cross-node atomics. A cache-line
+  bounce across UPI is way more expensive than within a
+  socket.
+- **Page-cache locality**. If a database keeps a hot table on
+  node 0 but the worker thread runs on node 1, every read
+  goes cross-node.
+
+## Memory bandwidth basics
+
+Each DDR channel provides a fixed bandwidth: DDR4-3200 = 25.6
+GB/s per channel. A modern server has 6–12 channels per
+socket → 150–300 GB/s per socket. Two sockets: 300–600 GB/s.
+
+Per-core, you get a fraction of that — limited by the L3-to-
+memory interconnect and the number of in-flight requests the
+core can sustain (~10–20 outstanding).
+
+A single core can typically saturate ~15-25 GB/s if its access
+pattern is friendly (streaming, prefetcher-friendly). For
+many cores in parallel, scale is sublinear because the
+controller is shared.
+
+Measure:
+
+```bash
+# Intel: pcm-memory or pcm
+sudo pcm-memory.x 1
+
+# AMD: AMDuProf or perf
+perf stat -e uncore_imc/cas_count_read/,uncore_imc/cas_count_write/ -a sleep 1
+```
+
+If you're memory-bound (your code's hot loop fits in code
+cache but data does not), bandwidth is your limiting resource;
+CPU frequency increases don't help.
+
+## Huge pages and NUMA
+
+Two interactions:
+
+1. **TLB pressure scales with working set / page size.** Big
+   working sets on 4KB pages can have TLB miss rates
+   approaching 50%. 2MB pages reduce that dramatically.
+2. **THP and NUMA balancing can fight.** NUMA balancing wants
+   to move pages between nodes for locality; THP coalesces
+   them into 2MB chunks that are awkward to migrate. Profiles
+   sometimes show high "compaction" CPU usage when both are
+   on.
+
+For best-case throughput: hugepages on, NUMA-pinned, first-
+touch parallelized.
+
+## NUMA balancing in the kernel
+
+`/proc/sys/kernel/numa_balancing` (default 1). The kernel
+periodically:
+
+1. Unmaps some of a process's pages (PROT_NONE the PTE).
+2. When the process faults, the kernel sees which CPU faulted
+   on which page → builds an access map.
+3. If a thread mostly accesses memory on a remote node,
+   migrate the thread (or the pages) to colocate.
+
+For most apps, leave it on. For latency-sensitive RT work, the
+periodic unmap-and-fault adds jitter — disable it and pin
+manually.
+
+## NUMA in containers and VMs
+
+K8s and Docker run on the same OS, see the same NUMA topology.
+By default, a container can be scheduled on any CPU, which
+means it can bounce across nodes — bad for performance.
+
+Kubernetes has **CPU manager static policy** (`--cpu-manager-policy=static`)
+and **topology manager** to pin pods to a node:
+
+```yaml
+# Pod requests integer CPUs → eligible for exclusive CPU pinning
+resources:
+  requests:
+    cpu: "4"
+    memory: 8Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+```
+
+For latency-sensitive workloads (DB pods, HFT, ML inference),
+this matters a lot. For everything else, the scheduler does an
+OK job.
+
+## CXL — the future of "memory tiers"
+
+**CXL** (Compute Express Link) is the emerging cache-coherent
+interconnect for attached memory. CXL 2.0+ devices look like
+NUMA nodes with longer latency:
+
+- CPU local DDR: ~80 ns
+- CXL-attached DDR (next chassis): ~150-250 ns
+- CXL pool (datacenter): 300+ ns
+
+NUMA-aware code wins again. As of 2025-2026, CXL Type 3 memory
+expanders are shipping; expect "near memory" and "far memory"
+tiers to become standard, and the existing NUMA machinery in
+Linux to manage them.
+
+## Useful patterns
+
+- **One process per node, sharded data.** Each process owns a
+  partition; cross-partition queries hit network/IPC, not UPI.
+  Used in Postgres for partitioned tables, Cassandra, ScyllaDB
+  (one shard per core).
+- **Pin readers, interleave data.** Compute threads pinned to
+  CPUs; large datasets `--interleave=all` so any thread can
+  read at roughly the same speed.
+- **Affinity-aware thread pools.** Each pool's threads
+  pinned; tasks dispatched to the pool whose node holds the
+  data.
+
+## The mental model
+
+NUMA is "memory has a home; access is fast at home, slower
+away." First-touch decides home. Pin threads + memory together
+for latency-sensitive work; interleave for bandwidth-bound
+work. Cross-node atomics and locks are very expensive — design
+data structures so each node's threads work on local data,
+syncing rarely.
+
+Most apps that "scale to 16 cores but stall at 32" are
+hitting cross-socket contention. The fix is usually
+architectural (shard the workload) rather than a knob.

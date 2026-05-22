@@ -1,0 +1,305 @@
+export const level = 'mid';
+
+# Deadlock
+
+Two threads, each holding a resource the other needs, both
+waiting forever. The simplest distributed-systems problem on
+one machine. Real deadlocks are usually less obvious than the
+textbook example — multiple resources, conditional paths, GC
+threads holding allocator locks, signal handlers grabbing
+mutexes — but the underlying theory is exactly Coffman's four
+conditions from 1971.
+
+## The four necessary conditions (Coffman)
+
+A deadlock requires **all four** of these simultaneously:
+
+1. **Mutual exclusion** — at least one resource can be held
+   by only one thread at a time.
+2. **Hold and wait** — a thread holds at least one resource
+   while waiting to acquire others.
+3. **No preemption** — resources can't be forcibly taken from
+   a thread; only released voluntarily.
+4. **Circular wait** — a cycle exists: T1 waits on R1 held by
+   T2, T2 waits on R2 held by T1 (or longer cycle).
+
+Break **any one** and deadlock can't occur. The strategies
+below each target a specific condition.
+
+## The textbook deadlock
+
+```c
+mutex_t A, B;
+
+// Thread 1
+lock(&A);
+lock(&B);    // ← blocked here forever
+// ...
+unlock(&B); unlock(&A);
+
+// Thread 2
+lock(&B);
+lock(&A);    // ← blocked here forever
+// ...
+unlock(&A); unlock(&B);
+```
+
+The cycle: T1 holds A waits for B; T2 holds B waits for A. All
+four conditions hold.
+
+## Strategy 1: Prevention (eliminate a condition)
+
+**Eliminate hold-and-wait.** Acquire all locks at once or none:
+
+```c
+if (try_lock_all(&A, &B)) {
+    // do work
+    unlock_all(&A, &B);
+}
+```
+
+C++17: `std::scoped_lock(lockA, lockB)` uses a deadlock-avoidance
+algorithm internally to grab both. Postgres has `LOCK TABLE
+... NOWAIT`. The cost: complexity in acquire paths, more
+contention since you hold everything from the start.
+
+**Eliminate circular wait — enforce a global lock order.** Pick
+a total order over all locks; every acquire path takes them in
+that order. Done.
+
+This is the practical default. Examples:
+
+- Inode numbers in filesystems: always lock the lower inode
+  first. Two threads renaming the same pair of files agree on
+  order, no deadlock.
+- Memory addresses: always lock the lower-addressed object
+  first.
+- Type hierarchy: always lock account before transaction
+  before audit_log.
+
+In code:
+
+```c
+void transfer(Account *a, Account *b, int amount) {
+    Account *first  = (a < b) ? a : b;
+    Account *second = (a < b) ? b : a;
+    lock(&first->mu);
+    lock(&second->mu);
+    // ...
+}
+```
+
+The pattern is dead simple and works for 95% of real
+deadlocks. The remaining 5% is the gnarly ones.
+
+**Eliminate no-preemption — `tryLock` with backoff:**
+
+```c
+while (true) {
+    lock(&A);
+    if (trylock(&B)) break;
+    unlock(&A);
+    nanosleep(random_jitter);
+}
+```
+
+Avoids deadlock; introduces possible **livelock** (everyone
+backs off in sync). Random jitter fixes it. Used in DB engines
+where lock ordering is too dynamic to enforce.
+
+**Eliminate mutual exclusion — use lock-free data structures.**
+The most elegant fix but the most expensive engineering. See
+*lockfree-and-atomics*.
+
+## Strategy 2: Avoidance (admission control)
+
+**Banker's algorithm** (Dijkstra). Each thread declares its
+**maximum** future resource need. Before granting any request,
+check: would this leave the system in a *safe state* (some
+ordering of completions exists)? If yes, grant. If no, block
+the requester until safe again.
+
+```
+3 threads, 12 instances of resource R.
+
+T1: holds 5, max 10  → still needs 5
+T2: holds 2, max 4   → still needs 2
+T3: holds 2, max 9   → still needs 7
+
+Available: 12 - (5+2+2) = 3.
+
+Is this safe?
+  3 ≥ T2 needs 2 → grant T2, T2 finishes, frees 2+2=4. Available=7.
+  7 ≥ T1 needs 5 → grant T1, finishes, frees 10. Available=17.
+  17 ≥ T3 needs 7 → grant T3.
+Yes, safe ordering: T2, T1, T3.
+```
+
+The math is elegant. **In practice, nobody uses it.** Reasons:
+
+- Threads don't know their max future needs.
+- The check is O(threads × resources²) on every request.
+- It assumes static thread set; dynamic creation breaks it.
+
+Used historically in mainframes; today it's a curriculum
+exercise.
+
+## Strategy 3: Detection and recovery
+
+Let deadlocks happen. Periodically check for cycles in the
+**wait-for graph** (T1 → T2 → T3 → T1 = cycle). When detected,
+break the cycle: kill a thread, rollback a transaction, free
+the resources, restart.
+
+Used by:
+
+- **Database engines** (Postgres, MySQL, Oracle). Detect cycles
+  in lock graphs; abort the "victim" transaction with
+  `ERROR: deadlock detected`. Client retries. This is why
+  retry loops on `SerializationFailure`/`DeadlockDetected` are
+  standard pattern in DB-using code.
+- **JVM**'s `ThreadMXBean.findDeadlockedThreads()` — for
+  diagnostics, doesn't auto-recover.
+- **Linux kernel** has lockdep (CONFIG_PROVE_LOCKING) — catches
+  potential deadlocks during testing, not in production.
+
+Picking the victim:
+
+- Youngest transaction (less rolled-back work).
+- Most resources held (frees the most).
+- Lowest priority.
+- Whatever's easiest in the engine's accounting.
+
+## Strategy 4: Ignore it (the ostrich algorithm)
+
+"Just don't do that." Many real systems take this approach:
+
+- **Linux kernel for spinlocks** — no detection, no avoidance.
+  The reasoning is that careful coding (and lockdep at test
+  time) catches them; runtime detection would be too expensive
+  on hot paths.
+- **POSIX `pthread_mutex_t`** — no detection. You can opt into
+  error-checking mutexes (`PTHREAD_MUTEX_ERRORCHECK`) which
+  catch self-deadlock but not multi-thread cycles.
+
+This works when:
+
+- The lock universe is small and well-understood.
+- You have static analysis or stress testing.
+- The failure mode (hang) is preferable to overhead.
+
+Not so great when the system is large and dynamic.
+
+## Spotting a deadlock in production
+
+```bash
+# Linux: who's blocked on what?
+ps -eo pid,stat,wchan,cmd
+# Look for D state (uninterruptible) or S+ stuck on a mutex
+
+# Detailed per-thread stack
+cat /proc/<pid>/stack
+gdb -p <pid>
+  thread apply all bt
+
+# JVM
+jstack <pid>
+# Output explicitly identifies deadlocks if all parties are JVM threads
+
+# Postgres
+SELECT pid, wait_event_type, wait_event, query, state
+FROM pg_stat_activity WHERE state = 'active';
+SELECT * FROM pg_locks WHERE NOT granted;
+
+# Both blockers in pg_locks → likely cycle.
+```
+
+If you see a hung Java app:
+
+```
+"Thread-1" #11 prio=5 ...
+   waiting to lock <0x000000076ab62208> (a java.lang.Object)
+   waiting for <0x000000076ab62210> (a java.lang.Object) which is held by "Thread-2"
+
+"Thread-2" #12 prio=5 ...
+   waiting for <0x000000076ab62208> which is held by "Thread-1"
+
+Found 1 deadlock.
+```
+
+jstack literally prints "Found 1 deadlock" when the cycle is
+all-Java. For native cycles or DB-app cycles, you have to
+reason about it from stacks.
+
+## Livelock — the close cousin
+
+Two threads that keep trying and aborting in lockstep:
+
+```c
+while (true) {
+    lock(&A);
+    if (trylock(&B)) break;
+    unlock(&A);  // both retry at the exact same time, both fail again
+}
+```
+
+No thread is blocked, but no thread makes progress. Looks fine
+from the kernel's perspective (no D state). Hard to diagnose
+because everything looks "busy."
+
+Fix: randomized backoff. Always.
+
+## Real-world deadlock anatomy
+
+A typical production deadlock involves at least one of:
+
+- **Two database row locks taken in different orders** by
+  different transactions. Classic Postgres deadlock; resolved
+  by retry on `SQLSTATE 40P01`.
+- **An app lock + a DB lock**, where two threads cross them
+  oppositely. The cycle spans two systems; jstack alone won't
+  see it.
+- **A lock + a `wait` for an external event** that requires
+  another thread (which is blocked on the lock).
+- **Logging or metrics call inside a hot lock**, where the
+  logger is trying to acquire its own internal lock that's held
+  by a thread blocked on the hot lock.
+- **A signal handler that takes a mutex** — handler runs on the
+  signaled thread; if that thread already holds the mutex, you
+  deadlock instantly.
+
+The fix is always one of:
+
+1. Establish lock order. (Best.)
+2. Drop locks before doing the thing that might block.
+3. Use `tryLock` with backoff. (Last resort.)
+
+## Two simple disciplines
+
+**Never call user code while holding a lock.** Callbacks,
+event handlers, logging, anything that can grow new dependencies
+should run outside your critical section.
+
+**Document lock invariants.** Every shared field has a comment:
+"protected by `lock_x`; lock_x is acquired after lock_y."
+Future readers (including you in three months) need this.
+
+## The mental model
+
+Deadlock is a cycle in the wait-for graph. Break any of
+Coffman's four conditions and the cycle is impossible:
+
+- No mutual exclusion → lock-free
+- No hold-and-wait → grab all at once or none
+- Preemption allowed → tryLock + backoff (livelock risk)
+- No circular wait → global lock ordering
+
+In production code: **lock ordering is the answer 95% of the
+time**. Number your locks. Acquire in increasing order. Write
+it down. The remaining 5% — dynamic resources, DB transactions,
+cross-system dependencies — use detection-and-retry instead.
+
+Avoidance (banker's algorithm) is for exams. Ignoring it is
+the kernel's choice but requires the discipline to never let
+the cycle form in the first place. For application code, prefer
+strategies you can name and grep for.

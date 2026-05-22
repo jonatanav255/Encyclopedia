@@ -1,0 +1,243 @@
+export const level = 'junior';
+
+# Processes and the PCB
+
+A process is the OS's unit of "a running program." It's not the
+program — the program is a file on disk. The process is the
+*execution* of that program: a memory layout, a set of open
+files, a current register state, a position in the scheduler.
+The kernel tracks all of that in one giant struct, the
+**Process Control Block (PCB)**.
+
+## What's in a PCB
+
+Every process the kernel knows about has a PCB. On Linux it's
+`struct task_struct`, defined in `include/linux/sched.h` — about
+1.5KB, 200+ fields. The big buckets:
+
+| Bucket | Examples |
+|---|---|
+| Identity | PID, parent PID, UID, GID, command name |
+| Scheduling state | state (R/S/D/Z), priority, nice, CPU mask, sched_class |
+| Memory | pointer to `mm_struct` (page tables, VMAs, brk, stack) |
+| Files | pointer to `files_struct` (FD table) |
+| Filesystem | pointer to `fs_struct` (CWD, root, umask) |
+| Signals | pending mask, blocked mask, handler table |
+| IPC | pipes, semaphores held |
+| Resource limits | rlimit array (max FDs, stack size, CPU time, ...) |
+| Accounting | start time, CPU time used, page faults |
+| Links | parent, children list, sibling list, process group |
+
+The kernel maintains a doubly-linked list of all PCBs plus a
+hash table keyed by PID. `ps` walks the list; `kill <pid>` looks
+up via the hash.
+
+## Process states
+
+A process is always in exactly one state from the kernel's
+perspective. On Linux:
+
+```
+                 fork()
+                   │
+                   ▼
+              ┌─────────┐
+              │   NEW   │
+              └────┬────┘
+                   │ scheduler picks it up
+                   ▼
+   ┌──────────────────────────────────┐
+   │     R  TASK_RUNNING               │ ← either running on a CPU
+   │        (running or runnable)      │   or sitting on a runqueue
+   └──┬──────────┬────────────────┬───┘
+      │ blocked  │ blocked        │ killed/exited
+      │ on I/O   │ on signal      │
+      ▼          ▼                ▼
+   ┌──────┐  ┌──────┐         ┌──────┐
+   │   D  │  │   S  │         │   Z  │
+   │ unin │  │ inter│         │ zomb │
+   │ sleep│  │ sleep│         │  ie  │
+   └───┬──┘  └───┬──┘         └───┬──┘
+       │  I/O   │ signal/event   │ parent calls wait()
+       │  done  │ wakes it       │
+       └────────┴────────┐       ▼
+                         ▼     gone
+                  TASK_RUNNING
+```
+
+The codes you see in `ps` and `top`:
+
+- **R** — running or runnable. Includes both "actually on a CPU"
+  and "sitting in a runqueue waiting for one." `ps` doesn't
+  distinguish — `top -H` showing R with low CPU% means runnable
+  but starved.
+- **S** — interruptible sleep. Waiting for something (read from
+  socket, sleep call). Wakeable by signal.
+- **D** — uninterruptible sleep. Waiting on an I/O the kernel
+  decided not to interrupt. `kill -9` won't kill a D process —
+  the kernel ignores signals in this state. A process stuck in
+  D usually means a hung NFS mount, a broken disk, or a driver
+  bug.
+- **T** — stopped (by SIGSTOP, e.g. `Ctrl-Z`).
+- **Z** — zombie. Process has exited; PCB still around because
+  the parent hasn't called `wait()` yet.
+- **X** — dead. Briefly, then the PCB is freed.
+
+## fork — make a copy of me
+
+`fork()` is the canonical way to make a new process on Unix.
+The kernel allocates a new PCB, copies most of the parent's
+fields, gives it a new PID, and returns. The child is a near-
+duplicate of the parent.
+
+```c
+pid_t pid = fork();
+if (pid == 0) {
+    // child: same code, fresh PCB
+} else if (pid > 0) {
+    // parent: pid is the child's PID
+} else {
+    // fork failed
+}
+```
+
+What gets copied:
+
+- Memory (via copy-on-write — page tables are duplicated, pages
+  aren't physically copied until written).
+- File descriptors (the FD table is copied; underlying file
+  table entries are shared, with the refcount bumped).
+- Signal handlers, working directory, environment.
+
+What doesn't:
+
+- PID (child gets a new one).
+- Parent PID (child's PPID is the parent's PID).
+- Pending signals (cleared in child).
+- File locks (not inherited).
+
+The COW makes fork cheap *if you don't write much before exec*.
+Forking a 10GB process is microseconds, not seconds — until the
+child or parent touches every page.
+
+## exec — replace my image
+
+`exec*()` doesn't make a new process. It replaces the current
+process's memory and registers with a new program, keeping the
+PCB (PID, FDs, etc.). Combined with fork, this is the canonical
+"start a new program" idiom:
+
+```c
+pid_t pid = fork();
+if (pid == 0) {
+    execlp("ls", "ls", "-l", NULL);
+    perror("exec");  // only reached on failure
+    _exit(1);
+}
+waitpid(pid, NULL, 0);
+```
+
+The exec family — `execve`, `execvp`, `execlp`, etc. — are all
+wrappers around the `execve` syscall. They differ in how they
+pass args, env, and how they find the binary.
+
+`posix_spawn` is the modern combined "fork + exec" — useful when
+you don't actually want the copy-on-write overhead of fork.
+
+## wait — collect my dead child
+
+When a process exits, its PCB stays around as a **zombie** until
+the parent calls `wait()` or `waitpid()` to read the exit status.
+The OS needs to keep the PCB so the parent can ask "what did my
+child exit with?"
+
+```c
+int status;
+pid_t child = waitpid(pid, &status, 0);
+if (WIFEXITED(status)) {
+    int code = WEXITSTATUS(status);
+    // exit code 0..255
+}
+```
+
+If the parent never calls wait, you get **zombie processes** —
+visible in `ps` as `<defunct>`, taking only a PCB slot. If the
+parent dies before the child, the child is reparented to PID 1
+(init/systemd), which calls `wait()` in a loop. So orphans
+aren't a problem; zombies whose parents are still running are.
+
+## exit — clean shutdown
+
+`exit(n)` does library cleanup (flushes stdio, runs atexit
+handlers) then calls the `_exit(n)` syscall. `_exit` is the raw
+syscall: close FDs, free memory, mark the PCB as zombie, send
+SIGCHLD to parent, schedule somebody else.
+
+Difference matters when you fork in a C program with buffered
+stdout — `exit` flushes (double output); `_exit` doesn't.
+
+## fork-exec vs spawn — the two models
+
+Unix: **fork + exec** as two separate syscalls.
+
+- Flexible: between fork and exec, the child can change the
+  environment, redirect FDs, set up signal handlers, etc. This
+  is how shells implement pipes and redirection.
+- Expensive on no-MMU systems and Windows-style models (no COW).
+- Hard to make safe in a multithreaded program (only async-
+  signal-safe functions are allowed between fork and exec).
+
+Windows: **`CreateProcess`** as one call.
+
+- Cheaper, no COW dance.
+- Less flexible — you configure everything via flags up front.
+
+Modern POSIX added `posix_spawn` for portability with the
+Windows model. Languages with managed runtimes (Java, Go,
+Python's `subprocess`) use it under the hood.
+
+## What's actually in `/proc/<pid>/`
+
+Linux exposes the PCB through `/proc/<pid>/` as readable text
+files:
+
+```
+/proc/<pid>/status     — human-readable PCB summary
+/proc/<pid>/stat       — same, scriptable single line
+/proc/<pid>/cmdline    — argv (NUL-separated)
+/proc/<pid>/environ    — env vars
+/proc/<pid>/maps       — VMAs (memory regions)
+/proc/<pid>/fd/        — symlinks for every open FD
+/proc/<pid>/task/      — one dir per thread
+/proc/<pid>/limits     — rlimits
+/proc/<pid>/cgroup     — cgroup membership
+```
+
+`ps`, `top`, `lsof`, `htop` — they all just read `/proc`. Which
+is why you can run `ls -l /proc/$$/fd` to see your shell's open
+files, no special tool needed.
+
+## Process vs thread (preview)
+
+A thread is a unit of execution; a process is a thread plus an
+isolated address space. On Linux they're the same kernel object
+(`task_struct`), just with different sharing flags. `fork`
+creates a task that shares nothing; `pthread_create` creates a
+task that shares the address space (`clone(CLONE_VM | ...)`).
+
+Threads get their own page in `/proc/<pid>/task/<tid>/`. PID
+seen by `getpid()` is the **thread group ID** (the original
+process); `gettid()` returns the specific thread's ID.
+
+## The mental model
+
+A process is a PCB. The PCB points at memory, files, and
+scheduler state — and itself sits in a list and a hash. fork
+duplicates a PCB; exec replaces the memory and registers; exit
+marks it zombie; wait reaps it. Everything else in process
+management — signals, scheduling, IPC — is operations on the
+PCB.
+
+When you look at `ps`, you're looking at the kernel's PCB table.
+When something feels off ("why is this process stuck?"), the PCB
+state (R/S/D/Z) is almost always the first clue.

@@ -1,0 +1,368 @@
+export const level = 'mid';
+
+# Signals
+
+Signals are the OS's way of saying something to a process out
+of band. "You divided by zero." "Your terminal closed." "The
+admin sent SIGTERM." "Your child exited." They predate threads
+and asynchronous APIs by decades, which means they don't
+compose nicely with either. Every modern code base has at
+least one signal-related bug that nobody understands; this
+page is about not being that codebase.
+
+## What signals are
+
+A signal is a small integer (1–31 for standard, 32+ for real-
+time) that the kernel delivers asynchronously to a process or
+thread. When delivered, one of three things happens:
+
+1. The default action runs (typically terminate, sometimes
+   with core dump; sometimes ignore; sometimes stop the
+   process).
+2. The process's installed **handler** runs.
+3. The signal is **blocked** (deferred) by the current
+   signal mask.
+
+The kernel keeps a per-thread "pending" set and a per-process
+"pending" set; the process set is for signals not directed at
+a specific thread.
+
+## The standard signals
+
+| Signal | # | Default | Notes |
+|---|---|---|---|
+| `SIGHUP` | 1 | Terminate | Terminal hangup; convention: re-read config |
+| `SIGINT` | 2 | Terminate | Ctrl-C |
+| `SIGQUIT` | 3 | Core | Ctrl-\, core dump |
+| `SIGILL` | 4 | Core | Illegal instruction |
+| `SIGTRAP` | 5 | Core | Breakpoint (debuggers) |
+| `SIGABRT` | 6 | Core | `abort()` |
+| `SIGBUS` | 7 | Core | Bad memory access (alignment, mmap past EOF) |
+| `SIGFPE` | 8 | Core | Float exception / div-by-zero |
+| `SIGKILL` | 9 | Terminate | **Cannot be caught, blocked, or ignored.** |
+| `SIGUSR1` | 10 | Terminate | Free for app use |
+| `SIGSEGV` | 11 | Core | Segfault — bad memory access |
+| `SIGUSR2` | 12 | Terminate | Free for app use |
+| `SIGPIPE` | 13 | Terminate | Write to pipe with no reader |
+| `SIGALRM` | 14 | Terminate | Timer expired (alarm()) |
+| `SIGTERM` | 15 | Terminate | Polite request to die |
+| `SIGCHLD` | 17 | Ignore | Child stopped/exited |
+| `SIGCONT` | 18 | Continue | Resume stopped process |
+| `SIGSTOP` | 19 | Stop | **Cannot be caught, blocked, or ignored.** |
+| `SIGTSTP` | 20 | Stop | Ctrl-Z |
+| `SIGTTIN`/`SIGTTOU` | 21/22 | Stop | Background process tried to read/write tty |
+| `SIGURG` | 23 | Ignore | Urgent socket data |
+| `SIGXCPU` | 24 | Core | CPU limit exceeded |
+| `SIGXFSZ` | 25 | Core | File size limit exceeded |
+| `SIGVTALRM`/`SIGPROF` | 26/27 | Terminate | Virtual/profiling timer |
+| `SIGWINCH` | 28 | Ignore | Terminal window size changed |
+| `SIGIO` | 29 | Terminate | Async I/O event |
+| `SIGPWR` | 30 | Terminate | Power failure |
+| `SIGSYS` | 31 | Core | Bad syscall (seccomp) |
+
+`SIGKILL` (9) and `SIGSTOP` (19) are special — the kernel
+guarantees the process can't refuse them. This is why
+`kill -9` always works.
+
+## Installing a handler
+
+```c
+#include <signal.h>
+
+void on_sigterm(int sig) {
+    // careful: this runs asynchronously
+    write(STDERR_FILENO, "got SIGTERM\n", 12);
+    g_should_exit = 1;
+}
+
+struct sigaction sa = {0};
+sa.sa_handler = on_sigterm;
+sigemptyset(&sa.sa_mask);
+sa.sa_flags = SA_RESTART;
+sigaction(SIGTERM, &sa, NULL);
+```
+
+`sigaction` is the modern API. The older `signal()` has
+historical portability issues — different platforms reset the
+handler differently after delivery. Use `sigaction`.
+
+Three useful `sa_flags`:
+
+- `SA_RESTART` — restart slow syscalls (`read`, `accept`, ...)
+  automatically after the handler returns, instead of failing
+  with `EINTR`. **Set this unless you have a reason not to.**
+- `SA_NOCLDWAIT` — for SIGCHLD, don't make zombies for children
+  whose status you don't care about.
+- `SA_SIGINFO` — use the 3-arg handler that gets extra context
+  (faulting address, sender PID, etc.) via `siginfo_t`.
+
+## Async-signal-safe — the central constraint
+
+A signal handler can run at any point, including in the middle
+of a `malloc`. If your handler also calls `malloc`, you're
+holding the allocator's internal mutex twice — instant
+deadlock.
+
+The kernel guarantees a small set of functions are
+**async-signal-safe**: re-entrant, no shared state. Roughly:
+
+- Direct syscalls: `read`, `write`, `open`, `close`, `kill`,
+  `_exit`.
+- A few utilities: `signal`, `sigaction`, `sigprocmask`.
+- Some string ops: `strcpy`, `strlen`.
+- A few atomic-write functions: `dprintf` with constant strings.
+
+What's NOT safe — most of stdio (`printf`, `fopen`), `malloc`,
+`free`, `pthread_*` (other than `pthread_sigmask` and
+`pthread_kill`), most of the C library.
+
+```c
+// BROKEN:
+void handler(int sig) {
+    printf("got signal %d\n", sig);   // ← may deadlock!
+    log_message(...);                  // ← worse
+}
+
+// SAFE:
+void handler(int sig) {
+    write(STDERR_FILENO, "got signal\n", 11);
+    g_flag = 1;                        // process at next safe point
+}
+```
+
+The standard pattern: **handler sets a flag (and maybe writes
+to a self-pipe); the main loop reacts to the flag**.
+
+## The self-pipe trick
+
+Pre-`signalfd`, the way to integrate signals with `select`/
+`poll`/`epoll` was the **self-pipe trick**:
+
+```c
+int sp[2];
+pipe(sp);
+set_nonblocking(sp[0]); set_nonblocking(sp[1]);
+
+void handler(int sig) { write(sp[1], "x", 1); }
+
+// in main loop:
+epoll_add(ep, sp[0], EPOLLIN);
+// when sp[0] fires, read it and handle whatever signal
+```
+
+The handler writes a byte to a pipe (write is async-signal-
+safe). The main event loop's `epoll_wait` returns; the loop
+reads the pipe and handles the signal in process context where
+it's safe to do anything.
+
+## signalfd — the modern replacement
+
+`signalfd` returns an FD that delivers signal info via reads:
+
+```c
+sigset_t mask;
+sigemptyset(&mask); sigaddset(&mask, SIGUSR1);
+sigprocmask(SIG_BLOCK, &mask, NULL);   // block normal delivery
+
+int sfd = signalfd(-1, &mask, 0);
+epoll_add(ep, sfd, EPOLLIN);
+
+// in main loop, when sfd fires:
+struct signalfd_siginfo info;
+read(sfd, &info, sizeof(info));
+// info.ssi_signo tells you which signal; handle normally
+```
+
+No async-signal-safe constraint. The signal becomes "just an
+FD that has data." Massively simpler.
+
+Used by anything signal-aware on modern Linux: systemd,
+libuv, Go runtime's syscall package.
+
+## Signal masks — blocking
+
+A blocked signal stays **pending** until it's unblocked or the
+process exits. Multiple instances of the same signal collapse
+into one pending bit (you don't know if the signal arrived 3
+times or 30).
+
+```c
+sigset_t mask;
+sigemptyset(&mask);
+sigaddset(&mask, SIGINT);
+pthread_sigmask(SIG_BLOCK, &mask, NULL);   // current thread
+
+// critical section where SIGINT is blocked
+
+pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
+```
+
+Each thread has its own signal mask. Block signals in worker
+threads, unblock in one dedicated "signal handler thread."
+
+## Real-time signals
+
+`SIGRTMIN` to `SIGRTMAX` (typically 34–64 on Linux).
+Differences from standard signals:
+
+- **Queued** — multiple instances are tracked separately, not
+  collapsed.
+- **Carry a payload** — small int or pointer.
+- **Strict delivery order** — lower-numbered first.
+
+```c
+struct sigaction sa = { .sa_sigaction = handler, .sa_flags = SA_SIGINFO };
+sigaction(SIGRTMIN, &sa, NULL);
+
+union sigval val = { .sival_int = 42 };
+sigqueue(target_pid, SIGRTMIN, val);
+```
+
+Used for fine-grained IPC. Most code doesn't need them; modern
+alternatives (signalfd, eventfd, sockets) are usually cleaner.
+
+## Signals and threads — the hard part
+
+Pre-NPTL Linux, signals were per-process. Modern Linux:
+
+- A signal directed at a specific thread (`pthread_kill`) goes
+  to that thread.
+- A signal directed at the process (`kill -2 pid`) goes to
+  **some** thread that doesn't have it blocked. Could be any.
+- Handlers are **process-wide** — install once, takes effect
+  everywhere.
+- Masks are **per-thread** — set independently.
+
+The standard pattern in multithreaded apps:
+
+```c
+// At startup:
+sigset_t mask;
+sigfillset(&mask);                // block everything
+pthread_sigmask(SIG_BLOCK, &mask, NULL);
+
+// Spawn worker threads — they inherit the mask, so signals don't
+// hit them.
+spawn_workers();
+
+// Then start one "signal handler" thread:
+pthread_create(&sigthread, NULL, signal_handler_thread, NULL);
+```
+
+The signal-handler thread uses `sigwait` (or signalfd) to
+synchronously receive signals — no async handler at all.
+
+```c
+void *signal_handler_thread(void *arg) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+
+    int sig;
+    while (true) {
+        sigwait(&mask, &sig);
+        // process sig — full library access, no async-signal-safe constraint
+    }
+}
+```
+
+This is what Go, Java, Tokio, and most modern runtimes do
+internally.
+
+## Common signal patterns
+
+**Graceful shutdown:**
+
+```c
+// trap SIGTERM, set a flag, let main loop drain and exit
+static volatile sig_atomic_t shutdown_flag = 0;
+void handler(int s) { shutdown_flag = 1; }
+sigaction(SIGTERM, &(struct sigaction){ .sa_handler = handler, .sa_flags = SA_RESTART }, NULL);
+// main loop: while (!shutdown_flag) { ... }
+```
+
+`sig_atomic_t` is a type guaranteed to be readable/writable
+atomically from a handler. Use it for the flag.
+
+**Reaping children — SIGCHLD:**
+
+```c
+void on_sigchld(int s) {
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved_errno;
+}
+```
+
+Without this, dead children become zombies. Save/restore
+`errno` because the handler can interrupt code that just set
+it.
+
+**Reload config — SIGHUP:**
+
+```c
+void on_sighup(int s) { g_reload = 1; }
+// main loop: if (g_reload) { reload_config(); g_reload = 0; }
+```
+
+Convention since the 80s. Daemons re-read config on SIGHUP.
+
+**Ignore SIGPIPE in network apps:**
+
+```c
+signal(SIGPIPE, SIG_IGN);
+// or set MSG_NOSIGNAL on every send()
+```
+
+Writing to a socket whose peer closed sends SIGPIPE by
+default. Most apps want `write` to return `EPIPE` instead.
+
+## SIGKILL and SIGSTOP — the uncatchable
+
+`SIGKILL` immediately terminates; the process gets no chance
+to clean up. Use sparingly — files may be left in inconsistent
+states, locks held, sockets in TIME_WAIT.
+
+`SIGSTOP` halts the process; `SIGCONT` resumes. Used by job
+control (Ctrl-Z is SIGTSTP, not SIGSTOP — but functionally
+similar). Useful for "pause this process while I take a
+snapshot" without involving the process itself.
+
+## Why signals are awful
+
+- Asynchronous delivery — race conditions everywhere.
+- Tiny safe API in handlers.
+- Hard to integrate with threads (without signalfd / sigwait).
+- Old syscalls return `EINTR` if signal arrived mid-call.
+- Different platforms have subtle differences.
+- Signal numbers vary across architectures (real-time range
+  especially).
+- No payload (except RT signals).
+- Hard to test reliably (timing-dependent).
+
+Modern alternatives wherever possible:
+
+- **signalfd** to turn signals into FDs.
+- **eventfd** for in-process notification (no signal needed).
+- **kill()** with SIGUSR1/2 for "wake my main thread."
+- **Cooperative shutdown** via shared flags + atomic + epoll
+  timeouts.
+
+## The mental model
+
+A signal is an asynchronous interrupt to a process. The
+handler can be called at *any* point; it must call only async-
+signal-safe functions. The standard discipline:
+
+- Use `sigaction` with `SA_RESTART`.
+- Handlers set flags / write to pipes; main code reacts.
+- Block signals in worker threads; have one thread handle them
+  via `sigwait` or `signalfd`.
+- Always ignore SIGPIPE in network code.
+- SIGKILL is the nuke; reserve it.
+
+If you find yourself writing a complex signal handler, you're
+probably solving the wrong problem. signalfd + epoll, eventfd
++ shared flag, or a dedicated signal-handling thread converts
+the async signal mess into ordinary control flow.

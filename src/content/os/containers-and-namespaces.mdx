@@ -1,0 +1,360 @@
+export const level = 'senior';
+
+# Containers, namespaces, and cgroups
+
+A container is not a "lightweight VM." It's a regular Linux
+process where the kernel pretends it has its own copy of
+specific resources — its own PID space, its own filesystem
+mounts, its own network stack, its own user IDs. The
+abstractions that enable this are **namespaces** (what you
+see) and **cgroups** (what you can use). Together they give
+you Docker, Kubernetes, systemd services, and every
+"sandboxed app" on Linux.
+
+## What's actually running
+
+A "container" is a process group with:
+
+- **Eight Linux namespaces** isolating its view of the world.
+- **A cgroup** capping its resource use.
+- **An overlay or bind-mounted filesystem** rooted at a
+  per-container path.
+- **Possibly seccomp + Linux capability drops** restricting
+  syscalls.
+
+That's it. No hypervisor, no separate kernel — same kernel as
+the host. `ps aux` on the host shows the container processes
+mixed in with everything else (with the host's PID numbers).
+
+## The eight namespaces
+
+| Namespace | What it isolates | Created via clone flag |
+|---|---|---|
+| **MNT** | Mount points / filesystem view | `CLONE_NEWNS` |
+| **PID** | Process IDs | `CLONE_NEWPID` |
+| **NET** | Network interfaces, ports, routes, firewall | `CLONE_NEWNET` |
+| **IPC** | SysV IPC, POSIX message queues | `CLONE_NEWIPC` |
+| **UTS** | Hostname, domain name | `CLONE_NEWUTS` |
+| **USER** | UIDs / GIDs, capability mapping | `CLONE_NEWUSER` |
+| **CGROUP** | cgroup root visible to processes | `CLONE_NEWCGROUP` |
+| **TIME** | Time offsets (since Linux 5.6) | `CLONE_NEWTIME` |
+
+A process can be in different namespaces of each type. New
+processes inherit their parent's namespaces unless created
+with `clone` (or moved with `setns`) into new ones.
+
+## PID namespace — your own process tree
+
+In a new PID namespace, the first process is PID 1
+(regardless of its real PID on the host).
+
+```bash
+# Host
+$ unshare --pid --fork --mount-proc bash
+# Inside the new namespace:
+# ps aux
+PID   USER  COMMAND
+  1   root  bash       ← we're PID 1 now
+ 17   root  ps aux
+
+# Host can still see us with its own numbering:
+$ ps -ef | grep bash
+... 27483 ... bash       ← host PID 27483
+```
+
+PID 1 is special: it inherits all orphans (`reaping zombies`)
+and dies = kernel panics in that namespace (the entire
+container dies). Container init systems like `tini`, `dumb-init`,
+or PID 1 in distroless images all serve this role.
+
+PIDs are translated: container's PID 1 = host's PID 27483.
+A process inside the container can't see (and can't `kill`)
+processes outside its namespace.
+
+## Network namespace — your own stack
+
+A NET namespace has its own:
+
+- Network interfaces (none by default — just loopback that's
+  down).
+- Routing tables.
+- Firewall rules (iptables/nftables).
+- Port number space (two containers can each bind to :80).
+- Socket buffers.
+
+```bash
+# Create a new network namespace
+sudo ip netns add ctnr
+sudo ip netns exec ctnr ip link    # only sees its own loopback
+
+# Wire it to the host via a veth pair
+sudo ip link add veth_host type veth peer name veth_ctnr
+sudo ip link set veth_ctnr netns ctnr
+sudo ip addr add 10.0.0.1/24 dev veth_host
+sudo ip netns exec ctnr ip addr add 10.0.0.2/24 dev veth_ctnr
+sudo ip link set veth_host up
+sudo ip netns exec ctnr ip link set veth_ctnr up
+```
+
+Now host and container can ping each other across the veth
+link. This is essentially what `docker run` does (plus
+bridging, NAT, port-mapping).
+
+## Mount namespace — your own filesystem
+
+A MNT namespace has its own mount point set. Container
+runtimes set up the container's filesystem as a chroot-like
+layered tree, then enter a new MNT namespace so the host's
+mounts aren't visible.
+
+The layered filesystem is usually **overlayfs**:
+
+```
+upper (writable container layer)
+  +
+lower 3 (app code)
+  +
+lower 2 (runtime, libraries)
+  +
+lower 1 (base distro, e.g. debian:slim)
+```
+
+Reads cascade down through layers until found. Writes go to
+the upper. Containers can share lower layers — same image,
+many containers, copy-on-write.
+
+`docker exec`'ing into a container puts your shell in the
+container's MNT, PID, NET, IPC, UTS, and USER namespaces.
+
+## USER namespace — UID/GID mapping
+
+The killer feature for "rootless containers." A USER namespace
+maps a range of UIDs in the container to a different range on
+the host.
+
+```
+container UID 0 (root) ─→ host UID 100000
+container UID 1        ─→ host UID 100001
+container UID 1000     ─→ host UID 101000
+```
+
+Container processes see themselves as root inside, but on the
+host they're an unprivileged user with no special powers. The
+container's "root" can't do anything the host UID 100000 can't.
+
+Used by:
+
+- Podman (rootless mode).
+- Docker (with `userns-remap`).
+- Firefox / Chrome sandboxes.
+- Snap / Flatpak.
+
+Limitations: some operations need real root and don't work
+(or work in weird ways) in a user namespace. The kernel
+matured a lot here over the last decade; in 2026 it's mostly
+robust.
+
+## cgroups — what you can use
+
+Namespaces isolate **what you see**. cgroups limit **what you
+can use**. A cgroup is a hierarchical group with controllers
+attached:
+
+| Controller | Limits |
+|---|---|
+| `cpu` | CPU time share / quota |
+| `cpuset` | Which CPUs / NUMA nodes |
+| `memory` | RAM and swap |
+| `io` | Disk bandwidth and IOPS |
+| `pids` | Number of processes |
+| `hugetlb` | Huge-page usage |
+| `rdma` | RDMA verbs |
+
+A process belongs to one cgroup per active controller. Adding
+the process is a one-line write to a cgroup file:
+
+```bash
+echo 12345 > /sys/fs/cgroup/mygroup/cgroup.procs
+```
+
+### cgroups v1 vs v2
+
+**v1** has separate hierarchies per controller. A process can
+be in different cpu, memory, io cgroups. Flexible but
+complex; controllers don't always interact well.
+
+**v2** has a single unified hierarchy. A process is in exactly
+one cgroup, which has whichever controllers are enabled.
+Simpler reasoning; better cross-controller behavior. Default
+on modern distros.
+
+```
+/sys/fs/cgroup/                            # v2 root
+├── cgroup.controllers     # available
+├── cgroup.subtree_control # enabled below
+├── cgroup.procs           # processes in this cgroup
+├── memory.max             # limit
+├── memory.current         # usage
+├── cpu.max                # quota (μs of CPU per period μs)
+├── cpu.weight             # share weight (default 100)
+└── system.slice/          # subgroups
+    └── docker-abc.scope/
+        ├── memory.max     # e.g. 512MiB
+        └── cgroup.procs   # container processes
+```
+
+### Memory limits in action
+
+```bash
+mkdir /sys/fs/cgroup/mygroup
+echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control
+echo "100M" > /sys/fs/cgroup/mygroup/memory.max
+echo $$ > /sys/fs/cgroup/mygroup/cgroup.procs
+
+# This shell and its children can now use at most 100MB.
+# Allocating more triggers cgroup-level OOM.
+```
+
+Docker, containerd, K8s all build on this. `docker run --memory 512m`
+sets `memory.max` on the container's cgroup.
+
+### CPU limits
+
+Two knobs:
+
+- **Weight** (`cpu.weight`, 1–10000, default 100): relative
+  share when CPU is contended. Two cgroups at weight 100 split
+  CPU 50/50; one at 200 vs one at 100 gets 2/3 vs 1/3.
+- **Quota** (`cpu.max`): hard cap. `50000 100000` = 50% of one
+  CPU per 100ms period (50ms used out of 100ms).
+
+In K8s, `requests.cpu` maps to weight; `limits.cpu` maps to
+quota. The infamous "throttling" you see in
+`container_cpu_cfs_throttled_periods_total` is your container
+exceeding its quota in a CFS period and being paused until the
+next period.
+
+## Putting it together — what `docker run` does
+
+1. Pull the image; assemble overlayfs layers in a directory.
+2. Create a cgroup with the appropriate `memory.max`, `cpu.max`.
+3. Spawn the container's PID 1 via `clone` with all the
+   `CLONE_NEW*` flags for the requested namespaces.
+4. In the child:
+   - Mount /proc, /sys, /dev appropriately (in the new MNT
+     namespace).
+   - `chroot` (or `pivot_root`) into the overlay rootfs.
+   - Drop capabilities, apply seccomp profile.
+   - `exec` the container's entrypoint.
+5. Add the resulting PID to the cgroup.
+6. Wire up networking via veth pair, bridge, port mappings,
+   NAT.
+7. Return control to you.
+
+A "container" is the resulting bundle of process(es) + cgroup
++ namespaces.
+
+## Capabilities and seccomp
+
+A regular Linux root has dozens of **capabilities** (CAP_NET_ADMIN,
+CAP_SYS_PTRACE, etc.). Container runtimes drop most of them by
+default — even processes that think they're root inside the
+container can't load kernel modules, change time, raw-packet
+sniff, etc.
+
+**Seccomp-BPF** filters allow/deny specific syscalls. Docker's
+default seccomp profile denies ~50 syscalls (uselib, kexec_load,
+clock_settime, etc.). Tightening seccomp is the cheapest way
+to reduce a container's attack surface.
+
+## Containers vs VMs
+
+| | Container | VM |
+|---|---|---|
+| Kernel | Shared with host | Own kernel |
+| Boot time | Milliseconds | Seconds |
+| Memory overhead | Process-sized | GB-class |
+| Isolation strength | Namespace + cgroup + seccomp | Hypervisor-enforced |
+| Cross-platform image | Same kernel ABI | Any OS |
+| Live migration | Hard (CRIU) | Standard |
+
+Containers are "shared kernel, isolated process bundle." VMs
+are "separate kernel, hardware-virtualized." Containers are
+the default for "I want to package my app"; VMs are the
+default for "I want strong isolation between tenants."
+
+**Firecracker, Kata Containers, gVisor** sit in between —
+microVMs or user-space kernels that give VM-level isolation
+with closer-to-container startup costs. Used by AWS Lambda
+(Firecracker), some K8s runtimes.
+
+## Other isolation: jails and zones
+
+- **FreeBSD jails** — older than Linux containers (2000).
+  Filesystem + network + process isolation in one primitive.
+  Conceptually similar to containers; less granular than
+  separate namespaces.
+- **Solaris zones** — same idea, separately developed (2004).
+  Came with built-in `dtrace`, ZFS, resource controls.
+- **Windows Server containers / Hyper-V containers** — Windows's
+  attempt. Hyper-V containers are actually microVMs.
+- **macOS sandbox** — Mach port-based; very different model.
+
+Linux's namespaces+cgroups is the model the rest of the
+industry standardized on (OCI runtime spec).
+
+## What's hard
+
+- **Init systems**: PID 1 has special responsibilities. Most
+  base images run a tiny init (tini, dumb-init) to handle
+  zombies and signal forwarding.
+- **Network**: bridges, NATs, iptables/nftables, CNI plugins
+  in K8s. Easy to misconfigure.
+- **Storage**: persistent state in a layered filesystem is
+  tricky; usually you mount external volumes.
+- **Security**: rootless containers, restrictive seccomp,
+  user namespaces, AppArmor/SELinux profiles. Lots of layers,
+  hard to verify.
+- **GPU / device passthrough**: needs explicit bind-mounts and
+  cgroup device controllers.
+
+K8s and managed platforms hide most of this. But when
+something breaks, you're in namespace land.
+
+## Tools
+
+```bash
+# List namespaces of a process
+ls -l /proc/<pid>/ns/
+
+# Enter another process's namespaces
+sudo nsenter -t <pid> -a
+
+# Show cgroup tree
+systemd-cgls
+systemd-cgtop
+
+# Per-cgroup metrics
+cat /sys/fs/cgroup/.../memory.current
+cat /sys/fs/cgroup/.../cpu.stat
+```
+
+For container debugging, `crictl`, `ctr` (containerd CLI),
+`docker exec` / `docker inspect`, and on K8s `kubectl exec`
+and `kubectl describe pod`.
+
+## The mental model
+
+A container is a normal process with kernel-enforced blinders
+(namespaces) and kernel-enforced limits (cgroups). The host
+runs one kernel; the container thinks it has its own world.
+
+Docker / Podman / containerd / CRI-O are different APIs over
+the same underlying primitives. K8s orchestrates them at
+scale.
+
+Containers aren't a hard security boundary the way VMs are —
+the shared kernel is the attack surface. For multi-tenant
+untrusted workloads, layer something stronger (Firecracker,
+Kata, gVisor) underneath. For trusted workloads, plain
+containers are fine and dramatically more efficient.

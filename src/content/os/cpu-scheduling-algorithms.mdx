@@ -1,0 +1,278 @@
+export const level = 'mid';
+
+# CPU scheduling algorithms
+
+A scheduler picks which runnable thread runs next on each CPU.
+The set of algorithms invented to do this is a museum of
+trade-offs between **throughput** (jobs done per unit time),
+**latency** (time from "I'm ready" to "I'm running"), and
+**fairness** (no thread starves). Knowing the museum tells you
+why your Linux box behaves the way it does — and why the rules
+change for batch jobs vs interactive shells vs real-time
+control.
+
+## The metrics scheduling tries to optimize
+
+| Metric | What it means | Who cares |
+|---|---|---|
+| **Throughput** | Jobs completed per second | Batch processing |
+| **CPU utilization** | % of time CPU is doing work | Cloud cost |
+| **Turnaround time** | Submit → finish | Batch jobs |
+| **Response time** | Submit → first response | Interactive shells, web servers |
+| **Wait time** | Time spent in runqueue (not running) | Latency-sensitive |
+| **Fairness** | Each thread gets a "fair share" | Multi-tenant |
+
+No algorithm wins on all of these — they trade off. Real
+schedulers blend.
+
+## First-Come, First-Served (FCFS / FIFO)
+
+Run threads in the order they arrived. Simplest possible.
+
+```
+Arrival: A (burst 24)  B (burst 3)  C (burst 3)
+Schedule: |  A (24)              | B (3) | C (3) |
+Wait:    A=0, B=24, C=27  → avg 17
+```
+
+**The convoy effect**: one CPU hog at the front of the queue
+makes everyone wait. If A took an hour and B/C needed a
+millisecond each, FCFS is brutal.
+
+Used in: nothing important anymore. Pedagogical baseline.
+
+## Shortest Job First (SJF) / Shortest Job Next (SJN)
+
+Run the thread with the smallest expected CPU burst next.
+
+```
+Arrival: A (burst 24)  B (burst 3)  C (burst 3)
+Schedule: | B (3) | C (3) |  A (24)              |
+Wait:    A=6, B=0, C=3  → avg 3
+```
+
+Provably optimal for average wait time *if you know the burst
+lengths*. You don't. The kernel can guess based on history —
+"this thread's average burst was 2ms, predict 2ms" — but it's
+fragile.
+
+**Starvation**: a stream of short jobs can starve a long one
+forever. Almost-SJF schemes age waiting jobs to avoid this.
+
+Used in: batch schedulers that know job size up front (HPC).
+
+## Shortest Remaining Time First (SRTF)
+
+Preemptive SJF. If a new job arrives with a shorter remaining
+time than the running one, preempt and switch.
+
+Same optimality, same starvation, plus context-switch overhead.
+
+## Round Robin (RR)
+
+Give every runnable thread a fixed **time slice** (quantum), say
+10ms. When the slice expires, preempt and move to the end of the
+queue. Next thread runs.
+
+```
+Quantum: 4
+Arrival: A (burst 10) B (burst 4) C (burst 8) — all at t=0
+Schedule: A B C A C A C
+          4 4 4 4 4 2 2 2
+```
+
+The defining knob is the **quantum size**:
+
+- **Too small** — context switches eat all the CPU.
+- **Too big** — interactive feel suffers (the user types,
+  nothing happens for 200ms).
+
+Modern Linux quanta are ~1ms in CFS for I/O-bound tasks, ~6ms for
+CPU-bound ones. The scheduler picks dynamically.
+
+Round Robin gives **fairness** and **bounded response time**
+((N-1) × quantum worst case). It doesn't optimize throughput.
+
+## Priority scheduling
+
+Every thread has a **priority**. Pick the highest-priority
+runnable thread. Tiebreak with RR among equals.
+
+Two variants:
+
+- **Static priority** — assigned at thread creation, never
+  changes. Real-time OSes use this (SCHED_FIFO, SCHED_RR).
+- **Dynamic priority** — kernel adjusts based on behavior.
+  Boost interactive threads (low CPU use, lots of sleep);
+  demote CPU hogs.
+
+**Starvation again**: low-priority threads never run if there's
+always a higher one ready. Fix: **aging** — bump priority of
+threads that have been waiting too long.
+
+## Multi-Level Feedback Queue (MLFQ)
+
+Several priority queues, each with its own time slice. Threads
+move *between* queues based on observed behavior.
+
+```
+high │ Q0  quantum 1ms   ← new threads start here
+     │ Q1  quantum 2ms
+     │ Q2  quantum 4ms
+low  │ Q3  quantum 8ms   ← CPU-bound demoted here
+```
+
+Rules:
+
+1. New thread → top queue.
+2. If it blocks before using its quantum → stay in the same
+   queue (it's interactive, reward it).
+3. If it uses its full quantum → demote to next queue (it's
+   CPU-bound, deprioritize).
+4. Periodically, promote everyone to top queue ("boost") so
+   nobody starves.
+
+MLFQ is *adaptive*: a thread's class isn't declared, it's
+inferred from how it uses the CPU. Solaris, classic Linux
+O(1), Windows all used variants. It's a brilliant idea with
+nasty edge cases (gaming — call sleep right before quantum
+expires to stay in top queue).
+
+## Lottery scheduling
+
+Give each thread a number of "tickets" proportional to its
+desired share. Pick a random ticket; the thread that owns it
+runs.
+
+```
+Thread A: 75 tickets  (75% expected share)
+Thread B: 25 tickets  (25% expected share)
+```
+
+**Properties**: probabilistically fair, no starvation
+(everyone has at least one ticket), trivially adjustable. Good
+for "users get shares of the machine" scenarios.
+
+**Variant — stride scheduling**: deterministic version. Each
+thread has a *stride* inversely proportional to its share; pick
+the thread with the smallest *pass* value, run it, add its
+stride to its pass. Always picks the most-behind thread. Exact
+fairness without randomness.
+
+Mostly academic; lottery's exact descendant didn't ship in
+mainstream kernels, but the *idea* — proportional share — became
+CFS.
+
+## Completely Fair Scheduler (CFS)
+
+Linux's default since 2007. Not really a "queue" — it's a
+red-black tree sorted by **vruntime**: each thread's CPU usage
+weighted by its "weight" (set by nice value).
+
+```
+vruntime(thread) ≡ actual CPU time × (NICE_0_LOAD / weight)
+```
+
+The scheduler always runs the thread with the **smallest
+vruntime**. Higher-nice (lower-priority) threads accumulate
+vruntime *faster*, so they get picked less often. nice 0 = 1024
+weight; nice 19 = 15; nice -20 = 88761.
+
+```
+Two threads, equal nice:
+  vruntime advances at same rate → each gets 50% CPU.
+
+Two threads, A=nice 0, B=nice 5:
+  weights ~1024 vs 335 → A gets ~75%, B gets ~25%.
+```
+
+There's no fixed time slice. The "slice" is dynamic:
+`min_granularity (1ms) … target_latency (6ms) / N runnable`.
+When a thread runs long enough that another thread now has
+smaller vruntime, switch.
+
+CFS deserves its own page; see *cfs-and-modern-schedulers*.
+
+## Real-time scheduling — SCHED_FIFO, SCHED_RR, SCHED_DEADLINE
+
+Linux exposes three real-time scheduling classes that **preempt
+normal threads** (SCHED_OTHER = CFS):
+
+- **SCHED_FIFO** — strict priority, no time slice. Highest-prio
+  runnable RT thread runs until it blocks or a higher-prio one
+  arrives. A buggy SCHED_FIFO infinite loop can lock out
+  everything else (including init) on a uniprocessor system.
+- **SCHED_RR** — like FIFO but with time slices, so equal-prio
+  RT threads round-robin.
+- **SCHED_DEADLINE** — give each thread a (runtime, deadline,
+  period); the kernel schedules using EDF (Earliest Deadline
+  First). Hard real-time guarantees with admission control.
+
+```c
+struct sched_param p = { .sched_priority = 50 };
+sched_setscheduler(0, SCHED_FIFO, &p);
+```
+
+Use cases: audio engines, robotics control loops, network
+appliances. Use with care — a runaway SCHED_FIFO can require a
+hardware reset.
+
+See *realtime-scheduling* for details.
+
+## Multiprocessor scheduling
+
+A modern machine has dozens of cores. The scheduler runs **per
+CPU**, with periodic **load balancing** moving threads between
+CPUs.
+
+Knobs:
+
+- **Affinity** — preferred CPUs for a thread. Keeps caches warm.
+- **Load balancing interval** — how often to rebalance. Too
+  often = cache pollution; too rarely = imbalance.
+- **NUMA awareness** — keep threads on the same NUMA node as
+  their memory.
+
+The hard call is **when to migrate**. Cache warmth says "leave
+the thread put." Load balance says "move it." Linux's heuristic
+involves load averages, idle-CPU search, NUMA distances, and
+recent migration history — about 5000 lines of code in
+`kernel/sched/fair.c` alone.
+
+## What you actually use
+
+For everyday Linux you almost never touch the scheduler. The
+exceptions:
+
+| Want | Use |
+|---|---|
+| Lower priority for a build | `nice -n 19 make` |
+| Higher priority (needs CAP_SYS_NICE) | `nice -n -10 ...` |
+| Real-time priority | `chrt -f 50 ./audio-engine` |
+| Pin to CPUs | `taskset -c 0-3 ./app` |
+| Restrict a service's CPU share | systemd `CPUWeight=`, cgroup |
+| Isolate a CPU from CFS entirely | kernel `isolcpus=2,3` boot param |
+
+In production, the most common ones are nice, taskset, and
+systemd's cgroup-based controls. Real-time scheduling is for
+specialists.
+
+## The mental model
+
+A scheduler is a policy on a queue. Every algorithm above is a
+different policy:
+
+- FCFS — order of arrival.
+- SJF — guess shortest, pick it.
+- RR — equal slices, rotate.
+- Priority — highest number wins.
+- MLFQ — priority that adapts to behavior.
+- Lottery/stride — proportional shares.
+- CFS — least-served-so-far.
+- Real-time — strict priority with deadlines.
+
+The right policy depends on what you want to optimize. CFS won
+in general-purpose Unix because it's *good enough* at all of
+fairness, latency, and throughput, with one knob (nice) for
+users who care. For everything else, there's a specialized
+scheduling class.

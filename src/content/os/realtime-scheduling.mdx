@@ -1,0 +1,274 @@
+export const level = 'senior';
+
+# Real-time scheduling
+
+"Real-time" doesn't mean "fast." It means **predictable**: an
+operation will complete by a specific deadline, every time, or
+the system is considered broken. A 1ms-late audio sample is a
+glitch. A 1ms-late airbag fires after impact. The OS support
+for hitting deadlines is a separate scheduling regime layered
+on top of normal scheduling.
+
+## Hard vs soft vs firm
+
+| Class | Late = | Examples |
+|---|---|---|
+| **Hard** | Catastrophic failure | Airbag, flight control, industrial robot |
+| **Firm** | Result useless, no damage | Video frame delivered after vblank |
+| **Soft** | Quality degrades | Audio glitch, game stutter, VoIP jitter |
+
+OSes you actually run (Linux, Windows, macOS) are **soft-RT
+capable** — you can get good latency most of the time, but
+nothing the *hardware* guarantees. Truly hard-RT needs a
+dedicated RTOS (QNX, VxWorks, FreeRTOS) or a co-kernel layer
+(Xenomai, RT-PREEMPT).
+
+## The two classic algorithms
+
+**Rate-Monotonic Scheduling (RM)** — static priority, shorter
+period = higher priority.
+
+```
+Task A: period 10ms, runtime 3ms → priority HIGH
+Task B: period 25ms, runtime 8ms → priority MED
+Task C: period 100ms, runtime 20ms → priority LOW
+```
+
+Optimal among static-priority algorithms. Provably schedulable
+when:
+
+```
+Σ (Cᵢ / Tᵢ) ≤ n × (2^(1/n) - 1)
+```
+
+For n=2 the bound is ~83%; as n→∞ it approaches ln 2 ≈ 69%.
+Above that, RM might miss deadlines even if total CPU < 100%.
+
+**Earliest Deadline First (EDF)** — dynamic priority. Whichever
+task's deadline is closest right now runs.
+
+Optimal among *all* preemptive algorithms on a uniprocessor:
+**schedulable iff total utilization ≤ 100%**. Can push the
+CPU much further than RM. Downside: complexity (deadlines have
+to be tracked) and instability under overload — when EDF can't
+keep up, *all* tasks miss deadlines; RM at least keeps the
+high-priority ones running.
+
+## Linux RT classes
+
+Linux exposes three real-time scheduling classes that all
+**preempt every CFS thread**:
+
+| Class | Priority | Time slice | Algorithm |
+|---|---|---|---|
+| `SCHED_FIFO` | 1–99 static | none — runs until blocked | strict prio |
+| `SCHED_RR`  | 1–99 static | RR quantum at equal prio | strict prio + RR |
+| `SCHED_DEADLINE` | (runtime, deadline, period) | given runtime per period | EDF + CBS |
+
+```c
+struct sched_param p = { .sched_priority = 50 };
+sched_setscheduler(0, SCHED_FIFO, &p);
+
+// Or via shell:
+// chrt -f 50 ./audio-engine
+```
+
+A SCHED_FIFO thread runs **until it blocks or a higher-priority
+RT thread preempts it**. If it doesn't block and nothing higher
+exists, it owns the CPU. A buggy SCHED_FIFO infinite loop is
+catastrophic on a uniprocessor.
+
+## The `rt_runtime` safety cap
+
+Because runaway RT threads can lock you out of the system, Linux
+caps total RT use:
+
+```bash
+sysctl kernel.sched_rt_period_us   # default 1_000_000
+sysctl kernel.sched_rt_runtime_us  # default 950_000  → 95%
+```
+
+So RT threads can use at most 95% of CPU per second. The
+remaining 5% goes to CFS no matter what. This is the safety net
+that lets you `kill` a runaway RT process — your shell still
+gets scheduled.
+
+Set `sched_rt_runtime_us = -1` to disable the cap. Don't do
+this unless you really know what you're doing. Truly.
+
+## SCHED_DEADLINE — EDF in the kernel
+
+Each thread gets three parameters:
+
+```c
+struct sched_attr a = {
+  .size           = sizeof(a),
+  .sched_policy   = SCHED_DEADLINE,
+  .sched_runtime  = 2_000_000,   // 2ms
+  .sched_deadline = 5_000_000,   // by 5ms after release
+  .sched_period   = 10_000_000,  // every 10ms
+};
+sched_setattr(0, &a, 0);
+```
+
+"Every 10ms, I need 2ms of CPU, finishing within 5ms of when
+I'm released." The kernel runs **admission control**: the new
+task is accepted only if total utilization on the target CPU(s)
+stays below 1.
+
+If your thread overruns its `runtime` budget, the kernel
+**throttles it** (CBS — Constant Bandwidth Server). You don't
+get to silently steal time from someone else. This is what
+makes deadline robust against misbehaving tasks.
+
+The right tool for periodic real-time work — audio engines,
+control loops, scheduled telemetry — when you can characterize
+the load.
+
+## Priority inversion — the Mars Pathfinder bug
+
+Classic failure mode. Three threads:
+
+- **H** (high prio) needs a mutex.
+- **M** (medium prio) is CPU-bound, doesn't touch the mutex.
+- **L** (low prio) holds the mutex.
+
+H blocks waiting for L. M preempts L (higher priority). L can't
+make progress on the mutex because M is running. So **H is
+effectively blocked by M**, even though H has higher priority
+than M.
+
+Pathfinder hit this on Mars in 1997: the high-prio bus thread
+was blocked by the meteorological data thread, which was
+preempted by ground-comm. Watchdog reset the spacecraft. Once a
+day. From Mars.
+
+## Priority inheritance
+
+Fix: when H blocks on a mutex held by L, **temporarily promote
+L to H's priority** until L releases the mutex. M no longer
+preempts L; L finishes, releases, demotes; H runs.
+
+POSIX: `pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)`.
+Linux futex: `FUTEX_LOCK_PI` is the kernel-side PI primitive.
+
+Pathfinder fixed the bug by enabling PI on the affected
+mutexes. The patch was uploaded.
+
+**Priority ceiling** is a stricter variant: the mutex itself has
+a ceiling priority, and any holder runs at that priority for
+the entire duration. Avoids the lookup needed by PI; less
+flexible.
+
+## RT-PREEMPT and PREEMPT_RT
+
+A vanilla Linux kernel disables preemption in some critical
+sections (spinlocks, interrupt handlers, top halves). Worst-
+case latency can be tens of milliseconds — fine for soft RT,
+useless for control loops.
+
+**RT-PREEMPT** (now `CONFIG_PREEMPT_RT`, merged in 6.12 in
+2024) rewrites:
+
+- **Spinlocks** → preemptible rt_mutexes (with PI baked in).
+- **Interrupt handlers** → run in kernel threads (so they can
+  be scheduled).
+- **Softirqs** → also kernel threads.
+
+Result: worst-case latency on industrial hardware drops from
+~30ms to ~30µs. Trade-off: throughput dips a few percent
+(everything has more locking overhead), and some drivers don't
+work right.
+
+Used by: industrial automation, robotics, professional audio
+(JACK), pro AV, automotive (Linux-based ADAS).
+
+## Latency analysis
+
+For RT work, **measure don't guess**. Tools:
+
+```bash
+cyclictest -t -p 80 -i 1000 -m   # standard PREEMPT_RT benchmark
+hwlatdetect                       # detects hardware-induced latency (SMI)
+ftrace + 'function_graph'         # trace kernel paths
+perf sched latency                # CFS scheduling delays
+```
+
+`cyclictest` runs a high-prio thread that sleeps for a fixed
+period and measures actual vs requested wakeup. The histogram
+of latencies — especially max — tells you if the system can
+hit a deadline.
+
+Good PREEMPT_RT result: `max < 100µs` over hours of mixed
+load. Bad: occasional 5ms spikes (probably an SMI — System
+Management Interrupt — from buggy firmware).
+
+## The CPU isolation trick
+
+Even with PREEMPT_RT, sharing a CPU with random kernel work is
+risky. Standard recipe:
+
+```
+boot params:
+  isolcpus=2,3         # CFS won't put threads on CPUs 2, 3
+  nohz_full=2,3        # disable tick on those CPUs while one task runs
+  rcu_nocbs=2,3        # offload RCU callbacks elsewhere
+  irqaffinity=0,1      # IRQs only on CPUs 0, 1
+```
+
+Then pin your RT threads to CPUs 2, 3:
+
+```bash
+taskset -c 2 ./control-loop
+```
+
+Those CPUs see almost nothing but your code. Worst-case latency
+in the hundreds of nanoseconds is achievable. This is the
+standard pattern in HFT and packet-processing appliances.
+
+## Useful patterns
+
+- **No `malloc` in the critical path.** Allocator may need a
+  syscall (`brk`, `mmap`) → unbounded latency. Pre-allocate
+  pools.
+- **No page faults.** `mlockall(MCL_CURRENT | MCL_FUTURE)` to
+  pin all your pages in RAM.
+- **No GC.** Use C/C++/Rust. JIT'd languages with stop-the-
+  world GC are unsuitable for hard RT (incremental GCs help for
+  soft RT — see Zing, ZGC tuned for low pause).
+- **No blocking syscalls in the loop.** Especially `read` from
+  disk. Cache everything; do disk I/O from a separate non-RT
+  thread.
+- **PI mutexes only.** Or lock-free data structures.
+
+## Linux + RT in 2026
+
+The picture has matured. PREEMPT_RT is mainline. Audio,
+robotics, and industrial use it. SCHED_DEADLINE is shipping in
+production schedulers (containerd has knobs). Even Kubernetes
+has experimental support for RT pods with isolated CPUs.
+
+It's still not QNX. If you need *certified* hard real-time —
+medical devices, automotive safety — you go to a microkernel
+RTOS or a dual-kernel setup (RTAI, Xenomai). For everything
+else, "Linux with PREEMPT_RT and proper isolation" is the
+standard answer.
+
+## The mental model
+
+Normal scheduling optimizes average response and fairness.
+Real-time scheduling optimizes worst-case latency. The trade-
+off is throughput: a system tuned for predictable 100µs
+deadlines is doing more bookkeeping than one tuned for
+maximum req/s.
+
+Pick the right class: SCHED_FIFO for "highest prio runs until
+blocked," SCHED_DEADLINE for periodic-with-budget, CFS for
+everything else. Always set `rt_runtime` caps in production.
+Use PI mutexes between RT threads. Measure with cyclictest.
+Isolate CPUs when the budget is tight.
+
+Hard real time is a property of the *whole stack* — hardware,
+firmware, kernel, application. The OS only gets you to "if
+nothing else interferes, the deadline is hit." Making "nothing
+else interferes" true is the rest of the work.

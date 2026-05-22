@@ -1,0 +1,213 @@
+export const level = 'mid';
+
+# Threads and threading models
+
+A thread is the unit of CPU scheduling. A process owns an
+address space; threads are the things actually running inside
+it. Two threads in the same process share memory (heap, globals,
+code) but each has its own stack, registers, and program
+counter. That's the whole abstraction. The interesting question
+is **who knows about the thread** — the kernel, the user-space
+runtime, or both.
+
+## The three threading models
+
+```
+1:1 (kernel threads)        M:N (hybrid)             N:1 (user threads)
+────────────────────         ────────────             ──────────────────
+user: T1  T2  T3            user: T1 T2 T3 T4 T5    user: T1 T2 T3
+       │   │   │                   │  │  │  │  │           │  │  │
+       ▼   ▼   ▼                   ▼  ▼  ▼  ▼  ▼          ▼  ▼  ▼
+kern: K1  K2  K3            kern: K1 K2                kern:    K1
+       │   │   │                   │  │                         │
+       ▼   ▼   ▼                   ▼  ▼                         ▼
+CPU:  CPU CPU CPU            CPU: CPU CPU             CPU:    CPU
+```
+
+- **1:1** — every user thread is a kernel thread. Linux, Windows,
+  macOS, modern FreeBSD. Simple to reason about; kernel schedules
+  directly. Cost: every thread is a `task_struct` (~10KB), and
+  context switches cross the kernel.
+- **N:1** — many user threads multiplexed onto one kernel thread
+  by a userspace scheduler. Cheap to create (just a stack +
+  state), but **one blocking syscall blocks every thread**, and
+  you can't use multiple cores. Old Linux pthreads pre-NPTL,
+  green threads.
+- **M:N** — N user threads on M kernel threads, with userspace
+  scheduling. Best of both, in theory. In practice nobody got
+  the integration with blocking syscalls right; FreeBSD KSE
+  failed, Solaris dropped its M:N model. Go's goroutines are the
+  successful modern attempt (M kernel threads, N goroutines, with
+  the runtime intercepting blocking ops).
+
+Mainstream Unix in 2026 is 1:1. If you want lightweight
+concurrency, the runtime gives you N:M itself (Go, Tokio,
+virtual threads in Java 21+).
+
+## Linux: threads are processes that share things
+
+There's no separate "thread" object in Linux. `pthread_create`
+calls `clone()` with a bunch of `CLONE_*` flags that tell the
+kernel "make a new task, but share these things with the parent":
+
+```c
+clone(child_fn, child_stack,
+      CLONE_VM       // share address space
+    | CLONE_FS       // share filesystem info (cwd, root)
+    | CLONE_FILES    // share FD table
+    | CLONE_SIGHAND  // share signal handler table
+    | CLONE_THREAD   // be in the same thread group
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | SIGCHLD,
+      arg);
+```
+
+`fork()` is `clone(SIGCHLD, ...)` — share nothing. So "process"
+and "thread" on Linux differ only in which flags you set. Both
+end up as `task_struct` entries; both get scheduled the same
+way; both can be killed individually.
+
+That's why `ps -T -p $$` shows threads as PCBs and why
+`/proc/<pid>/task/<tid>/` exists.
+
+## Thread vs process — what's shared
+
+| Resource | Threads share? | Why |
+|---|---|---|
+| Address space (heap, globals, code) | Yes | Same `mm_struct` |
+| Open file descriptors | Yes | Same `files_struct` |
+| CWD, umask | Yes | Same `fs_struct` |
+| Signal handlers (the table) | Yes | Same `sighand_struct` |
+| Stack | No | Each thread has its own |
+| Registers, program counter | No | Per-thread by definition |
+| Thread-local storage (TLS) | No | Per-thread by design |
+| `errno` | No (it's TLS) | Would be unusable otherwise |
+| Pending signals | Half-and-half | Process-directed vs thread-directed |
+
+Stack is the subtle one. Each thread gets its own stack (default
+~8MB on Linux); the kernel allocates them in different VMAs.
+Overrun your stack and you get SIGSEGV via guard pages.
+
+## Thread-local storage
+
+`__thread` (C) / `thread_local` (C++) / `pthread_setspecific`
+give you per-thread variables. Implemented via a per-thread
+register (`%fs` on x86-64 Linux) that points to a per-thread
+data block. Accessing a TLS variable is ~one extra instruction
+vs a global.
+
+```c
+__thread int counter = 0;  // per-thread; each thread sees its own copy
+
+void increment() { counter++; }  // no lock needed
+```
+
+`errno` is the original TLS variable — every thread has its own,
+which is why `errno` is safe across threads.
+
+## How thread creation actually works
+
+```c
+pthread_t tid;
+pthread_create(&tid, NULL, worker, arg);
+```
+
+What happens:
+
+1. glibc allocates a stack (default 8MB via mmap, MAP_ANONYMOUS,
+   PROT_READ|PROT_WRITE, with a guard page).
+2. Allocates a TLS block.
+3. Sets up a struct with the entry function and arg.
+4. Calls `clone()` with the CLONE_THREAD flags above.
+5. Kernel creates the new `task_struct`, adds it to the run
+   queue.
+6. Returns the new TID via `&tid`.
+
+The new thread starts executing `worker(arg)`. When `worker`
+returns, glibc cleans up the stack and exits the thread.
+
+The "thread pool" pattern exists because steps 1–5 take
+microseconds. For tasks that themselves take microseconds,
+amortize: keep a pool of threads alive, hand them work.
+
+## Thread cancellation
+
+`pthread_cancel(tid)` asks the thread to die. By default it dies
+at the next **cancellation point** — a syscall the runtime marks
+as cancellable (`read`, `write`, `sleep`, etc.). Use
+`pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS)` for "die
+immediately," but it's almost always a footgun (you can be
+killed mid-malloc, holding the heap lock — instant deadlock).
+
+Modern code avoids cancellation. Pass an explicit "should stop"
+flag (`std::atomic<bool>`, Go context, Rust CancellationToken)
+and check it at safe points.
+
+## User-mode threading and async runtimes
+
+When the kernel charges 10KB and a syscall per thread, you can't
+have a million of them. So runtimes that want a million
+concurrent tasks (web servers, game backends) build their own
+schedulers on top of a small kernel-thread pool:
+
+| Runtime | Tasks | Backing kernel threads | Blocking-syscall fix |
+|---|---|---|---|
+| Go | goroutines (2KB stack growable) | GOMAXPROCS (= cores) | Runtime intercepts; spawns new kernel thread if needed |
+| Tokio (Rust) | futures | configurable thread pool | `tokio::task::spawn_blocking` for blocking work |
+| Node.js | callbacks/promises | 1 main + libuv pool (4 by default) | Move blocking I/O to the libuv pool |
+| Java 21+ | virtual threads | carrier threads (= cores) | Pinning detection; unmount carrier on blocking |
+| Erlang/BEAM | processes (~few KB) | 1 scheduler per core | Yields on every reduction |
+
+The pattern: cheap user-space "thread" abstraction + a small
+pool of real OS threads + heroics to make blocking syscalls
+not stall the whole pool. When the heroics fail, you get the
+"why did adding `time.Sleep` block my entire server" class of
+bug.
+
+## Choosing a model in 2026
+
+- **Compute-heavy, fixed concurrency** (N workers crunching) →
+  use kernel threads directly via your language's `std::thread`,
+  `pthread_create`, etc. One per core.
+- **I/O-heavy, high concurrency** (web server, scraper) → use
+  an async runtime (Tokio, Go, Node, virtual threads).
+- **Mix** → most modern stacks let you mix. Go: most code in
+  goroutines, CPU-bound work in a worker pool. Rust: Tokio
+  + `spawn_blocking`. Java: virtual threads for I/O, platform
+  threads for CPU.
+
+Don't reach for raw threads if your problem is "10,000 in-flight
+HTTP requests." Don't reach for async if your problem is "4
+threads each computing a matrix multiply."
+
+## What goes wrong with threads
+
+The hard part isn't creating them, it's coordinating them.
+Sharing memory between threads without synchronization gets you:
+
+- **Data races** — two threads write the same variable
+  unordered. UB in C/C++. In Java/Go, you see partial writes,
+  stale reads, torn 64-bit values on 32-bit systems.
+- **Deadlocks** — A holds lock X waiting on Y; B holds Y waiting
+  on X. Both stuck forever.
+- **Livelocks** — both retry their operations forever, neither
+  progresses.
+- **Starvation** — one thread always loses the race for a lock.
+
+Most of the rest of the OS-concurrency curriculum is about
+preventing these.
+
+## The mental model
+
+A thread is a stack + registers + a slot in the scheduler. A
+process is "threads + isolated memory + isolated FDs." On Linux
+they're the same kernel object with different sharing.
+
+Use kernel threads when you have a small number of long-lived
+units of work. Use a user-space runtime when you have many
+short-lived ones. The runtime is the one that should worry
+about how blocking syscalls interact with its scheduler — not
+you, line-by-line.

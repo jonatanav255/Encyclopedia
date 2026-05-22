@@ -67,6 +67,7 @@ const SHIKI_LANGS = [
   'c',
   'cpp',
   'dockerfile',
+  'go',
   'graphql',
   'html',
   'http',

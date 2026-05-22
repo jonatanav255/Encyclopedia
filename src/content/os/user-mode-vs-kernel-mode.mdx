@@ -1,0 +1,165 @@
+export const level = 'mid';
+
+# User mode vs kernel mode
+
+Every modern CPU has at least two privilege levels. The OS runs in
+the privileged one ("kernel mode," "supervisor," "ring 0," "EL1");
+your code runs in the unprivileged one ("user mode," "ring 3,"
+"EL0"). The boundary is enforced by the hardware, not the kernel —
+which is why you can't just "call into the kernel" from a regular
+function call.
+
+## What user mode can't do
+
+In user mode, the CPU refuses to execute privileged instructions
+or touch privileged state. Specifically:
+
+- **I/O port instructions** (`in`, `out` on x86) — would let you
+  read/write directly to device registers.
+- **Loading control registers** (CR0, CR3, IDTR, GDTR on x86) —
+  would let you reconfigure paging or the interrupt table.
+- **Halting the CPU** (`hlt`) — would freeze the machine.
+- **Disabling interrupts** (`cli`) — would let you monopolize the
+  CPU forever.
+- **Accessing kernel memory pages** — the MMU page-protection bit
+  blocks user-mode reads of kernel-only pages.
+
+Try any of those from user mode and the CPU raises a **general
+protection fault** or **#GP exception**. The kernel's exception
+handler turns that into `SIGSEGV` and your process dies.
+
+## Why the hardware enforces it
+
+Software-only protection wouldn't be sound. If "kernel mode" were
+just a flag the kernel set in RAM, any program could clear it. The
+distinction has to be a CPU state the kernel can *enter and exit*
+but user code *cannot set*.
+
+On x86, that's the **CPL (Current Privilege Level)** field in the
+CS register's segment selector. 0 = kernel, 3 = user. The only
+ways to drop CPL from 3 to 0:
+
+1. **Syscall instruction** (`syscall`, `sysenter`, or the older
+   `int 0x80`). Jumps to a kernel entry point and atomically
+   raises privilege.
+2. **Interrupt.** Hardware raises CPL to 0 and jumps to the
+   handler in the IDT.
+3. **Exception/trap.** Same — page fault, divide-by-zero, etc.
+
+All three are gates the kernel set up; user code can't pick the
+destination, only fire the gate.
+
+## The mode-switch dance
+
+A syscall is *not* a function call. Mechanically:
+
+```
+user code (ring 3)
+    │ syscall  ← instruction; atomically:
+    │           - CPL: 3 → 0
+    │           - SP: user → kernel stack
+    │           - RIP: jumps to syscall entry in kernel
+    ▼
+kernel entry handler
+    │ save user registers
+    │ dispatch by syscall number (rax)
+    │ run the syscall (e.g. sys_read)
+    │ restore user registers
+    │ sysret  ← atomically:
+    │           - CPL: 0 → 3
+    │           - SP: kernel → user
+    │           - RIP: back to user code after the syscall
+    ▼
+user code resumes
+```
+
+The kernel uses a **separate stack** per CPU per process. User
+code can't see it. This matters because the kernel can't trust
+the user stack — a malicious program could shrink it, mark it
+unreadable, or overlap it with kernel pages.
+
+## Costs
+
+Even a no-op syscall (`getpid()`) takes ~100–300ns on modern CPUs.
+Where does the time go?
+
+- Saving/restoring registers (~30–50 cycles).
+- Switching stacks (~10 cycles).
+- The pipeline flush from `swapgs` and CR3 changes
+  (Meltdown mitigation, KPTI, adds 50–500ns).
+- Cache and TLB pollution.
+
+Compare to a function call (~1ns). That's a 100x–1000x difference,
+which is why io_uring exists: it lets one syscall submit thousands
+of operations.
+
+The **vDSO** (virtual dynamic shared object) is the kernel's
+escape hatch for the cheapest reads. `gettimeofday`, `clock_gettime`,
+and `getcpu` are implemented as user-space code with kernel-managed
+data pages — no mode switch at all. That's why a tight loop calling
+`clock_gettime` can run at billions of calls per second.
+
+## What kernel mode can do that user mode can't
+
+| Action | User mode | Kernel mode |
+|---|---|---|
+| Allocate pages | `mmap` syscall | Direct: walk page tables |
+| Read disk | `read` syscall | Talk to NVMe controller |
+| Send packet | `send` syscall | Write to NIC ring buffer |
+| Switch processes | wait for timer | Modify scheduler state directly |
+| Access another process | `ptrace`, IPC | Read any page |
+| Crash the machine | impossible* | trivially (panic) |
+
+*Outside of triggering a kernel bug via a syscall, which is the
+whole point of the kernel privilege boundary.
+
+## Why "everything is a syscall" matters
+
+Because user mode can't touch hardware, **every interaction with
+the outside world is a syscall**. Reading a file? `read`.
+Connecting to a server? `socket`+`connect`. Even allocating
+memory eventually hits `brk` or `mmap` (libc batches small
+allocations to amortize).
+
+This is why `strace` is so useful for debugging — it logs every
+syscall, and that's literally every interaction your program has
+with anything outside its own address space. If the bug isn't in
+your code, it's in a syscall.
+
+## Privilege escalation as a class of bug
+
+A **privilege escalation** vulnerability is anything that lets
+user code make the CPU drop to kernel mode without the kernel
+intending to allow it. Examples:
+
+- Kernel bug where a syscall writes into user-controlled memory
+  with kernel privileges.
+- A driver that doesn't validate ioctl arguments and follows a
+  user-controlled pointer.
+- Speculative execution side channels (Meltdown) that leak
+  kernel-mode data to user mode.
+
+This is why kernel security patches are urgent in a way that
+userspace patches usually aren't: one bad syscall handler can be
+"any user owns the entire machine."
+
+## Two-mode is the floor, not the ceiling
+
+x86 has four rings (0–3); only 0 and 3 are used by mainstream
+OSes. Hypervisors added a new "ring -1" (VMX root mode for
+Intel VT-x) below ring 0, so the hypervisor can trap operations
+the *kernel* tries. ARM has EL0 (user), EL1 (kernel), EL2
+(hypervisor), EL3 (secure monitor / TrustZone). The principle —
+hardware-enforced privilege boundaries with controlled entry
+gates — is the same all the way up.
+
+## The mental model
+
+User mode is a cage. Kernel mode holds the key. The only doors
+out of the cage are the syscall gate, the interrupt gate, and
+the exception gate — all set up by the kernel. Anything else is
+a CPU fault.
+
+That's why you can run untrusted code (a browser tab, a Docker
+container) on the same machine as your password manager: the cage
+is enforced by transistors, not by polite convention.

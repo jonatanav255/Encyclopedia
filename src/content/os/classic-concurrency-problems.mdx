@@ -1,0 +1,338 @@
+export const level = 'mid';
+
+# Classic concurrency problems
+
+The four problems every OS textbook drills you on. They look
+artificial — five philosophers? a sleeping barber? — but each
+one isolates a specific concurrency pitfall in pure form.
+Producers/consumers is *capacity coordination*. Readers/writers
+is *shared vs exclusive access*. Dining philosophers is
+*deadlock prevention*. Sleeping barber is *event signaling
+across a boundary*. The patterns recur everywhere.
+
+## Producer-Consumer (bounded buffer)
+
+One or more producers add to a queue; one or more consumers
+pull from it. Two coordination requirements:
+
+1. Don't produce into a full queue.
+2. Don't consume from an empty queue.
+
+### With mutex + two condition variables
+
+```c
+mutex_t       m;
+cond_t        not_full, not_empty;
+queue_t       q;        // capacity N
+
+void produce(item) {
+    lock(&m);
+    while (queue_full(&q))           // ← always while, not if
+        cond_wait(&not_full, &m);
+    queue_push(&q, item);
+    cond_signal(&not_empty);
+    unlock(&m);
+}
+
+item consume() {
+    lock(&m);
+    while (queue_empty(&q))
+        cond_wait(&not_empty, &m);
+    item x = queue_pop(&q);
+    cond_signal(&not_full);
+    unlock(&m);
+    return x;
+}
+```
+
+Two CVs because there are two distinct things to wait for —
+"queue not full" (for producers) and "queue not empty" (for
+consumers). One shared CV with `broadcast` also works but wakes
+more threads than necessary.
+
+### With semaphores (no CVs)
+
+```c
+sem_t empty;   // init = N — count of empty slots
+sem_t full;    // init = 0 — count of items
+mutex_t m;
+
+void produce(item) {
+    sem_wait(&empty);   // block until a slot is empty
+    lock(&m);
+    queue_push(&q, item);
+    unlock(&m);
+    sem_post(&full);    // one more item available
+}
+
+item consume() {
+    sem_wait(&full);    // block until an item is available
+    lock(&m);
+    item x = queue_pop(&q);
+    unlock(&m);
+    sem_post(&empty);   // one more empty slot
+    return x;
+}
+```
+
+Symmetric and elegant: each semaphore counts one thing. The
+mutex protects the queue itself (the data structure, not the
+"is there space" predicate).
+
+### Common bugs
+
+- Using `if` instead of `while` in the CV version → spurious
+  wakeup / Mesa-style signal causes a consumer to pop from an
+  empty queue.
+- Calling `sem_wait` while holding the mutex → deadlock waiting
+  to happen.
+- Signaling outside the mutex in the CV version → some
+  pthread impls work, some don't. Stay inside.
+- One CV for both conditions + `signal` (not `broadcast`) → can
+  wake the wrong side (e.g., wake another producer when a slot
+  appears, while consumers are also waiting). Use `broadcast`
+  or two CVs.
+
+## Readers-Writers
+
+Many readers can hold the lock simultaneously. Writers need
+exclusive access. The catch: **what's "fair"?**
+
+### Reader-preference (writers can starve)
+
+```c
+int  readers = 0;
+mutex_t m;        // protects `readers`
+mutex_t rw;       // the actual data lock
+
+void read_acquire() {
+    lock(&m);
+    readers++;
+    if (readers == 1) lock(&rw);    // first reader locks out writers
+    unlock(&m);
+}
+void read_release() {
+    lock(&m);
+    readers--;
+    if (readers == 0) unlock(&rw);  // last reader lets writers in
+    unlock(&m);
+}
+void write_acquire() { lock(&rw); }
+void write_release() { unlock(&rw); }
+```
+
+Simple but readers can keep arriving forever, indefinitely
+delaying writers. Bad in update-heavy systems; fine for
+mostly-read static config.
+
+### Writer-preference (readers can starve)
+
+Track waiting writers; readers must wait if any writer is
+waiting. Inverse of above; same starvation issue, opposite
+victim.
+
+### Fair / FIFO
+
+Use a queue: requests serve in arrival order, with reads
+grouped consecutively. Most production rwlocks
+(`pthread_rwlock_t`, Java `ReentrantReadWriteLock` in fair
+mode) implement some flavor of this. Slower than the simple
+versions; safer in practice.
+
+### Why rwlocks are tricky in practice
+
+Acquiring a read lock requires writing a shared counter or
+queue — every reader bounces a cache line between cores. On
+hot paths with lots of readers, **a plain mutex is often
+faster** than a rwlock because there's nothing for readers to
+contend on (you just serialize).
+
+For genuinely read-heavy data with rare writes, prefer **RCU**
+or **copy-on-write with atomic pointer swap** — readers pay
+near-zero, writers pay one atomic + a grace period.
+
+## Dining Philosophers
+
+Five philosophers around a circular table; one chopstick
+between each pair; need both adjacent chopsticks to eat.
+Algorithms that work for one philosopher break for five.
+
+### The naive solution that deadlocks
+
+```c
+mutex_t chopsticks[5];
+
+void philosopher(int i) {
+    while (true) {
+        think();
+        lock(&chopsticks[i]);             // grab left
+        lock(&chopsticks[(i+1) % 5]);     // grab right
+        eat();
+        unlock(&chopsticks[i]);
+        unlock(&chopsticks[(i+1) % 5]);
+    }
+}
+```
+
+Five philosophers all pick up their left chopstick
+simultaneously, each holds one, each waits forever for the
+right. **Deadlock** — all four classic conditions hold (mutex,
+hold-and-wait, no preemption, circular wait).
+
+### Four classic fixes
+
+**1. Break circular wait (lock ordering):**
+
+```c
+int a = min(i, (i+1) % 5), b = max(i, (i+1) % 5);
+lock(&chopsticks[a]);   // always lower-numbered first
+lock(&chopsticks[b]);
+```
+
+Philosopher 4 (right neighbor 0) picks 0 then 4 instead of 4
+then 0. Cycle broken; no deadlock. This is the standard fix
+in real code: **establish a global lock order**.
+
+**2. Asymmetric: even philosophers grab left first, odd grab
+right first.** Same effect; breaks symmetry.
+
+**3. Limit concurrency:** only allow N-1 philosophers at the
+table at once (counting semaphore init=N-1). At most one is
+denied; cycles can't form.
+
+**4. Atomic two-lock acquire (tryLock):** try to grab both;
+if either fails, release the first and back off.
+
+```c
+while (true) {
+    lock(&chopsticks[i]);
+    if (trylock(&chopsticks[(i+1) % 5]) == 0) break;
+    unlock(&chopsticks[i]);
+    nanosleep(random_backoff);
+}
+eat();
+```
+
+Avoids deadlock; introduces possible **livelock** (everyone
+keeps trying and failing in sync). Random backoff fixes it
+probabilistically.
+
+### Why it matters
+
+Almost every real-world deadlock is a dining-philosophers
+instance with a different name: two database connections both
+need to lock rows X and Y; two services both try to lock
+queues A and B; two threads both need locks L1 and L2 — in
+inconsistent order.
+
+The fix is always the same: **acquire locks in a globally
+consistent order**, or use `tryLock` with backoff if that's
+impossible.
+
+## Sleeping Barber
+
+A barber's shop has one chair, N waiting-room chairs. The
+barber sleeps if there are no customers. When a customer
+arrives, they wake the barber. If a customer arrives and all
+waiting chairs are full, they leave. Coordinate the wakes and
+the queue.
+
+```c
+sem_t customers;    // counts customers in shop (init 0)
+sem_t barber;       // signals barber ready (init 0)
+mutex_t m;
+int waiting = 0;
+
+void barber_thread() {
+    while (true) {
+        sem_wait(&customers);   // sleep until a customer arrives
+        lock(&m);
+        waiting--;
+        sem_post(&barber);      // signal "ready for you"
+        unlock(&m);
+        cut_hair();
+    }
+}
+
+void customer(int id) {
+    lock(&m);
+    if (waiting >= N) {         // shop full
+        unlock(&m);
+        return;                  // leave
+    }
+    waiting++;
+    sem_post(&customers);        // wake barber
+    unlock(&m);
+    sem_wait(&barber);           // wait for barber to invite you
+    get_haircut();
+}
+```
+
+The interesting bit: **two-way handshake**. The customer
+signals the barber; the barber signals the customer back. This
+ensures the barber assigns each customer to one chair (no two
+customers think the barber is theirs simultaneously).
+
+Real-world analog: a thread pool with a bounded queue, where
+new jobs are rejected if the queue is full. The thread-pool
+implementation is essentially this problem.
+
+## Cigarette Smokers (and other less-loved ones)
+
+Three smokers each have one infinite supply (tobacco,
+paper, matches). An agent puts down two of the three on a
+table; the smoker who has the missing item rolls. Constraint:
+you can't modify the agent (it's an abstraction of an OS).
+
+Notable for proving that **semaphores alone aren't enough** in
+some scenarios — you need extra threads (pushers) to demux. A
+reminder that the right *number* of synchronization primitives
+matters, not just having them.
+
+In modern OS practice this one is academic; mentioned for
+completeness.
+
+## What these teach you
+
+| Problem | Pitfall it isolates |
+|---|---|
+| Producer-Consumer | Capacity bounds; matching wait/signal pairs |
+| Readers-Writers | Mutual exclusion vs concurrent read; starvation |
+| Dining Philosophers | Deadlock from inconsistent lock ordering |
+| Sleeping Barber | Two-way signaling across a queue boundary |
+| Cigarette Smokers | When primitives don't compose |
+
+Every real concurrent system contains instances of these. The
+production code looks different ("DB connection pool," "config
+hot-reload," "task queue worker"), but the underlying patterns
+are these four.
+
+## Patterns drawn from them
+
+- **Capacity coordination**: bounded queue + two condition
+  variables, or empty/full semaphores.
+- **Shared-vs-exclusive access**: rwlock for write-rare; mutex
+  for write-frequent; RCU for write-rare + read-hot.
+- **Deadlock prevention**: lock ordering. If you can't order,
+  use `tryLock` with backoff.
+- **Cross-thread signaling**: condition variable for "wait
+  inside a critical section"; semaphore for "wait across a
+  boundary (handler, thread, signal)."
+- **Bounded rejection**: count-and-refuse pattern from sleeping
+  barber. Used in pool exhaustion, rate limiters.
+
+## The mental model
+
+These four problems pre-date every modern concurrent system,
+and the systems still get them wrong. Producer-consumer with
+the wrong wait/signal pairing causes deadlocks in CI pipelines.
+Dining philosophers replays as DB deadlocks in every transactional
+system. Readers-writers shows up as "the cache is hot but the
+update path takes 200ms."
+
+If you can solve all four correctly on a whiteboard, with the
+right primitive choice and the right loop discipline, you can
+write nearly any concurrent code that comes up in normal
+backend work. The exotic stuff (lock-free queues, RCU) is
+optimization for cases where these solutions become the
+bottleneck.

@@ -1,0 +1,219 @@
+export const level = 'mid';
+
+# Interrupts, exceptions, traps, and faults
+
+These are the kernel's incoming messages. An interrupt is the disk
+saying "your read is done." An exception is the CPU saying "this
+instruction can't run." A trap is software saying "drop into the
+kernel deliberately." Same delivery mechanism (the IDT), very
+different meanings.
+
+## Five categories — names matter
+
+| Category | Source | Synchronous? | Example | Recoverable? |
+|---|---|---|---|---|
+| **Interrupt** | External device | No (async) | Disk done, NIC packet | Always |
+| **Trap** | Software, intentional | Yes | `syscall`, `int3` breakpoint | Always |
+| **Fault** | CPU, current instr. | Yes | Page fault, #GP | Sometimes |
+| **Abort** | CPU, current instr. | Yes | Double fault, machine check | Rarely |
+| **Exception** | Umbrella for the above three | Yes | — | — |
+
+Intel calls "interrupts" the async ones from outside the CPU, and
+"exceptions" the synchronous ones from the current instruction.
+"Trap," "fault," and "abort" are subtypes of exception that
+differ in **what the return address points to**:
+
+- **Trap** — return address points to the instruction *after*.
+  `int3` (debugger), `syscall`, overflow trap. Useful when you
+  want to continue.
+- **Fault** — return address points to the instruction that
+  faulted. The handler is expected to fix the problem and let
+  the instruction retry. Page fault is the canonical example.
+- **Abort** — instruction can't be restarted, and the handler
+  often can't recover. Double fault, machine check exception.
+
+The distinction is invisible from C, but if you're writing an
+exception handler in assembly it determines whether you increment
+or don't increment the saved RIP.
+
+## The IDT — the kernel's switchboard
+
+The **Interrupt Descriptor Table** is an array of 256 entries.
+Each entry says "if this vector fires, jump to this handler at
+this privilege level." The CPU's `IDTR` register points to it;
+the kernel sets it up at boot.
+
+```
+Vector  Source            Handler
+0       #DE divide error  do_divide_error
+1       #DB debug         do_debug
+3       #BP breakpoint    do_int3
+6       #UD invalid op    do_invalid_op
+8       #DF double fault  do_double_fault
+13      #GP protection    do_general_protection
+14      #PF page fault    do_page_fault
+...
+32      Timer (LAPIC)     apic_timer_interrupt
+33      Keyboard          (PIC IRQ1)
+...
+128     int 0x80          entry_INT80_compat   (legacy syscall)
+```
+
+Vectors 0–31 are reserved by Intel for exceptions. 32–255 are
+free for the OS to assign to devices.
+
+## What happens on an interrupt
+
+```
+1. Device asserts IRQ on bus
+2. Interrupt controller (APIC) picks a CPU, sends vector
+3. CPU finishes current instruction (mostly)
+4. CPU consults IDT[vector] → entry point
+5. CPU pushes EFLAGS, CS, RIP onto kernel stack
+   (and switches to kernel stack if coming from user mode)
+6. CPU jumps to handler at CPL=0
+7. Handler runs (typically: ack the device, schedule deferred work)
+8. Handler returns via `iret` → restores EFLAGS, CS, RIP
+9. CPU resumes whatever it was doing
+```
+
+The whole thing is hardware-managed up to step 6. Steps 7–8 are
+the kernel's code. The "mostly" in step 3 is why some
+instructions are interruptible mid-execution (rep movsb saves
+progress in RCX) and others aren't.
+
+## Top half / bottom half
+
+An interrupt handler runs **with interrupts disabled** (the
+kernel doesn't want a flood of nested handlers). That means
+the handler must be fast — a few microseconds — or other
+interrupts get dropped.
+
+Linux splits work in two:
+
+- **Top half** (the actual interrupt handler): minimal. Ack the
+  device, copy data out of the device buffer into a per-CPU
+  queue, schedule the bottom half. Done.
+- **Bottom half** (deferred): the heavy work. Runs with
+  interrupts enabled. Three flavors:
+  - **Softirq** — preallocated, statically defined (TIMER_SOFTIRQ,
+    NET_RX_SOFTIRQ, BLOCK_SOFTIRQ). Runs on the CPU that took the
+    interrupt. Fastest, but fixed types.
+  - **Tasklet** — built on softirq; dynamic, but serialized per
+    tasklet (one runs at a time globally).
+  - **Workqueue** — runs in a kernel thread with full process
+    context. Can sleep. Use when you need to do blocking work.
+
+```
+NIC IRQ
+  ↓
+top half (do_IRQ): ack NIC, schedule NET_RX_SOFTIRQ
+  ↓ (returns immediately)
+softirq runs (ksoftirqd if backlog): process packets up the stack
+  ↓
+TCP/UDP code, wake waiting sockets, etc.
+```
+
+The split is why high-rate networking uses **NAPI**: above a
+threshold, the NIC interrupt schedules a softirq that *polls*
+the NIC for more packets instead of taking another interrupt
+per packet. Fewer mode switches, more throughput.
+
+## Page faults — faults that aren't bugs
+
+Most faults indicate a bug (divide by zero, invalid opcode). The
+**page fault** is the exception: it's a normal, expected part of
+how virtual memory works.
+
+When the CPU tries to access a virtual address and the page
+table entry is missing or has wrong permissions, it raises #PF.
+The fault handler has to figure out which case:
+
+| Case | Handler does | User sees |
+|---|---|---|
+| Demand-paged page never touched | Allocate a zero page, install PTE | Nothing |
+| Page swapped out | Read from swap, install PTE | Stall |
+| Copy-on-write after fork | Copy the page, mark writable | Nothing |
+| Stack growth | Extend the stack VMA, install PTE | Nothing |
+| Genuine bad access (NULL, etc.) | Send SIGSEGV | Crash |
+| Kernel bug accessing user-space | OOPS / panic | Reboot |
+
+So a "page fault" in `top`'s minor/major faults columns is mostly
+normal traffic, not errors. Minor = no I/O (zero page, COW).
+Major = had to read from disk.
+
+## Double fault — the "you broke the handler" fault
+
+If an exception fires *while the CPU is delivering another
+exception*, you get a **double fault** (#DF). If *that* handler
+faults, you get a **triple fault** — and on most CPUs the
+machine just resets. (No vector 16 for "triple"; the CPU gives
+up.)
+
+In practice double faults mean:
+
+- The kernel stack overflowed (page fault on the stack, while
+  handling a page fault).
+- The IDT itself was corrupted.
+- A kernel bug in an exception handler.
+
+Linux installs a #DF handler on a separate "IST" stack
+(interrupt stack table) precisely so it can survive the kernel
+stack itself going bad — long enough to log a panic.
+
+## Software interrupts — `int N` and `syscall`
+
+You can fire an interrupt from software with `int N`. Three
+uses in modern systems:
+
+- `int3` (single byte `0xCC`) — debugger breakpoint. Trap, not
+  fault, so RIP advances past it.
+- `int 0x80` — legacy Linux syscall entry. Slow; modern code
+  uses `syscall`.
+- `int N` to a kernel-defined vector — some kernels use this
+  for IPI (inter-processor interrupts).
+
+The `syscall` instruction is technically separate from interrupts
+(uses MSRs `LSTAR`, `STAR`, `SFMASK` for the entry point) but
+semantically it's the same: drop privilege, jump to fixed handler.
+
+## Inter-processor interrupts (IPIs)
+
+When CPU 0 needs CPU 1 to do something *right now* — TLB
+shootdown, scheduler kick, reschedule for load balance — it
+sends an IPI via the local APIC. The target CPU takes an
+interrupt at its next safe point.
+
+```
+CPU 0: change page table, then send IPI to CPUs 1, 2, 3
+CPU 1: take IPI → run flush_tlb handler → flush local TLB
+CPU 2, 3: same
+CPU 0: wait for all to acknowledge → continue
+```
+
+This is what makes "freeing a page" so expensive on big systems:
+you can't just clear the PTE, you have to TLB-shoot down every
+core that might have it cached.
+
+## What you actually see as a user
+
+- `dmesg` lists kernel messages, including OOPS reports from
+  unhandled exceptions in driver code.
+- `vmstat 1` shows interrupts/sec under `in`. A spike usually
+  means a misbehaving NIC or a chatty timer.
+- `cat /proc/interrupts` lists every vector and per-CPU count.
+  Useful for "is this NIC IRQ pinned to one CPU?"
+- A segfault is the kernel translating an unhandleable #PF in
+  user code into `SIGSEGV`.
+
+## The mental model
+
+The IDT is the kernel's `switch` on everything that comes from
+outside C-level control flow — devices, faults, deliberate
+traps. The hardware does the table lookup and the privilege
+escalation; the kernel writes the cases.
+
+If you understand "interrupt = fast top half, defer the work,
+and don't sleep in it," you understand 80% of what driver
+authors get wrong. The other 20% is page faults inside an
+interrupt handler, and that's a different kind of fun.

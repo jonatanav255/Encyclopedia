@@ -1,0 +1,347 @@
+export const level = 'mid';
+
+# Synchronization primitives
+
+The kernel and user-space libraries ship a small zoo of
+locking primitives. They look interchangeable on the surface
+but cost wildly different amounts and behave differently under
+contention. Knowing which one a `std::mutex` or
+`pthread_mutex_t` actually is — and what its kernel friend
+`futex` does — explains most of the surprises you hit when
+making code parallel.
+
+## What hardware gives you
+
+Synchronization always bottoms out in atomic CPU instructions:
+
+| Instruction | What it does |
+|---|---|
+| `XCHG` (x86) | Atomic swap memory with register |
+| `LOCK XADD` | Atomic fetch-and-add |
+| `LOCK CMPXCHG` | Compare-and-swap (CAS) |
+| `LL/SC` (ARM, RISC-V) | Load-Linked / Store-Conditional |
+
+CAS is the most general:
+
+```c
+// pseudocode for CAS(addr, expected, new)
+atomic {
+    if (*addr == expected) {
+        *addr = new;
+        return true;
+    } else {
+        return false;
+    }
+}
+```
+
+Every lock above the assembly layer is built on these. A modern
+CAS on x86 is ~10–20 cycles when uncontended, hundreds when
+the cache line is bouncing between cores.
+
+## Spinlock — the simplest lock
+
+A boolean in shared memory. Acquirer spins until it's 0, then
+CAS it to 1.
+
+```c
+typedef struct { atomic_int locked; } spinlock_t;
+
+void lock(spinlock_t *l) {
+    while (atomic_exchange(&l->locked, 1) == 1) {
+        // spin
+    }
+}
+void unlock(spinlock_t *l) { atomic_store(&l->locked, 0); }
+```
+
+**TAS (test-and-set)** as shown: every spinning core does an
+atomic write every iteration, hammering the cache line.
+
+**TTAS (test-and-test-and-set)** is the obvious fix: spin on
+a normal read until it looks 0, *then* try the atomic:
+
+```c
+while (true) {
+    while (atomic_load(&l->locked)) /* relax */;
+    if (atomic_exchange(&l->locked, 1) == 0) break;
+}
+```
+
+The first inner loop reads the cached line silently. Only the
+core that thinks it can acquire pays for the atomic. Much
+better behavior under contention.
+
+**Exponential backoff** further smooths things: if you fail
+the CAS, wait longer before trying again. Reduces ping-pong on
+oversubscribed locks.
+
+**Ticket lock**: every acquirer gets a ticket number; the lock
+holds the "now serving" number. Wait until yours comes up.
+Provides FIFO fairness.
+
+**MCS lock**, **CLH lock**: queue locks where each waiter spins
+on its own cache line, not the shared one. Best under heavy
+contention, used inside the Linux kernel.
+
+## Spinlock vs sleeping lock — the cost model
+
+**Spinlock**: burns CPU while waiting. Acquire = nanoseconds if
+uncontended.
+
+**Sleeping lock (mutex)**: parks the thread in the kernel.
+Acquire = nanoseconds if uncontended, ~µs if contended (context
+switch). Releases CPU to others.
+
+Rule of thumb:
+
+- If the critical section is **shorter than a context switch**
+  (~2µs), spin. Burning CPU is cheaper than scheduling.
+- If it's longer, sleep. Better to let someone else run.
+
+The kernel uses spinlocks for short critical sections and
+sleeping mutexes for long ones. User-space gets one primitive
+(mutex) that does both.
+
+## futex — the kernel side of user-space mutexes
+
+A modern user-space mutex is **a single 32-bit integer in user
+memory**. Most of the time, lock/unlock just CAS that integer
+in user space — *no syscall*. Only when the lock is contended
+does the kernel get involved, via the `futex` syscall.
+
+The protocol (simplified):
+
+```
+lock:
+    if CAS(state, 0, 1): return        // uncontended, no syscall
+    state = 2                           // mark "contended"
+    futex(state, WAIT, 2)              // park if still == 2
+    // loop with CAS again
+
+unlock:
+    if atomic_store(state, 0) was 2:
+        futex(state, WAKE, 1)          // wake one waiter
+    else:
+        return                          // no contention, no syscall
+```
+
+`futex_wait(addr, value)` says "go to sleep if `*addr == value`."
+The compare is atomic with the sleep, so no race between "I
+saw the lock contended" and "I'm now sleeping."
+
+`futex_wake(addr, n)` wakes up to n waiters.
+
+This is what `pthread_mutex_t`, `std::mutex`, Java's
+`synchronized`, and Go's `sync.Mutex` all use under the hood on
+Linux. The user-space fast path is what makes mutexes cheap
+when uncontended.
+
+## Reader-writer locks
+
+Allow multiple readers OR one writer at a time. Wins when reads
+massively outnumber writes (config, lookup tables).
+
+```c
+pthread_rwlock_t lock;
+pthread_rwlock_rdlock(&lock);  // many can hold
+pthread_rwlock_wrlock(&lock);  // exclusive
+```
+
+Costs:
+
+- Read acquire: a CAS or fetch-add on a reader count. Heavier
+  than a normal mutex read because every reader writes to the
+  same cache line (bouncing). Often *worse* than a normal mutex
+  on hot paths.
+- Writer can starve indefinitely if readers keep arriving (some
+  implementations are "writer-preferring" to mitigate).
+
+For genuinely read-heavy workloads with rare writes, RCU (see
+*lockfree-and-atomics*) or per-CPU counters often outperform
+rwlocks.
+
+## Recursive mutexes
+
+A normal mutex deadlocks if the same thread tries to acquire it
+twice. A **recursive mutex** tracks the holder and lets the
+same thread re-acquire without deadlocking.
+
+```c
+pthread_mutexattr_t a;
+pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+pthread_mutex_init(&lock, &a);
+```
+
+Slightly more expensive (per-acquire owner check). Most C++
+guidance says **avoid recursive mutexes**: they often signal a
+design problem ("which functions hold the lock?"). Mainstream
+Rust doesn't ship one in std for this reason.
+
+## Reentrant vs non-reentrant — different question
+
+A function is **reentrant** if it can be safely called from a
+signal handler / from another thread re-entering it. Not about
+locks at all — it means "the function holds no internal
+mutable state across calls."
+
+`strtok` is non-reentrant (uses a static buffer). `strtok_r` is
+reentrant. Reentrant ≠ thread-safe (a non-reentrant function
+can be thread-safe with internal locking — but not signal-safe).
+
+## Condition variables
+
+Mutexes guard data; condition variables let you wait for
+**state**. Example: a queue that needs a "wait for an item"
+operation.
+
+```c
+pthread_mutex_t m;
+pthread_cond_t  cv;
+queue_t q;
+
+void produce(item) {
+    pthread_mutex_lock(&m);
+    queue_push(&q, item);
+    pthread_cond_signal(&cv);    // wake one waiter
+    pthread_mutex_unlock(&m);
+}
+
+item_t consume() {
+    pthread_mutex_lock(&m);
+    while (queue_empty(&q))       // ← always a loop!
+        pthread_cond_wait(&cv, &m);
+    item_t x = queue_pop(&q);
+    pthread_mutex_unlock(&m);
+    return x;
+}
+```
+
+Three rules you must follow:
+
+1. **Always wait in a loop**, not an `if`. Spurious wakeups
+   are legal; `signal` may wake multiple threads; predicate
+   may flip back to false before you grab the lock.
+2. **Hold the mutex while signaling** in most implementations
+   (some allow signal-then-unlock; check yours). The mutex
+   protects the predicate the waiter checks.
+3. `wait` **atomically** drops the mutex and sleeps. Acquires
+   it again before returning. There's no race window.
+
+This is "Mesa-style" CV. Hoare-style hands the lock directly
+from signaler to waiter (no race possible), but is harder to
+implement.
+
+`pthread_cond_broadcast` wakes all waiters; useful when the
+state change might satisfy several of them.
+
+## Semaphores
+
+Counter + a wait list. `wait` decrements (blocks if 0);
+`post` increments (wakes a waiter).
+
+```c
+sem_t sem;
+sem_init(&sem, 0, 5);   // 5 permits
+
+sem_wait(&sem);  // -1, block if was 0
+// ... do work ...
+sem_post(&sem);  // +1, wake a waiter
+```
+
+Two roles:
+
+- **Binary semaphore (init=1)** = mutex with no ownership.
+  Acquirable and releasable by different threads (useful for
+  signaling, but you can't tell who unlocked you).
+- **Counting semaphore** = "N permits available." Limit
+  concurrent access to a resource pool ("at most 10 DB
+  connections in use").
+
+Modern code prefers explicit mutex + condvar for ownership
+clarity. POSIX sem_t is the only well-supported async-signal-
+safe synchronization primitive (limited use).
+
+## Barriers
+
+Synchronize N threads to a meeting point. Each thread calls
+`pthread_barrier_wait`; nobody proceeds until all have arrived.
+Then everyone proceeds together.
+
+```c
+pthread_barrier_t b;
+pthread_barrier_init(&b, NULL, 4);
+
+// in each of 4 threads:
+do_phase_1();
+pthread_barrier_wait(&b);  // wait for all 4
+do_phase_2();
+```
+
+Used in parallel algorithms with phases (BSP-style).
+
+## Once-flags
+
+Initialize something exactly once, even if called from many
+threads concurrently:
+
+```c
+pthread_once_t once = PTHREAD_ONCE_INIT;
+void init(void) { /* expensive init */ }
+
+void use(void) {
+    pthread_once(&once, init);
+    // safe to use the initialized thing
+}
+```
+
+C++11: `std::call_once`. Java: static initializers are
+guaranteed once. Rust: `Once`, `OnceCell`, `OnceLock`.
+
+The naive pattern (`if (!ready) { lock; if (!ready) init(); ready = true; unlock; }`)
+is **double-checked locking** — broken without proper memory
+barriers. Use the library primitive.
+
+## Lock-free / wait-free
+
+Algorithms that make progress without taking locks. CAS-based.
+See *lockfree-and-atomics*.
+
+## A choosing guide
+
+| Need | Use |
+|---|---|
+| Mutual exclusion, common case | `std::mutex` / `pthread_mutex_t` (futex-backed) |
+| Critical section < 1µs, contended often | spinlock with backoff |
+| Reads >> writes, complex data | rwlock — but benchmark vs plain mutex |
+| Wait for state change | mutex + condition variable |
+| Limit concurrent resource use to N | counting semaphore |
+| Initialize exactly once | `call_once` / `pthread_once` |
+| Coordinate phases across threads | barrier |
+| Avoid locks entirely | atomics + lock-free algorithm, or RCU |
+
+## What goes wrong
+
+- **Forgetting to unlock** on every return path → deadlock.
+  Use RAII (`std::lock_guard`, `MutexGuard` in Rust, `try-with-
+  resources`-style in Java).
+- **Different lock order** in different code paths → deadlock
+  on contention. Pick a global lock order and stick to it.
+- **Acquiring locks across blocking calls** → multiplies hold
+  time, kills throughput.
+- **Holding locks in signal handlers** → instant deadlock (the
+  handler can interrupt the holder).
+- **Lock-free + bad memory ordering** → seemingly-fine code
+  that's broken on weakly-ordered hardware (ARM, POWER).
+
+## The mental model
+
+All synchronization bottoms out in atomic CPU instructions.
+User-space mutexes use **futex** to skip the kernel on the
+uncontended fast path. Spinlocks burn CPU; sleeping locks
+parking takes µs. Pick based on critical-section length and
+contention. Condition variables let you wait for state, not
+just access. Always wait in a loop. RAII-lock everything.
+
+The rest of concurrent programming is just data flow over
+these primitives.

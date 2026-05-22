@@ -1,0 +1,303 @@
+export const level = 'senior';
+
+# Memory models and ordering
+
+A multithreaded program where every thread sees memory in the
+exact order operations were issued is the world of textbook
+examples. Real CPUs don't run that world — they reorder loads
+and stores aggressively for performance, and compilers reorder
+even more aggressively. The **memory model** is the contract
+between the programmer and the hardware/compiler that says
+which reorderings are allowed and what guarantees you can rely
+on. Get the contract wrong and your code has subtle bugs that
+only appear on ARM, only under load, only sometimes.
+
+## Why hardware reorders
+
+Modern CPUs are out-of-order machines with deep pipelines,
+store buffers, multiple cache levels, and speculative
+execution. A store doesn't go directly to memory — it sits in
+a per-core store buffer until the cache hierarchy can absorb
+it. A load may issue speculatively before earlier instructions
+finish.
+
+Consequence: **a single thread always sees its own operations
+in program order**, but another thread observing the same
+memory may see them out of order.
+
+```
+Thread 1            Thread 2
+x = 1;              r1 = y;
+y = 1;              r2 = x;
+```
+
+Naive expectation: if Thread 2 sees `y == 1`, it must see
+`x == 1` (because Thread 1 wrote x first). On strong hardware
+(x86) this is true. On weak hardware (ARM, POWER) Thread 2 can
+legitimately observe `r1 = 1, r2 = 0` — the store buffer
+released the stores in the opposite order.
+
+## Memory model strengths
+
+```
+Strongest                                          Weakest
+─────────────────────────────────────────────────────────────▶
+Sequential                                              Weakly
+Consistency      x86 (TSO)        ARMv8, POWER          Ordered
+(SC)                                                    (relaxed)
+```
+
+- **Sequential Consistency (SC)** — global total order on all
+  memory ops; each thread's ops appear in program order. The
+  textbook model. Easy to reason about. No real CPU implements
+  it because it would be slow.
+- **Total Store Order (TSO)** — x86. Stores are ordered with
+  each other; loads can be reordered before earlier stores to
+  different addresses (because of the store buffer). The
+  reordering above (store-load) is the only weakening.
+- **Weakly ordered** — ARM, POWER, RISC-V (without RVWMO
+  acquire/release). Loads and stores can be reordered with
+  each other in almost any direction. Anything you want to be
+  ordered, you have to ask for explicitly.
+
+Most code written assuming x86 semantics is silently broken on
+ARM. You catch it when you ship to Apple Silicon or AWS
+Graviton.
+
+## The four reorderings
+
+There are exactly four pairwise reorderings of consecutive
+memory operations:
+
+| Reordering | x86 allows? | ARM allows? |
+|---|---|---|
+| Store → Load | Yes (store buffer) | Yes |
+| Store → Store | No | Yes |
+| Load → Load | No | Yes |
+| Load → Store | No | Yes |
+
+x86's TSO only permits store-load reordering. That's why
+programs that "work fine on my Mac/Intel" sometimes break on
+ARM: ARM permits all four.
+
+## Fences / barriers
+
+A **memory barrier** (or fence) is an instruction that
+constrains reordering across it.
+
+| Barrier | Forbids |
+|---|---|
+| `mfence` (x86) | All four reorderings across it |
+| `sfence` (x86) | Store-store reordering |
+| `lfence` (x86) | Load-load reordering |
+| `dmb` (ARM) | All four (with sub-flavors `ish`, `ishst`, `ishld`) |
+
+You almost never write these directly. You use higher-level
+constructs (atomic operations with memory orderings, mutexes)
+and the compiler emits the right fence.
+
+## happens-before — the universal language
+
+Every modern memory model defines a partial order on
+operations called **happens-before** (HB):
+
+- Within a thread: every operation HB the next (program order).
+- Across threads: an unlock HB a subsequent lock on the same
+  mutex; a `release` store HB an `acquire` load that observes
+  it; thread start HB any op in the spawned thread; thread join
+  HB any op after the join.
+
+**The rule**: if A HB B, then B sees A's writes. If neither
+happens-before the other, you have a **data race** and the
+behavior is undefined.
+
+## C++ memory orderings (and what they mean)
+
+`std::atomic` operations take an explicit `std::memory_order`:
+
+| Order | What it means |
+|---|---|
+| `memory_order_seq_cst` | Sequentially consistent. Default. Slowest, easiest. |
+| `memory_order_release` | This store synchronizes-with any `acquire` load that sees it. |
+| `memory_order_acquire` | This load synchronizes-with the `release` store that produced its value. |
+| `memory_order_acq_rel` | Both (for read-modify-write). |
+| `memory_order_relaxed` | Atomic, but no ordering. |
+| `memory_order_consume` | Like acquire but only for dependent loads. Effectively unused. |
+
+The **release/acquire pair** is the workhorse:
+
+```cpp
+std::atomic<bool> ready{false};
+int data;
+
+// Thread A: publish data
+data = compute();
+ready.store(true, std::memory_order_release);
+
+// Thread B: wait and use
+while (!ready.load(std::memory_order_acquire))
+    ;
+use(data);   // safe: data write HB ready.store HB ready.load HB use
+```
+
+The release on `ready` says "all writes before me must be
+visible to anyone who acquires this." The acquire on `ready`
+says "I see everything the releaser wrote before its store."
+
+`relaxed` is for counters and flags where you only need
+atomicity, not ordering. `seq_cst` is the safe default if
+you're unsure.
+
+## Java memory model (JMM)
+
+JSR-133 (2004) gave Java a real memory model. Highlights:
+
+- **`volatile`** writes have release semantics; reads have
+  acquire. So `volatile boolean ready` works the same as the
+  C++ example above.
+- **`synchronized`** entry has acquire semantics, exit has
+  release.
+- **`final` fields** initialized in the constructor are
+  guaranteed visible to other threads *if the object reference
+  doesn't leak before construction completes*. This is what
+  makes immutable objects (`String`, `Integer`) safely shared
+  without sync.
+- **`java.util.concurrent` classes** (locks, queues, atomics)
+  follow happens-before rules consistently.
+
+The infamous **double-checked locking** for lazy init was
+broken in old Java (pre-JMM); since 1.5 it works *if the field
+is `volatile`*:
+
+```java
+private volatile Singleton inst;
+Singleton get() {
+    if (inst == null) {
+        synchronized (lock) {
+            if (inst == null) {
+                inst = new Singleton();   // safe with volatile
+            }
+        }
+    }
+    return inst;
+}
+```
+
+Without `volatile`, another thread could see a non-null `inst`
+whose fields are still uninitialized.
+
+## Go's memory model
+
+Simpler than C++. Operations are ordered by:
+
+- Initialization (package init happens-before main).
+- Goroutine creation.
+- Channel send happens-before the corresponding receive.
+- Mutex unlock happens-before subsequent lock.
+- `sync.Once` completion happens-before any other call.
+- `sync/atomic` operations are sequentially consistent
+  *with respect to each other*.
+
+Notably: in Go, "if there's no happens-before, the read can
+return any prior write" — same UB-ish behavior as C/C++, but
+the model is documented in simpler terms.
+
+The Go message: **use channels or `sync` primitives**; don't
+hand-roll atomics across goroutines unless you really know
+what you're doing.
+
+## Rust's memory model
+
+Rust inherits C++'s atomic memory ordering (same `Ordering`
+enum: `SeqCst`, `Release`, `Acquire`, `AcqRel`, `Relaxed`).
+
+The big difference: **data races are statically prevented**
+by the borrow checker for safe code. You can only race in
+`unsafe` blocks. So while Rust still has memory orderings,
+they're for `Atomic*` types in low-level/unsafe contexts. In
+normal Rust, `Mutex<T>` + `Send` + `Sync` traits keep you
+out of trouble without thinking about orderings at all.
+
+## What goes wrong — three classic bugs
+
+**1. Double-checked locking without ordering:**
+
+```c
+// BROKEN on weak memory
+if (!ready) {
+    lock();
+    if (!ready) { init(&obj); ready = true; }
+    unlock();
+}
+use(obj);  // other thread may see ready=true but obj uninitialized
+```
+
+Fix: make `ready` atomic with release on the store and acquire
+on the load. Or use `std::call_once`.
+
+**2. Publish-via-non-atomic-pointer:**
+
+```c
+// BROKEN — pointer publish without release
+obj = malloc(sizeof(*obj));
+obj->field = 42;
+global_ptr = obj;   // store
+
+// other thread:
+if (global_ptr) use(global_ptr->field);  // may see 0!
+```
+
+Other threads can observe `global_ptr != NULL` before they
+observe the write to `obj->field`. Fix: atomic store with
+release, atomic load with acquire.
+
+**3. Lazy init flag without barrier:**
+
+```c
+// Singleton pattern, broken
+static T *single = NULL;
+T* get() {
+    if (!single) single = make_T();
+    return single;
+}
+```
+
+Two threads might both pass the check, both call `make_T`,
+both store; one allocation leaks. Even worse: with reordering,
+a thread might see `single != NULL` but the object isn't
+constructed yet. Use proper once primitives.
+
+## How to write code that's portable
+
+1. **Use high-level primitives.** Mutexes, channels, atomics
+   with seq_cst — they're correct on all platforms.
+2. **If you reach for explicit memory orderings**, prefer
+   release/acquire pairs and document why.
+3. **Run a TSan-equivalent.** ThreadSanitizer for C/C++/Go;
+   Java has happens-before tools; Rust catches data races at
+   compile time.
+4. **Test on weak hardware.** If you only ever run on x86 and
+   ship to ARM customers, you have a class of latent bugs
+   waiting to surface. Run your test suite on ARM CI.
+5. **Don't invent your own primitives.** Lock-free queues
+   look easy and are wrong in subtle ways. Use Boost.Atomic,
+   crossbeam, java.util.concurrent.
+
+## A tiny mental model
+
+> **Without synchronization, no thread sees what another thread
+> writes — at any time, in any order.**
+
+The hardware and compiler are free to do anything as long as
+your *own thread's* observations remain consistent. To force
+ordering across threads, use happens-before edges (mutexes,
+atomics with release/acquire, channels, fences).
+
+Sequential consistency is what you naïvely assume. Acquire/
+release is what you should reach for when SC is too slow.
+Relaxed is for counters. Anything you actually publish to other
+threads needs an edge.
+
+If that paragraph doesn't make perfect sense, **don't write
+lock-free code**. Mutexes are fine. Mutexes have correct
+happens-before edges built in.

@@ -1,0 +1,327 @@
+export const level = 'mid';
+
+# Disk I/O and scheduling
+
+Disk is where physics meets the OS. Spinning HDDs care
+desperately about head movement; SSDs care about wear and
+parallelism; both care about queuing. The block I/O layer sits
+between file systems and devices, batching, reordering, and
+merging requests to maximize throughput. Knowing what the
+layer does and which knobs matter explains most "why is my
+disk slow" questions.
+
+## HDD physics — why seeks dominate
+
+A spinning disk has:
+
+- **Platters** rotating at 7,200 or 15,000 RPM.
+- A read/write **head** that has to be over the right
+  track.
+
+Reading a block costs three things:
+
+1. **Seek time** — move the head to the right track
+   (~5-10ms average; ~1ms for short seeks).
+2. **Rotational latency** — wait for the sector to come under
+   the head (~4ms average at 7200 RPM, half a rotation).
+3. **Transfer time** — read the bytes (~0.1ms for 4KB).
+
+Implications:
+
+- One **random 4KB read** ≈ 10ms. So **~100 IOPS** per spinning
+  disk, regardless of capacity.
+- One **sequential 4KB read** ≈ 0.1ms (head's already there).
+- Sequential is 100× faster than random.
+
+This single fact shaped every classic storage system. Every B-
+tree node is sized for one block; databases use bulk inserts;
+log-structured systems exist to convert random into sequential.
+
+## SSD architecture
+
+NAND flash, organized into:
+
+- **Pages** (4–16KB) — unit of read and write.
+- **Erase blocks** (256KB–4MB) — unit of erase. You can't
+  overwrite a page; you must erase the whole block first.
+- **Channels** (8–32 inside the drive) — parallel access paths.
+
+Reads: ~100µs, fully parallel across channels. SSDs do
+**100,000+ IOPS** easily.
+
+Writes: ~500µs per page. But **erase-before-write** makes
+random writes complex — to "overwrite" you actually write to a
+fresh page, mark the old one dead, and let the **FTL** (Flash
+Translation Layer) garbage-collect later.
+
+**Wear leveling** spreads writes across all blocks so no single
+block gets erased to death. Modern enterprise SSDs survive
+thousands of full-drive overwrites; consumer SSDs hundreds.
+
+**Write amplification**: one logical write triggers more
+physical writes (move data around to clean garbage). Worse at
+high utilization (>80% full). Why over-provisioning and TRIM
+matter.
+
+## NVMe — the right interface for SSDs
+
+SATA (SCSI/AHCI) was designed for HDDs: one queue of 32
+commands. Bottleneck for SSDs that can serve 64+ commands in
+parallel.
+
+**NVMe** (NVM Express) gives each CPU its own submission/
+completion queue, up to 64K queues of 64K commands each. The
+SSD picks commands from any queue. Massive parallelism. The
+interface itself doesn't bottleneck modern SSDs.
+
+PCIe attachment cuts latency further (no SAS/SATA controller in
+the path). NVMe-over-PCIe is what makes 1M+ IOPS / 7 GB/s
+drives possible.
+
+## The Linux block layer
+
+```
+Application
+    │
+    │ read/write
+    ▼
+File system (ext4, xfs, ...)
+    │
+    │ submit_bio(BIO)
+    ▼
+Block layer
+  ├─ Multi-queue (blk-mq) — per-CPU software queues
+  ├─ I/O scheduler — none / kyber / bfq / mq-deadline
+  └─ Hardware queues — fed to the driver
+    │
+    ▼
+Device driver (NVMe, SATA, virtio-blk, ...)
+    │
+    ▼
+Storage
+```
+
+A **BIO** (Block I/O) is the in-flight unit: target device,
+sector, length, list of pages. The block layer can:
+
+- **Merge** adjacent BIOs into one bigger one (writing two
+  consecutive 4KB blocks → one 8KB write).
+- **Reorder** BIOs to minimize seeks (mostly historical with
+  SSDs).
+- **Throttle** per cgroup/process.
+
+## I/O schedulers
+
+| Scheduler | When | What it does |
+|---|---|---|
+| **none / noop** | Fast SSD/NVMe | No-op queue; just forward to device |
+| **mq-deadline** | General | Deadline-based; bound on latency |
+| **kyber** | Latency-sensitive | Adapts target latency under load |
+| **bfq** | Desktop / mixed workloads | Per-process budgets; fairness |
+| **cfq** (gone) | Historical (replaced by bfq) | Complete Fair Queueing |
+
+For NVMe with high parallelism, **none** is usually best — the
+SSD's own scheduler is smarter than the kernel's. For HDDs,
+**bfq** or **mq-deadline** wins for desktop usability.
+
+```bash
+# See / change current scheduler:
+cat /sys/block/nvme0n1/queue/scheduler
+# [none] mq-deadline kyber bfq
+
+echo bfq | sudo tee /sys/block/nvme0n1/queue/scheduler
+```
+
+## RAID — Redundant Array of Inexpensive Disks
+
+Combine multiple physical disks into one logical device for
+performance, capacity, or redundancy.
+
+| Level | Layout | Pros | Cons |
+|---|---|---|---|
+| **0** | Stripe | 2× throughput, 2× capacity | Any drive lost → all data lost |
+| **1** | Mirror | Reads scale; survives 1 drive loss | Half capacity |
+| **5** | Stripe + 1 parity drive | Survives 1 loss, N-1 capacity | Write amplification (RMW), slow rebuilds |
+| **6** | Stripe + 2 parity | Survives 2 losses | More write amp |
+| **10** | Stripe of mirrors | Best perf + redundancy | Half capacity |
+
+**RAID-5/6 small-write problem**: writing one block requires
+reading the old data and parity, computing new parity, writing
+both. **Read-modify-write**. On HDDs that's 4 seeks per small
+write — catastrophic. SSDs handle it OK but still amplify
+writes.
+
+**Rebuild time**: a failed drive in a 10TB RAID-5 takes hours
+to a day to rebuild, during which a second failure means
+total loss. For TB-class drives, RAID-6 (tolerates 2 failures)
+is the modern norm.
+
+ZFS, Btrfs, and modern filesystems integrate RAID semantically
+(RAID-Z, btrfs-raid) — they know which blocks belong to which
+file, so they can skip rebuilding unused space.
+
+## Direct I/O vs buffered I/O
+
+**Buffered** (default): writes go to the page cache; the
+kernel flushes asynchronously.
+
+```c
+write(fd, buf, len);   // copy into kernel page cache; return fast
+```
+
+**Direct** (`O_DIRECT`): bypass the page cache; the kernel
+DMAs directly to/from your buffer. Requires aligned buffers
+and aligned sizes (typically 512B or 4KB).
+
+```c
+int fd = open("data", O_RDWR | O_DIRECT);
+// align buffer to 4KB:
+char *buf = aligned_alloc(4096, len);
+write(fd, buf, len);  // straight to disk; no page cache copy
+```
+
+Use direct I/O when:
+
+- The application manages its own cache (Postgres, MySQL,
+  RocksDB) — page cache would duplicate.
+- You want predictable latency (no surprises from cache
+  flushes).
+- You're moving huge data (cache pollution would hurt other
+  apps).
+
+For everything else, buffered is right. The page cache is
+huge, free, and usually correct.
+
+## fsync — covered in detail in the journaling page
+
+Brief recap:
+
+- `write` returns when bytes are in kernel page cache.
+- `fsync(fd)` returns when data + metadata are on the
+  platters/NAND.
+- `fdatasync(fd)` skips metadata that doesn't affect read.
+- All three issue a hardware **write barrier** or **FUA** (Force
+  Unit Access) to flush the disk's cache.
+
+Latency of fsync:
+
+- HDD with cache: 10ms+ (rotational + cache flush).
+- HDD without cache (or barriers properly): 30ms+.
+- SATA SSD: 1–5ms.
+- NVMe consumer SSD: 100µs–1ms.
+- NVMe enterprise SSD (cap-backed): 30–100µs (cache is durable
+  on power loss).
+
+Most database commit-throughput discussions are really
+"how fast can we fsync per second."
+
+## io_uring — modern async I/O
+
+The classic async I/O on Linux (`libaio` / `io_submit`) only
+worked for direct I/O and was widely considered a footgun.
+
+**io_uring** (Linux 5.1+, mature in 5.6+) is the modern
+replacement. Two shared ring buffers between user space and
+kernel:
+
+- **Submission queue** — user writes operations to do.
+- **Completion queue** — kernel writes results.
+
+One syscall (`io_uring_enter`) tells the kernel "look at the
+SQ, do these, post completions." With `IORING_SETUP_SQPOLL`,
+even that syscall is gone — a kernel thread polls the SQ.
+
+Per-op throughput: hundreds of thousands of completed ops per
+second per core, often more. Used by:
+
+- Modern Linux servers (Nginx, varnish, RocksDB).
+- Network proxies via the io_uring socket ops added in 5.5+.
+- Databases (Postgres has growing support, MySQL too).
+
+If you're writing a high-throughput I/O service on Linux in
+2026, io_uring is the right primitive.
+
+## Throttling and cgroups
+
+For shared servers, you can cap a cgroup's disk bandwidth:
+
+```
+# cgroup v2 cpu.io
+echo "8:0 rbps=1048576 wbps=1048576" > /sys/fs/cgroup/mygroup/io.max
+# 1 MB/s read, 1 MB/s write on device 8:0 (sda)
+```
+
+K8s exposes this via `BlockIO` annotations and CRI flags.
+Useful for noisy-neighbor isolation; matters less on
+oversubscribed cloud volumes (where the cloud provider does
+its own throttling).
+
+## Cloud volumes — yet another layer
+
+EBS, GCP PD, Azure Disks are all network-attached block
+devices. From the VM's perspective they look like local disks,
+but:
+
+- IOPS and bandwidth are provisioned and metered.
+- Latency includes the network round-trip (a few hundred
+  microseconds on top of the physical media).
+- Many cloud volume types throttle bursts (credit-based gp2,
+  baseline + burst on Azure).
+
+**Local NVMe** on cloud instances (i3, i4i, c6id) is real
+NVMe attached to the host — the latency profile of an actual
+SSD. But the data is ephemeral (lost on instance stop).
+
+For databases on cloud, the rule is: predictable IOPS (io2,
+ultra-disk), enough provisioned, fsync latency profiled.
+Surprises here are the most common production storage
+incidents.
+
+## Diagnosing
+
+```bash
+# Disk utilization, throughput, queue depth
+iostat -xz 1                  # %util, w/s, await, aqu-sz
+
+# Per-process I/O
+iotop                          # which processes are reading/writing
+
+# Latency histograms (requires bcc-tools)
+biolatency 1
+biolatency -D 1               # per-disk
+
+# What's open and reading
+fuser -v /mnt/data
+
+# Throttling cgroups
+cat /sys/fs/cgroup/.../io.stat
+```
+
+Red flags:
+
+- High `%util` with low `r/s` + `w/s` → small ops, possibly
+  random.
+- `await` (avg I/O time) much higher than the device's
+  expected latency → queueing.
+- `aqu-sz` (queue depth) growing → device saturated; not
+  enough parallelism, or device is the bottleneck.
+- High `await` on `iostat` but low `svctm` → time spent in the
+  kernel queue, not the device. Often I/O scheduler choice.
+
+## The mental model
+
+HDDs do ~100 IOPS; SSDs do 10K–1M+. The block layer batches
+and reorders requests; the I/O scheduler matters most on HDDs
+and least on NVMe. fsync makes data durable at substantial
+latency cost.
+
+Direct I/O for self-cached apps; buffered for everything else.
+io_uring is the modern Linux primitive for high-throughput
+async I/O. RAID-6 + COW filesystem is the standard local-
+storage answer; cloud volumes are network-attached and need
+their own latency budgeting.
+
+Most "slow disk" complaints are one of: too many small random
+ops (sequential them), no fsync budget (your app is constantly
+fsyncing, latency-bound), or the wrong I/O scheduler. The
+tools above point at which.

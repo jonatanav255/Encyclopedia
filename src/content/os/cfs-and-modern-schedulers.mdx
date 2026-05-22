@@ -1,0 +1,263 @@
+export const level = 'senior';
+
+# CFS and modern schedulers
+
+The Completely Fair Scheduler is Linux's default since 2.6.23
+(2007). Its job description is "make every runnable thread feel
+like it's on its own dedicated CPU running at `1/N` the actual
+speed." Achieving that without per-tick scheduling overhead
+required a clever invariant — `vruntime` — and a clever data
+structure — a red-black tree. In 2026 CFS is being replaced by
+**EEVDF** (Earliest Eligible Virtual Deadline First) on newer
+kernels; both share the same DNA.
+
+## The invariant: vruntime
+
+Every runnable thread has a `vruntime` — its accumulated CPU
+time, weighted by its priority (its `nice` value):
+
+```
+delta_vruntime = delta_actual × (NICE_0_WEIGHT / weight)
+```
+
+`NICE_0_WEIGHT` is 1024. Nice values map to weights:
+
+| nice | weight | relative share |
+|---|---|---|
+| -20 | 88761 | ~87× |
+| -10 | 9548  | ~9.3× |
+|  0  | 1024  | 1× |
+|  5  | 335   | ~0.33× |
+| 10  | 110   | ~0.11× |
+| 19  | 15    | ~0.015× |
+
+So at nice 0, vruntime advances at the rate of wall time. At
+nice 5 it advances ~3× faster (you fall "behind" faster, get
+scheduled less). At nice -5 it advances ~3× slower (you stay
+"ahead," get scheduled more).
+
+**The scheduling rule**: always run the thread with the smallest
+vruntime.
+
+The red-black tree holds runnable threads keyed by vruntime;
+"smallest" is the leftmost node, O(1) lookup, O(log n) insert
+and remove.
+
+## How "time slices" emerge
+
+CFS doesn't have fixed time slices like RR. Instead, two knobs:
+
+- `sched_latency_ns` (target wakeup latency): default 6ms on a
+  small box, scales with CPUs. Every runnable thread should run
+  within this window.
+- `sched_min_granularity_ns`: minimum quantum, default 0.75ms.
+  Don't switch more often than this even if it would improve
+  latency.
+
+The effective slice per thread is roughly
+`sched_latency / nr_running`, clamped to min_granularity. After
+the slice, the scheduler checks whether some other thread now
+has smaller vruntime; if so, switch.
+
+```
+3 runnable nice-0 threads, 6ms latency:
+  each gets ~2ms before re-evaluation
+
+20 runnable threads:
+  6ms / 20 = 0.3ms — but min is 0.75ms, so each gets ~0.75ms
+  and the target latency stretches to 15ms.
+```
+
+This is the "min_granularity floor" — too many runnable threads
+and latency *has* to suffer to keep context-switch overhead
+sane.
+
+## Sleeping and the "vruntime gift"
+
+A thread that sleeps for 10 minutes wakes up with a tiny
+vruntime relative to threads that have been running. If you just
+ran the leftmost-vruntime thread, the sleeper would monopolize
+the CPU for ages catching up.
+
+CFS prevents this with a **wakeup tweak**: when a thread wakes,
+its vruntime is set to `max(its_vruntime, min_vruntime - some_grace)`.
+It gets a small boost (responsive — wakes up and runs quickly)
+but not unbounded credit.
+
+This is why CFS feels good on interactive workloads. An
+unblocked thread (window manager, terminal) gets scheduled
+*almost immediately* over CPU hogs, without explicitly being
+"interactive class."
+
+## Group scheduling and cgroups
+
+By default, CFS is fair between **threads**. But that gives a
+user with 100 threads 100× the CPU of a user with 1 thread.
+
+**Group scheduling** (CONFIG_FAIR_GROUP_SCHED) makes it fair
+between **cgroups**. The scheduler runs in two levels: pick a
+group fairly, then pick a thread within the group fairly.
+
+```
+Group A (CPU weight 1000): 1 thread
+Group B (CPU weight 1000): 100 threads
+
+Without group sched: A gets 1%, B gets 99%.
+With group sched:    A gets 50%, B gets 50% (split among 100 threads).
+```
+
+This is what cgroups v2 `cpu.weight` controls. Used everywhere:
+containers, systemd services, K8s pods.
+
+## Multi-CPU CFS
+
+Each CPU has its own runqueue (a separate red-black tree).
+Threads stay on the runqueue they were created on, unless
+**load balancing** moves them.
+
+Load balancing runs:
+
+- Every tick on the local CPU (cheap, just for the local queue).
+- Periodically system-wide (search idle CPUs, move overloaded
+  threads).
+- On a `clone()` (where to place the new thread).
+- On wakeup (where to wake a sleeping thread — same CPU? sibling?).
+
+The hard call is "should I move this thread to a less-busy CPU?"
+Moving costs cache warmth. Not moving means a CPU sits idle
+while another is oversubscribed. Heuristics in
+`kernel/sched/fair.c` (`find_idlest_cpu`, `select_idle_sibling`,
+NUMA balancing) are decades of tuning.
+
+You can observe with:
+
+```bash
+cat /proc/schedstat              # per-CPU schedule counts
+cat /proc/<pid>/sched           # per-thread CFS info, NUMA hits
+mpstat -P ALL 1                 # per-CPU utilization
+```
+
+## NUMA balancing
+
+On multi-socket boxes, memory has a "home node" (the socket
+whose memory controller it lives on). Remote access is ~2× the
+latency of local. The kernel tries to keep a thread on the same
+NUMA node as its memory.
+
+Two parts:
+
+1. **Periodic page faults** — the kernel intentionally unmaps
+   some of a process's pages; the resulting fault tells it
+   "thread X is accessing page Y." Builds an access pattern
+   map.
+2. **Migration decisions** — if a thread is on node 0 but most
+   of its accesses are to node 1's memory, migrate the thread
+   (or, less commonly, the pages).
+
+Knob: `numa_balancing` (`/proc/sys/kernel/numa_balancing`,
+0/1). Default on. Can hurt latency-sensitive workloads (the
+periodic unmap → fault costs); pin and disable for HFT.
+
+## EEVDF — what's replacing CFS
+
+In Linux 6.6 (2023) CFS was largely replaced by **EEVDF**
+(Earliest Eligible Virtual Deadline First). Same vruntime
+machinery, but it adds a *deadline* per thread:
+
+- **Eligibility**: a thread is eligible to run when its
+  vruntime ≤ `avg_vruntime`. (Don't run threads that are
+  ahead of fair share.)
+- **Deadline**: deadline = vruntime + (slice / weight). Among
+  eligible threads, run the one with the **earliest** deadline.
+
+Effects vs CFS:
+
+- Better latency control. You can ask for short slices and get
+  scheduled often without affecting your total share.
+- Per-thread `sched_attr.sched_runtime` (a slice request) is now
+  a real knob, not a wish.
+- Cleaner handling of latency-vs-throughput trade-offs.
+
+For most workloads EEVDF is "CFS but slightly better." For
+latency-sensitive code, the per-thread slice control is a
+meaningful improvement.
+
+## Scheduling classes — CFS is one of many
+
+Linux has a stack of **scheduling classes**, checked in order:
+
+1. **stop_sched_class** — kernel migration thread, the most
+   important thing in the world. One per CPU.
+2. **dl_sched_class** — SCHED_DEADLINE (EDF).
+3. **rt_sched_class** — SCHED_FIFO, SCHED_RR.
+4. **fair_sched_class** — CFS / EEVDF (SCHED_NORMAL,
+   SCHED_BATCH).
+5. **idle_sched_class** — idle thread when nothing else.
+
+A SCHED_FIFO thread preempts every CFS thread. A
+SCHED_DEADLINE thread preempts every FIFO thread. CFS only ever
+sees a CPU when no higher class wants it.
+
+This is why a runaway audio thread can DoS your laptop: it
+asked for SCHED_FIFO, the kernel honored that, your shell never
+gets to run. (Recovery: `chrt` from a higher-priority RT shell,
+or `kernel.sched_rt_runtime_us` defaults to 950000 of every
+1000000 µs, capping total RT use at 95%. That cap is the only
+thing that saves you.)
+
+## SCHED_BATCH and SCHED_IDLE
+
+Variants of CFS for non-interactive work:
+
+- **SCHED_BATCH** — same fair share as SCHED_NORMAL, but the
+  wakeup boost is disabled. Useful for compute jobs that don't
+  need quick wakeups; reduces preemption of other work.
+- **SCHED_IDLE** — runs only when *nothing else* (including
+  nice 19 SCHED_NORMAL) wants the CPU. Weight ~3, so even a
+  tiny normal thread crushes it.
+
+```bash
+chrt -i 0 ./background-job  # SCHED_IDLE
+chrt -b 0 ./build           # SCHED_BATCH
+```
+
+Solid for "don't let this slow down anything else" workloads.
+
+## When CFS feels wrong
+
+If your workload behaves weirdly under CFS, the usual suspects:
+
+- **Too many runnable threads** → slice shrinks to
+  min_granularity, target_latency stretches. Use fewer threads
+  (thread pool sized to cores).
+- **Mixed CPU + I/O bursts** → CFS's wakeup boost can starve
+  steady-state CPU users with bursty wakers. Bump the CPU
+  user's nice down, or pin it.
+- **NUMA misplacement** → check `numastat`; pin memory + thread
+  to the same node.
+- **cgroup misconfig** → `systemd-cgls` and `systemd-cgtop` to
+  see who's actually getting CPU.
+- **Real-time class starving CFS** → check
+  `kernel.sched_rt_runtime_us` and what's in SCHED_FIFO.
+
+`perf sched record` + `perf sched latency` is the standard
+investigation tool — shows per-thread wakeup-to-run delays.
+
+## The mental model
+
+CFS schedules by `vruntime`: the thread that's had the least
+weighted CPU time runs next. A red-black tree makes "least"
+fast. The scheduler adjusts the slice dynamically to keep
+target wakeup latency low. cgroups make it fair between groups.
+NUMA balancing and load balancing migrate threads to keep CPUs
+busy without trashing caches.
+
+It's not the fastest possible scheduler for any single
+workload. It's the best general-purpose scheduler ever shipped:
+fair enough for shared boxes, latency-aware enough for
+interactive desktops, throughput-aware enough for batch. EEVDF
+keeps the recipe and adds an explicit deadline knob.
+
+For 99% of workloads, the right answer is "leave CFS alone and
+sometimes set a nice value." The 1% is what the rest of the
+scheduling literature is for.

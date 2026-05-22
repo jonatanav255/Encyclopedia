@@ -1,0 +1,342 @@
+export const level = 'mid';
+
+# File systems
+
+A file system turns a block device — "20 trillion 4KB blocks,
+numbered 0 to N" — into a hierarchical namespace of files and
+directories with metadata, permissions, and crash semantics.
+Linux pulls a clever trick: every file system you've ever used
+looks identical to applications, because they all sit behind
+the same generic interface, the **VFS**.
+
+## VFS — one interface, many file systems
+
+Applications call `open`, `read`, `write`, `unlink`. The
+kernel dispatches via the **Virtual File System** layer to the
+file system that owns the path.
+
+```
+   open("/srv/data/file.bin")
+            │
+            ▼
+   ┌────────────────────────────┐
+   │  VFS layer                 │
+   │  - path resolution         │
+   │  - permission checks       │
+   │  - cached dentries/inodes  │
+   └─────────┬──────────────────┘
+             │ super_operations, inode_operations, file_operations
+             ▼
+   ┌────────────────────────────┐
+   │  Concrete FS: ext4, xfs,    │
+   │  btrfs, zfs, fat, nfs, etc. │
+   └─────────┬──────────────────┘
+             │
+             ▼
+        Block layer ───→ Disk
+```
+
+Every file system implements a set of operation vectors:
+"how do I read an inode," "how do I look up a name in a
+directory," "how do I sync this file." VFS does the rest:
+caching, the file-descriptor table, path resolution, security.
+
+## The four core VFS objects
+
+| Object | Represents | One per |
+|---|---|---|
+| **superblock** | mounted filesystem | mount point |
+| **inode** | a file's metadata | file (regardless of name) |
+| **dentry** | a name-to-inode mapping | path component |
+| **file** | an open instance of a file | open() call |
+
+`inode` is the file. `dentry` is a name pointing at an inode.
+A file with two hard links has one inode and two dentries.
+Opening a file creates a `struct file`, which holds the offset
+and reference count; multiple opens of the same file → multiple
+`struct file`s, all pointing to the same inode.
+
+## inode — the file itself
+
+An inode holds:
+
+- File type (regular, directory, symlink, socket, fifo, block
+  device, char device).
+- Permissions (rwxrwxrwx), owner UID, owner GID.
+- Size in bytes.
+- Timestamps (atime, mtime, ctime).
+- Link count (how many directory entries point here).
+- Block pointers (where the data lives on disk).
+- Extended attributes (ACLs, SELinux labels, etc.).
+
+What's **not** in the inode:
+
+- The file's name. Names live in directory entries, which point
+  at the inode by inode number.
+- The path. Same reason — there's no inherent path. The path is
+  the sequence of directory entries you traversed to reach the
+  inode.
+
+This is why "renaming a file is cheap" — you change a directory
+entry, not the inode. And why `inotify` reports inode-numbered
+events: the name might be gone, but the inode is still there.
+
+## Hard links and symbolic links
+
+A **hard link** is another directory entry pointing at the same
+inode. `ln src dst` makes a new name; `unlink src` decrements
+the inode's link count by 1. When count hits 0 *and* no open FDs
+reference it, the inode and its blocks are freed.
+
+```bash
+$ touch a; ln a b; ls -li a b
+123456 -rw-r--r-- 2 user group 0 May 21 a   ← link count 2
+123456 -rw-r--r-- 2 user group 0 May 21 b
+```
+
+Same inode number, link count 2. Modify a — b changes (same
+inode). Delete a — b still works.
+
+A **symbolic link** is a tiny file whose contents are a path.
+The kernel follows the path on access:
+
+```bash
+$ ln -s a c; ls -li c
+234567 lrwxrwxrwx 1 user group 1 May 21 c -> a
+```
+
+Different inode (it's a different file). Delete `a` — `c` is
+dangling. Symlinks can cross file systems; hard links can't.
+
+## Directories — name → inode tables
+
+A directory is a special file whose contents are entries
+mapping names to inode numbers:
+
+```
+inode 100 (dir /home/user):
+  .       → inode 100
+  ..      → inode 99
+  file.txt → inode 101
+  notes/   → inode 102
+  ...
+```
+
+How directories are *implemented* varies:
+
+- **Linear list** (small dirs): ext2, ext3 without dir_index,
+  FAT. Linear scan; O(n) lookup. Painful at >10k entries.
+- **Hash table** (htree): ext3/4 with `dir_index`, FAT32 long
+  names. O(1) average lookup.
+- **B-tree**: xfs, btrfs, NTFS. O(log n), good for huge
+  directories.
+
+`ls -l` on a 100,000-entry directory is *fast* on xfs/btrfs/
+ext4 but agonizing on a non-indexed FAT.
+
+## Path resolution — what `open("/a/b/c")` does
+
+```
+1. Start at root inode (dentry for /).
+2. Look up "a" in /'s directory → inode A.
+3. Check execute permission on /.
+4. Look up "b" in A → inode B.
+5. Check execute permission on A.
+6. Look up "c" in B → inode C.
+7. Check requested perms (read, write) on C.
+8. Allocate a struct file pointing at C.
+9. Return the FD.
+```
+
+Every component is a `lookup`. The **dentry cache** is the
+secret weapon: completed lookups are cached, so the next
+`open("/a/b/c2")` only does step 6.
+
+`/proc/sys/fs/dentry-state` shows the cache; under memory
+pressure the kernel shrinks it. Some workloads (lots of
+"stat that file" calls, like rsync) live or die on dentry
+cache hit rate.
+
+## Mounts — splicing file systems into the namespace
+
+A mount attaches one file system's root directory to a
+**mount point** (a directory in another file system). After
+mounting, accesses below the mount point go to the mounted FS.
+
+```bash
+mount /dev/sda1 /mnt
+ls /mnt   # contents of sda1's root
+umount /mnt
+ls /mnt   # back to original directory contents
+```
+
+Bind mounts splice an arbitrary directory:
+
+```bash
+mount --bind /var/lib/postgres /home/pg/data
+# Now /home/pg/data IS /var/lib/postgres
+```
+
+Used heavily in containers (mount the host's `/etc/resolv.conf`
+into the container's namespace).
+
+`/proc/mounts` lists active mounts. `mount` with no args reads
+it.
+
+## Inodes are finite
+
+Each file system reserves a fixed pool of inode slots at
+mkfs time (ext4) or grows them dynamically (xfs, btrfs).
+
+```bash
+df -i
+Filesystem     Inodes  IUsed  IFree IUse% Mounted on
+/dev/sda1     1310720  78423 1232297    6% /
+```
+
+Run out of inodes and you get **"No space left on device"** even
+with terabytes free. Common when a directory accumulates
+millions of tiny files (a misconfigured cache, mail spool,
+build artifacts).
+
+ext4 default: ~1 inode per 16KB of data. xfs allocates inodes
+in dynamic chunks — usually no shortage.
+
+## File holes (sparse files)
+
+A file can have logical size N but only allocate blocks for the
+parts you wrote. The unwritten portions are **holes** that read
+as zeros and cost no disk.
+
+```c
+int fd = open("sparse", O_CREAT|O_WRONLY, 0644);
+lseek(fd, 1ULL << 40, SEEK_SET);   // 1 TB
+write(fd, "x", 1);
+// File logical size: 1 TB. Disk used: 1 block.
+```
+
+`ls` shows logical size; `du` shows allocated size. Sparse
+files are how VM disk images and database files often look.
+
+`cp` preserves holes (`--sparse=auto`). `cp --sparse=always`
+makes copies sparse when possible. `tar` has `--sparse`.
+
+## Permissions
+
+Three permission triplets: owner, group, other. Each with
+read/write/execute bits.
+
+```
+-rwxr-xr--   1 alice  staff   0 May 21 file
+ │└┬┘└┬┘└┬┘
+ │ │  │  └─── other: r--
+ │ │  └────── group: r-x
+ │ └───────── owner: rwx
+ └─────────── file type: '-' regular, 'd' dir, 'l' symlink, ...
+```
+
+Special bits:
+
+- **setuid** (`u+s`) on an executable → runs with the owner's
+  EUID instead of the runner's. How `passwd`, `sudo` work.
+- **setgid** on a file → same for EGID. On a directory → new
+  files inherit the directory's group.
+- **sticky** on a directory → only the file's owner (or root)
+  can delete it. Set on `/tmp`.
+
+ACLs (POSIX) and SELinux/AppArmor labels are extended
+attributes stored in the inode's xattr area.
+
+## Extended attributes (xattrs)
+
+Arbitrary key-value metadata attached to an inode. Used for:
+
+- ACLs (`security.posix_acl`).
+- Capabilities (`security.capability`).
+- SELinux labels (`security.selinux`).
+- macOS resource forks via `com.apple.*`.
+- User metadata (`user.tag`, `user.comment`) — anything you want.
+
+```bash
+setfattr -n user.tag -v archive file.txt
+getfattr -n user.tag file.txt
+```
+
+Most file systems support xattrs; size limits vary (typically
+4–64KB total per inode).
+
+## stat — the inode dump
+
+```bash
+$ stat /etc/hosts
+  File: /etc/hosts
+  Size: 220       Blocks: 8          IO Block: 4096   regular file
+Device: fe01h/65025d   Inode: 1310726     Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-05-21 09:00:00.000000000 +0000
+Modify: 2026-04-15 14:23:11.000000000 +0000
+Change: 2026-04-15 14:23:11.000000000 +0000
+ Birth: 2026-01-12 00:00:00.000000000 +0000
+```
+
+Every field is from the inode. Note three timestamps + birth:
+
+- **atime** — last read access (often disabled or `relatime` for
+  performance).
+- **mtime** — last data modification.
+- **ctime** — last metadata change (perms, owner, link count).
+- **crtime / birth** — creation (not in classic POSIX; ext4,
+  btrfs, NTFS keep it).
+
+`relatime` is the modern default: atime only updated if it was
+older than mtime/ctime. Saves the "every read causes a write"
+overhead.
+
+## File system comparison (Linux)
+
+| FS | Max file | Max FS | Journaling | Snapshots | Compression |
+|---|---|---|---|---|---|
+| **ext4** | 16 TiB | 1 EiB | Yes (3 modes) | No | No |
+| **xfs** | 8 EiB | 8 EiB | Yes (metadata) | No (LVM for that) | No |
+| **btrfs** | 16 EiB | 16 EiB | COW | Yes | Yes |
+| **ZFS** | 16 EiB | 256 ZiB | COW + transactions | Yes | Yes |
+| **f2fs** | 3.94 TiB | 16 TiB | Yes | No | Yes (recent) |
+| **NTFS** (Linux RW) | 16 EiB | 16 EiB | Yes | VSS | Yes |
+
+Defaults today: **ext4** (Ubuntu/Debian root), **xfs** (RHEL/
+Fedora root since RHEL 7), **btrfs** (openSUSE, Fedora desktop
+since 33), **APFS** (macOS), **NTFS** (Windows), **ZFS** (FreeBSD,
+TrueNAS, some enterprise Linux).
+
+The crash-consistency / journaling story for these is in
+*journaling-and-crash-consistency*.
+
+## What "everything is a file" actually means
+
+Files, directories, block devices, character devices, sockets,
+FIFOs, and (kind of) processes via `/proc` all look like files
+to the kernel. They have inodes, can be `open`ed, can be
+`read`/`written` (subject to type).
+
+This is why you can `cat /dev/sda` (a block device) or
+`echo > /proc/sys/...` (a pseudo-file). The VFS makes the
+abstraction uniform. The concrete `file_operations` per
+file type are different — `read` on a regular file talks to a
+disk; `read` on a socket pulls from a network queue — but the
+API is the same.
+
+## The mental model
+
+VFS abstracts file systems behind a generic interface. Inodes
+are files; directory entries (dentries) are names; opening
+creates a `struct file`. Path resolution walks dentries,
+cached aggressively.
+
+Each concrete file system (ext4, xfs, btrfs, NFS) plugs in
+its own `inode_operations` / `file_operations`. Applications
+don't care which. The differences show up at the edges — crash
+behavior, max file size, snapshot capability, on-disk layout.
+
+For application code, "the file system" is a uniform API. For
+ops, "which file system" matters a lot — see the journaling
+page for why fsync is fast on one and slow on another.

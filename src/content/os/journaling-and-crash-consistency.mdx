@@ -1,0 +1,338 @@
+export const level = 'senior';
+
+# Journaling and crash consistency
+
+A file system holds metadata (inodes, allocation bitmaps,
+directory entries) and data on a block device. If the machine
+crashes mid-write, you can end up with a state that doesn't
+make sense — an inode pointing at blocks the bitmap thinks are
+free, a directory entry for a file that doesn't exist, half-
+written data. **Crash consistency** is the property that the FS
+either has the new state or the old state, never an
+incoherent mix. The standard technique is the **journal**:
+write *intentions* before mutations, replay on recovery.
+
+## What can go wrong without a journal
+
+Append one byte to a file:
+
+```
+1. Find a free block in the allocation bitmap.
+2. Mark that block as used in the bitmap.       ← write 1
+3. Write the data to the block.                  ← write 2
+4. Update the inode's size and block pointers.  ← write 3
+5. Update the inode's mtime.                     ← write 3
+```
+
+If the machine crashes between any two writes, you have a
+problem:
+
+- Crash after #2, before #3: bitmap claims a block is used,
+  but no inode owns it. **Leaked block.**
+- Crash after #3, before #4: data on disk, but the inode
+  doesn't know — bitmap says used, inode says no. **Dangling
+  allocation.**
+- Crash after partial inode update: inode says size grew but
+  no block pointer for the new block. **File-system
+  inconsistency**, possibly unrecoverable corruption.
+
+`fsck` (file system check) could detect and patch these by
+scanning everything — but on a multi-TB volume that's *hours*.
+Nobody wants to spend hours recovering after every kernel
+panic.
+
+## The journal — write-ahead logging for FS metadata
+
+The fix: before each metadata change, **write a description of
+the planned change to a journal** (a fixed area of the disk).
+After the journal write is durable, perform the actual
+changes. Once they're persisted, mark the journal entry as
+committed.
+
+```
+Step 1: Write journal entry [bitmap update + inode update + data]
+        to journal area.                       ← single sequential write
+Step 2: Wait for journal write to hit disk (barrier/flush).
+Step 3: Apply the changes to the actual FS structures.
+Step 4: Mark journal entry as completed.
+```
+
+On recovery after crash:
+
+- For each *committed* journal entry that wasn't marked
+  completed, **redo it** (the changes may or may not have been
+  applied to the FS proper; redo is idempotent so this is
+  safe).
+- For each *uncommitted* journal entry, ignore it (the operation
+  never claimed to be durable).
+
+Recovery time depends on journal size, not disk size —
+seconds, not hours.
+
+## Three journaling modes (ext4)
+
+ext4 lets you pick *what* gets journaled. From safest to
+fastest:
+
+| Mode | What's journaled | Crash window |
+|---|---|---|
+| **data=journal** | metadata AND data | Smallest |
+| **data=ordered** | metadata only; data written before metadata refers to it | Medium (default) |
+| **data=writeback** | metadata only; data may land in any order | Largest |
+
+**data=journal** is the safest — both your write and the inode
+update are in the journal, so on recovery both are either
+applied or not. Cost: every byte of data is written twice
+(journal then final). Worst throughput.
+
+**data=ordered** (default) is the sane middle: metadata only in
+the journal, but the kernel **orders** I/O so data hits disk
+*before* the metadata that points to it. After a crash, you
+either see the old metadata (pointing to old data) or the new
+metadata (pointing to new data which is already there). Never
+new metadata pointing to garbage.
+
+**data=writeback** doesn't order data vs metadata. You can see
+new inode size pointing at blocks that hold stale or
+uninitialized data. Maximum throughput; corruption risk for the
+data itself (though metadata is still consistent).
+
+xfs only journals metadata (equivalent to writeback for data).
+It compensates with `O_DIRECT` for apps that care, and with
+applications doing their own `fsync`.
+
+## fsync — the durability barrier
+
+Journaling guarantees the *FS* is consistent. It doesn't
+guarantee your *file's contents* are on disk when `write`
+returns. The disk cache, the kernel's page cache, and the
+controller's cache all batch writes for throughput.
+
+**`fsync(fd)`** says: flush all dirty pages and metadata for
+this file out of every cache, all the way to the platters/
+NAND, before returning. Now it's truly durable.
+
+The "durability cascade":
+
+```
+1. Write data blocks belonging to fd.
+2. Write the file's metadata (inode).
+3. Write all containing directories' metadata.
+4. Issue a barrier/FUA to the disk so cache is flushed.
+```
+
+Cost: tens of microseconds (NVMe) to tens of milliseconds
+(spinning disk or networked storage). Databases call fsync on
+every WAL commit; their throughput depends entirely on how
+fast it is.
+
+## fdatasync — the cheaper sync
+
+`fdatasync(fd)` flushes data and the inode fields that affect
+read-back (size, block pointers) but not timestamps or owner
+changes. Avoids the metadata-block write if only timestamps
+moved.
+
+Often 2-3× faster than `fsync` on databases that don't care
+about atime/mtime. Postgres uses it by default.
+
+## The "fsync of the parent directory" trap
+
+To make a newly created file durable, you have to `fsync` the
+**directory** too — otherwise the directory entry pointing to
+it might not be on disk.
+
+```c
+int fd = open("newfile", O_CREAT|O_WRONLY, 0644);
+write(fd, data, len);
+fsync(fd);                  // file's data is durable
+close(fd);
+
+int dirfd = open(".", O_RDONLY);
+fsync(dirfd);               // directory entry is durable
+close(dirfd);
+```
+
+Without the directory fsync, a crash after creating the file
+can leave you with the file's contents on disk but no
+directory entry referencing it — effectively gone.
+
+This is one of the things SQLite, Postgres, RocksDB, etc. all
+do correctly and most ad-hoc code does not.
+
+## The rename trick — atomic file replacement
+
+To safely replace a file's contents:
+
+```c
+// write to a temp file
+int fd = open("file.tmp", O_CREAT|O_WRONLY|O_TRUNC, 0644);
+write(fd, newdata, len);
+fsync(fd);                  // durable
+close(fd);
+// atomically swap
+rename("file.tmp", "file"); // single FS operation
+// fsync the directory so the rename is durable
+int dirfd = open(".", O_RDONLY);
+fsync(dirfd);
+close(dirfd);
+```
+
+`rename` is atomic with respect to crashes (the journal makes it
+so). After the rename:
+
+- Either `file` has the old contents (crash before rename
+  commits).
+- Or `file` has the new contents (crash after).
+
+Never half-written. This is **the** way to make a config file
+update safe.
+
+## The 2009 ext4 zero-length-file disaster
+
+Old apps wrote a config file like:
+
+```c
+fd = open("config", O_CREAT|O_WRONLY|O_TRUNC);  // truncate
+write(fd, data, len);
+close(fd);
+// (no fsync; no rename)
+```
+
+On ext3 with `data=ordered`, this worked because ext3 flushed
+data within 5 seconds of metadata. On ext4 with delayed
+allocation, metadata (size = N) could hit disk hours before
+the actual data. Crash → file exists, size says N, contents
+are all zeros.
+
+The fix was a kernel workaround for this exact pattern (auto-
+flush on truncate-then-rename), plus a community PSA: **use
+rename**. The right code is the temp-file-then-rename pattern
+above.
+
+## Atomic appends?
+
+`write` to an `O_APPEND` file is atomic up to a page boundary
+on most file systems. After a crash, you either see the whole
+append or none. *But* this is the file system's behavior, not
+a guarantee — for true durability you still need fsync.
+
+For logging, the practical approach: app writes; periodic
+fsync (every N records or M ms); on recovery, parse and
+discard incomplete trailing entry.
+
+## COW file systems — a different model
+
+ZFS, Btrfs, APFS don't use a journal. They use **copy-on-write
+at the block level**: every change writes a new block; the
+metadata tree above it is updated to point at the new block.
+The root pointer (uberblock in ZFS) is updated last.
+
+```
+Old tree:                After update:
+   root ── a            new_root ── a
+        ── b                     ── b
+        ── c                     ── c'  ← new version of c
+                                          (old c kept until GC)
+```
+
+Until the root pointer flips, readers see the old state. After
+it flips (one atomic write to one block), they see the new
+state. **There's no "inconsistent" state on disk** — every
+flush moment is a valid filesystem.
+
+Benefits:
+
+- **Snapshots are essentially free** — just keep an old root
+  pointer around.
+- **Atomic multi-block operations** — write all the new blocks
+  first, then one pointer swap.
+- **End-to-end checksums** — both block and metadata are
+  checksummed; bad sectors are detected (and on ZFS, healed
+  from redundancy).
+
+Costs:
+
+- **Write amplification** — modifying one byte requires
+  rewriting a block. On SSDs, that's a flash wear issue; on
+  HDDs, more seeks.
+- **Fragmentation over time** — old block locations get reused
+  out of order.
+- **Free space management is harder** — need to garbage-collect
+  superseded blocks.
+
+ZFS is the most mature; APFS shipped to billions of devices
+without much fuss; Btrfs has been "stable for daily use" for a
+decade with caveats around RAID-5/6.
+
+## Log-Structured File Systems (LFS)
+
+Take COW to its limit: **all writes go to the end of an
+append-only log**. Old data is left in place; periodic
+**cleaner** reclaims dead blocks.
+
+Sprite LFS was the original (1991). Modern descendants:
+
+- **f2fs** (Flash-Friendly FS) — designed for SSDs by Samsung,
+  shipped on Android.
+- **Many database engines** (LevelDB, RocksDB, Cassandra) use
+  LSM-tree storage, which is essentially the same idea above
+  the FS layer.
+
+Wins on write throughput (always sequential, fast on both HDD
+and SSD). Cleaner contention is the long-tail cost.
+
+## SSD-specific concerns
+
+NAND flash can't overwrite — it must erase before writing.
+Erase blocks are large (256KB–4MB). The SSD's **FTL** (Flash
+Translation Layer) maintains a logical-to-physical map and
+handles wear leveling.
+
+`fsync` on an SSD includes flushing the FTL's write cache,
+which can take milliseconds even though "the write" was
+microseconds. The drive's capacitor-backed cache (enterprise
+SSDs) lets it ack fsync immediately while still being safe.
+
+`TRIM` (or `discard`) tells the SSD that a block is no longer
+in use, so the FTL can erase and recycle it. Without TRIM, the
+SSD slows over time as it runs out of pre-erased blocks. Most
+modern FS mounts handle TRIM automatically (`discard` mount
+option, or periodic `fstrim`).
+
+## fsck — when the journal isn't enough
+
+Even with journaling, things go wrong (hardware bit-flips,
+kernel bugs, journal corruption). `fsck` is the offline repair
+tool. Reads all metadata; verifies consistency
+(inode-block-bitmap agreement, link counts, directory loops);
+applies fixes.
+
+xfs uses `xfs_repair`; ext4 uses `e2fsck`; btrfs uses
+`btrfs check`. On big volumes, expect long runtimes; some
+filesystems (xfs especially) emphasize "online checking" via
+`xfs_scrub` running while mounted.
+
+The general rule: **never trust a filesystem that hasn't been
+fsck'd after corruption symptoms**. Mounting RO and running
+the checker is the first thing to do.
+
+## The mental model
+
+A journal is write-ahead logging for the file system itself.
+Metadata changes go to a sequential log first; the real
+mutation happens after; recovery replays the log.
+
+COW file systems are the alternative: write new versions of
+everything, swap a single root pointer atomically. No
+inconsistent on-disk state ever exists.
+
+For applications: `fsync(file_fd)` and `fsync(parent_dir_fd)`
+are the two things that make a write durable. Use the
+write-temp-then-rename pattern for atomic file replacement.
+Don't rely on the kernel's auto-flush hacks; they're
+workarounds for bugs, not guarantees.
+
+Crash consistency is a property the OS and FS provide for the
+*FS structure*. Crash *durability* for your *data* is on you
+and your `fsync` calls.

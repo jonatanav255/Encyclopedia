@@ -1,0 +1,333 @@
+export const level = 'senior';
+
+# Kernel memory allocators
+
+The kernel needs to allocate memory for itself — task_structs,
+network packet buffers, file system inodes, page tables, every
+fixed-size object that comes and goes millions of times per
+second. The user-space `malloc` model doesn't fit: it can't
+take page faults inside an interrupt handler, can't sleep
+waiting for a page, and needs to be NUMA-aware. So Linux has
+three layers of allocator stacked on top of each other.
+
+## The three layers
+
+```
+┌─────────────────────────────────────────────────┐
+│  kmalloc(size, flags)  /  kfree(ptr)             │  ← caller API
+│  Small (≤ ~4KB), arbitrary size                  │
+└─────────────────────────────────────────────────┘
+           │ uses
+           ▼
+┌─────────────────────────────────────────────────┐
+│  Slab / SLUB / SLOB                              │  ← fixed-size object cache
+│  Many size classes, per-CPU caches               │
+└─────────────────────────────────────────────────┘
+           │ uses (when out of objects)
+           ▼
+┌─────────────────────────────────────────────────┐
+│  Buddy allocator                                 │  ← page-frame allocator
+│  Power-of-two page chunks (4KB → many MB)        │
+└─────────────────────────────────────────────────┘
+           │ manages
+           ▼
+       Physical RAM (zones: DMA, NORMAL, HIGHMEM)
+```
+
+A `kmalloc(32)` hits the slab cache for 32-byte objects, which
+was filled from buddy pages. The buddy gives out 4KB chunks
+(or 2^n KB chunks for larger requests).
+
+## Buddy allocator — the foundation
+
+Manages **physical page frames** in power-of-two-sized blocks.
+Maintains free lists for orders 0 (4KB), 1 (8KB), 2 (16KB)…
+up to MAX_ORDER (typically 11 = 4MB).
+
+To allocate a block of order k:
+
+```
+1. If free list for order k is non-empty, take one. Done.
+2. Else find smallest order j > k with free list non-empty.
+3. Split a block of order j into two "buddies" of order j-1.
+4. One buddy goes to free list j-1; recurse.
+```
+
+To free a block of order k:
+
+```
+1. Compute the buddy's address (flip bit k+12).
+2. If buddy is free (in free list k), merge into one order-k+1 block.
+3. Recurse upward.
+```
+
+Splitting and merging is O(MAX_ORDER) — small constant. The
+buddy invariant (block aligned to its size) makes computing
+the buddy address a single XOR.
+
+External fragmentation is the cost: you might have plenty of
+free order-0 pages but no contiguous order-3 (32KB) block. This
+hurts huge-page allocation under memory pressure; the kernel
+runs **memory compaction** to shuffle free pages together.
+
+## Memory zones
+
+Not all physical memory is equal:
+
+- **ZONE_DMA** (0–16MB) — for ancient DMA-capable devices.
+- **ZONE_DMA32** (16MB–4GB) — for 32-bit DMA devices.
+- **ZONE_NORMAL** (4GB+ on 64-bit) — most allocations.
+- **ZONE_HIGHMEM** — pre-x86-64 vestige, not used on 64-bit.
+- **ZONE_MOVABLE** — pages that can be migrated (for hotplug,
+  compaction).
+
+Each zone has its own buddy lists and watermarks. An allocation
+request includes a "GFP mask" specifying which zones are
+acceptable.
+
+## Slab allocator — fast small-object recycling
+
+Buddy is great for pages, terrible for "I need 32 bytes." A
+naive solution would scatter little allocations into 4KB
+pages, wasting almost everything. The **slab allocator**
+solves this by maintaining per-object-size caches.
+
+A **slab** is one or more contiguous pages, divided into
+fixed-size objects. A **cache** is a collection of slabs for
+one object type.
+
+```
+kmalloc-32 cache:
+  ┌────────────────────────────────────────┐
+  │ slab 1 (4KB): [obj][obj][obj] ... [obj] │  128 × 32-byte objects
+  └────────────────────────────────────────┘
+  ┌────────────────────────────────────────┐
+  │ slab 2 (4KB): [obj][obj]...   [free]   │
+  └────────────────────────────────────────┘
+  ...
+```
+
+Allocating an object: pop from a per-CPU free list (lockless
+fast path). Releasing: push back to the per-CPU free list.
+Slabs themselves move between "empty," "partial," and "full"
+states. Empty slabs may be returned to buddy under memory
+pressure.
+
+The kernel ships caches for every common object type:
+
+```
+$ sudo cat /proc/slabinfo
+# name           <active_objs> <num_objs> <objsize> <objperslab> ...
+TCPv6                1234        1700        2304      14
+task_struct          5670        5800        9472       3
+dentry             123456      124000         192      21
+inode_cache         34567       34600         600       6
+mm_struct             456         480        1632       5
+filp                 8123        8400         256      16
+...
+```
+
+`task_struct` cache is what gives you a new PCB in nanoseconds
+when `fork()` is called.
+
+## Three slab implementations
+
+Linux has shipped three:
+
+- **SLAB** — original, complex metadata, three-tier (per-CPU
+  array cache + per-node shared array + slab list).
+- **SLUB** — current default. Simpler design, per-CPU "active
+  slab," fewer metadata structures. Better scalability.
+- **SLOB** — minimal, for tiny embedded systems.
+
+API is identical across all three (`kmem_cache_create`,
+`kmem_cache_alloc`, etc.). You pick at kernel build time.
+
+## kmalloc — the generic interface
+
+For arbitrary-sized allocations:
+
+```c
+void *p = kmalloc(size, GFP_KERNEL);
+kfree(p);
+```
+
+Maps to one of the pre-built `kmalloc-N` slab caches for
+power-of-two sizes (8, 16, 32, 64, …, up to a couple of pages).
+For larger sizes (typically >8KB), falls through to direct
+page allocation via the buddy.
+
+## GFP flags — what the allocator can do
+
+The flags argument is the most important part of `kmalloc`:
+
+| Flag | Meaning |
+|---|---|
+| `GFP_KERNEL` | Standard. May sleep waiting for memory. Use from process context. |
+| `GFP_ATOMIC` | **Must not sleep.** Use from interrupt context. Smaller pool. |
+| `GFP_USER` | For pages that will be mapped into user space. |
+| `GFP_NOIO` | Don't trigger I/O (avoid recursion: an I/O driver may not want to start more I/O). |
+| `GFP_NOFS` | Don't trigger filesystem ops. Same reasoning. |
+| `__GFP_ZERO` | Zero the memory. |
+| `__GFP_DMA` | Must come from DMA zone. |
+| `__GFP_NORETRY` | Don't retry on failure; return NULL fast. |
+
+The split between sleeping (`GFP_KERNEL`) and not (`GFP_ATOMIC`)
+is the most operationally important. Allocating with
+`GFP_KERNEL` inside an interrupt handler is a kernel bug —
+sleeping with interrupts disabled deadlocks.
+
+## vmalloc — virtually contiguous, physically scattered
+
+`kmalloc` returns physically contiguous memory. For large
+allocations that don't need physical contiguity, use `vmalloc`:
+
+```c
+void *p = vmalloc(64 * 1024 * 1024);  // 64MB
+vfree(p);
+```
+
+`vmalloc` allocates many separate pages and stitches them into
+a contiguous virtual range using its own page-table region in
+kernel space. Pros: works even under fragmentation. Cons:
+
+- Slower (page-table setup per call).
+- Each access goes through an extra TLB layer.
+- Limited address space (`VMALLOC_*` range, ~32TB on x86-64).
+- Useless for DMA (devices speak physical addresses).
+
+Use `vmalloc` for things like:
+
+- Loading kernel modules (their `.text` and `.data`).
+- Buffers for `/proc` and `/sys` files that can be larger than
+  a slab block.
+- Anything large that doesn't need to be DMA-mapped.
+
+## Per-CPU allocations
+
+For data accessed only from one CPU (or replicated per CPU to
+avoid contention), there's `alloc_percpu`:
+
+```c
+int __percpu *counter = alloc_percpu(int);
+this_cpu_inc(*counter);    // lockless, just bump local CPU's copy
+sum = 0;
+for_each_possible_cpu(cpu)
+    sum += *per_cpu_ptr(counter, cpu);
+```
+
+The pages are arranged so each CPU's slice is on its NUMA-
+local node. Statistics counters, RCU bookkeeping, and many
+fast-path data structures use this.
+
+## Memory pressure — kswapd and direct reclaim
+
+Each zone has three watermarks: **high**, **low**, **min**.
+
+```
+free pages
+   high  ──────  plenty; no reclamation
+   low   ──────  wake kswapd to reclaim asynchronously
+   min   ──────  emergency: allocators do direct reclaim
+                 (or fail)
+```
+
+`kswapd` (per-NUMA-node kernel thread) wakes when free pages
+drop below `low` and reclaims until they reach `high`. It does
+this in the background; allocations stay fast.
+
+When pressure exceeds `kswapd`'s ability, the allocating task
+itself enters **direct reclaim** — synchronously evicting
+pages before its allocation can proceed. Visible to users as
+latency spikes.
+
+What gets reclaimed:
+
+- File-cache pages (clean: free immediately; dirty: write to
+  disk first).
+- Inactive anonymous pages (swap to disk).
+- Shrinker callbacks (slab caches, dentries, inodes register
+  callbacks to release objects under pressure).
+
+`/proc/meminfo` shows `Cached`, `Buffers`, `SReclaimable` —
+all of these can be reclaimed under pressure. That's why
+"free memory" on Linux looks scary low and isn't.
+
+## OOM killer
+
+When direct reclaim still can't satisfy an allocation, the
+kernel invokes the **OOM killer**: pick a process, kill it,
+free its memory, retry.
+
+Heuristic for picking the victim (`oom_score`):
+
+- Larger RSS → more likely.
+- `oom_score_adj` per process → admin can hint (positive =
+  prefer to kill; negative = protect; -1000 = never).
+- Recently-spawned children → less likely.
+- Special exemption for `init` and kthreads.
+
+```bash
+echo -1000 > /proc/<pid>/oom_score_adj   # immunize
+```
+
+Used to protect critical services (sshd, monitoring agents).
+Don't immunize databases unless you have a plan; an OOM-killed
+database is a recoverable disaster, but an OOMing kernel that
+can't kill anything is an unrecoverable one.
+
+## NUMA
+
+On multi-socket systems, each socket has its own memory
+controller. Local memory is fast; remote is ~1.5–2× slower.
+
+The kernel keeps separate buddy/slab structures per NUMA node.
+Allocations default to "from the local node, fall back to
+remote." User-space can pin via `numactl`, `mbind`,
+`set_mempolicy`.
+
+Slab caches and per-CPU allocators are NUMA-aware. Standard
+`kmalloc(..., GFP_KERNEL)` from CPU on node 0 returns memory
+from node 0.
+
+## Tools
+
+```bash
+sudo cat /proc/slabinfo                # per-cache live/dead/size
+sudo slabtop                            # ncurses live view, sorted
+
+cat /proc/meminfo                       # global breakdown
+cat /proc/buddyinfo                     # per-zone free-list lengths
+cat /proc/pagetypeinfo                  # per-zone, per-type, per-order
+
+cat /proc/vmstat                        # huge dump of counters
+cat /sys/kernel/debug/kmemleak          # CONFIG_DEBUG_KMEMLEAK
+```
+
+Slab leaks (e.g., a driver that allocates but never frees a
+type of object) show up as a steadily growing `<num_objs>` in
+slabinfo for that cache. Catch this early or you OOM.
+
+## The mental model
+
+The kernel allocator is a three-layer cake:
+
+- **Buddy** gives out pages. Power-of-two blocks. Foundation
+  for everything below.
+- **Slab/SLUB** carves pages into fixed-size object pools,
+  per-CPU for speed. This is what makes `task_struct`,
+  `inode`, `sk_buff` allocations cost nanoseconds.
+- **kmalloc / vmalloc** is the caller interface. `kmalloc`
+  is fast for small physically-contiguous; `vmalloc` is slower
+  but unlimited-by-fragmentation.
+
+Pick GFP flags carefully — `GFP_KERNEL` may sleep; `GFP_ATOMIC`
+must not. Pressure is handled by kswapd in the background and
+direct reclaim under load. OOM is the last resort.
+
+User-space allocators (jemalloc, mimalloc, tcmalloc, glibc
+ptmalloc) borrow these ideas — per-CPU arenas, size-class
+buckets, segregated free lists — because the underlying
+problem ("recycle small objects fast") is the same. Only the
+top layer of the kernel allocator (GFP flags, buddy, NUMA
+zones) is uniquely kernel-shaped.

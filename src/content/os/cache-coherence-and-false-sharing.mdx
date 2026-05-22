@@ -1,0 +1,284 @@
+export const level = 'senior';
+
+# Cache coherence and false sharing
+
+Multi-core CPUs each have private L1 and L2 caches; they share
+L3 (mostly). When two cores cache the same memory line, the
+hardware has to keep them consistent — that's the **cache
+coherence protocol**. When two pieces of unrelated data
+accidentally land on the same cache line and two cores
+hammer them, the protocol ping-pongs the line back and forth
+and your code crawls. That's **false sharing**.
+
+## The cache line
+
+The unit of cache management. On modern x86 and ARM: **64
+bytes**. Some Intel server parts have 64-byte lines + a
+sector-coherence trick at 128; M1/M2 have 128-byte lines.
+
+Loads and stores actually move whole lines between caches and
+memory. Touch byte `0x1000`, the line `0x1000–0x103F` is now
+in your L1.
+
+## The coherence problem
+
+Two cores cache the same line. Core A writes its copy. Core B
+must either:
+
+- See the new value next time it reads (writes are propagated).
+- Discover its copy is stale (invalidation).
+
+Real CPUs use **invalidation-based** protocols: a write
+broadcasts an invalidate; other cores drop the line; the writer
+holds it exclusively.
+
+## MESI
+
+The textbook protocol. Every cache line in every cache is in
+one of four states:
+
+| State | Meaning |
+|---|---|
+| **M** odified | I have the only copy, and it's dirty (memory is stale). |
+| **E** xclusive | I have the only copy, clean (matches memory). |
+| **S** hared | Other caches may have a clean copy. |
+| **I** nvalid | I don't have this line (or my copy is stale). |
+
+Transitions on operations:
+
+```
+Core A reads line not in cache:
+  Bus read → other caches respond if they have it
+  If others had it as M/E: they downgrade to S
+  A's state: S (or E if no one else had it)
+
+Core A writes a line in state S:
+  Bus invalidate → others drop to I
+  A's state: M
+
+Core A writes a line in state E:
+  No bus traffic. A's state: M.
+
+Core A writes a line in state M:
+  No bus traffic.
+```
+
+The invariant: **at most one M; if any is M, no others have
+the line.** This is what keeps memory coherent across cores.
+
+## MOESI and MESIF — variants
+
+AMD's **MOESI** adds an **O** (Owned) state — a single owner of
+a dirty line that can also be Shared by others. Avoids writing
+back to memory before sharing; one core has the canonical dirty
+copy and serves reads.
+
+Intel's **MESIF** adds an **F** (Forward) state — exactly one
+cache among the shared copies is the responder for new requests
+(prevents multiple caches racing to respond).
+
+Implementation detail; performance-relevant for big NUMA
+machines. Functionally still "single writer or many readers,
+not both."
+
+## Cost of coherence operations
+
+| Op | Approximate cost |
+|---|---|
+| L1 hit (E or S state) | ~4 cycles |
+| L2 hit | ~12 cycles |
+| L3 hit | ~40 cycles |
+| Cross-core same socket (cache-to-cache transfer) | ~70 cycles |
+| Cross-socket (NUMA) | ~300+ cycles |
+| Memory (DRAM) | ~200–400 cycles |
+
+A write to a line shared by N cores costs **N invalidates** —
+broadcast on the ring/mesh and acknowledged. With 64 cores
+hammering one line, you can spend tens of microseconds per
+contended write.
+
+## False sharing — the silent killer
+
+The cache line is 64 bytes. If two pieces of unrelated data
+sit on the same line and two cores write them, the **line**
+ping-pongs even though the data is logically independent.
+
+Canonical example:
+
+```c
+struct Counters {
+    int64_t c0;   // 8 bytes
+    int64_t c1;   // 8 bytes — same cache line as c0
+    int64_t c2;
+    int64_t c3;
+    // ...
+};
+
+// Thread 0: counters.c0++ in a hot loop
+// Thread 1: counters.c1++ in a hot loop
+
+// They're not touching the same data — but they ARE touching the
+// same cache line. Each write invalidates the other thread's copy.
+// Throughput is 10–100× worse than padded.
+```
+
+Symptoms in a profile:
+
+- High counter on a function that "shouldn't" be slow.
+- L1d cache miss rate elevated.
+- `perf stat`: lots of `LLC-loads` and `LLC-load-misses` on
+  what should be hot data.
+- Performance scales **negatively** with core count
+  (4 threads slower than 1).
+
+## Fixing false sharing
+
+Pad shared data to its own cache line:
+
+```c
+struct AlignedCounter {
+    alignas(64) int64_t value;
+    char pad[64 - sizeof(int64_t)];   // belt + suspenders
+};
+
+AlignedCounter counters[NUM_THREADS];
+
+// Thread i: counters[i].value++ — each thread owns its line.
+```
+
+C++17 has portable cache-line constants:
+
+```cpp
+struct alignas(std::hardware_destructive_interference_size) Counter {
+    std::atomic<int64_t> value;
+};
+```
+
+Rust has `crossbeam_utils::CachePadded<T>`. Java has
+`@Contended` (JEP 142). Go has manual padding.
+
+The cost: 64 bytes per counter instead of 8 — eight times the
+memory for a counter array. Worth it when the lines are
+contended.
+
+## True sharing is also expensive
+
+Two threads honestly contending on the same atomic value (a
+real counter, both threads need the same answer): same
+ping-pong. There's no way around it without changing the
+algorithm.
+
+Mitigations:
+
+- **Sharded counters** — per-thread or per-CPU counters, sum
+  on read. Java's `LongAdder`, Linux's per-CPU counters.
+- **Combining** — buffer updates locally, flush periodically.
+- **Coalescing locks** — combine many updates into one lock
+  acquisition.
+
+These trade exact-read accuracy or latency for throughput.
+
+## Cache-line bouncing on a lock
+
+Even an uncontended mutex has a hot cache line: the lock word.
+On lock/unlock paths, the holder's CPU must own the line
+exclusively. If different CPUs acquire the lock in turn, the
+line bounces.
+
+This is one reason "minimize hold time" + "use thread-local
+data" both help: shorter holds → less contention; thread-local
+data avoids hitting shared lines at all.
+
+## Pseudo-sharing on multi-counter atomic types
+
+```c
+std::atomic<int> a;
+std::atomic<int> b;  // adjacent in memory → same line
+```
+
+A and B atomics, declared separately, will often land on the
+same cache line. Two threads each incrementing one of them will
+false-share. The compiler can't always tell to pad. Use the
+`alignas` trick for performance-critical atomics.
+
+## Tools for finding false sharing
+
+```bash
+# perf c2c — Cache-to-Cache analysis, the dedicated tool
+sudo perf c2c record ./your_prog
+sudo perf c2c report
+
+# Output identifies "HITM" events — load that hits a line dirty in
+# another cache. Many HITMs to the same line == false sharing or
+# heavy true sharing.
+```
+
+`perf c2c` rolled out in Linux 4.10; it's the canonical tool
+for this class of bug.
+
+## Memory ordering interacts with coherence
+
+Coherence keeps the *values* consistent across cores. Memory
+**ordering** (covered in *memory-models-and-ordering*) governs
+the order in which *writes from one core become visible to
+others*. Both have to work right.
+
+On x86 (TSO), stores to *different* lines from one core can
+be observed in order by another core only with appropriate
+fences. On ARM, even fewer ordering guarantees hold. Coherence
+isn't enough — you also need barriers.
+
+## Why cache-friendly code matters
+
+The same dataset can run 10× faster with cache-aware layout:
+
+- **Struct of Arrays vs Array of Structs**. If you iterate one
+  field, SoA puts it in fewer cache lines.
+
+  ```c
+  // AoS — iterating .x touches every line:
+  struct Particle { float x, y, z, vx, vy, vz, ax, ay, az, mass; };
+  Particle particles[N];
+
+  // SoA — iterating x_arr touches only x:
+  struct ParticleArrays {
+      float x[N], y[N], z[N], vx[N], ...
+  };
+  ```
+
+- **Pack hot fields together**. Cold fields in a separate
+  struct pointed to by the hot one.
+
+- **Avoid pointer chasing**. Linked lists have terrible cache
+  behavior (random access pattern). Arrays of small objects
+  beat lists of large ones for traversal.
+
+This is the "data-oriented design" pillar in game engines.
+
+## False sharing in your own code — likely places
+
+- Adjacent atomics in a struct.
+- Per-thread state in an array, no padding.
+- Lock-free queues where head and tail are adjacent (they
+  should be on separate lines).
+- Reference counts adjacent to data (the count is hot from
+  one thread, the data from another).
+
+If you have an atomic and a regular field in the same struct,
+both touched by different threads, you have false sharing.
+
+## The mental model
+
+Cache lines are the unit of coherence. The protocol (MESI/
+MOESI/MESIF) maintains "one writer or many readers, never
+both." Any cross-core write costs invalidates.
+
+False sharing is when two pieces of unrelated data live on the
+same line and threads contend on the line without contending
+on the data. Pad to cache lines. True sharing is the same
+mechanism with intentional data overlap; mitigate with
+sharding, combining, or rearchitecting.
+
+If a function is unaccountably slow under threads, suspect a
+cache line. `perf c2c` or careful padding usually tells the
+story.

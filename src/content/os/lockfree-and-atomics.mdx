@@ -1,0 +1,291 @@
+export const level = 'staff';
+
+# Lock-free programming, atomics, and reclamation
+
+Lock-free code uses atomic CPU instructions to coordinate
+without mutexes. It's fast under high contention because no
+thread ever blocks waiting for another. It's also a famous
+bug factory: every working lock-free algorithm I've seen
+arrived in literature with at least one correction. Memorize
+the patterns, don't invent them.
+
+## Definitions that get confused
+
+- **Blocking** — a thread can be paused indefinitely (waiting
+  for a lock holder that's been suspended).
+- **Lock-free** — at least *one* thread always makes progress
+  in a bounded number of steps. Individual threads can still
+  starve.
+- **Wait-free** — *every* thread makes progress in a bounded
+  number of steps. Strongest guarantee; rarely practical.
+
+Most "lock-free" data structures in the wild are technically
+lock-free, occasionally wait-free for the simplest ops
+(read-mostly).
+
+## The hardware ground floor
+
+All of this is built on a small set of atomic instructions:
+
+| Op | What it does | x86 | ARM |
+|---|---|---|---|
+| Atomic load/store | One value, atomically | aligned MOV | `LDR`/`STR` (aligned) |
+| Fetch-and-add | Add, return old value | `LOCK XADD` | `LDADD` (ARMv8.1+) |
+| Compare-and-swap (CAS) | If `*addr == expected`, write `new`; return success | `LOCK CMPXCHG` | `LDXR/STXR` loop |
+| Load-Linked/Store-Conditional | Pair: load, then conditional store iff nobody else wrote since | — | `LDXR` / `STXR` |
+| Double-word CAS (DCAS) | CAS 16 bytes at once | `LOCK CMPXCHG16B` | `CASP` |
+
+C/C++/Rust expose these as `std::atomic` / `std::sync::atomic`.
+Java has `AtomicInteger`, `AtomicReference`, `VarHandle`. Go
+has `sync/atomic`.
+
+## CAS — the workhorse
+
+```cpp
+std::atomic<int> counter{0};
+
+void increment_lockfree() {
+    int old, neu;
+    do {
+        old = counter.load(std::memory_order_relaxed);
+        neu = old + 1;
+    } while (!counter.compare_exchange_weak(
+        old, neu,
+        std::memory_order_release, std::memory_order_relaxed));
+}
+```
+
+Read-modify-write loop: read current value, compute new,
+try to CAS. If someone else changed it in the meantime, retry.
+
+This is what every `AtomicInteger.incrementAndGet`,
+`fetch_add`, etc. is doing internally. Note `compare_exchange_weak`
+— it's allowed to spuriously fail (faster code-gen on ARM via
+LL/SC); always use it in a loop.
+
+For pure counters, prefer `fetch_add` over a CAS loop. The CPU
+has a direct instruction for it (`LOCK XADD`); much faster
+than a CAS loop under contention.
+
+## A lock-free stack (Treiber stack)
+
+The first lock-free data structure (R. Kent Treiber, 1986):
+
+```cpp
+template <typename T>
+struct LFStack {
+    struct Node { T value; Node* next; };
+    std::atomic<Node*> head{nullptr};
+
+    void push(T v) {
+        Node* n = new Node{std::move(v), nullptr};
+        Node* old;
+        do {
+            old = head.load(std::memory_order_relaxed);
+            n->next = old;
+        } while (!head.compare_exchange_weak(
+            old, n, std::memory_order_release, std::memory_order_relaxed));
+    }
+
+    std::optional<T> pop() {
+        Node* old;
+        do {
+            old = head.load(std::memory_order_acquire);
+            if (!old) return std::nullopt;
+        } while (!head.compare_exchange_weak(
+            old, old->next, std::memory_order_acq_rel, std::memory_order_acquire));
+        T v = std::move(old->value);
+        delete old;     // ← THIS IS WRONG. See "ABA" below.
+        return v;
+    }
+};
+```
+
+Push is correct. Pop is wrong, in a way that's invisible until
+you run it on real hardware under contention.
+
+## The ABA problem
+
+Thread X reads `head = A`. Pauses.
+
+Thread Y pops A, pops B, pushes A back. Stack now: A → C.
+
+Thread X resumes, does CAS(head, A, A->next). The CAS succeeds
+(head is still A pointer-wise!), but A->next now points to C,
+not B as X expected. X just discarded B silently.
+
+CAS only compares values, not identities. When the value can
+recycle (a pointer that's freed and reallocated, a sequence
+number that wraps), CAS lies to you.
+
+## Three fixes for ABA
+
+**1. Tagged pointers (DCAS).** Stick a monotonic counter in
+the high bits of the pointer or in a second word.
+
+```
+head = (Node*, counter)
+CAS the (pointer, counter) tuple atomically.
+```
+
+Each push increments counter. If Y pops A and pushes it back,
+the counter has moved; X's CAS fails. Requires 128-bit CAS
+(x86 `CMPXCHG16B`, ARM `CASP`).
+
+**2. Hazard pointers** (Maged Michael, 2004). Each thread
+publishes the pointers it's currently dereferencing in a
+shared "hazard" table. Before a thread frees a node, it scans
+the table: if anyone has the node as a hazard, defer the free.
+
+Bounds memory at O(threads × hazard slots). Adds a memory
+barrier per dereference. Used inside `folly`, `concurrentqueue`,
+proposed for C++26 standard (`<hazard_pointer>`).
+
+**3. Epoch-based reclamation (EBR)**. Threads enter "epochs"
+when they start an operation; a node freed in epoch N can be
+reclaimed once all threads have advanced to epoch ≥ N+2. No
+per-deref barrier; reclamation in batches.
+
+Cheaper steady-state than hazard pointers; worse worst-case
+memory (a stalled thread holds an epoch back forever). Used in
+`crossbeam-epoch` (Rust), parts of the Linux kernel
+(read-copy-update, see below).
+
+## RCU — read-copy-update
+
+Linux kernel's reclamation scheme for read-heavy data
+structures (the routing table, the FD table, dentries).
+
+```
+reader:                     writer:
+  rcu_read_lock();            new = copy_and_modify(old);
+  p = rcu_dereference(ptr);   rcu_assign_pointer(ptr, new);
+  use(p);                     synchronize_rcu();     // wait for readers
+  rcu_read_unlock();          kfree(old);
+```
+
+Three rules:
+
+1. Readers do nothing expensive — `rcu_read_lock` disables
+   preemption (or is a no-op in some variants). No atomics on
+   the read side.
+2. Writers publish updates via atomic pointer swaps.
+3. After publishing, the writer waits for a **grace period**
+   — every CPU has gone through a context switch since the
+   publish — so no reader can still hold the old version. Then
+   free.
+
+Wins enormously on read-heavy paths: readers pay almost
+nothing. Writers pay the grace period. Userspace versions:
+`liburcu`, `crossbeam-epoch`.
+
+## The natural use cases for lock-free
+
+- **Counters** that need atomic increment from many threads —
+  `fetch_add`. Trivial, fast.
+- **Single-producer/single-consumer queues** — no CAS needed,
+  just acquire/release on head/tail indices. Used everywhere
+  in low-latency systems.
+- **Read-mostly published values** — atomic pointer with
+  release/acquire. Updates are rare, reads scale linearly.
+- **Worker stealing** — a deque per worker; owner pushes/pops
+  one end with no atomics; thieves CAS the other end. Tokio,
+  Go scheduler, Java's ForkJoinPool.
+
+For multi-producer multi-consumer queues, stacks, hash maps,
+use a well-tested library: `crossbeam`, `folly/MPMCQueue`,
+`tbb::concurrent_queue`, `ConcurrentHashMap` in Java.
+Don't roll your own.
+
+## Linearizability — what "correct" means
+
+A concurrent operation is **linearizable** if, from the outside,
+it looks like it happened atomically at some single point in
+time between its invocation and its return.
+
+```
+Thread A: push(1) →             →
+Thread B:           push(2) →   →
+Thread C: top() →               → returns 1 or 2 (both ok)
+                                  but never returns 1 then 2 then 1
+```
+
+This is the gold-standard correctness condition. Linearizable
+data structures compose: a system built from linearizable
+components is itself linearizable. Lock-free libraries call out
+which operations are linearizable and which aren't (some
+relaxations like quiescent consistency are cheaper).
+
+## The constant-factor lie
+
+Lock-free *can* be slower than a well-tuned mutex under low
+contention. The CAS loop has a retry cost; the atomic ops
+have stronger memory fences; cache-line bouncing on the head
+pointer of a contended stack can pin a core.
+
+A futex-backed mutex with low contention is *one* uncontended
+CAS plus a function call. A lock-free pop is the same CAS but
+in a retry loop, and you pay reclamation overhead. Don't
+assume lock-free is faster — benchmark.
+
+The wins show up under **high contention** (the mutex
+serializes everything, lock-free at least parallelizes attempts)
+or in **latency-sensitive paths** (no risk of being blocked by a
+suspended thread). For an audio thread that must hit 48kHz, a
+lock-free SPSC queue beats a mutex unconditionally because the
+mutex could in theory block.
+
+## Reading the literature
+
+When you see "lock-free queue" papers, mentally translate:
+
+- "Linearizable" → behaves like atomic at some point.
+- "Wait-free" → every thread done in bounded steps.
+- "Obstruction-free" → progress if you stop everyone else
+  briefly. Weakest non-blocking guarantee.
+- "Memory-bounded" → won't leak nodes forever (uses HP or EBR).
+- "ABA-safe" → uses tagged pointers or HP/EBR or no recycle.
+
+Anything without these qualifiers is suspect.
+
+## Tools
+
+- **TSan** (ThreadSanitizer) — runtime data race detector for
+  C/C++/Go. Slow (~5–10× slowdown), but finds real bugs.
+- **Loom** (Rust) — model checker that runs your test under
+  every possible interleaving of atomic ops. Catches ordering
+  bugs at unit-test time.
+- **Java Concurrency Stress (jcstress)** — same idea for JVM.
+  Run it before claiming a class is lock-free.
+- **`relacy`** (C++) — race detector for relaxed atomics.
+
+If you wrote lock-free code without running one of these, you
+have a bug. Probably a latent reclamation bug; possibly an
+ordering bug.
+
+## When *not* to go lock-free
+
+- Mutex throughput is fine.
+- You're not on a fast path.
+- The team doesn't have the bandwidth to maintain it.
+- Your data structure isn't in a well-known set
+  (queue, stack, hash map).
+- You'd be the only user.
+
+The pragmatic answer is usually: **use a coarse mutex, profile,
+and only reach for atomics where the profile says the lock is
+the bottleneck.** And then use a library.
+
+## The mental model
+
+Atomics give you ordered, indivisible reads/writes. CAS lets
+you do "if-then-set" without a lock. Hazard pointers, EBR, and
+RCU solve the "when can I free this" problem that locks solve
+for free. Linearizability is the correctness condition.
+
+For real systems: counters → fetch_add. SPSC queue → indices
+with release/acquire. Published config → atomic pointer + RCU
+or EBR. Anything else → a well-tested library, or a mutex.
+
+Hand-rolled lock-free data structures are how you put junior
+engineers on a six-month bug hunt. Don't.

@@ -1,0 +1,212 @@
+export const level = 'mid';
+
+# System calls
+
+A system call is the only way user code can ask the kernel to do
+something — open a file, allocate memory, send a packet. It's a
+controlled doorway from ring 3 to ring 0 with a number on it.
+Knowing how the door works tells you why some operations are
+fast, why others are slow, and why `strace` shows you everything
+that matters.
+
+## The syscall number
+
+The kernel has a numbered table of every syscall it supports. On
+Linux x86-64, `read` is 0, `write` is 1, `open` is 2, etc. (see
+`/usr/include/asm/unistd_64.h`). User code loads the number in a
+register and traps into the kernel.
+
+```asm
+; Linux x86-64 — calling write(1, buf, len)
+mov  rax, 1          ; syscall number (write)
+mov  rdi, 1          ; arg1: fd
+mov  rsi, buf        ; arg2: buffer pointer
+mov  rdx, len        ; arg3: length
+syscall              ; trap
+; rax now holds the return value
+```
+
+The kernel side has a switch (well, a table lookup) that
+dispatches by `rax` to the right handler. Numbers are append-only
+— removing or renumbering a syscall would break every existing
+binary. New syscalls (`statx`, `pidfd_open`, `io_uring_setup`,
+`openat2`) just get added to the end.
+
+## The four ways into the kernel
+
+| Mechanism | When | Cost |
+|---|---|---|
+| `int 0x80` | Legacy 32-bit Linux | Slow (~1000 cycles) |
+| `sysenter` / `sysexit` | Intel, fast path on 32-bit | ~100 cycles |
+| `syscall` / `sysret` | x86-64, modern Linux | ~80–200 cycles |
+| **vDSO** | `gettimeofday`, `clock_gettime` | ~5 cycles (no mode switch) |
+
+`syscall` is the modern fast path: it bakes the privilege change,
+stack switch, and entry point into one instruction. The kernel
+configures the entry point at boot via the `LSTAR` MSR.
+
+## What the kernel does on entry
+
+```
+syscall instruction (CPL: 3 → 0)
+  ↓
+entry_SYSCALL_64 (assembly stub)
+  ├─ swap GS base → kernel uses GS for per-CPU data
+  ├─ switch from user stack to kernel stack
+  ├─ save user registers on kernel stack
+  ├─ (if KPTI) switch page tables (CR3)
+  └─ call do_syscall_64
+       ├─ look up handler in sys_call_table[rax]
+       ├─ validate user pointers (copy_from_user)
+       ├─ run the handler (e.g. sys_read)
+       ├─ copy results back (copy_to_user)
+       └─ return
+  ├─ (if KPTI) switch CR3 back
+  ├─ restore user registers
+  ├─ swap GS base back
+  └─ sysret (CPL: 0 → 3)
+```
+
+Each step is a handful of cycles, but they add up. **KPTI** (the
+Meltdown mitigation) adds the two CR3 switches — measurable
+overhead, ~30% on syscall-heavy workloads when it shipped.
+
+## copy_from_user / copy_to_user — why they exist
+
+The kernel **cannot blindly dereference a user pointer**. The
+user might:
+
+- Pass a pointer to kernel memory, trying to leak it.
+- Pass a pointer to an unmapped page (page fault inside the
+  kernel — recoverable, but only if you arranged for it).
+- Pass a pointer that another thread unmaps mid-syscall (TOCTOU).
+
+`copy_from_user(dst, user_src, n)` does the safe thing: checks
+that the address is in user space, handles page faults during
+the copy, and returns 0 on success or the number of unwritten
+bytes on fault. Forgetting it is a classic kernel bug class —
+the [old `ROOT_DEV` exploit](https://lwn.net/Articles/95985/)
+genre.
+
+## Errno — how syscalls report failure
+
+Syscalls return a single integer. Negative values are errors.
+glibc's wrapper turns negative returns into `-1` and sets the
+thread-local `errno`. So when you see:
+
+```c
+int fd = open("/etc/foo", O_RDONLY);
+if (fd == -1) perror("open");  // "open: No such file or directory"
+```
+
+…the kernel actually returned `-ENOENT` (-2), libc converted it
+to `errno=2` and `fd=-1`. The list of error codes is in
+`/usr/include/asm-generic/errno-base.h` and `errno.h`. Useful
+ones:
+
+- `EAGAIN` / `EWOULDBLOCK` — try again later (nonblocking I/O).
+- `EINTR` — interrupted by a signal; retry.
+- `ENOMEM` — out of memory or address space exhausted.
+- `EBADF` — bad file descriptor.
+- `EACCES` — permission denied.
+- `EEXIST` — file already exists.
+
+## Restartable vs not — `EINTR`
+
+If a signal arrives while a slow syscall is blocked (waiting on
+read from a pipe, accept on a socket), the kernel can either:
+
+- **Restart** the syscall automatically when the signal handler
+  returns. The application doesn't see anything.
+- **Return `EINTR`**. The application is supposed to retry.
+
+Which one happens depends on the syscall and the `SA_RESTART`
+flag on the signal. Old syscalls (`read`, `write`) restart by
+default; some don't (`select`, `epoll_wait`, `accept` in some
+cases). Defensive code wraps slow syscalls in a retry loop:
+
+```c
+ssize_t n;
+do {
+    n = read(fd, buf, len);
+} while (n == -1 && errno == EINTR);
+```
+
+This is one of the reasons "just use `EINTR`-safe wrappers" is
+common advice. Most modern libraries (libuv, Go runtime) hide it.
+
+## vDSO — syscalls without a syscall
+
+A handful of syscalls just read kernel-maintained data; they
+don't need to do anything privileged. `clock_gettime` reads the
+current time; `getcpu` reads which CPU you're on. For these, the
+kernel maps a small page of code + a data page into every process
+and lets user code call them directly — no mode switch, no entry
+overhead.
+
+```
+$ cat /proc/self/maps | grep vdso
+7ffe0e1f8000-7ffe0e1fa000 r-xp 00000000 00:00 0  [vdso]
+```
+
+That's why `clock_gettime` can run at hundreds of millions of
+calls per second on modern Linux. If you're benchmarking syscall
+overhead and seeing weirdly fast numbers, you're hitting the vDSO.
+
+## io_uring — amortizing the door cost
+
+For high-throughput servers, the per-syscall overhead is the
+bottleneck. **io_uring** (Linux 5.1+) lets you submit and reap
+I/O operations via two shared-memory ring buffers — submissions
+and completions — without crossing into the kernel for each one.
+
+```
+user                              kernel
+  │ writes SQEs to submission ring  │
+  │ (no syscall yet)                │
+  │                                 │
+  │ io_uring_enter() once          │
+  │ ──────────────────────────────▶ │ kernel reads N SQEs
+  │                                 │ executes them
+  │                                 │ writes CQEs to completion ring
+  │ ◀────────────────────────────── │
+  │ reads CQEs (no syscall)         │
+```
+
+One syscall, N operations. With `IORING_SETUP_SQPOLL` you can
+get zero syscalls — a kernel thread polls the ring. The cost is
+a constantly-busy core.
+
+## strace — the syscall printer
+
+`strace` uses `ptrace(PTRACE_SYSCALL, ...)` to stop the target
+before and after every syscall and print arguments + return value.
+Slow (every syscall pays a stop+resume penalty), but it shows
+exactly what your program asks the kernel for.
+
+```bash
+$ strace -e openat,read ls /tmp
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3..."..., 832) = 832
+openat(AT_FDCWD, "/tmp", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+```
+
+`strace -c` summarizes by syscall — useful for "where is my
+program spending its kernel time?"
+
+`perf trace` and `bpftrace` do the same job without ptrace's
+overhead, using kprobes/tracepoints. Reach for them on production.
+
+## The mental model
+
+A syscall is a numbered request. The kernel exposes a fixed table
+of them; you put the number in a register and trap. Everything
+expensive about syscalls is the trap itself — mode switch, stack
+switch, register save/restore, cache pollution. Everything fast
+about modern Linux I/O (io_uring, vDSO) is built around *avoiding*
+the trap.
+
+That's why "minimize syscalls" is the same advice as "minimize
+allocations" or "minimize cache misses": the cost isn't in the
+work, it's in the bookkeeping.

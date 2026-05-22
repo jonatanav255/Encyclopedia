@@ -1,0 +1,321 @@
+export const level = 'senior';
+
+# Virtualization
+
+A hypervisor runs multiple OSes on one physical machine, each
+believing it owns the hardware. It does this by **trapping
+the privileged operations** that each guest OS tries to
+perform and emulating them, or by using hardware extensions
+that let the guest run privileged code natively but in a
+sandboxed world. The cloud is built on this. Containers are
+the cheaper, less-isolated alternative.
+
+## Type 1 vs Type 2
+
+```
+Type 1 ("bare-metal")              Type 2 ("hosted")
+
+┌────────┐ ┌────────┐ ┌────────┐    ┌────────┐ ┌────────┐
+│ Guest1 │ │ Guest2 │ │ Guest3 │    │ Guest1 │ │ Guest2 │
+│ OS     │ │ OS     │ │ OS     │    │ OS     │ │ OS     │
+└────────┘ └────────┘ └────────┘    └────────┘ └────────┘
+       Hypervisor (Xen, ESXi)              Hypervisor (VirtualBox)
+              │                              │
+         Hardware                        Host OS (Linux/macOS/Win)
+                                              │
+                                         Hardware
+```
+
+- **Type 1** (bare-metal): hypervisor *is* the lowest software
+  layer. Xen, VMware ESXi, Microsoft Hyper-V (when configured
+  as the parent partition). What public clouds run.
+- **Type 2** (hosted): hypervisor runs as a process under a
+  normal host OS. VirtualBox, VMware Workstation, Parallels.
+  What you have on your laptop.
+- **KVM** is a hybrid: a Linux kernel module that turns the
+  host into a Type-1-ish hypervisor when active. Cloud uses
+  it heavily (AWS, GCP).
+
+## The fundamental trick: trap-and-emulate
+
+Privileged instructions (writing to control registers,
+issuing I/O port commands, modifying page tables) can't run
+in guest user mode without faulting. The hypervisor:
+
+1. Runs the guest **kernel in unprivileged mode**.
+2. When the guest kernel tries to do something privileged →
+   fault → hypervisor takes over.
+3. Hypervisor **emulates** the operation against virtual
+   hardware state.
+4. Returns control to the guest.
+
+Popek and Goldberg (1974) proved this works only if **every
+privileged instruction traps when run unprivileged**. Classic
+x86 violated this — some instructions silently ignored
+privilege violations instead of trapping. This made
+"virtualizing x86 efficiently" a hard problem until hardware
+extensions arrived.
+
+## Pre-VT-x: the two solutions before hardware help
+
+**Binary translation (VMware, 1999).** The hypervisor scans
+guest kernel code and rewrites the problem instructions on
+the fly. The guest sees the original instructions in its own
+view of memory but actually runs translated code. Brilliant
+and complex.
+
+**Paravirtualization (Xen, 2003).** Don't pretend to be
+hardware. Expose **hypercalls** — explicit "please do this for
+me" requests that the modified guest kernel calls instead of
+issuing privileged instructions. Faster than trap-and-emulate
+but requires modifying the guest. Linux gained paravirt
+hooks; Windows largely didn't.
+
+## Intel VT-x and AMD-V — hardware to the rescue
+
+Intel VT-x (2005) and AMD-V added a new CPU mode pair: **VMX
+root** (hypervisor) and **VMX non-root** (guest). The
+hypervisor uses `vmlaunch` / `vmresume` to enter guest mode,
+where the guest kernel runs at its normal privilege level
+inside a sandbox. Privileged operations the hypervisor cares
+about trigger a **VM-exit** back to root mode.
+
+```
+        Hypervisor (VMX root, ring 0)
+              │ vmlaunch
+              ▼
+        Guest (VMX non-root)
+        ┌─────────────────────┐
+        │ ring 0: guest kernel│  ← runs normally most of the time
+        │ ring 3: guest apps  │
+        └─────────────────────┘
+              │ VM-exit (privileged op, EPT fault, IPI, etc.)
+              ▼
+        Hypervisor decides what to do
+              │ vmresume
+              ▼
+        Back to guest
+```
+
+Now virtualization is fast. The hypervisor only sees the guest
+when something interesting happens.
+
+## Memory virtualization — shadow vs nested page tables
+
+The guest OS thinks it owns physical memory. Actually the host
+controls the real page tables. Two implementations:
+
+**Shadow page tables (pre-EPT/NPT):**
+
+The hypervisor maintains a second "shadow" page table that
+maps guest virtual addresses directly to host physical pages.
+Every guest update to its page table → trap → hypervisor
+updates the shadow. Slow on workloads with frequent VM page-
+table changes (fork-heavy).
+
+**Nested page tables (EPT on Intel, NPT on AMD):**
+
+Hardware does two-level translation:
+
+```
+Guest virtual address ─→ Guest physical (via guest page tables)
+                      ─→ Host physical (via EPT, set by hypervisor)
+```
+
+Two TLB walks per uncached translation. Way faster than shadow
+PT because the hypervisor doesn't intervene on guest page-
+table modifications. Standard on every modern CPU; KVM uses it
+by default.
+
+The trade-off: deeper page-table walks (4+4=8 memory accesses
+in the worst case for a TLB miss). Modern CPUs have larger
+TLBs and prefetch logic to compensate.
+
+## I/O virtualization
+
+The hard part. Three approaches:
+
+**Full emulation (slow).** The hypervisor pretends to be an old
+device (e1000 NIC, IDE disk). Every read/write of the device's
+I/O ports traps into the hypervisor, which translates to the
+real hardware. Compatible (guest needs no special driver) but
+slow.
+
+**Paravirtualized devices (virtio).** Standardized virtual
+devices with explicit ring-buffer protocols, designed for
+virtualization. Guest's virtio driver writes to a shared ring;
+hypervisor processes batches. Used everywhere — `virtio-net`,
+`virtio-blk`, `virtio-scsi`, `virtio-gpu`. Default in KVM and
+Xen.
+
+**Passthrough / SR-IOV.** Give the guest direct access to a
+real PCI device. The hardware's IOMMU keeps the guest from
+DMA'ing into other guests' memory.
+
+- **PCI passthrough** — one device, one guest. The host can't
+  use it.
+- **SR-IOV** (Single Root I/O Virtualization) — one PCI device
+  presents many "virtual functions"; each looks like an
+  independent device. Used heavily for high-perf NICs in
+  cloud.
+
+Performance ladder: emulated < paravirt (virtio) < SR-IOV ≈
+bare-metal. Modern cloud uses virtio for general workloads,
+SR-IOV for high-perf NICs (ENA on AWS, gVNIC on GCP).
+
+## IOMMU and DMA isolation
+
+A device doing DMA writes directly to memory addresses. In a
+virtualized world that's dangerous — a malicious guest could
+program its passed-through NIC to DMA into another guest's
+memory.
+
+The **IOMMU** (Intel VT-d, AMD-Vi) does for devices what the
+MMU does for processes: translates device-issued addresses
+through a per-device page table set by the hypervisor.
+Devices can only DMA where the hypervisor says.
+
+Required for safe device passthrough. Also useful for
+**user-space drivers** — DPDK, SPDK use VFIO + IOMMU to give
+unprivileged user processes safe DMA access.
+
+## Live migration
+
+Move a running VM from one host to another, ideally with
+sub-second downtime. The standard algorithm (pre-copy):
+
+```
+1. Mark guest memory write-protected.
+2. Copy all guest memory to destination.
+3. Loop: copy pages dirtied since last pass. Stop when "dirty rate"
+   drops below threshold (or after N iterations).
+4. Pause guest on source briefly. Send final delta + CPU state.
+5. Resume guest on destination.
+6. Free memory on source.
+```
+
+Works because most pages don't change in the few seconds the
+copy takes. Workloads with high page-dirty rates (memcached
+under load) can fail to converge.
+
+Used heavily in cloud: host maintenance without dropping VMs.
+
+## CPU virtualization for nested workloads
+
+Running a hypervisor inside a VM (nested virtualization).
+Cloud providers expose this via `vmx`/`svm` CPU flags in the
+guest. KVM-inside-KVM works on modern hardware.
+
+Performance cost: two layers of trap-and-emulate. Used for
+running container runtimes that themselves use VMs
+(Firecracker inside AWS), CI for hypervisor development,
+nested K8s test clusters.
+
+## Hyper-V architecture — a different model
+
+Microsoft Hyper-V has:
+
+- **Root partition** (host) — runs Windows; manages the
+  hypervisor.
+- **Child partitions** (guests) — run guest OSes.
+- **Hypervisor** below both.
+
+VTLs (Virtual Trust Levels) give nested isolation within a
+single guest — used by Windows for VBS (Virtualization-Based
+Security): the kernel runs in VTL 0, security-critical code in
+VTL 1. Even kernel exploits can't reach VTL 1.
+
+## Lightweight VMs — Firecracker, Cloud Hypervisor
+
+Standard QEMU emulates a full PC platform — BIOS, USB, IDE,
+PCI bus, even though the guest doesn't need most of it. Cold
+boot: seconds. Memory overhead: hundreds of MB.
+
+**Firecracker** (AWS, 2018) strips this to the minimum:
+virtio-net, virtio-blk, a serial console. No BIOS, no PCI bus.
+Boot time: ~125ms. Memory overhead: ~5MB. Used by Lambda and
+Fargate.
+
+**Cloud Hypervisor** (Intel/AMD/RH joint) is the Rust
+successor. Same minimal-device philosophy. Used by Kata
+Containers v3.
+
+These are between containers and full VMs — VM-level isolation
+with container-class startup costs. The future of serverless
+isolation.
+
+## When to use a VM vs container
+
+| Need | Pick |
+|---|---|
+| Strong isolation, untrusted code | VM (or Firecracker / Kata) |
+| Different OS (Windows on Linux host) | VM |
+| Run software needing kernel modules | VM |
+| Many short-lived, similar workloads | Container |
+| Maximum density, willing to share kernel | Container |
+| Low-latency, predictable resource limits | Container with cgroups |
+| Strict regulatory/security multi-tenancy | VM |
+
+In practice: cloud providers use VMs (or microVMs) as the
+outer boundary between tenants and containers inside each VM
+for the customer's own workloads.
+
+## Costs of virtualization
+
+- **CPU**: a few % overhead for trap-and-emulate-on-events;
+  near-zero for compute-bound code running entirely in guest
+  mode.
+- **Memory**: hypervisor needs some (negligible for big
+  guests; significant per-VM if you run many small VMs).
+- **I/O**: virtio is close to bare-metal for throughput;
+  latency adds tens of µs for ring traversal.
+- **Cache / TLB**: VM-exits trash CPU state. Heavy I/O
+  workloads in VMs have more TLB and cache misses than
+  bare-metal.
+- **NUMA effects**: same as bare-metal but worse if vCPUs and
+  vRAM span sockets.
+
+Cloud SR-IOV and KVM with nested page tables get you to
+~95-98% of bare-metal for most workloads. For HPC and HFT, the
+last 2-5% matters and people still use bare-metal.
+
+## Inside the guest — telltale signs
+
+A guest can usually tell it's virtualized:
+
+```bash
+# Linux:
+systemd-detect-virt    # → kvm, vmware, xen, microsoft, oracle, ...
+dmesg | grep -i virt
+cat /sys/class/dmi/id/sys_vendor
+
+# CPU flag indicating hypervisor presence:
+cat /proc/cpuinfo | grep hypervisor
+```
+
+`hypervisor` flag in CPUID bit 31 of ECX is the standard way
+the hypervisor self-identifies. Useful for guest agents
+(VMware Tools, qemu-guest-agent, Hyper-V integration services).
+
+## The mental model
+
+A hypervisor virtualizes the CPU (VT-x/AMD-V), memory (EPT/
+NPT), and I/O (virtio + IOMMU). Guests run their own kernels
+in VMX non-root mode; the hypervisor intervenes only on
+VM-exits.
+
+Type 1 hypervisors (Xen, ESXi, Hyper-V) sit directly on
+hardware; Type 2 (VirtualBox, Workstation) sit on a host OS.
+KVM is Type-1-ish: a Linux kernel module that turns the host
+into a hypervisor.
+
+Containers and VMs solve different problems. Containers share
+a kernel (cheap, weaker isolation). VMs have separate kernels
+(expensive, stronger isolation). Modern systems layer them:
+microVMs for tenant isolation, containers inside for
+application packaging.
+
+The cloud is a giant hypervisor. Understanding what costs
+you 5% throughput in EC2 vs bare-metal — VM-exits, virtio,
+nested page tables, IOMMU — is the path to understanding
+*all* of cloud performance.

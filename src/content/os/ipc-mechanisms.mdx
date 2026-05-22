@@ -1,0 +1,331 @@
+export const level = 'mid';
+
+# IPC — interprocess communication
+
+Two processes have separate address spaces. They can't share
+memory the way two threads can. So the OS provides a menu of
+**IPC mechanisms**: ways to pass data, signal events, and
+sometimes share memory between processes. Each is suited to
+different shapes of communication — local vs networked, byte
+stream vs message, one-to-one vs many, kernel-mediated vs
+shared-memory speed.
+
+## The menu
+
+| Mechanism | Shape | Speed | Cross-machine? |
+|---|---|---|---|
+| Pipes (anonymous) | Byte stream, unidirectional | µs / write | No |
+| Named pipes (FIFOs) | Byte stream, unidirectional | µs | No |
+| UNIX domain sockets | Stream or datagram, bidirectional | µs | No |
+| TCP/UDP sockets | Stream or datagram, bidirectional | µs–ms | Yes |
+| SysV / POSIX message queues | Messages, with priorities | µs | No |
+| SysV / POSIX shared memory | Shared bytes | ns (after setup) | No |
+| Signals | Tiny event, fire-and-forget | µs | No |
+| `eventfd` / `signalfd` / `timerfd` | Event-as-FD | µs | No |
+| `pidfd` | Reference to a process, for IPC ops | µs | No |
+| Memory-mapped files | Shared bytes via filesystem | ns (after setup) | Optional |
+
+## Pipes — the original
+
+`pipe()` creates a pair of FDs: one read end, one write end.
+Bytes written to the write end flow out of the read end. Used
+by every shell since 1973 for `cmd1 | cmd2`.
+
+```c
+int p[2];
+pipe(p);                          // p[0]=read, p[1]=write
+
+if (fork() == 0) {
+    close(p[0]);                  // child: write only
+    write(p[1], "hello\n", 6);
+    close(p[1]);
+    _exit(0);
+}
+close(p[1]);                      // parent: read only
+char buf[16];
+read(p[0], buf, sizeof(buf));
+```
+
+Properties:
+
+- **Anonymous**: lives in kernel memory; only the original
+  process and its fork-inherited descendants can use it.
+- **Unidirectional**: for bidirectional, make two pipes.
+- **Buffered**: kernel buffer (~64KB on Linux). `write` blocks
+  if full; `read` blocks if empty.
+- **Atomic up to `PIPE_BUF`** (4096 bytes on Linux): writes
+  smaller than this aren't interleaved with other writers'.
+- **EOF on read** when all write ends close.
+- **SIGPIPE on write** when no read end exists. (Ignore SIGPIPE
+  in network/IPC code; handle `EPIPE` instead.)
+
+Shell pipelines: the shell fork-then-exec's each stage with
+the pipe FDs `dup2`'d to stdin/stdout. Each stage doesn't know
+it's in a pipeline.
+
+## FIFOs (named pipes)
+
+Same as pipes but live in the filesystem namespace; any
+process can `open` them by path:
+
+```bash
+mkfifo /tmp/myfifo
+echo hello > /tmp/myfifo &        # blocks until reader opens
+cat /tmp/myfifo                    # → hello
+```
+
+Useful for ad-hoc Unix glue: unrelated processes (no parent-
+child relationship) coordinate. Less used now that UNIX domain
+sockets exist; FIFOs are still unidirectional.
+
+`open` blocks until both reader and writer have opened (a
+rendezvous). Use `O_NONBLOCK` if you don't want to block.
+
+## UNIX domain sockets
+
+The local Swiss Army knife. Same API as TCP sockets, but path-
+named and stay on the local machine.
+
+```c
+// Server:
+int s = socket(AF_UNIX, SOCK_STREAM, 0);
+struct sockaddr_un addr = { .sun_family = AF_UNIX };
+strcpy(addr.sun_path, "/tmp/mysock");
+bind(s, (struct sockaddr*)&addr, sizeof(addr));
+listen(s, 16);
+int c = accept(s, NULL, NULL);
+
+// Client:
+int c = socket(AF_UNIX, SOCK_STREAM, 0);
+connect(c, (struct sockaddr*)&addr, sizeof(addr));
+write(c, "hello", 5);
+```
+
+Advantages over TCP loopback:
+
+- ~2× faster (no TCP/IP overhead).
+- File-system permissions on the socket file.
+- **Pass file descriptors** between processes (the only
+  POSIX IPC that can do this).
+
+```c
+// Send FD over a UNIX socket — control message magic:
+char buf[CMSG_SPACE(sizeof(int))];
+struct msghdr msg = {0};
+struct iovec iov = { .iov_base = "x", .iov_len = 1 };
+msg.msg_iov = &iov; msg.msg_iovlen = 1;
+msg.msg_control = buf; msg.msg_controllen = sizeof(buf);
+
+struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+cmsg->cmsg_level = SOL_SOCKET;
+cmsg->cmsg_type = SCM_RIGHTS;
+cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+*(int*)CMSG_DATA(cmsg) = fd_to_send;
+
+sendmsg(sock, &msg, 0);
+```
+
+Used by:
+
+- systemd to pass listening sockets to services (socket
+  activation).
+- Web servers like Nginx for master→worker FD handoff.
+- Docker for managing container FDs.
+- Browsers for sandbox processes.
+
+Also supports `SOCK_DGRAM` for message-boundary semantics and
+`SOCK_SEQPACKET` for ordered, reliable, bounded-message
+behavior.
+
+## TCP / UDP sockets
+
+Cross-machine IPC. Covered in the networking topic. Same
+`socket`/`bind`/`listen`/`connect` API as UNIX domain sockets,
+just with `AF_INET` / `AF_INET6` and IP addresses.
+
+For local-only IPC, prefer UNIX domain sockets — they're
+faster and don't expose anything on the network. For
+cross-host, TCP/UDP.
+
+## SysV message queues
+
+```c
+int mq = msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
+struct mymsg { long type; char data[100]; } m = { .type = 5 };
+strcpy(m.data, "hello");
+msgsnd(mq, &m, sizeof(m.data), 0);
+
+// Other process:
+msgrcv(mq, &m, sizeof(m.data), 5, 0);   // 5 = receive only type 5
+```
+
+Messages have types; you can selectively receive by type.
+Persistent — survive process death, killed explicitly with
+`ipcrm`. Listed in `ipcs -q`.
+
+Mostly historical. POSIX message queues (`mq_open`,
+`mq_send`, `mq_receive`) are the modern equivalent — same
+idea, saner API. Both are rarely used in 2026; UNIX domain
+sockets cover most cases.
+
+## SysV / POSIX shared memory
+
+The fast path. Two processes mmap the same region of memory
+and read/write directly — at memory speed, no syscall per
+access.
+
+```c
+// Create / attach via POSIX (preferred over SysV):
+int fd = shm_open("/myshm", O_CREAT | O_RDWR, 0600);
+ftruncate(fd, 4096);
+void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+               MAP_SHARED, fd, 0);
+
+// Both processes see the same memory.
+// You must add your own synchronization (futex on a shared word,
+// or pthread mutex with PTHREAD_PROCESS_SHARED attribute).
+```
+
+`/dev/shm` is the backing tmpfs. `ls /dev/shm` shows existing
+segments.
+
+Used for:
+
+- High-volume IPC (graphics: X11 SHM extension, Wayland buffers).
+- Database shared buffer pools (Postgres `shared_buffers`).
+- Inter-process message queues for trading systems.
+- Browser process isolation with shared video frames.
+
+The hard part is synchronization. POSIX provides
+`PTHREAD_PROCESS_SHARED` mutexes for placing inside a shared
+memory region, but few people use them — most build a custom
+ring buffer with atomic head/tail pointers.
+
+## eventfd, signalfd, timerfd — events as FDs
+
+Modern Linux unifies "events" into the FD/epoll universe:
+
+| FD type | What it represents |
+|---|---|
+| `eventfd` | A 64-bit counter. Write to bump; read returns and resets. For "wake my event loop." |
+| `signalfd` | Read a signal via `read()` instead of an async handler. |
+| `timerfd` | Timer expiry triggers FD readable. |
+| `pidfd` | Reference to a process. Wait on it for exit; send signals safely (no PID reuse race). |
+| `inotify_fd` | File system change events. |
+
+Why this matters: with these, **every notification source is
+an FD**, and your one `epoll` loop sees them all uniformly. No
+async signal handlers, no separate timer thread, no separate
+signal thread. Just one event loop.
+
+```c
+int ev = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+// Producer thread:
+uint64_t one = 1;
+write(ev, &one, sizeof(one));
+
+// Consumer's epoll loop sees ev ready, reads it.
+```
+
+Used heavily by libuv, Tokio, the Go runtime, modern Linux
+servers.
+
+## Memory-mapped files for cross-process shared data
+
+Same `mmap` machinery you'd use for one process; two processes
+that mmap the same file with `MAP_SHARED` see the same memory.
+Useful when you want the data to persist past process exit (the
+file holds the state).
+
+```c
+int fd = open("shared.dat", O_RDWR);
+void *p = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+// Both processes can read/write p.
+```
+
+LevelDB, RocksDB, lightning-fast caches all use this pattern.
+
+## Doors and ALPC and Mach ports — non-POSIX
+
+- **Solaris doors** — a hybrid of RPC and shared memory. Caller
+  syscalls a "door"; the kernel does an optimized context
+  switch to the server thread with arguments already in place.
+  Lower latency than sockets. Used heavily on Solaris.
+- **Windows ALPC** (Advanced Local Procedure Call) — Windows's
+  equivalent. Used internally for kernel↔userspace messaging,
+  COM, RPC. Hidden behind RPC and COM APIs.
+- **Mach ports** (macOS/iOS) — the foundation of XPC. Capability-
+  based: a port right is a transferrable reference. Every IPC
+  on Mach goes through ports.
+
+If you do macOS-only work, learning Mach IPC unlocks how the
+system actually communicates. Otherwise the cross-platform
+equivalents (sockets, shared memory) are easier.
+
+## Choosing — the practical guide
+
+| Need | Use |
+|---|---|
+| Quick byte stream between fork()ed processes | Anonymous pipe |
+| Same but for unrelated processes | UNIX domain socket (or FIFO) |
+| Bidirectional, structured | UNIX domain socket |
+| Cross-machine | TCP or gRPC / HTTP / message broker |
+| Pass file descriptors | UNIX domain socket with `SCM_RIGHTS` |
+| Fast bulk data, local | Shared memory (mmap or shm_open) |
+| Wake an event loop from another thread | `eventfd` |
+| Receive signals in an event loop | `signalfd` |
+| Periodic timer in event loop | `timerfd` |
+| Watch a process for exit | `pidfd_open` + epoll |
+| Persistent message queue | Brokers (Kafka, RabbitMQ) — kernel queues are mostly historical |
+
+For most new code: **UNIX domain sockets + shared memory for
+hot paths + eventfd / signalfd / pidfd for events**. The SysV
+stuff is mostly only in legacy code.
+
+## Performance ladder
+
+Roughly, latency per round trip:
+
+```
+mutex (intra-thread)       : 25 ns
+shared memory + futex      : 100 ns
+eventfd ping-pong          : 1-2 µs
+UNIX domain socket         : 3-10 µs
+TCP loopback               : 10-30 µs
+Local TCP across host      : 30-100 µs
+Cross-DC RPC               : 1-10 ms
+```
+
+Pick the cheapest that fits the access pattern. A 100 µs
+budget per request leaves no room for chatty IPC.
+
+## Container and namespace nuances
+
+Each Linux namespace partitions some kernel resources:
+
+- **NET ns** — separate network stack; sockets can't reach
+  across.
+- **IPC ns** — separate SysV/POSIX message queues, shared
+  memory.
+- **MNT ns** — separate filesystem view; UNIX sockets and
+  FIFOs are file paths, so they're namespace-bound.
+
+For cross-container IPC inside one host: shared mounts of a
+UNIX socket directory, host networking, or volume-shared
+memory files.
+
+## The mental model
+
+IPC is "how do two address spaces talk?" Pipes for parent-
+child byte streams; UNIX sockets for general local
+bidirectional + FD passing; shared memory for bulk data;
+events-as-FDs for clean integration with epoll loops; TCP for
+cross-host.
+
+The right choice is usually not "what's the fastest" but
+"what's idiomatic for this access pattern" — burst messages →
+sockets; continuous high-volume → shared memory; wake-ups
+between threads → eventfd; cross-network → real RPC framework.
+
+SysV IPC, FIFOs, signals are still in the toolbox but rarely
+the right answer for new code in 2026.

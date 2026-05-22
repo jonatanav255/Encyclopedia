@@ -1,0 +1,350 @@
+export const level = 'mid';
+
+# Semaphores and monitors
+
+The two pre-1980 inventions that made concurrent programming
+tractable. A **semaphore** is a counter with atomic
+wait/post. A **monitor** is a higher-level construct: a mutex
+plus condition variables wrapped around an object's data. Most
+modern languages use monitors (Java `synchronized`, C#
+`lock`/`Monitor`, Python `RLock` + `Condition`). Semaphores
+survive as a building block for resource pools and as the
+"only sync primitive safe from a signal handler."
+
+## Semaphores — Dijkstra's primitive
+
+Edsger Dijkstra invented them in 1965 ("THE" system). A
+semaphore is:
+
+```
+struct semaphore {
+    int  count;       // permits available
+    queue<thread> waiters;
+};
+
+P(s) / wait(s):  // "proberen" — to test
+    atomic {
+        s.count--;
+        if (s.count < 0) {
+            block(current_thread);
+            waiters.push(current_thread);
+        }
+    }
+
+V(s) / signal(s) / post(s):  // "verhogen" — to raise
+    atomic {
+        s.count++;
+        if (s.count <= 0) {
+            t = waiters.pop();
+            wake(t);
+        }
+    }
+```
+
+Two variants:
+
+- **Binary semaphore** (count starts at 1) — looks like a
+  mutex, but anyone can `post`. No ownership.
+- **Counting semaphore** (count = N) — N permits. Bound on
+  concurrency.
+
+POSIX gives you both via `sem_t`:
+
+```c
+#include <semaphore.h>
+sem_t s;
+sem_init(&s, /*pshared*/ 0, /*initial*/ 10);
+sem_wait(&s);   // P
+// use 1 of 10 permits
+sem_post(&s);   // V
+sem_destroy(&s);
+```
+
+## Where semaphores still earn their keep
+
+1. **Resource pools** — "at most 10 DB connections in use."
+
+   ```c
+   sem_t pool;
+   sem_init(&pool, 0, 10);
+
+   conn = get_conn();           // ↓ count
+   sem_wait(&pool);
+   use(conn);
+   sem_post(&pool);             // ↑ count
+   release_conn(conn);
+   ```
+
+2. **Producer-consumer with a bounded buffer** — two
+   semaphores, one for empty slots, one for full slots, plus a
+   mutex for buffer access.
+
+   ```c
+   sem_t empty;   // init = N (buffer size)
+   sem_t full;    // init = 0
+   mutex_t m;
+
+   produce(x):
+       sem_wait(&empty);   // wait for room
+       lock(&m);
+       enqueue(x);
+       unlock(&m);
+       sem_post(&full);    // signal an item
+
+   consume():
+       sem_wait(&full);    // wait for an item
+       lock(&m);
+       x = dequeue();
+       unlock(&m);
+       sem_post(&empty);   // signal a slot
+       return x;
+   ```
+
+   This is the canonical example in every textbook because
+   each semaphore has one job: empty counts slots,
+   full counts items. Symmetric, deadlock-free,
+   no busy-waiting.
+
+3. **Signaling from interrupts / signal handlers** — `sem_post`
+   is async-signal-safe. Most other sync primitives are not.
+   The pattern:
+
+   ```c
+   sem_t ready;
+
+   void handler(int sig) { sem_post(&ready); }   // safe!
+
+   void main_thread() {
+       signal(SIGUSR1, handler);
+       sem_wait(&ready);   // sleeps until signal
+   }
+   ```
+
+   This is how some long-lived daemons coordinate between a
+   signal handler and a worker thread.
+
+## What semaphores are bad at
+
+Owner-less. Anyone can `post`. That's flexible but means:
+
+- No automatic release on thread death.
+- No way to detect "wrong thread released the lock."
+- No RAII pattern that works cleanly.
+- No priority inheritance (the OS doesn't know who holds it).
+- No automatic re-acquire on signal interruption (`sem_wait`
+  can return early with EINTR).
+
+For mutual exclusion, prefer a mutex. For "wait for a
+specific condition while holding a lock," prefer condition
+variables. Semaphores excel at *counting* (how many permits
+left) more than at *locking* (who owns this).
+
+## The semaphore-vs-mutex trap
+
+A binary semaphore (init=1) and a mutex *look* equivalent:
+
+```c
+sem_init(&s, 0, 1);  sem_wait(&s);  /* CS */  sem_post(&s);
+mutex_init(&m);      mutex_lock(&m); /* CS */ mutex_unlock(&m);
+```
+
+Differences that bite:
+
+- The mutex remembers its owner; a semaphore doesn't. You
+  can't `mutex_unlock` from a thread that didn't lock; you
+  can with a semaphore.
+- The mutex supports priority inheritance with the right
+  attribute; semaphores don't.
+- Semaphores often go through the kernel even uncontended
+  (`sem_post` from a signal handler must); mutexes use the
+  futex fast path.
+
+For 99% of cases — protect a piece of data — use a mutex.
+Pick a semaphore deliberately, because counting is what you
+need.
+
+## Monitors — Hoare and Brinch Hansen
+
+A **monitor** bundles:
+
+- Private data.
+- A set of operations on that data.
+- An implicit lock that protects entry to those operations
+  (only one thread inside at a time).
+- One or more condition variables for waiting on internal
+  state changes.
+
+Pseudocode:
+
+```
+monitor BoundedBuffer {
+    queue q;
+    condition not_full, not_empty;
+
+    operation enqueue(x) {
+        while (q.full())  not_full.wait();
+        q.push(x);
+        not_empty.signal();
+    }
+
+    operation dequeue() -> x {
+        while (q.empty())  not_empty.wait();
+        x = q.pop();
+        not_full.signal();
+        return x;
+    }
+}
+```
+
+The "monitor lock" is implicit — entering `enqueue` or
+`dequeue` automatically acquires it; returning releases it.
+The CVs `not_full` / `not_empty` are tied to the monitor's
+mutex: `wait` drops it; `signal` doesn't reacquire (Mesa) or
+does (Hoare).
+
+## Hoare vs Mesa semantics
+
+The two flavors of condition signaling. The difference is what
+happens *immediately after `signal`*:
+
+- **Hoare** (1974) — signaler **passes the lock atomically** to
+  the woken waiter, which runs *next*. The signaler is suspended
+  and resumes after the waiter releases. Cleanly preserves the
+  predicate: if the signaler proved condition X, the waiter
+  sees X.
+- **Mesa** (1980) — signaler **keeps running**. The woken
+  waiter goes to the ready queue and must re-acquire the lock,
+  later. By the time it runs, another thread might have changed
+  the state — so the waiter must **re-check the predicate**.
+
+Mesa won. It's easier to implement and lets the signaler finish
+without an extra context switch. Cost: every `wait` must be in
+a `while` loop:
+
+```c
+// Mesa-style — what every pthread / Java / Go / Python uses:
+while (predicate_not_true())
+    cond.wait(lock);
+```
+
+Java's `Object.wait()` even documents the rule explicitly:
+"It is recommended that applications guard against [spurious
+wakeups] by always using the loop idiom."
+
+## Spurious wakeups
+
+`pthread_cond_wait` can wake up even without `signal`. Allowed
+by spec; happens for performance reasons (the kernel woke the
+thread for unrelated reasons and didn't bother to verify the
+predicate). Same conclusion: **always loop on the predicate**.
+
+## Signal vs broadcast
+
+- `cond.signal()` — wake **one** waiter (any one).
+- `cond.broadcast()` — wake **all** waiters.
+
+Use `broadcast` when more than one waiter might be able to
+proceed (e.g., you produced N items, or the predicate change
+might satisfy multiple distinct conditions). Use `signal` when
+you know only one waiter can use the update. Over-broadcasting
+is wasteful but correct; under-broadcasting is a deadlock waiting
+to happen.
+
+## Monitors in real languages
+
+| Language | Monitor primitive | Condition variables |
+|---|---|---|
+| Java | `synchronized` (per-object lock) | `Object.wait` / `notify` / `notifyAll` (per-object) |
+| C# | `lock(obj)` or `Monitor.Enter` | `Monitor.Wait` / `Pulse` / `PulseAll` |
+| Python | `threading.RLock` + `Condition` | explicit |
+| Go | `sync.Mutex` + `sync.Cond` (rarely used; channels preferred) | `Cond.Wait` / `Signal` / `Broadcast` |
+| Rust | `Mutex` + `Condvar` | `Condvar.wait` / `notify_one` / `notify_all` |
+| C/POSIX | `pthread_mutex_t` + `pthread_cond_t` | explicit |
+
+Java pre-1.5 had only one CV per object. Java 5+ added
+`Lock` + `Condition` for multiple CVs per lock — much better
+when you want to signal "the queue has space" separately from
+"the queue has items."
+
+## Classic monitor patterns
+
+**Producer/consumer (bounded buffer):**
+
+```java
+class BoundedBuffer<T> {
+    private final Object lock = new Object();
+    private final Queue<T> q = new LinkedList<>();
+    private final int cap;
+    public BoundedBuffer(int cap) { this.cap = cap; }
+
+    public void put(T x) throws InterruptedException {
+        synchronized (lock) {
+            while (q.size() == cap) lock.wait();
+            q.add(x);
+            lock.notifyAll();  // broadcast — wakers may be put or take
+        }
+    }
+    public T take() throws InterruptedException {
+        synchronized (lock) {
+            while (q.isEmpty()) lock.wait();
+            T x = q.remove();
+            lock.notifyAll();
+            return x;
+        }
+    }
+}
+```
+
+Java's `BlockingQueue` is this pattern in the standard library,
+with explicit `notFull` / `notEmpty` conditions instead of one
+shared wait set.
+
+**Readers-writers (writer-preferring):**
+
+Track active readers + waiting writers; readers wait if any
+writer is queued, writers wait if any reader/writer is active.
+Easier with two CVs (`canRead`, `canWrite`).
+
+**Bounded leaky-bucket rate limiter:** monitor protects token
+count; CV wakes consumers when tokens replenish.
+
+## The Mesa monitor invariant
+
+When you enter the monitor (acquire the lock), the data must
+be in a *valid state*. When you exit (release the lock), it
+must be again. While inside, you may temporarily break the
+invariant — but if you `wait`, you must restore it first
+(other threads will run while you sleep).
+
+Practically: don't call `wait` in the middle of updating a
+data structure. Finish the update, then wait. Otherwise other
+threads see a broken state.
+
+## When to skip monitors entirely
+
+For high-throughput shared data structures, channels (Go) and
+actor models (Erlang, Akka) replace shared-state-with-monitors
+with message passing. Or lock-free data structures (concurrent
+queues, hash maps). Monitors don't scale to dozens of cores on
+hot paths because the implicit lock is a serialization point.
+
+But for moderate concurrency — most application code — the
+monitor pattern is the right default. It's hard to misuse, has
+clear ownership, and integrates with everything from debuggers
+to APIs.
+
+## The mental model
+
+Semaphore = counter you can wait on. Use for "limit concurrency
+to N" or "signal an event from a context that can't take a
+mutex."
+
+Monitor = lock + condition variables wrapped around an object's
+data. Enter the lock to touch the data; wait on a CV when the
+data isn't in the state you need; signal/broadcast when you
+change the data so others can re-check.
+
+Always wait in a loop (Mesa semantics + spurious wakeups).
+Always restore invariants before `wait`. Always pair a `wait`
+with a corresponding `signal` somewhere — a wait with no
+signaler is a deadlock waiting to be discovered in production.
