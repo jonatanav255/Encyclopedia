@@ -1,0 +1,152 @@
+export const level = 'mid';
+
+# Calling conventions and the ABI
+
+When function A calls function B, both sides have to agree on how
+arguments are passed, who saves what registers, where the return
+value lands, and how the stack is laid out. That agreement is the
+**ABI** — Application Binary Interface — and the **calling
+convention** is the part of it that governs function calls. You
+rarely have to think about ABIs directly, but every crash dump you
+read and every FFI binding you wire up depends on knowing this layer.
+
+## The System V AMD64 calling convention
+
+On Linux, macOS, and BSDs running on x86-64, function calls follow
+**System V AMD64 ABI**. The essentials:
+
+| Item | Rule |
+| --- | --- |
+| First 6 integer / pointer args | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` (in order). |
+| First 8 floating-point args | `xmm0` through `xmm7`. |
+| Args beyond that | Pushed on the stack, right-to-left. |
+| Integer return value | `rax` (with `rdx` for 128-bit returns). |
+| Floating-point return | `xmm0` (with `xmm1` for `_Complex`). |
+| Caller-saved registers | `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8-r11`, all `xmm*`. The caller must save them across a call if it still needs them. |
+| Callee-saved registers | `rbx`, `rbp`, `r12-r15`, `rsp`. The callee must preserve these. |
+| Stack alignment | `rsp` must be 16-byte aligned **before** the `call` (so 16-byte minus 8 inside the callee, after `call` pushes the return address). |
+| Red zone | 128 bytes below `rsp` that **leaf functions** can use without adjusting `rsp`. |
+
+Windows x64 has its own convention (different argument registers:
+`rcx`, `rdx`, `r8`, `r9`; "shadow space" reserved by the caller).
+Don't mix them up — calling a Windows-ABI function from Linux code
+crashes immediately.
+
+ARM64 has its own ABI (`x0-x7` for first 8 integer args, `v0-v7`
+for FP, callee-saves on `x19-x28`), and it's broadly similar in
+shape.
+
+## What this looks like in a real crash
+
+When you read a `gdb` backtrace and see arguments printed at the top
+of each frame, those values come from the **calling convention** —
+gdb pulls them out of the registers (or stack) where the ABI says
+they should be. For frames mid-call (where the registers have been
+clobbered), gdb often prints `<optimized out>` because the values
+have been overwritten and the compiler didn't emit DWARF info to
+recover them.
+
+Look at compiler-generated code:
+
+```c
+int add(int a, int b) { return a + b; }
+```
+
+```asm
+add:
+    lea    eax, [rdi + rsi]   ; a is in edi (low 32 of rdi); b in esi
+    ret                        ; return value in eax
+```
+
+That's the whole calling convention in one snippet. `a` came in
+`rdi`, `b` in `rsi`, the result goes in `rax`, and the function
+preserves no registers because it didn't need to.
+
+## Caller-saved vs callee-saved, the practical view
+
+The split exists to balance two needs:
+
+- The **caller** wants registers it can use without telling anyone.
+- The **callee** wants registers it can use without saving first.
+
+If everything were callee-saved, every function would have to push/pop
+a long list of registers on entry and exit, even ones it didn't
+touch. If everything were caller-saved, every function call would
+require the caller to save everything it cared about across calls.
+The ABI picks a balance: ~half the registers each way. Compilers
+prefer caller-saved registers for short-lived values (no save needed
+if no call happens in between) and callee-saved registers for values
+held across calls.
+
+This shows up in micro-optimizations. A loop that calls a function
+on every iteration burns more cycles than the same loop with the
+call inlined, partly because the caller has to save its hot loop
+state to memory or to callee-saved registers around each call.
+
+## The red zone, and why kernel code disables it
+
+The 128-byte red zone lets a leaf function (one that doesn't call
+anything else) use stack space below `rsp` without bothering to
+update `rsp`. Saves an instruction.
+
+But: in kernel code or signal handlers, an interrupt can fire at
+any time. The interrupt handler will use the current stack, which
+means it'll clobber whatever was in the red zone. The Linux kernel
+is compiled with `-mno-red-zone` for this reason. So is some signal-
+handler-adjacent userspace code.
+
+The red zone is one of those small ABI details that quietly cause
+bugs when you cross between worlds (user/kernel, signal handlers).
+
+## FFI: where ABIs become visible
+
+When you bind to a C library from another language — Python ctypes,
+Node N-API, Rust extern "C", Go cgo, Java JNI — you are negotiating
+the calling convention by hand.
+
+- Get the **argument order** wrong: garbage values.
+- Get the **type sizes** wrong (`long` is 64-bit on Linux, 32-bit on
+  Windows; `int` is 32-bit everywhere; `size_t` is 64-bit on 64-bit
+  platforms): silent corruption.
+- Forget that **callbacks** crossing the FFI boundary must respect
+  the C ABI (no unwinding into C code from C++ destructors or
+  Rust panics): undefined behavior.
+- Mis-align a struct passed by value: depending on the compiler,
+  it might compile and then read garbage at runtime.
+
+This is why bindings generators (`bindgen`, `cbindgen`,
+`napi-rs`, SWIG) exist — getting the ABI right by hand is
+miserable.
+
+## C++ name mangling and the missing-symbol error
+
+C names are stable: `void add(int, int)` is just `add` in the symbol
+table. C++ names are **mangled** to encode the signature, namespace,
+and template parameters: `_Z3addii`.
+
+This is why:
+
+- `extern "C"` on a function declaration is the standard "expose
+  this to the linker with a C-stable name."
+- Mixing C++ libraries built with different compilers (especially
+  pre- and post-`_GLIBCXX_USE_CXX11_ABI=1`) can give you "undefined
+  reference to `std::string::...`" at link time.
+
+Demangle with `c++filt` to read crash dumps:
+
+```
+$ c++filt _ZN5MyApp7ProcessEPKci
+MyApp::Process(char const*, int)
+```
+
+## The takeaway
+
+The ABI is the unwritten contract between every function in a
+process. Argument register order, who saves what, stack alignment,
+red zone, struct layout — all spelled out for each platform. Most
+of the time you ignore it; when you read a crash, write a JIT, do
+FFI, or debug a "works on my machine" linkage problem, this layer
+is where the answer lives. System V AMD64 (Linux/macOS) and Microsoft
+x64 (Windows) are the two main x86-64 conventions; ARM64 has its
+own. Mixing them, or getting the type widths or alignments wrong
+across an FFI boundary, is a reliable source of mystery bugs.

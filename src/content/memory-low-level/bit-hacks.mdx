@@ -1,0 +1,216 @@
+export const level = 'mid';
+
+# Bit hacks
+
+There's a small canon of bit-twiddling tricks that show up over and
+over in compilers, codecs, databases, network code, and the standard
+library. Most are now CPU instructions or compiler intrinsics, so you
+rarely need to write them by hand — but recognizing them in code,
+disassembly, and crash dumps is part of being fluent at this layer.
+The canonical reference is **Hacker's Delight** (Warren).
+
+## Power-of-two detection
+
+```c
+bool is_power_of_two(unsigned x) {
+  return x != 0 && (x & (x - 1)) == 0;
+}
+```
+
+`x & (x - 1)` clears the lowest set bit. If the result is zero, there
+was only one set bit — i.e., the value is a power of two. The
+`x != 0` guard rules out the degenerate case (zero has zero set bits
+and would falsely pass the second check).
+
+This shows up everywhere: hash table capacities (always a power of
+two so `hash & (n - 1)` replaces `hash % n`), buffer sizes,
+alignment masks.
+
+## Round up to the next power of two
+
+```c
+unsigned next_pow2(unsigned x) {
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
+}
+```
+
+Each `|=` doubles the run of trailing 1-bits. After 5 steps, every
+bit from the highest set bit downward is 1. Add 1 and you have the
+next power of two. Modern CPUs have `lzcnt` (leading zero count) so
+the compiler reduces this to one or two instructions; the technique
+still matters when reading old codebases.
+
+C++20 ships `std::bit_ceil(x)` and `std::has_single_bit(x)` exactly
+to make these explicit.
+
+## Population count (popcount)
+
+Counting the number of 1-bits in a word. The classic SWAR
+("SIMD within a register") implementation:
+
+```c
+unsigned popcount(uint64_t x) {
+  x = x - ((x >> 1) & 0x5555555555555555);
+  x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333);
+  x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0f;
+  return (x * 0x0101010101010101) >> 56;
+}
+```
+
+Counts pairs, then nibbles, then bytes, then sums. Beautiful and
+historically important. Today every x86-64 CPU since SSE4.2 has a
+**`popcnt`** instruction; ARM has it as **`cnt`**. Compilers map
+`__builtin_popcount(x)` to one of these — use the intrinsic; let
+the compiler emit the hand-rolled version on platforms without it.
+
+Popcount shows up in: bitmap indexes (count set bits in a range),
+Hamming distance computations (popcount of XOR), cryptography,
+bloom filter occupancy, posting list intersection in search engines,
+roaring bitmaps.
+
+## Lowest set bit isolation
+
+```c
+x & -x        // isolate lowest set bit
+x & (x - 1)   // clear lowest set bit
+```
+
+`-x` is `~x + 1` in two's complement (see
+`memory-low-level/twos-complement.mdx`). The combination flips every
+bit below the lowest set, leaving exactly that bit. Used in Fenwick
+trees and traversing set bits in a bitmap. BMI1 has both
+operations as single instructions: **`blsi`** isolates the lowest
+set bit (`x & -x`); **`blsr`** clears the lowest set bit
+(`x & (x - 1)`).
+
+## Branchless min / max / abs
+
+```c
+int min(int a, int b) { return b ^ ((a ^ b) & -(a < b)); }
+int abs(int x) { int mask = x >> 31; return (x + mask) ^ mask; }
+```
+
+Avoid the branch. The trick: `-(a < b)` is `0` or `-1` (all ones).
+ANDing with all-ones picks one operand, ANDing with zero picks the
+other. The compiler often turns ordinary `if (a < b) ...` into a
+`cmov` (conditional move) instruction, which has the same effect
+without the syntactic obscurity. Hand-writing branchless code is
+mostly historical now — `cmov`, `csel` (ARM), and predicated
+execution do this automatically.
+
+The exception: when the compiler can't prove the branch is fine to
+remove (e.g., it can't prove the condition is data-dependent in the
+right way), branchless code can still help a hot loop. Measure
+before assuming.
+
+## Endianness swap (byteswap)
+
+```c
+uint32_t swap32(uint32_t x) {
+  return ((x & 0xff000000) >> 24) |
+         ((x & 0x00ff0000) >> 8)  |
+         ((x & 0x0000ff00) << 8)  |
+         ((x & 0x000000ff) << 24);
+}
+```
+
+x86 has **`bswap`** and ARM has **`rev`** — both one cycle.
+Compilers recognize the pattern above and emit the instruction.
+`__builtin_bswap32` / `__builtin_bswap64` / `std::byteswap` give you
+direct access. See `memory-low-level/endianness.mdx` for *why* this
+operation exists.
+
+## Set / clear / toggle / test a bit
+
+```c
+x |=  (1u << n);    // set
+x &= ~(1u << n);    // clear
+x ^=  (1u << n);    // toggle
+(x >> n) & 1u;      // test
+```
+
+The four operations on a single bit, by index. The constants
+`(1u << n)` are bit **masks**. Every bitmask operation in your code
+is some variant of these four lines.
+
+## Saturating arithmetic without branches
+
+```c
+uint8_t add_sat(uint8_t a, uint8_t b) {
+  uint16_t s = (uint16_t)a + b;
+  s |= -(s >> 8);
+  return (uint8_t)s;
+}
+```
+
+If the sum overflows 8 bits, the high byte is non-zero; `-(s >> 8)`
+becomes all ones; OR with `s` clamps to `0xFF`. Used in audio, image,
+and DSP code where you want clamping not wrap-around. ARM has
+saturating arithmetic instructions; x86 has them in SSE.
+
+## Multiply for log2 / ctz / bitscan
+
+```c
+int log2_int(uint32_t x) {
+  // x must be a power of two
+  static const int table[32] = { /* de Bruijn sequence */ };
+  return table[(x * 0x077CB531U) >> 27];
+}
+```
+
+This is the classic de Bruijn trick. Pre-modern-CPU code used it to
+get bit positions. Now `__builtin_ctz` (count trailing zeros) and
+`__builtin_clz` (count leading zeros) map to **`tzcnt`** / **`bsf`**
+/ **`lzcnt`** / **`bsr`** instructions and give you bit positions in
+one cycle. Use the intrinsics.
+
+## Why "use the intrinsic, not the hack"
+
+Twenty years ago, hand-coded bit hacks were faster than naive
+operations because compilers didn't recognize them. Today every
+mature compiler:
+
+- Recognizes the `swap32` pattern and emits `bswap`.
+- Recognizes the SWAR popcount and emits `popcnt` (or the SWAR if
+  the target lacks `popcnt`).
+- Replaces `x & (x - 1) == 0` with `(x & (x - 1)) == 0` and turns
+  branches on it into `bt`/`btr`.
+
+For new code, **use the standard library / intrinsics**:
+
+- C: `__builtin_popcount`, `__builtin_ctz`, `__builtin_clz`,
+  `__builtin_bswap*`.
+- C++20: `<bit>` header — `std::popcount`, `std::countl_zero`,
+  `std::countr_zero`, `std::has_single_bit`, `std::bit_ceil`,
+  `std::byteswap`.
+- Rust: `u64::count_ones`, `u64::leading_zeros`, etc.
+- Java: `Integer.bitCount`, `Integer.numberOfLeadingZeros`.
+- Go: `bits.OnesCount`, `bits.LeadingZeros`.
+
+These compile to the right hardware instruction on each platform.
+
+## When bit hacks still matter
+
+Reading old code (especially compression / crypto / kernel) — the
+patterns above appear constantly. Writing inner loops for code
+generators, parsers, and database execution engines — sometimes you
+need a specific bit operation the standard library doesn't expose
+(e.g., `pext`/`pdep` from BMI2 for parallel bit extract / deposit,
+used by DuckDB and ClickHouse). Reading disassembly to verify the
+compiler did what you expected.
+
+## The takeaway
+
+A small catalogue of bit operations underlies a huge amount of
+low-level code: power-of-two checks, popcount, isolate/clear lowest
+bit, byteswap, count zeros, branchless arithmetic. Each was once a
+clever trick; most are now one CPU instruction reached via
+compiler intrinsic or standard-library function. Recognize them so
+you can read the code that still uses them; reach for the named
+intrinsic when you need them yourself.

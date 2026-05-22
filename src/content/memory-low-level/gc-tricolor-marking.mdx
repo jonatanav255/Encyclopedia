@@ -1,0 +1,149 @@
+export const level = 'senior';
+
+# GC tricolor marking
+
+Every tracing garbage collector — JVM (G1, ZGC, Shenandoah), Go,
+.NET CLR, V8, OCaml — uses the same abstract algorithm:
+**tricolor marking**. The colors are a coordination protocol that
+lets a collector run concurrently with the mutator (your program)
+without missing live objects or freeing reachable ones.
+
+## The three colors
+
+Imagine every object in the heap is one of three colors at any moment:
+
+| Color | Meaning |
+| --- | --- |
+| **White** | Not yet visited. By the end of marking, all whites are unreachable garbage. |
+| **Gray** | Visited (alive), but its fields haven't been scanned yet. |
+| **Black** | Visited and all outgoing references have been scanned. |
+
+A collection starts with every object white. The collector walks the
+**roots** (registers, stack slots, globals, runtime structures) and
+paints each root-reachable object **gray** — it's known alive but
+not yet explored. Then in a loop: pick a gray object, paint each of
+its referents gray (if they were white), paint the object itself
+**black**. When there are no gray objects left, every reachable
+object is black, every remaining white object is garbage, and the
+collector can reclaim them.
+
+```
+                roots
+                  |
+                  v
+   white --(visit)--> gray --(scan fields)--> black
+                                |
+                                v
+                          (transitive closure)
+```
+
+## The strong invariant
+
+The whole algorithm rests on one invariant:
+
+> **At the end of marking, no black object points to any white
+> object.**
+
+If that holds, every reachable object is black (or gray and
+reachable from black) and every white object is unreachable. The
+collector frees every white in one sweep.
+
+The mutator running concurrently can violate this. If the mutator
+takes a pointer from a white object's slot and stores it into a
+black object's slot, then deletes the original reference, the
+collector finishes marking *without ever visiting that white object*
+— and frees something the mutator still has a live pointer to. That's
+a use-after-free in a GC.
+
+## Write barriers preserve the invariant
+
+To run the marker concurrently, the runtime intercepts pointer
+writes. A **write barrier** is a tiny snippet of code injected at
+every store of a pointer field. It detects the dangerous shapes and
+fixes them.
+
+Two practical write barriers — both used in real collectors:
+
+<Compare
+  left={{
+    title: 'Dijkstra (forward) barrier',
+    points: [
+      'On `black.field = white_obj`, paint `white_obj` **gray**.',
+      'Preserves the no-black-points-to-white invariant by pulling the white forward.',
+      'Used by Go (since 1.5) and many JVM collectors\' concurrent phases.',
+      'Cost: a check and a possible enqueue per pointer store.',
+    ],
+  }}
+  right={{
+    title: 'Yuasa (snapshot-at-the-beginning, SATB) barrier',
+    points: [
+      'On overwriting any pointer (`obj.field = new_ref`), record the **old** value into the mark queue, then perform the store.',
+      'Preserves the "snapshot from start of marking" — anything live at the start stays marked.',
+      'Used by G1 GC and Shenandoah.',
+      'Slightly more conservative — keeps some "floating garbage" until next cycle.',
+    ],
+  }}
+/>
+
+Both make the marker correct in the face of mutator changes.
+Choosing between them is a runtime design decision; modern collectors
+pick one and stick to it.
+
+## Why this matters for app developers
+
+You don't write tricolor code, but the *consequences* show up in
+operational behavior:
+
+- **Concurrent marking is not free.** The write barrier adds a
+  small cost (a few cycles) to every pointer store in your program.
+  This is why "allocate lots of small objects with pointer fields"
+  is more expensive in managed languages than the pure
+  malloc-cost would suggest.
+- **Compacting is the expensive part, not marking.** Marking can run
+  concurrently. Sweeping (freeing whites) usually runs concurrently
+  too. The pauses come from operations that need to **stop the
+  world** — root scanning at the start, remapping references during
+  compaction, finalization. Modern collectors (ZGC, Shenandoah,
+  G1 in mostly-concurrent mode) push pause times below 10 ms even
+  for huge heaps by minimizing what runs stop-the-world.
+- **Cycle isn't "the time GC takes."** GC overlapping with the
+  mutator means CPU is shared. A "1 ms pause" might come with 30%
+  of CPU consumed by concurrent marking for 200 ms. Both numbers
+  matter — pause time for tail latency, throughput overhead for
+  cost.
+- **Allocation patterns shape collector cost.** Many short-lived
+  objects favor generational GC (young-gen collections are
+  cheap). Big long-lived structures of mutated pointers stress the
+  write barrier and old-gen marker. See
+  `memory-low-level/generational-and-region-gc.mdx` for how
+  collectors exploit allocation patterns.
+
+## Concurrent marking in practice
+
+A real concurrent collection has phases like:
+
+```
+1. Initial mark           (STW, short)    -- mark roots, paint root-reachable gray
+2. Concurrent mark        (with mutator)  -- transitive closure; mutator runs with write barrier
+3. Final mark / remark    (STW, short)    -- drain barrier-added work; finish marking
+4. Concurrent sweep       (with mutator)  -- reclaim whites
+[optional]
+5. Concurrent compaction  (with mutator)  -- move objects, fix pointers via read/load barrier
+```
+
+The work that has to be STW is bounded — typically the roots, which
+are small. The expensive part (the transitive closure) runs while
+your code runs. That's why JVM ZGC and Shenandoah, plus Go's
+collector, advertise sub-10 ms pauses on heaps of hundreds of GiB.
+
+## The takeaway
+
+Tricolor marking is the universal abstraction for tracing GCs.
+White / gray / black classifies objects by "not visited / visited
+but children not yet / fully scanned." The invariant
+"no black points to white" must hold at the end of marking; **write
+barriers** maintain it while the mutator runs. The pauses you see
+in production GC mostly come from work that *can't* be done
+concurrently — root scanning, remapping during compaction —
+not from marking itself. Modern low-pause collectors are
+engineering wins built on this same abstract algorithm.

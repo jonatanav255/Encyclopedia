@@ -73,6 +73,16 @@ function TopicIcon({ topic, className }: { topic: string; className?: string }) 
           <path d="M12 3a13 13 0 0 1 0 18a13 13 0 0 1 0-18z" />
         </svg>
       );
+    case 'memory-low-level':
+      // RAM chip — labeled rectangle with pins, the iconic "memory module"
+      return (
+        <svg {...common}>
+          <rect x="3" y="7" width="18" height="10" rx="1" />
+          <path d="M7 11h2M11 11h2M15 11h2" />
+          <path d="M5 17v2M9 17v2M15 17v2M19 17v2" />
+          <path d="M5 5v2M9 5v2M15 5v2M19 5v2" />
+        </svg>
+      );
     case 'javascript':
       // JS mark (shape kept; tinted to match the pill)
       return (
@@ -159,6 +169,12 @@ function TopicIcon({ topic, className }: { topic: string; className?: string }) 
   }
 }
 
+// Pill labels — by default the slug doubles as the label. Override here
+// for topics whose pretty label uses characters (like &) the slug can't.
+const PILL_LABELS: Record<string, string> = {
+  'memory-low-level': 'memory & low-level',
+};
+
 export function TopicPill({
   topic,
   size = 'sm',
@@ -168,12 +184,13 @@ export function TopicPill({
 }) {
   const sizeClass = size === 'xs' ? 'text-[10px] px-1.5 py-0.5 gap-1' : 'text-xs px-2 py-0.5 gap-1.5';
   const iconClass = size === 'xs' ? 'w-2.5 h-2.5' : 'w-3 h-3';
+  const label = PILL_LABELS[topic] ?? topic;
   return (
     <span
       className={`inline-flex items-center rounded-md border font-semibold uppercase tracking-wider ${tone.bg} ${tone.text} ${tone.border} ${sizeClass}`}
     >
       <TopicIcon topic={topic} className={iconClass} />
-      {topic}
+      {label}
     </span>
   );
 }

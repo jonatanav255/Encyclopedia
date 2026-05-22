@@ -1,0 +1,150 @@
+export const level = 'senior';
+
+# NUMA and locality
+
+Once a server has more than one CPU socket, memory stops being
+uniformly accessible. Each socket has its own memory controller; RAM
+attached to socket 0 is much faster to reach from socket 0 than from
+socket 1. This is **NUMA** — Non-Uniform Memory Access — and ignoring
+it on big machines silently halves your throughput.
+
+## The shape of a NUMA machine
+
+A typical 2-socket Xeon or EPYC server looks like:
+
+```
+   socket 0                       socket 1
+   +-------+                      +-------+
+   | CPU 0 |  -- UPI / Infinity   | CPU 1 |
+   +-------+      (interconnect)  +-------+
+       |                              |
+   +-------+                      +-------+
+   | RAM 0 |                      | RAM 1 |
+   +-------+                      +-------+
+```
+
+Each socket sees its **local** RAM in roughly 80 ns. Reaching the
+**remote** socket's RAM takes 120-150 ns — every load has to cross
+the inter-socket link (Intel UPI / AMD Infinity Fabric), which adds
+latency and saturates under load. On modern AMD EPYC, even within a
+single socket you have multiple **NUMA nodes** (one per CCD/CCX) for
+the same reason.
+
+`numactl --hardware` shows the topology:
+
+```
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 ... 31
+node 0 size: 256 GB
+node 1 cpus: 32 33 ... 63
+node 1 size: 256 GB
+node distances:
+node    0    1
+  0:   10   21
+  1:   21   10
+```
+
+Distance 10 means "local" by convention; 21 means "this remote access
+costs ~2.1x". On 4-socket and 8-socket machines the numbers get worse,
+and not all pairs are equidistant.
+
+## First-touch policy
+
+Linux's default NUMA policy is **first-touch**: when a page is first
+written to, it's allocated from the RAM of the node where the writing
+CPU is. `malloc` doesn't allocate pages — it reserves virtual
+address space; the actual physical page is allocated on the **first
+write to it**, by the kernel page-fault handler, on the current
+thread's node.
+
+This has a sharp consequence: if thread 0 (on node 0) does
+`malloc(1GB); memset(...)`, the entire gigabyte sits on node 0. If
+later thread 1 (on node 1) processes it, every access crosses the
+interconnect. The right pattern is **parallel first-touch**: have
+each worker thread initialize the slice it will later process.
+
+```c
+// wrong — single-threaded init, then parallel processing
+data = malloc(N * sizeof(double));
+for (i = 0; i < N; i++) data[i] = 0;   // all on node 0
+#pragma omp parallel for
+for (i = 0; i < N; i++) data[i] = work(i);
+
+// right — parallel init touches its own pages
+data = malloc(N * sizeof(double));
+#pragma omp parallel for
+for (i = 0; i < N; i++) data[i] = 0;   // each thread touches its slice
+#pragma omp parallel for
+for (i = 0; i < N; i++) data[i] = work(i);
+```
+
+The second version often runs 1.5-2x faster on a 2-socket box for the
+same logical work, just by getting the pages onto the right nodes.
+
+## Pinning matters more than people think
+
+If a thread keeps migrating between CPUs, its hot working set in the
+local cache gets cold on the new core, and pages it first-touched
+become remote. Modern Linux's scheduler tries to keep threads on
+their original node, but under load it'll happily migrate them.
+
+Tools:
+
+- **`numactl --cpunodebind=0 --membind=0 ./prog`** — pin both CPUs
+  and memory allocation to node 0. The blunt instrument; perfect for
+  benchmarking and most production services.
+- **`taskset -c 0-31 ./prog`** — pin to specific CPUs.
+- **`sched_setaffinity` / `pthread_setaffinity_np`** in code, per
+  thread.
+- **`numactl --interleave=all`** — round-robin pages across all
+  nodes. Worst-case access pattern for any one allocation, but
+  predictable; good when you have no idea which thread will touch
+  what (mostly for unknown workloads, rarely the right choice for
+  production).
+
+Postgres, Redis, JVM apps (`-XX:+UseNUMA`), and DPDK all benefit
+substantially from explicit NUMA binding on multi-socket boxes.
+
+## How to tell NUMA is hurting you
+
+`numastat -m` shows memory by node and counters like `numa_miss` (a
+page was allocated from the wrong node because the right one was
+full) and `numa_foreign` (other nodes had to allocate to satisfy us).
+If these are growing fast, you're under NUMA pressure.
+
+`perf stat -e cycle_activity.stalls_mem_any,offcore_response.demand_data_rd.l3_miss.remote_dram`
+on Intel shows you remote-DRAM hits explicitly. The ratio against
+local DRAM hits tells you if NUMA is in play.
+
+In Java/Go, `top -H` showing threads jumping between CPUs on
+different sockets is the visual cue — the OS scheduler isn't
+keeping them locally.
+
+## Containers and Kubernetes
+
+Container runtimes inherit the host's NUMA topology by default and
+don't pin. On a 2-socket box you can land a single container's
+threads on both sockets, fighting for the interconnect for everything
+they touch. Kubernetes's **CPU Manager** with `static` policy plus
+**Topology Manager** can give a pod exclusive cores and align them
+with one NUMA node. For latency-sensitive workloads this is the
+difference between p99 of 5 ms and p99 of 25 ms.
+
+## Cloud reality
+
+Cloud VMs hide a lot of this — most instance types are explicitly
+single-NUMA-node (one vCPU set, one NUMA node) precisely so customers
+don't have to think about it. The big instances that span multiple
+sockets (`*.metal`, the largest `m5`/`m7i`/`c7i` sizes) absolutely
+do expose NUMA, and the same patterns apply.
+
+## The takeaway
+
+On a single-socket machine, NUMA is invisible. The moment you're on
+a 2+-socket server or a bare-metal cloud instance, memory is no
+longer uniformly fast. Default Linux first-touch puts pages on the
+first writer's node, so init order matters. Pinning threads and
+memory to a node with `numactl` is the standard tool; for very large
+allocations, parallel first-touch beats single-threaded init.
+Measure with `numastat` and `perf` — the wrong NUMA placement
+silently doubles memory latency.

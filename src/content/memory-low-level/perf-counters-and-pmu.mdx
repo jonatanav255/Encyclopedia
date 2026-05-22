@@ -1,0 +1,166 @@
+export const level = 'senior';
+
+# Performance counters and the PMU
+
+Every modern CPU has a **Performance Monitoring Unit** — a small set
+of hardware counters wired directly into the core. They tick on
+specific microarchitectural events: cache misses, branch
+mispredictions, instructions retired, cycles stalled, TLB misses,
+and dozens more. Software profilers like `perf` read these counters
+and let you ask the CPU what it was *actually* doing while your code
+ran, rather than guessing.
+
+## The two questions only counters can answer
+
+Wall-clock profiling (`gprof`, sampling profilers) tells you **where**
+time went — which functions. Counters tell you **why** that time
+was spent there. The two big questions:
+
+1. **Is this code memory-bound or compute-bound?**
+2. **What microarchitectural event is the cycles burning on?**
+
+Without counters, you can spend hours guessing. With them, the
+answer drops out in seconds.
+
+## `perf stat`: the workhorse
+
+```
+$ perf stat -d ./prog
+ Performance counter stats for './prog':
+
+   12,345.67 msec task-clock
+        2,100        context-switches
+   45,678,901,234   cycles
+   34,567,890,123   instructions          #  0.76 insn per cycle
+    5,123,456,789   branches              #  415.4 M/sec
+       89,012,345   branch-misses         #  1.74% of all branches
+    8,765,432,100   L1-dcache-loads
+      234,567,890   L1-dcache-load-misses #  2.67% of all L1-dcache hits
+       12,345,678   LLC-loads
+        3,456,789   LLC-load-misses       # 28.0% of all LL-cache hits
+```
+
+Three numbers do most of the diagnostic work:
+
+| Counter | What it means | Healthy range |
+| --- | --- | --- |
+| **IPC** (instructions per cycle) | How many instructions completed per cycle on average. | 1.0+ is normal; 3.0+ is excellent; below 0.5 means the CPU is stalled on something. |
+| **Branch miss rate** | Fraction of branches mispredicted. | < 1% great, 5%+ probably a bottleneck. |
+| **LLC miss rate** | Fraction of last-level cache loads that went to DRAM. | < 5% great, 25%+ means you're memory-bandwidth-bound. |
+
+**IPC under 1.0 with a high LLC miss rate** → memory-bound. Need
+better data layout or prefetching.
+
+**IPC under 1.0 with a high branch miss rate** → branchy code. Sort
+data, hint the predictor, or rewrite branchless.
+
+**IPC at 2+ with high cache hit rates** → compute-bound. The win is
+algorithmic or SIMD, not data-layout.
+
+## `perf record` / `perf report`: sampled profiling
+
+`perf stat` gives you aggregate counts. `perf record` *samples* the
+counters and attributes each sample to the instruction running at
+that moment. Combine with `perf report` or flame graphs and you get
+"which function caused the cache misses?" — not just "we have a
+lot of them."
+
+```
+$ perf record -e cache-misses -F 999 -g ./prog
+$ perf report
+```
+
+`-e <event>` picks the event to sample on. Default is `cycles`,
+which gives you a normal CPU profile. Switching to `cache-misses`
+turns the profile into "where the cache misses happened." Same
+for `branch-misses`, `dTLB-load-misses`, etc.
+
+This is how you find the *actual* hotspot. The function with the
+most CPU time isn't always the one to optimize — sometimes it's the
+one with no IPC because it's stalled on memory.
+
+## The top-down methodology
+
+Intel and the kernel `perf` tool ship a **top-down analysis**:
+`perf stat --topdown`. It classifies every cycle into one of four
+buckets:
+
+- **Retiring** — the CPU was doing useful work, instructions completed.
+- **Bad Speculation** — branch mispredictions and speculative work
+  that got thrown away.
+- **Front-end Bound** — the CPU couldn't fetch / decode instructions
+  fast enough.
+- **Back-end Bound** — the CPU had instructions ready but couldn't
+  execute them (waiting on data or compute resources).
+
+A healthy program retires 70%+ of cycles. If "Back-end Bound" is
+dominant, drill into Memory Bound vs Core Bound. If "Bad
+Speculation" is high, you've got a branch-prediction problem. This
+narrows "the code is slow" to "the code is memory-latency-bound at
+the L3 miss level" in five seconds.
+
+## `perf c2c`: false sharing and contention
+
+`perf c2c record / report` is the tool built specifically for
+diagnosing cache-line contention. It groups samples by cache-line
+address, ranks the lines by **HITM** count (a cache fetched a line
+in another core's M state), and shows the threads sharing each line.
+
+If you suspect false sharing (see
+`memory-low-level/false-sharing.mdx`), this is the proof. Two
+threads with high HITM activity on the same cache-line address →
+they're fighting for it.
+
+## Counters in production
+
+`perf` is interactive, but the same counters are accessible
+programmatically via the `perf_event_open` syscall, and tools like
+**eBPF** (see `memory-low-level/ebpf-for-tracing.mdx`) can read
+them in low-overhead, always-on ways. Continuous profilers like
+**Parca**, **Pyroscope**, **Pixie**, **Datadog Continuous Profiler**,
+and **AWS CodeGuru** all use this plumbing to give you flame graphs
+of production traffic without per-process restart.
+
+In Kubernetes, perf counters work on the host but require
+privileges (`CAP_PERFMON` since 5.8; `CAP_SYS_ADMIN` before that)
+and `kernel.perf_event_paranoid` set permissively. Cloud providers
+generally allow it on bare-metal and on most VM sizes.
+
+## A practical investigation pattern
+
+When something is "slow but I don't know why," walk this ladder:
+
+<Steps>
+<Step n="1" title="`perf stat -d ./prog`">
+Get IPC, branch miss rate, cache miss rate. Three numbers tell you
+which way to look first.
+</Step>
+<Step n="2" title="`perf stat --topdown ./prog`">
+Confirm whether you're back-end (memory or compute) or front-end
+or bad speculation.
+</Step>
+<Step n="3" title="`perf record -g ./prog && perf report`">
+Standard CPU profile. See *which functions* are burning cycles.
+</Step>
+<Step n="4" title="`perf record -e <suspect-event> -g ./prog`">
+Profile sampled on the specific event identified in step 1.
+"Where do the cache misses come from?" "Where do the branch
+mispredicts come from?" Concrete answers.
+</Step>
+<Step n="5" title="`perf c2c` if multi-threaded">
+Last stop: cache-line contention. False-sharing and coherence
+ping-pong show up here and nowhere else.
+</Step>
+</Steps>
+
+## The takeaway
+
+The PMU is the most accurate profiling source available — it's the
+CPU telling you exactly what it did. `perf stat -d` gives you the
+three-number triage (IPC, branch misses, cache misses). `perf
+record` with a chosen event gives you sampled attribution. `perf
+c2c` finds cache-line contention. On Apple Silicon, the equivalents
+live in Xcode Instruments and the M-series have their own
+PMU-equivalent counters; on AMD, `AMD uProf` is the friendlier
+front-end. Either way, when a perf mystery is real, hardware
+counters answer it in minutes.

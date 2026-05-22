@@ -1,0 +1,169 @@
+export const level = 'senior';
+
+# Generational and region-based GC
+
+Tricolor marking (see `memory-low-level/gc-tricolor-marking.mdx`)
+tells you *how* to find live objects. **Generational** and
+**region-based** GC are about *which* objects to look at on each
+collection. Modern production GCs use both ideas because they
+exploit a single empirical observation: **most objects die young**.
+
+## The weak generational hypothesis
+
+Decades of measurements across languages converge on this:
+
+- 80-98% of objects become garbage shortly after allocation.
+- Of objects that survive their first collection, most live a long
+  time.
+
+This gives the bimodal distribution that generational GC is built
+for. If you only have to collect the young population frequently
+and skip the old population most of the time, you do dramatically
+less total work than a full-heap collection.
+
+## How generational GC works
+
+The heap is split into a **young generation** (Eden + survivor
+spaces) and an **old generation** (tenured).
+
+<Steps>
+<Step n="1" title="Allocate cheaply into young">
+
+New objects go into Eden — a contiguous region with a bump-pointer
+allocator. Allocation is two instructions: increment, return. No
+free-list walk, no fragmentation. Most objects never leave Eden.
+
+</Step>
+<Step n="2" title="Minor GC: young-only collection">
+
+When Eden fills, run a minor collection. **Tricolor-mark just the
+young generation, treating references from old as roots.** Survivors
+get copied to a survivor space; dead objects are dropped in bulk by
+resetting Eden's bump pointer.
+
+Minor GC is fast: small heap region, cheap copy of few survivors, the
+mutator pauses briefly (single-digit ms even on big heaps).
+
+</Step>
+<Step n="3" title="Promote long-lived objects">
+
+After surviving N minor GCs (the "tenuring threshold", typically
+~7-15), an object is **promoted** to the old generation. Old-gen
+collections are far rarer.
+
+</Step>
+<Step n="4" title="Major / full GC: old generation">
+
+Periodically, the old generation must be collected too — a long-lived
+data structure that became unreachable will only be freed there.
+This is much more expensive (larger heap, less locality), so
+collectors do everything to keep it concurrent and incremental.
+
+</Step>
+</Steps>
+
+The win: instead of scanning the whole heap every cycle, you scan a
+small region (young gen, maybe ~100-500 MiB) frequently, plus a slow
+background pass over the rest. The total work drops by 5-20x for the
+allocation patterns typical of server apps.
+
+## The remembered set problem
+
+Generational GC has a catch: a minor collection only walks the young
+generation, but a **pointer from old to young** must keep that young
+object alive. The collector needs to find all old→young pointers
+without scanning the entire old generation.
+
+Solution: a **write barrier** records every pointer store from old
+to young into a side structure called the **remembered set** (or
+**card table** — a bitmap where each bit covers a small region of
+the old gen, marking it as "contains old→young pointer, needs
+scanning").
+
+So in a generational collector, **every pointer assignment in your
+code costs a few extra instructions** for the write barrier check.
+This is one of the under-appreciated costs of managed runtimes.
+
+## Region-based GC: G1 / ZGC / Shenandoah
+
+Modern collectors take the "split the heap" idea further. The
+**Garbage-First** family (G1, ZGC, Shenandoah on JVM; Pauseless
+in Azul C4; .NET's Server GC) divides the heap into **many small
+regions** (typically 1-32 MiB each) instead of two big generations.
+
+<Compare
+  left={{
+    title: 'Two-generation (CMS, ParNew, classic)',
+    points: [
+      'Fixed split: young | old.',
+      'Major collection scans the entire old gen — long pauses on big heaps.',
+      'Compaction during major GC is a long stop-the-world phase.',
+      'Predictable but doesn\'t scale past ~30 GiB without pain.',
+    ],
+  }}
+  right={{
+    title: 'Region-based (G1, ZGC, Shenandoah)',
+    points: [
+      'Heap split into hundreds or thousands of regions.',
+      'Each region tagged "Eden", "Survivor", "Old", or "Humongous" — roles can change between cycles.',
+      'Collector picks the regions with the **most garbage** to collect first ("garbage-first" — the G of G1).',
+      'Concurrent compaction: copy live objects out of a region while the mutator runs, then free the region.',
+    ],
+  }}
+/>
+
+Region-based collectors are how modern JVMs and runtimes deliver
+**sub-10 ms pauses on 100+ GiB heaps**. ZGC and Shenandoah use a
+**load barrier** (every pointer load is intercepted, not just stores)
+to enable concurrent compaction — the collector can move an object
+while another thread is reading from it, and the barrier fixes up
+the reference on the fly.
+
+## The cost model in production
+
+What this means operationally:
+
+- **Allocation pressure matters.** Code that produces lots of
+  short-lived garbage stresses the young gen and triggers frequent
+  minor GCs. The fix is usually reusing buffers / object pools, not
+  the GC.
+- **Old-gen mutation matters too.** Lots of pointer writes from old
+  to young (e.g., maintaining caches of references to recent
+  objects) hammers the write barrier and remembered set. The
+  classic "old-gen LRU cache" antipattern.
+- **Heap size affects pause shape, not just allocation cost.**
+  Bigger heap means bigger old gen, more remembered-set work, longer
+  full-GC pauses on legacy collectors. On region-based collectors,
+  bigger heap is mostly fine — the regions are still small.
+- **`-XX:+UseG1GC` is the JVM default** since Java 9 and is right
+  for most workloads. **`-XX:+UseZGC`** is right for very large
+  heaps (32 GiB+) with tight pause-time targets. The old `CMS`
+  collector is removed; don't reach for it.
+
+## Go's collector: a different point in the design space
+
+Go's collector is **non-generational** — no young/old split. It's a
+concurrent mark-sweep with sub-millisecond pauses, and the language
+deliberately reduces allocation pressure (stack allocation via
+escape analysis, value semantics, small structs). The thesis: if you
+allocate less, you don't need generational GC's complexity. It works
+because Go programs tend to allocate less garbage than equivalent
+JVM programs, partly by design and partly by culture.
+
+The trade-off: Go pays GC cost on every object, including the
+short-lived ones a generational GC would clean up nearly for free.
+Server workloads with high allocation rates can hit walls on
+Go's GC that JVM workloads don't. The right answer is workload-
+specific and shifts over time as the Go collector improves.
+
+## The takeaway
+
+Most objects die young — generational GC exploits this by frequently
+collecting a small young generation and rarely doing full-heap
+work. Region-based collectors generalize this: hundreds of small
+regions, collect the garbage-richest first, compact concurrently
+via load barriers. The cost of all this shows up at every pointer
+write (a barrier instruction) and proportional to allocation rate,
+not heap size. For tuning: pick the collector matched to your heap
+size and pause-time target, then reduce allocation pressure in app
+code before reaching for tuning flags.

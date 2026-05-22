@@ -1,0 +1,169 @@
+export const level = 'senior';
+
+# malloc internals
+
+`malloc` looks like one function. Underneath it's a small operating
+system that decides whether to carve a slice from an existing free
+list, request a fresh block from the kernel, return memory to the
+OS, or do nothing. The choice of allocator (glibc, jemalloc,
+tcmalloc, mimalloc) often shifts production throughput by 10-30%
+without any code change.
+
+## What every modern allocator does
+
+The shape is the same across allocators, with knobs in different
+places:
+
+<Steps>
+<Step n="1" title="Small allocations: size classes and bins">
+
+Allocations below a threshold (typically ~256 KiB) are bucketed into
+**size classes**. Each class is a freelist of fixed-size chunks. A
+`malloc(40)` goes to the "48-byte class" bin; freed memory returns
+to that bin. This makes allocation O(1) for the common case — pop
+the head of the right freelist.
+
+Size classes are usually a geometric series (jemalloc: 1.25x growth,
+tcmalloc: power-of-two with sub-classes). Picking the spacing trades
+off **internal fragmentation** (waste per allocation) against the
+number of bins.
+
+</Step>
+<Step n="2" title="Per-thread arenas / caches">
+
+Every thread has its own freelist cache. `malloc` checks the local
+cache first — no lock, no atomic. Only when the local cache is
+empty does it touch a shared structure (`arena` in glibc,
+`central cache` in tcmalloc) under a lock.
+
+This is the single biggest win over a 1990s allocator. Multi-threaded
+allocators with no per-thread cache hit a brick wall at ~4 cores
+because every malloc goes through the same mutex. Per-thread caches
+let allocation rate scale almost linearly with cores.
+
+</Step>
+<Step n="3" title="Large allocations: mmap directly">
+
+Above the threshold (typically 128 KiB - 4 MiB), allocators bypass
+their own freelist machinery and call `mmap(MAP_ANONYMOUS)` directly.
+The block returns to the OS via `munmap` on `free`. No fragmentation
+because each large block is its own VMA.
+
+The threshold is tunable: `M_MMAP_THRESHOLD` in glibc. Some apps
+benefit from raising it (fewer mmap/munmap syscalls); some from
+lowering it (large frees return memory to the OS immediately).
+
+</Step>
+<Step n="4" title="Returning memory to the OS">
+
+When a heap region empties, the allocator can return pages to the OS
+via `madvise(MADV_DONTNEED)` (drop pages, keep VA mapped) or
+`munmap` (drop the VMA entirely). When and how aggressively to do
+this is the **most workload-sensitive knob** the allocator has.
+
+Aggressive return: low RSS, more page faults on future allocations.
+Lazy return: high RSS that may look like a leak, lower allocation
+latency. jemalloc's `decay_ms` and tcmalloc's `background_thread`
+are the typical levers.
+
+</Step>
+</Steps>
+
+## The allocators you'll actually see
+
+<Compare
+  left={{
+    title: 'glibc malloc (ptmalloc2)',
+    points: [
+      'Linux default. Reasonable, conservative, often slower than alternatives at high allocation rates.',
+      'Per-arena (not per-thread) — arena count caps at `8 * ncores`. Threads share arenas under lock.',
+      'Known to keep large RSS after big spikes (heap can\'t shrink past in-use chunks).',
+      'Tuning: `MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`, `MALLOC_MMAP_THRESHOLD_`.',
+    ],
+  }}
+  right={{
+    title: 'jemalloc / tcmalloc / mimalloc',
+    points: [
+      '**jemalloc**: developed at Facebook; widely used in Rust apps via `jemallocator` (was the Rust stdlib default until 1.32 in 2019). Excellent multi-threaded perf, low fragmentation, mature profiling.',
+      '**tcmalloc**: Google\'s. Strong on heavily-threaded workloads. Background thread returns memory.',
+      '**mimalloc**: Microsoft Research. Best raw speed in many benchmarks; smaller code, more aggressive about returning memory.',
+      'Drop-in via `LD_PRELOAD=/path/to/libjemalloc.so` — no app rebuild needed.',
+    ],
+  }}
+/>
+
+For server workloads, swapping glibc for jemalloc or tcmalloc is one
+of the highest-leverage no-code-change wins available. Production
+incidents from "weird RSS growth" or "memory locks under load" often
+disappear with this single change.
+
+## Fragmentation: internal vs external
+
+**Internal** fragmentation: you asked for 40 bytes; the allocator
+gave you a 48-byte chunk. The 8 wasted bytes per allocation are
+internal fragmentation. Geometric size classes typically waste
+~15-25% on average — the cost of having O(1) allocation.
+
+**External** fragmentation: free space exists, but in the wrong
+shape. The allocator has 1 GiB free total, but no contiguous run
+large enough to satisfy a 100 MiB request. Long-running processes
+with mixed allocation sizes accumulate this. The classic symptom:
+RSS doesn't grow but allocation latency does, because the allocator
+keeps scanning past holes.
+
+Mitigations:
+
+- **Size-class allocators reduce external fragmentation a lot** —
+  each bin is its own pool, so freed memory of a given size is always
+  reusable for that same size.
+- **Compacting GCs** (managed runtimes) physically move objects to
+  eliminate external fragmentation. Native allocators can't compact
+  because raw pointers are exposed.
+- **Arena allocators** (see below) sidestep the problem for
+  workloads where you free everything at once.
+
+## When to use an arena/pool allocator
+
+If you have a phase that allocates lots of small things and frees
+them **all at once** — e.g., per-request memory in a server, per-frame
+state in a game, per-document parser scratch — a bump-pointer **arena
+allocator** is dramatically faster and simpler than malloc/free:
+
+```cpp
+void* p = arena.alloc(size);   // just: ptr += size; return ptr - size;
+// ... many allocations ...
+arena.reset();                  // drop everything in O(1)
+```
+
+Cost: you can't free individual allocations early. Benefit:
+allocation is two instructions, no fragmentation, no
+synchronization. Apache Portable Runtime, Postgres's `MemoryContext`,
+LLVM's `BumpPtrAllocator`, Rust's `bumpalo`, and every game engine's
+"frame allocator" use this pattern.
+
+## RSS != "real memory use"
+
+After a big spike followed by frees, RSS often stays high even with
+jemalloc/tcmalloc. The pages are inside the allocator's freelists,
+not returned to the OS. This **looks like a leak** in monitoring but
+isn't — the memory is reusable for the next spike. Force a return
+with `malloc_trim(0)` (glibc) or the allocator-specific API
+(`mallctl("arena.purge", ...)` for jemalloc).
+
+The right question for "is my process leaking?" is not "is RSS
+growing?" but "is the in-use heap (from the allocator's own stats)
+growing?" Every modern allocator exports stats — jemalloc's
+`jemalloc.stats`, tcmalloc's `MallocExtension::GetStats`, glibc's
+`mallinfo2`.
+
+## The takeaway
+
+`malloc` is a per-process allocator on top of `mmap`/`brk`. Modern
+implementations use per-thread caches and size-class bins to make
+small allocations effectively free. Large allocations go straight
+to `mmap`. Picking jemalloc / tcmalloc / mimalloc over glibc often
+yields a 10-30% throughput improvement on multi-threaded workloads
+with no code changes. For batch-allocate / batch-free workloads, an
+arena allocator is faster than any general-purpose malloc. And
+"high RSS after a spike" is usually allocator caching, not a leak —
+check the allocator's own stats before assuming the worst.

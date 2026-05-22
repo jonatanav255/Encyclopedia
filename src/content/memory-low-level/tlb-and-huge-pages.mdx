@@ -1,0 +1,160 @@
+export const level = 'senior';
+
+# TLB and huge pages
+
+Every memory access your program makes goes through **virtual to
+physical address translation** (see
+`memory-low-level/virtual-memory.mdx`). That translation requires
+walking the page tables — which themselves live in memory. The CPU
+cache for those translations is the **TLB** (Translation Lookaside
+Buffer). When the TLB misses, you pay tens of nanoseconds per access
+on top of the data fetch — sometimes more than the data itself
+costs.
+
+## The TLB is small
+
+A modern x86-64 core has roughly:
+
+| Cache | Entries (typical) |
+| --- | --- |
+| L1 data TLB | 64-128 |
+| L1 instruction TLB | 64-128 |
+| L2 TLB (shared) | 1024-2048 |
+
+The standard page size on x86-64 and ARM64 is **4 KiB**. So 1024 TLB
+entries cover at most 1024 * 4 KiB = **4 MiB** of working set. The
+moment your hot data exceeds that, you're paying TLB misses.
+
+A full page-table walk on x86-64 traverses **four levels**, each a
+memory access. The walks themselves are cached (the page walker has
+its own caches), but a true cold walk can be ~50-100 ns. That can
+double or triple the cost of an otherwise-cached load.
+
+## When TLB misses dominate
+
+Workloads that scan large random-ish memory regions are TLB-bound:
+
+- In-memory databases scanning multi-gigabyte hash tables.
+- Graph algorithms hopping through pointer-rich heaps.
+- JVM heaps in the 8-64 GB range under random access.
+- Memory-mapped files (`mmap`) over multi-TB datasets — every fresh
+  page is a TLB miss *and* a minor fault.
+
+For these, the data fits in DRAM bandwidth-wise, but the *address
+translations* are the bottleneck.
+
+## Huge pages: bigger TLB entries
+
+A **huge page** is a single page-table entry that covers a much
+larger region:
+
+| Architecture | Standard | Large | Huge |
+| --- | --- | --- | --- |
+| x86-64 | 4 KiB | 2 MiB | 1 GiB |
+| ARM64 (4K base) | 4 KiB | 2 MiB | 1 GiB |
+| ARM64 (16K base) | 16 KiB | 2 MiB (via contiguous PTEs) | 1 GiB |
+
+With 2 MiB pages, the same 1024 L2 TLB entries cover **2 GiB**
+instead of 4 MiB — a 512x increase in TLB reach. For database
+buffer pools and JVM heaps this often delivers single-digit-percent
+to ~30% speedup just by removing TLB miss stalls.
+
+## Two ways to get huge pages
+
+<Compare
+  left={{
+    title: 'Transparent Huge Pages (THP)',
+    points: [
+      'Kernel transparently promotes 4 KiB pages to 2 MiB when possible.',
+      'No application changes; allocator-friendly.',
+      'Can cause unpredictable latency spikes from background defragmentation (khugepaged).',
+      'Many databases (MongoDB, Redis docs) recommend setting `transparent_hugepage/enabled = madvise` — explicit opt-in only.',
+    ],
+  }}
+  right={{
+    title: 'Explicit hugetlbfs',
+    points: [
+      'Reserve a pool of huge pages at boot (`vm.nr_hugepages`).',
+      'Apps `mmap` from `/dev/hugepages` or use `MAP_HUGETLB`.',
+      'Deterministic — no background promotion, no latency surprises.',
+      'Used by Postgres (`huge_pages=on`), DPDK, KVM, big JVM (`-XX:+UseLargePages`).',
+    ],
+  }}
+/>
+
+The general rule: **THP `madvise` mode** is the safe default for
+most workloads. **`hugetlbfs`** is the right choice for known-large
+allocations (DB buffer pools, hypervisor RAM, packet buffers) where
+you want guaranteed huge pages and no jitter.
+
+## Why "always-on THP" can hurt
+
+Linux's default `transparent_hugepage = always` lets `khugepaged`
+scan memory in the background, find runs of 4 KiB pages, and
+defragment them into 2 MiB blocks. The defrag step can stall
+your process during allocations. Redis and MongoDB explicitly
+recommend `madvise` (only allocations that asked for huge pages
+get them) to avoid this — the famous "Redis latency spikes after
+upgrading the kernel" issue from 2014 traced to THP.
+
+The trade-off is workload-dependent. For most batch / analytics
+workloads, always-on is fine — the throughput win dominates. For
+tail-latency-sensitive services, `madvise` is safer.
+
+## How to measure TLB pressure
+
+Linux:
+
+```
+perf stat -e dTLB-loads,dTLB-load-misses,iTLB-load-misses,page-faults ./prog
+```
+
+A `dTLB-load-misses / dTLB-loads` ratio above ~1% is significant.
+Above 5% and TLB misses are likely your top cost. Walking that down
+with huge pages or layout changes is worth a measured experiment.
+
+`perf stat -e cpu/event=0x08,umask=0x10/u` (Intel) breaks out
+the actual page-walk cycles — the cleanest signal that you should
+care.
+
+## TLB shootdowns: the multi-core trap
+
+When one core unmaps or modifies a page mapping (e.g., `munmap`,
+`mprotect`, GC compaction), every other core that *might* have that
+entry in its TLB needs to be told to invalidate. The kernel sends
+an **IPI** (inter-processor interrupt) to every affected core — they
+each take an interrupt, flush the entry, and ack. This is a **TLB
+shootdown**.
+
+Symptoms: a `mprotect` call that takes microseconds on a single-core
+box takes hundreds of microseconds on a 64-core machine, with all
+cores briefly stalled. JVM GC with compaction was a classic case
+until G1/ZGC got smarter about it. The remediation is usually "do
+fewer mapping changes" — batch your munmap, avoid `mprotect` on
+hot paths, prefer arena allocators that don't repeatedly remap.
+
+## Practical guidance
+
+- For a DB buffer pool or JVM heap > 8 GiB, enable **2 MiB huge
+  pages explicitly** via the database/runtime's flag. The setup
+  cost is one boot-time setting; the win is real.
+- For latency-sensitive services, set
+  `/sys/kernel/mm/transparent_hugepage/enabled = madvise`. Don't
+  disable THP entirely — it's useful for the rest of the system.
+- Watch `dTLB-load-misses` ratio when profiling a memory-bound app.
+  Above 1%, huge pages are likely worth trying.
+- Beware **TLB shootdown storms** on big-core boxes — measure
+  per-core CPU when your mapping-change-heavy code suddenly becomes
+  the long pole.
+
+## The takeaway
+
+The TLB is the cache for "where in physical memory does this virtual
+address live?" It's small (~1k entries) so it only covers ~4 MiB of
+working set at standard page size. Huge pages (2 MiB, 1 GiB)
+multiply TLB reach by hundreds or thousands and are the cheapest
+single tuning knob for memory-bound workloads with multi-GB working
+sets. Transparent huge pages give you most of the benefit
+automatically; explicit hugetlbfs gives you determinism. On big
+multi-core systems, TLB shootdowns from frequent mapping changes
+become a problem in their own right.

@@ -1,0 +1,154 @@
+export const level = 'senior';
+
+# Cache coherence (MESI)
+
+`memory-low-level/false-sharing.mdx` describes the *symptom* — two
+threads writing to adjacent variables get inexplicably slow. This
+page is the *mechanism*. The cache coherence protocol, usually
+**MESI** (or its MOESI/MESIF variants), is what makes multi-core
+caches "just work" — and what makes them stall when used badly.
+
+## The problem coherence solves
+
+Every CPU core has its own L1 and L2 cache. Without coordination, a
+write by core 0 to address `X` wouldn't be visible to core 1's read
+of `X`, because core 1's cache still has the stale value. Coherence
+is the hardware protocol that maintains the illusion: **at any
+moment, every cache observes a consistent view of memory** (per
+cache line — coherence is per-line, not per-byte).
+
+## The four MESI states (per cache line)
+
+Each cache line in each cache is tagged with one of:
+
+| State | Meaning | Other caches |
+| --- | --- | --- |
+| **M** (Modified) | I have it, dirty, and I'm the only holder. | All Invalid. |
+| **E** (Exclusive) | I have it, clean, and I'm the only holder. | All Invalid. |
+| **S** (Shared) | I have a clean copy. Others might too. | Other caches in S, memory is up-to-date. |
+| **I** (Invalid) | I don't have a valid copy. | Whoever does is in M / E / S. |
+
+Reads of a line in M, E, or S hit the local cache and are fast.
+Reads of I have to go to the bus.
+
+## How a write works (and why it's expensive)
+
+Take the common case: core 0 wants to write to a line that core 1
+has in S. Core 0's cache must first **invalidate** core 1's copy —
+otherwise core 1 would observe a stale value. The cache controller
+sends an **Invalidate** message over the inter-core interconnect,
+waits for an acknowledgment, then upgrades its own state to M and
+performs the write.
+
+```
+core 0: S -> M    (must invalidate everyone else first)
+core 1: S -> I    (forced by the invalidate)
+```
+
+That round-trip is tens to hundreds of nanoseconds, depending on how
+the cores are connected. On a single socket, it goes over a ring or
+mesh interconnect (~30-70 ns). Cross-socket, it goes over UPI /
+Infinity Fabric (~120 ns+) — see
+`memory-low-level/numa-and-locality.mdx`.
+
+**Reading is cheap. Writing to a shared line is expensive.** That
+asymmetry is the foundation of every "concurrent read, exclusive
+write" data structure (RW locks, RCU, COW, read-mostly snapshots).
+
+## Cache-line ping-pong
+
+If two cores keep writing to the same line, every write forces a
+state transition on every other holder:
+
+```
+core 0: write -> M, core 1 -> I
+core 1: read   -> M migrates to core 1, core 0 -> I
+core 0: write -> bounces back, core 1 -> I
+...
+```
+
+This is **ping-pong**. Even with no logical contention (each thread
+writes its *own* counter), if those counters live in the same 64-byte
+line, every write costs an inter-core handoff. That's false sharing.
+
+Real coherence traffic shows up in `perf c2c` (Linux) as
+**HITM** ("hit modified") events — a cache fetched a line that was
+in another cache's M state, forcing a remote fetch. Every HITM is
+a coherence stall.
+
+## Why x86 says "MESI" but actually runs MOESI / MESIF
+
+Real coherence protocols extend MESI with an extra state to optimize
+the common "one writer, many readers" case:
+
+- **MOESI** (AMD): adds **O** (Owned) — like M, but other caches can
+  also have a clean S copy. The owner forwards reads without writing
+  back to memory.
+- **MESIF** (Intel): adds **F** (Forward) — like S, but designated
+  as the source for read requests. Lets shared lines be forwarded
+  cache-to-cache instead of always going through memory.
+
+For app-level reasoning you can stick to MESI mental model — the
+extra states are optimizations that don't change the
+correctness story.
+
+## The implications you should remember
+
+<Cheatsheet
+  rows={[
+    ['Per-line, not per-byte', 'Two unrelated 4-byte vars in the same 64-byte line still contend. The hardware doesn\'t see your struct fields.'],
+    ['Reads are cheap', 'A line in S is cached on as many cores as want it. Read-mostly workloads scale linearly.'],
+    ['Writes invalidate everyone', 'One write to a shared line forces N-1 invalidations and an ack round-trip. Cost grows with core count.'],
+    ['Atomic ops are coherence ops', 'A locked `cmpxchg` is "acquire this line in M, perform RMW, release". Same coherence cost as a contended write.'],
+    ['Cross-socket is much worse', 'Coherence traffic that stays on-die is ~70 ns. Cross-UPI / Infinity Fabric is ~150+ ns. NUMA-aware data layout matters.'],
+  ]}
+/>
+
+## Designing for coherence, not against it
+
+The patterns that win:
+
+- **Per-core / per-thread state**, merged occasionally. Hit counters,
+  log buffers, allocator caches all use this. No coherence traffic
+  for the hot path.
+- **RW locks** when reads dominate writes. Many cores hold the lock
+  in S; one writer occasionally takes M.
+- **Read-mostly snapshots with atomic pointer swap**. Readers race
+  on a single cache-line read (cheap); writers build a new version
+  and swap once (one expensive write).
+- **Cache-line padding** for any per-thread state that lives in a
+  shared array. `alignas(64)` or hand-rolled padding.
+- **Avoid shared mutable structures in hot loops.** The cost is
+  rarely the lock — it's the coherence traffic on whatever the lock
+  is protecting.
+
+The patterns that lose:
+
+- A shared atomic counter incremented by every thread on every event.
+- Producer/consumer queues with a single contended head/tail and no
+  batching.
+- Hash maps where every bucket lives in the same cache line as its
+  neighbor.
+
+## Measurement, not intuition
+
+Two cores writing "their own" variables can be slow for reasons you
+won't see in the source. `perf c2c` is the tool — it shows
+cache-line addresses and the threads touching them, ranked by
+contention. Anything with a high HITM count is a real coherence
+hotspot.
+
+On Apple Silicon, the equivalents live in Xcode Instruments under
+the "Cache" template. On AMD, `AMD uProf`. On Linux generally,
+`perf c2c record` + `perf c2c report`.
+
+## The takeaway
+
+Cache coherence is the hardware contract that makes multi-core CPUs
+look like a single memory. The cost is paid per writeable line, per
+write — every write to a line another core holds requires
+invalidation traffic and an ack. Reads scale beautifully across
+cores; shared writes do not. Design hot paths for per-core data,
+read-mostly snapshots, and cache-line isolation. The bottleneck of
+a "lock-free, atomic everything" implementation is almost always
+the coherence protocol, not the algorithm.

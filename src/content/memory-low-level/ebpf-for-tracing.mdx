@@ -1,0 +1,169 @@
+export const level = 'senior';
+
+# eBPF for tracing
+
+eBPF — Extended Berkeley Packet Filter — is the most quietly
+significant Linux feature of the last decade. It lets you attach
+small, safe programs to almost any point in the kernel (or in
+userspace), have them run on every event, and ship results back to
+userland without breaking anything. For tracing, it has largely
+replaced `strace`, `tcpdump` ad-hoc scripts, `SystemTap`, and most
+custom kernel modules.
+
+## What it actually is
+
+eBPF programs are compiled to a small, virtual-instruction-set
+bytecode. The kernel runs each program through a **verifier** that
+proves it terminates, accesses only valid memory, doesn't dereference
+unvalidated pointers, and finishes in bounded time. If it passes,
+the verifier hands it to the JIT, which compiles it to native
+machine code. From then on, every triggering event runs that
+native code — basically zero overhead.
+
+The key design point: the kernel runs **arbitrary code on hot paths,
+safely.** That's the whole reason this took off — you couldn't do
+that with kernel modules without risking panics.
+
+## What you can attach to
+
+| Hook | Triggers on |
+| --- | --- |
+| **kprobes** | Entry / return of any kernel function. |
+| **uprobes** | Entry / return of any userspace function in any binary. |
+| **tracepoints** | Stable, named events the kernel exports (e.g., `sched:sched_switch`, `block:block_rq_complete`). |
+| **USDT** (user-static probes) | Markers compiled into user binaries (Postgres, MySQL, Node, OpenJDK, glibc all ship them). |
+| **perf events** | PMU counters (cache misses, branch misses — see `memory-low-level/perf-counters-and-pmu.mdx`). |
+| **XDP / TC** | Network packet hooks for filtering / forwarding. |
+| **LSM** | Security policy enforcement. |
+| **fentry / fexit** | Newer, lower-overhead alternative to kprobes for kernel functions. |
+
+The breadth is the point — you can put a probe on nearly any
+behavior you can name.
+
+## bpftrace: the friendly front door
+
+You don't usually write eBPF bytecode by hand. The default tools:
+
+- **`bpftrace`**: an awk-like one-liner language. Best for ad-hoc
+  investigation. Brendan Gregg's `bpftrace` cheatsheets are the
+  starting point.
+- **`bcc`** (BPF Compiler Collection): Python and C, more verbose,
+  for complex tools.
+- **`libbpf` + CO-RE** (Compile Once, Run Everywhere): the modern
+  way to ship production tools. Compile once, run on any kernel
+  without re-compilation. This is what Cilium, Falco, and Tetragon
+  use.
+
+A `bpftrace` one-liner that counts syscalls per process, live:
+
+```
+$ sudo bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+```
+
+Run it, hit Ctrl-C, get a histogram. Zero setup, zero target-app
+changes.
+
+## Three real examples of what this replaces
+
+<Compare
+  left={{
+    title: 'Old way',
+    points: [
+      '`strace -p $PID` to see syscalls — slows the process down dramatically.',
+      'Add log lines, redeploy, hope you logged the right thing.',
+      'Patch the kernel with a custom module to instrument something — risk a panic.',
+      '`tcpdump` to a file, post-process offline — slow and disk-heavy.',
+    ],
+  }}
+  right={{
+    title: 'eBPF way',
+    points: [
+      '`opensnoop`, `execsnoop`, `tcpconnect` — production-safe, no slowdown.',
+      'Attach a uprobe to the running binary, collect samples, detach. No restart.',
+      'No kernel modules. The verifier guarantees safety.',
+      'XDP filters packets in the NIC driver path — millions of pps with negligible overhead.',
+    ],
+  }}
+/>
+
+## The toolkit you should know
+
+The `bcc` and `bpftrace` projects ship dozens of ready-made tools.
+The ones that pay back the most for systems work:
+
+| Tool | What it does |
+| --- | --- |
+| **`execsnoop`** | Trace every `exec()` system-wide. Catches stray scripts, cron oddities. |
+| **`opensnoop`** | Trace every `open()`. "Which files is my process reading?" without `strace`. |
+| **`tcpconnect`** | Trace every outbound TCP connection. Catches "who connected to this IP?" |
+| **`tcpretrans`** | Show TCP retransmits in real time. Network-layer health. |
+| **`biolatency`** | Block I/O latency histograms. Find storage tail latency. |
+| **`runqlat`** | CPU scheduler wait-time histogram. "Why does my pod feel slow?" |
+| **`offcputime`** | Where threads spend off-CPU time (waiting, blocking). The missing half of a flame graph. |
+| **`profile`** | A 1% (or 49 Hz) sampled CPU profile, system-wide. Cheap continuous profiling. |
+
+Every one of these would have been an "ask the kernel team" problem
+in 2015. Now they're a single command.
+
+## Production observability built on eBPF
+
+Tools shipping eBPF as their core:
+
+- **Cilium** — Kubernetes networking and security via XDP/TC.
+- **Falco** — runtime security via syscall and LSM hooks.
+- **Tetragon** — security observability via fentry / fexit.
+- **Pixie** — auto-instrumented service mesh observability.
+- **Parca / Pyroscope** — continuous profiling, sampled at ~50 Hz.
+- **Datadog Continuous Profiler / AWS CodeGuru** — managed
+  continuous profiling using the same plumbing.
+
+The common thread: **always-on, low-overhead, no app changes.** No
+agent libraries to link in, no language-specific instrumentation —
+just hook the syscall or the userspace function pointer and
+extract the data.
+
+## The constraints to remember
+
+eBPF programs are **not arbitrary code**:
+
+- **No unbounded loops.** The verifier won't accept them (newer
+  kernels allow bounded loops with limits).
+- **Limited stack.** 512 bytes per program. Anything bigger goes
+  through maps.
+- **No floating-point.**
+- **Maps are the only persistent state.** Hash maps, arrays, LRU
+  maps — used to share state with userspace and between probes.
+- **Privileges needed.** Loading eBPF programs traditionally
+  required `CAP_SYS_ADMIN`; newer kernels split this into
+  `CAP_BPF`, `CAP_PERFMON`, etc., for least-privilege deployment.
+
+The constraints exist because the verifier has to *prove* the
+program safe at load time. Within them, you can build essentially
+anything observable.
+
+## When eBPF isn't the answer
+
+- **Cross-platform tools.** eBPF is Linux-only. macOS historically
+  had DTrace (eBPF's spiritual predecessor), but System Integrity
+  Protection has hobbled it since 10.11 and it's largely
+  non-functional on Apple Silicon. Windows now has
+  eBPF-for-Windows, still earlier-stage than Linux eBPF.
+- **Application-level logic.** eBPF is great at kernel and syscall
+  boundaries, less great at "what's the value of this Python
+  variable in this stack frame." For that, OpenTelemetry SDKs and
+  in-process profilers are still the right answer.
+- **Heavy data collection.** eBPF programs are bounded; if you need
+  to ship gigabytes per second to userspace, the perf event ring
+  buffer will throttle you. Aggregate inside the kernel; ship
+  summaries out.
+
+## The takeaway
+
+eBPF turned the kernel into a programmable observability platform.
+For tracing, it has replaced `strace`, ad-hoc kprobes, and most
+"add logging and redeploy" workflows. Start with `bpftrace`
+one-liners for investigation; reach for `libbpf` + CO-RE for
+production tools. The verifier's constraints (bounded loops, no FP,
+small stack, maps for state) define what you can write — and in
+exchange, you get safe in-kernel execution on hot paths with
+effectively zero overhead.
