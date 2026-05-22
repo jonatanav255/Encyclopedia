@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react';
-import { codeToHtml } from 'shiki';
+import { useHighlighted } from '../../lib/highlightCode';
 
 type Props = {
   bad: string;
@@ -76,20 +75,3 @@ function Panel({
   );
 }
 
-function useHighlighted(code: string, lang: string): string | null {
-  const [html, setHtml] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    codeToHtml(code, { lang, theme: 'github-dark-dimmed' })
-      .then((result) => {
-        if (!cancelled) setHtml(result);
-      })
-      .catch(() => {
-        if (!cancelled) setHtml(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [code, lang]);
-  return html;
-}

@@ -2,168 +2,34 @@ export const level = 'senior';
 
 # CAP and PACELC
 
-The most quoted, most misunderstood theorem in distributed systems.
-Brewer's CAP says: in the presence of a network **P**artition, a
-system must choose between **C**onsistency and **A**vailability. The
-mistake is treating it as a free three-way choice — "we'll pick CA"
-— when partitions aren't optional. They happen. You picked CP or AP
-the moment you spread your data across machines.
+The proof, the per-property definitions, and the long catalog of
+"what is CP / AP / EL / EC" live in **system-design/cap-theorem**
+and **system-design/consistency-models-overview**. This page is
+about using that vocabulary to make architecture decisions: which
+two PACELC letters does each feature need, and what does that
+choice cost you?
 
-PACELC fixes the framing. It says: **E**lse (when there's no
-partition) you still trade **L**atency for **C**onsistency. That
-trade-off is the one you actually live with every day in production.
+## The shortest accurate statement
 
-## CAP, said precisely
+- **CAP** (partition behavior): under a network partition, a
+  distributed store picks between linearizable Consistency and
+  full Availability. **P is not a choice** — partitions happen
+  whether you plan for them or not.
+- **PACELC** (steady-state): even with no partition, you still
+  trade Latency against Consistency. The second half is the one
+  you live with daily; partitions are rare, latency is constant.
 
-Three properties, only two during a partition:
-
-- **Consistency** (Gilbert/Lynch sense — linearizability): every
-  read sees the most recent committed write. There is a single,
-  agreed-upon timeline of values.
-- **Availability**: every non-failing node returns a non-error
-  response. Reads and writes succeed somewhere.
-- **Partition tolerance**: the system keeps operating when the
-  network drops messages between nodes.
-
-The theorem: when **P** occurs, you cannot simultaneously have **C**
-and **A**. You either refuse some operations (give up A) or you
-serve them with potentially stale data (give up C).
+Every distributed system gets two letters. Treat them as an
+explicit design statement per feature, not a marketing tag on the
+database.
 
 <Callout type="warn">
-"We picked CA" is a category error in any system with more than one
-node. The network can partition; you cannot opt out. The real choice
-is CP or AP when a partition happens.
+"We picked CA" is a category error in any system with more than
+one node. Partitions include cross-AZ link flaps, switch packet
+loss, GC pauses long enough to miss heartbeats, and clock skew
+that expires leases. You cannot opt out. The real choice is CP
+or AP under partition.
 </Callout>
-
-## Why "CA" doesn't exist
-
-If you "choose CA," you've assumed the network never partitions. It
-does. Partitions are not just full network splits — they include:
-
-- A cross-AZ link flapping for 90 seconds.
-- A switch dropping packets to one rack.
-- A GC pause long enough that the node misses heartbeats and gets
-  fenced.
-- A clock skew big enough that leases look expired.
-
-Single-machine systems (one Postgres, no replicas) are genuinely CA
-in the sense that there's nothing to partition from. The moment you
-add a replica or a coordinator, partitions are on the menu.
-
-## PACELC — the more honest framing
-
-Daniel Abadi's extension. Read it as two if-statements:
-
-```
-if (Partition) {
-  choose between Availability and Consistency   // PA or PC
-} else {
-  choose between Latency and Consistency         // EL or EC
-}
-```
-
-Every system gets two letters. The first describes its partition
-behavior. The second describes its steady-state trade-off — and that
-one matters more, because partitions are rare and latency is
-constant.
-
-Common configurations:
-
-- **PC/EC** — refuses to serve stale data even when fast. Spanner,
-  CockroachDB (default), single-leader Postgres.
-- **PA/EL** — stays available and fast; reads may be stale.
-  Cassandra (default), DynamoDB eventually-consistent reads.
-- **PC/EL** — sacrifices availability under partition but serves
-  fast (often stale-bounded) reads otherwise. DynamoDB with strong
-  reads, MongoDB with `readConcern: majority` on a non-primary.
-- **PA/EC** — rare and slightly contradictory; usually means tunable
-  consistency where you pay latency for stronger reads.
-
-## Where common datastores actually sit
-
-The marketing pages lie. The defaults matter.
-
-### Postgres (single-leader)
-
-**CP / EC.** One primary serializes writes. If the primary is
-partitioned away from clients, writes stop (loss of A). When healthy,
-reads from the primary are linearizable.
-
-Streaming replicas drift into eventual consistency — reads from a
-replica are PA/EL by accident. If your app reads from a replica and
-calls that "Postgres consistency," you are wrong. See
-**replication-and-cdc.mdx** for replica-lag mitigations.
-
-### MySQL
-
-Same shape as Postgres in single-leader. Group Replication and
-InnoDB Cluster add quorum-based failover (still CP under partition,
-just with automatic primary election).
-
-### MongoDB
-
-Replica set with primary election. Default `readConcern: local` and
-`writeConcern: 1` is effectively **PA/EL** — you can read stale,
-writes succeed if the primary acks. Tune to `writeConcern: majority`
-+ `readConcern: majority` and you slide toward **PC/EC**.
-
-The defaults bit a lot of teams in the 2014–2018 era. They're saner
-now; still, read your own config.
-
-### DynamoDB
-
-Two modes per request.
-
-- **Eventually-consistent read** (default): **PA / EL**. Reads any
-  replica, may be stale by ~1s.
-- **Strongly-consistent read** (`ConsistentRead: true`): **PC / EC**.
-  Reads from the partition's leader; costs 2x RCU; fails under
-  partition.
-
-Same table, different consistency depending on the flag. The honest
-description is "PACELC-tunable per request."
-
-### Cassandra / ScyllaDB
-
-**PA / EL** with tunable quorum. `QUORUM` reads + `QUORUM` writes
-gets you read-your-writes on a healthy cluster (W + R > N), but it
-is still not linearizable — there is no leader, just LWT (lightweight
-transactions) for the cases where you really need it.
-
-If you want CP behavior, you are fighting the data model.
-
-### Spanner
-
-**CP / EC.** Globally distributed, externally consistent reads via
-TrueTime — atomic clocks plus GPS give bounded clock uncertainty,
-and the commit protocol waits out the uncertainty interval before
-acking. Pays latency (typically 5–10ms commit wait) to give you a
-single global timeline.
-
-CockroachDB and YugabyteDB approximate this without TrueTime via
-HLCs (hybrid logical clocks) and slightly weaker bounds.
-
-### etcd / ZooKeeper / Consul
-
-**CP / EC.** Raft (etcd, Consul) or ZAB (ZooKeeper) consensus. Quorum
-writes, linearizable reads via read index or leader lease. Under
-partition the minority side stops serving writes — that's correct.
-See **consensus-raft-paxos.mdx**.
-
-### Redis (single node)
-
-CA in the trivial sense (one node, nothing to partition). Redis
-Cluster is **PA / EL** by default — split-brain is possible, writes
-on the minority side are lost on heal. Use Redis Sentinel + careful
-failover settings, or accept that Redis is not your source of truth.
-
-### Kafka
-
-The brokers form a **CP** quorum (via KRaft since 4.0 — ZooKeeper
-removed March 2025). Producers can choose `acks=all` for durable
-writes that wait on the in-sync replica set. Consumers can read
-stale from any replica via the new follower-fetch feature, paying
-some staleness for locality.
 
 ## Picking the side you actually want
 
@@ -189,7 +55,7 @@ payments are PC/EC; their dashboard analytics are PA/EL. The mistake
 is treating the whole system as one trade-off.
 </Callout>
 
-## Common misuses
+## Common architecture-level misuses
 
 ### "We're CA because we're on one AWS region"
 
@@ -204,30 +70,14 @@ reads, or causal order. A user who writes a comment and then doesn't
 see it on refresh is a bug, regardless of whether the system
 converges in 200ms.
 
-### "We picked Cassandra for strong consistency"
-
-Cassandra defaults to PA/EL. You can layer LWT (Paxos per partition
-key) on top for CAS-style operations, but you're paying for it and
-the ergonomics are poor. If you wanted CP, you wanted a different
-database.
-
 ### Treating CAP as a permanent label
 
 CAP describes behavior **during a partition**. A system that's CP
 today can degrade to AP if you misconfigure quorums; an AP system
 can be made effectively CP for specific keys with LWT. Configs and
-client choices move you around.
-
-### Confusing "linearizable" with "serializable"
-
-- **Linearizable** is a real-time guarantee on single objects: reads
-  see the latest committed write in wall-clock order.
-- **Serializable** is about transactions: the schedule is equivalent
-  to some serial execution.
-
-Spanner is both. Postgres at `SERIALIZABLE` isolation is serializable
-on one node but not linearizable across replicas. They are
-independent axes.
+client choices move you around. (For the linearizable-vs-
+serializable distinction, see
+**concurrency/linearizability-and-serializability**.)
 
 ## The mental model
 

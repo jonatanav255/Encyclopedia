@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react';
-import { codeToHtml } from 'shiki';
+import { useHighlighted } from '../../lib/highlightCode';
 
 type Segment =
   | { kind: 'code'; lang: string; code: string }
@@ -63,20 +62,7 @@ function TextBlock({ text }: { text: string }) {
 }
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
-  const [html, setHtml] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    codeToHtml(code, { lang, theme: 'github-dark-dimmed' })
-      .then((out) => {
-        if (!cancelled) setHtml(out);
-      })
-      .catch(() => {
-        if (!cancelled) setHtml(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [code, lang]);
+  const html = useHighlighted(code, lang);
 
   if (html) {
     return (

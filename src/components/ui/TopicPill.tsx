@@ -1,18 +1,8 @@
-type Tone = {
-  bg: string;
-  text: string;
-  border: string;
-};
-
-const tone: Tone = {
+const tone = {
   bg: 'bg-sky-500/15',
   text: 'text-sky-300',
   border: 'border-sky-500/30',
 };
-
-export function toneFor(_topic: string): Tone {
-  return tone;
-}
 
 function TopicIcon({ topic, className }: { topic: string; className?: string }) {
   const cls = className ?? 'w-3 h-3';
