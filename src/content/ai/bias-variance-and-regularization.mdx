@@ -1,0 +1,332 @@
+export const level = 'mid';
+
+# Bias, variance, and regularization
+
+A model that gets 60% on train and 58% on test is **underfit** —
+high bias, low variance. A model that gets 99% on train and 72% on
+test is **overfit** — low bias, high variance. The cure for each is
+different, and confusing them is one of the most common ways
+practitioners waste weeks of tuning.
+
+This page is the mental model behind "more data," "regularization,"
+"early stopping," and the rest of the standard overfitting toolkit.
+Bishop and Goodfellow are the canonical references; Murphy and
+Burkov are gentler.
+
+## The decomposition
+
+For a fixed-complexity model class, the expected error on a new
+point decomposes:
+
+```
+E[loss] = bias^2 + variance + irreducible_noise
+```
+
+- **Bias** — the average error of the model class. A linear model
+  predicting a curve has high bias no matter how much data you
+  give it. The class can't represent the truth.
+- **Variance** — how much the learned model changes when you
+  retrain on a different sample of the same distribution. A
+  10000-leaf decision tree on 1000 rows has high variance — small
+  changes in data move the leaves around drastically.
+- **Irreducible noise** — the part of `y` that is genuinely random
+  given `x`. No model fixes this. The floor.
+
+The decomposition matters because the **cures are opposite**:
+
+- High bias → bigger model class (deeper trees, more features,
+  more layers, less regularization). More data doesn't help.
+- High variance → smaller model class, more regularization, or
+  more data. A bigger model makes it worse.
+
+The diagnostic that tells you which:
+
+<Compare
+  left={{
+    title: "High bias (underfit)",
+    points: [
+      "Train accuracy is bad",
+      "Val accuracy is bad and close to train",
+      "Adding more data doesn't help train accuracy",
+      "Adding more features or model capacity helps",
+      "Symptom: model is too dumb for the problem",
+    ],
+  }}
+  right={{
+    title: "High variance (overfit)",
+    points: [
+      "Train accuracy is good",
+      "Val accuracy is much worse than train",
+      "Adding more data narrows the train/val gap",
+      "Regularization or simpler model closes the gap",
+      "Symptom: model memorized the training set",
+    ],
+  }}
+/>
+
+## Why more data fixes variance but not bias
+
+The intuition: variance is "the model's idiosyncratic mistakes
+that come from random training samples." More data averages them
+out. As `n → ∞`, the variance contribution to expected error goes
+to zero.
+
+Bias, by contrast, is "the gap between the best member of your
+model class and the truth." More data lets you find the best
+member more precisely, but the best member is still limited by the
+class. A linear model fed 100 million points of `y = sin(x)` is
+still a line. The bias floor is set by the model class itself.
+
+The corollary that matters in practice:
+
+- If your model is **underfitting** (high bias), collecting more
+  data is a waste of money. Reach for a bigger model.
+- If your model is **overfitting** (high variance), more data is
+  the most reliable fix. Regularization is the second-best fix
+  when more data isn't available.
+
+This is the answer to "should we label more data?": **only if your
+val curve is clearly above your train curve**. If they're already
+together, more data won't help.
+
+## Regularization: the knobs and what they do
+
+Regularization is "everything you do to prefer simpler models."
+The standard knobs:
+
+### L1 regularization (Lasso)
+
+Adds `λ * sum(|w|)` to the loss. The effect:
+
+- **Drives weights to exactly zero** — a corner of the L1 ball
+  geometrically forces sparsity.
+- **Effectively does feature selection** — features with
+  coefficient zero are removed.
+- Use it when you suspect many features are irrelevant and want
+  the model to tell you which.
+- Doesn't play well with deep nets (sparse weights aren't useful
+  there) — L1 is mostly a linear-model tool.
+
+### L2 regularization (Ridge / weight decay)
+
+Adds `λ * sum(w^2)` to the loss. The effect:
+
+- **Shrinks all weights toward zero** but rarely to exactly zero.
+- **Smoother decision boundaries** — high-magnitude weights are
+  penalized disproportionately.
+- The "weight decay" parameter in every NN trainer is L2 on the
+  weights. Default value in most frameworks is `1e-4` or `1e-5`.
+- Use it as a safe default. Hard to do harm with a small L2.
+
+### Dropout (NN-only)
+
+At training time, randomly zero out a fraction (typically 0.1-0.5)
+of activations on each forward pass. The effect:
+
+- **Approximates training an ensemble** of subnetworks
+  simultaneously.
+- **Forces redundant representations** — no single neuron can be
+  relied on.
+- **NN-specific.** Doesn't make sense for trees or linear models.
+- **Off at inference time.** This is the bug everyone hits once.
+  If your inference numbers look wrong, check that `model.eval()`
+  or equivalent is on.
+
+Dropout is less popular than it was in 2017 — batch norm and
+layer norm provide some of the same regularization implicitly, and
+modern transformers often use dropout only on attention.
+
+### Early stopping
+
+Train until validation loss stops improving, then stop. Save the
+model from the best val epoch.
+
+The reason this is regularization: training loss keeps decreasing
+(model keeps fitting training noise), but validation loss bottoms
+out and starts climbing. Stopping at the bottom keeps you in the
+sweet spot.
+
+Everyone forgets that **early stopping is regularization**. It's
+arguably the cheapest and most effective form. A model trained to
+30 epochs with patience-5 early stopping often beats the same
+model trained to 100 epochs with hand-tuned weight decay.
+
+The catch: early stopping uses the validation set for a tuning
+decision. If you also use it for hyperparameter selection, you're
+leaking the val set twice. You need three splits.
+
+### Data augmentation
+
+Synthetic variations of training examples — image flips, crops,
+rotations; text paraphrasing; SMOTE for tabular minority classes.
+
+The effect: **expand the effective training set** without
+collecting more labels. The augmented examples should reflect the
+real distribution's invariances ("a cat rotated 30° is still a
+cat") but not impossible ones.
+
+Domain-specific. Image augmentation is mature; tabular is hit-or-
+miss (SMOTE works sometimes, hurts sometimes); text augmentation
+is back-translation, paraphrasing, or LLM rewrites.
+
+### Other knobs worth knowing
+
+- **Max tree depth, min samples per leaf** — for tree models.
+  Shallower trees, fatter leaves, less overfitting.
+- **Number of trees + learning rate** — for boosted ensembles.
+  More trees with a smaller learning rate = smoother fit.
+- **Subsample / colsample** (XGBoost, LightGBM) — train each tree
+  on a random subset of rows/columns. Ensemble decorrelation.
+- **Label smoothing** — replace `[0, 0, 1, 0]` with
+  `[0.025, 0.025, 0.925, 0.025]`. Stops the model from getting
+  arbitrarily confident.
+
+## Which knob for which problem
+
+<Cheatsheet caption="Pick the regularizer by symptom.">
+| Symptom | Right knob |
+|---|---|
+| Linear model with too many features | L1 (sparsity, feature selection) |
+| Linear model overfitting smoothly | L2 |
+| Deep network overfitting | L2 (weight decay) + dropout + early stopping |
+| Decision tree overfitting | Limit depth, min samples per leaf |
+| Boosted trees overfitting | Lower learning rate + more rounds + early stopping + subsample |
+| Small training set, big model | More data > all regularization combined |
+| Class imbalance | Class weights, focal loss, SMOTE — not pure regularization, but related |
+| Validation loss bouncing | Learning rate too high; not a regularization issue |
+</Cheatsheet>
+
+## The train / val / test split nobody respects
+
+You need **three** splits, not two. The reason most teams use two
+and get away with it most of the time:
+
+- **Train** — fit the model parameters.
+- **Validation** — pick hyperparameters (regularization strength,
+  learning rate, model depth, etc.). Early-stop on this set.
+- **Test** — touched **exactly once**, after all decisions are
+  made, to report final performance.
+
+The failure mode that the test set exists to catch:
+
+```
+You tune for two weeks.
+You pick "the best model on the val set."
+You report its val accuracy as "the result."
+
+What you have actually done: selected the model that, of the
+50 configurations you tried, happened to overfit your val set
+the most. Your reported number is biased upward.
+```
+
+This is "I tuned hyperparameters on the test set" — the silent
+version. The test set is the only honest estimate of what you'll
+see in production. **Once you peek, you've burned it.** No
+double-dipping.
+
+The pragmatic discipline:
+
+- 60-70% train, 15-20% val, 15-20% test for medium datasets.
+- For small datasets, use k-fold CV for train/val and hold out a
+  separate test set.
+- For time-series, **walk-forward** splits — train on weeks 1-8,
+  val on week 9, test on week 10. Never random shuffle a time-
+  series.
+- **Lock the test set at project start.** Put it behind a function
+  that can only be called once. Make it impossible to look at
+  accidentally.
+
+When you suspect the test set has been compromised (because the
+team has been iterating against it for months), the only fix is
+**a fresh test set**. Collect it cold, do not look at it during
+tuning, run the final model once.
+
+## Capacity vs data — the cheat sheet
+
+A useful mental rule of thumb:
+
+- **Tiny data (&lt; 1000 rows)** — favor high-bias, low-variance
+  models: logistic regression, shallow trees, simple linear.
+- **Medium data (10K-1M rows)** — gradient-boosted trees with
+  regularization. The sweet spot for most business problems.
+- **Large data (>10M rows)** — neural nets earn their keep here,
+  because they have enough capacity to absorb the signal and the
+  data to constrain the variance.
+- **Massive data (LLM-scale)** — the regularization is implicit in
+  the data itself. Explicit regularization is mostly weight decay
+  and dropout, both small.
+
+Mismatching is the failure mode:
+
+- Big model + small data = overfit.
+- Small model + big data = underfit; you're leaving accuracy on
+  the table.
+
+## A diagnostic walkthrough
+
+When a model isn't working, run this checklist:
+
+<Steps>
+<Step n="1" title="Plot training and validation loss over epochs">
+What does the curve look like?
+
+- Both high, gap small → underfit. Bigger model.
+- Train low, val high, gap growing → overfit. More regularization
+  or more data.
+- Both high, val bouncing → learning rate too high.
+- Both very low but production is bad → leakage. Audit features.
+</Step>
+
+<Step n="2" title="Compute train vs val score on the same metric">
+A big gap is variance. A small gap with both low is bias.
+</Step>
+
+<Step n="3" title="If overfitting, try in this order">
+1. Early stopping (free).
+2. Weight decay / L2 (one hyperparameter).
+3. Dropout (NN only).
+4. Simpler model class.
+5. More data.
+</Step>
+
+<Step n="4" title="If underfitting, try in this order">
+1. Bigger model.
+2. More features (especially interactions and engineered features).
+3. Longer training.
+4. Lower learning rate, more epochs.
+5. Better model class entirely.
+</Step>
+
+<Step n="5" title="Sanity check the test set is still clean">
+If you've been peeking at test scores for weeks, the reported
+number is over-optimistic. Get a fresh test set or accept the
+uncertainty.
+</Step>
+</Steps>
+
+## The discipline
+
+- **Bias and variance are different problems with opposite cures.**
+  Plot train and val curves before choosing a knob.
+- **More data fixes variance, not bias.** Stop labeling if your
+  curves are already together.
+- **Early stopping is regularization.** Free, effective, the most
+  underrated knob.
+- **L1 for sparsity, L2 for smoothness, dropout for nets.**
+- **Three splits, not two.** Lock the test set. Don't peek.
+- **Time-series gets walk-forward, never random shuffle.**
+- **Big model + small data is the most common overfitting
+  failure**, and the fix is rarely "more regularization" — it's
+  "smaller model."
+
+## What to learn next
+
+- `ai/feature-engineering-fundamentals.mdx` — the features feeding
+  the model matter more than the regularizer.
+- `ai/classical-ml-when-llms-are-overkill.mdx` — the right model
+  class for the data shape; bias-variance trade-offs are concrete
+  there.
+- `ai/data-and-model-drift.mdx` — a well-regularized model still
+  decays in production; this is why.
+- `ai/llm-eval-design.mdx` — the LLM equivalent of "lock the test
+  set" is the held-out golden set.

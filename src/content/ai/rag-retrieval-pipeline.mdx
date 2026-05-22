@@ -1,0 +1,282 @@
+export const level = 'mid';
+
+# RAG retrieval pipeline
+
+RAG (retrieval-augmented generation) is what people mean when they
+say "talk to my docs." The model itself didn't learn your corpus;
+you retrieve relevant chunks at query time and stuff them into the
+prompt. Everything interesting happens in the retrieval pipeline,
+not in the LLM call.
+
+The full pipeline has seven stages. Each one is a place where the
+quality of your final answer can quietly collapse.
+
+```
+ingest:   docs → chunk → embed → index
+query:    question → embed → retrieve → rerank → assemble → LLM
+```
+
+You evaluate the whole thing end-to-end, but you debug it stage by
+stage. The most expensive mistake is assuming a bad answer means
+the model is bad. Nine times out of ten it means retrieval handed
+the model the wrong chunks.
+
+## Stage 1 — Chunking
+
+You can't embed a 200-page PDF as one vector. Embedding models have
+input limits (most are ~512 tokens; some go to 8K) and even where
+they don't, a single vector averaged over 200 pages encodes nothing
+useful. So you split documents into chunks.
+
+The naive default — fixed-size 512-token windows — is what every
+"hello world" RAG tutorial does, and it's wrong for most real
+corpora. It shreds tables in half, splits a code block from its
+explanation, and orphans markdown headers from their bodies. See
+`chunking-strategies.mdx` for the menu of approaches; for now,
+remember:
+
+- **Chunk size is a tuning knob.** 256–1024 tokens is the usual
+  range. Smaller = more precise retrieval, less context per hit.
+- **Overlap matters.** 10–20% overlap between adjacent chunks
+  catches sentences that straddle the boundary.
+- **Structure-aware beats fixed-size** on docs with headers,
+  tables, or code.
+
+The trap: chunking is invisible. Bad chunks don't error, they just
+quietly reduce retrieval recall by 10–30%.
+
+## Stage 2 — Embedding
+
+Each chunk becomes a dense vector — typically 768, 1024, 1536, or
+3072 dimensions of `float32`. Embedding models map semantically
+similar text to vectors with high cosine similarity.
+
+```ts
+// Roughly what every provider's SDK looks like
+const { embedding } = await embeddings.create({
+  model: 'text-embedding-3-small',
+  input: chunk.text,
+});
+// embedding.length === 1536
+```
+
+Picking a model:
+
+- **`text-embedding-3-small`** (OpenAI, 1536d, ~$0.02 per million
+  tokens). Sane default in 2026. Supports Matryoshka truncation —
+  you can cut to 512d and lose &lt;5% recall.
+- **`text-embedding-3-large`** (3072d). Higher quality, 6.5× the
+  cost.
+- **BGE / E5 / GTE / Nomic** — open-weight families. Run locally,
+  no per-token cost, comparable quality at 768–1024d.
+- **Cohere `embed-english-v3`** — separate vectors for query and
+  document modes (asymmetric). Often beats symmetric models on
+  retrieval benchmarks.
+
+Two gotchas that bite:
+
+1. **Embedding the query the same way you embedded the docs.**
+   Asymmetric models have separate `query` and `passage` modes.
+   Use the wrong one and recall drops sharply with no error.
+2. **Don't change the embedding model after indexing.** Vectors
+   from different models live in incompatible spaces. Switching
+   means re-embedding the entire corpus.
+
+## Stage 3 — Indexing
+
+You now have N vectors and need to answer "find the K closest to
+this query vector" in sub-100ms when N is in the millions. Linear
+scan is O(N) — fine at 10K vectors, hopeless at 10M. You need an
+approximate nearest-neighbor (ANN) index.
+
+The defaults:
+
+- **HNSW** — graph-based, the standard. Used by pgvector, Qdrant,
+  Weaviate, Elasticsearch, Pinecone.
+- **IVF** — partition-based. Faster to build, lower recall at the
+  same speed.
+- **ScaNN** (Google) — vector quantization plus partitioning.
+  Excellent at billion scale.
+
+`vector-search-and-anns.mdx` covers the tradeoffs in depth. For
+this page: pick HNSW, tune `ef_search` for the recall/latency you
+need, move on.
+
+`nosql/time-series-and-vector.mdx` covers the storage side —
+pgvector vs Pinecone vs Qdrant.
+
+## Stage 4 — Retrieval
+
+At query time: embed the question, search the index, get back the
+top-K candidates with similarity scores.
+
+```ts
+const queryVec = await embed(question);
+const hits = await index.search(queryVec, { topK: 50 });
+// each hit: { id, score, metadata: { docId, chunkId, text } }
+```
+
+Two non-obvious choices here:
+
+**K is bigger than you think.** Most tutorials use K=5. Real
+systems retrieve K=20–100 candidates and then rerank down to 5.
+Pure ANN recall at K=5 is often 60–70%; at K=50 it's 90%+ for the
+same index. The reranker (stage 5) is what gives you precision back
+from a wide retrieval net.
+
+**Pure vector search has a known weakness: exact-match queries.**
+Search for "OAuth 2.1" and a pure-vector system happily returns
+chunks about "authentication" that don't mention 2.1. Hybrid
+search (BM25 + vector) is how you fix this — see
+`hybrid-search-bm25-plus-vectors.mdx`. If your users search for
+SKUs, error codes, or proper nouns, you need hybrid.
+
+## Stage 5 — Reranking
+
+The top-50 from ANN are *candidates*, not answers. A cross-encoder
+reranker re-scores each (query, chunk) pair using a smaller model
+that actually reads both texts together.
+
+```ts
+const reranked = await rerank({
+  model: 'rerank-3.5',  // Cohere, BGE, etc.
+  query: question,
+  documents: hits.map(h => h.text),
+  topN: 5,
+});
+```
+
+Why this matters: a bi-encoder (the embedding model) scored query
+and chunk *independently*. A cross-encoder sees both at once and
+can model fine-grained relevance. For K=20 the latency cost is
+typically 10–50ms — cheap for the precision lift, which is often
++5 to +15 nDCG@5 on real corpora. See
+`rerankers-and-cross-encoders.mdx`.
+
+A reranker is the highest-leverage knob in a RAG system after
+chunking. If retrieval feels noisy, add a reranker before you
+think about fine-tuning anything.
+
+## Stage 6 — Context assembly
+
+Now you have the final K chunks. You stuff them into the prompt.
+This stage looks trivial and is full of footguns.
+
+**The context window is a budget, not a free space.** Even with
+1M-token models, throwing 50 chunks into a prompt does worse than
+5 well-chosen ones — the "lost in the middle" effect is real and
+well-measured. Long-context models consistently underweight content
+in the middle of the prompt.
+
+**Order chunks by reverse relevance, or by source order.** Putting
+the highest-scoring chunk last (right before the question) lifts
+answer quality on most benchmarks. Or group by source document so
+the model sees coherent context, not scrambled snippets.
+
+**Two assembly strategies:**
+
+<Compare
+  left={{
+    title: "Stuff",
+    points: [
+      "Concatenate all K chunks into one prompt",
+      "One LLM call",
+      "Fast and cheap",
+      "Breaks when chunks exceed context budget",
+      "Default for K ≤ 10 with modest chunks",
+    ],
+  }}
+  right={{
+    title: "Refine / Map-Reduce",
+    points: [
+      "Process chunks in passes, summarizing as you go",
+      "Many LLM calls",
+      "Handles arbitrary K and document size",
+      "Latency adds up — refine over 20 chunks is seconds",
+      "Use when stuff doesn't fit",
+    ],
+  }}
+/>
+
+Real systems almost always use stuff. If your retrieval is good,
+K=5 chunks fit comfortably and one well-prompted LLM call beats
+any chain you can build.
+
+## Stage 7 — Generation
+
+The LLM call. The least interesting stage in a well-built RAG
+pipeline. Two things to actually get right:
+
+- **Tell the model to cite chunk IDs.** Without this you cannot
+  evaluate whether the model used retrieval or hallucinated. Pass
+  chunks as `[1] ...`, `[2] ...` and require the answer to cite.
+- **Tell the model to refuse if context is insufficient.** The
+  default failure mode is to invent an answer from world knowledge,
+  which destroys the whole point of RAG.
+
+## Where the pipeline fails — by stage
+
+<Cheatsheet caption="Diagnosing a bad answer — work the pipeline backwards.">
+| Symptom | Likely stage | What to check |
+|---|---|---|
+| Model invents an answer not in context | 7 (prompt) | Cite-or-refuse instruction; check final prompt |
+| Right doc retrieved but wrong section | 1 (chunking) | Chunk size too big, structure ignored |
+| Doc in corpus, never retrieved | 3 / 4 (index, recall) | Increase `ef_search`, increase K, try hybrid |
+| Top hits are about the right *topic*, not the right *entity* | 5 (reranking) | Add a cross-encoder reranker |
+| Query matches "OAuth" but misses "OAuth 2.1" | 4 (retrieval) | Add BM25, use hybrid |
+| Quality dropped after re-indexing | 2 (embedding) | Did the model change? Asymmetric mode mismatch? |
+| First K results are great in dev, mediocre in prod | corpus drift | New docs, distribution shift, re-tune K and chunking |
+</Cheatsheet>
+
+## Context-window budgeting
+
+A practical budget for a 128K-token model:
+
+- **System prompt + instructions:** 500–2000 tokens.
+- **Retrieved chunks:** 4000–16000 tokens (K=5–20, ~400–800 each).
+- **Conversation history:** variable, capped.
+- **Headroom for the answer:** 1000–4000 tokens (model writes
+  inside the same window).
+
+Don't fill the window. Beyond ~30% utilization on most current
+models, quality starts to wobble. Bigger context windows are not
+a substitute for better retrieval — they're a tool for the cases
+where good retrieval still produces large context.
+
+## The evaluation loop
+
+A RAG pipeline you can't evaluate is a pipeline that quietly
+regresses every time someone edits a prompt. Build a golden set of
+~50–200 (question, expected-source) pairs from day one. Measure:
+
+- **Retrieval recall@K** — was the right chunk in the top K?
+- **Answer faithfulness** — does the answer match the retrieved
+  context, or did the model invent?
+- **Answer correctness** — does the answer match the gold answer?
+
+`llm-eval-design.mdx` covers the full evaluation framework. The
+short version: pure end-to-end LLM-as-judge eval is noisy. Split it
+into retrieval eval (cheap, deterministic) and generation eval
+(expensive, judge-based) so you can localize regressions.
+
+## The discipline
+
+- Chunking decides your recall ceiling. Don't accept the
+  fixed-512-token default on real docs.
+- Retrieve wide (K=20–100), rerank narrow (top-5).
+- Hybrid search beats pure vector on real corpora — almost always.
+- A reranker is the cheapest big quality win.
+- Cite-or-refuse the prompt. No exceptions.
+- Eval the stages separately; eval is the only thing that catches
+  silent regressions.
+
+## What to learn next
+
+- `chunking-strategies.mdx` — stage 1 in depth.
+- `vector-search-and-anns.mdx` — stage 3 internals.
+- `hybrid-search-bm25-plus-vectors.mdx` — fixing pure-vector
+  weaknesses.
+- `rerankers-and-cross-encoders.mdx` — stage 5.
+- `llm-eval-design.mdx` — measuring all of this.
+- `system-design/search-system-architecture.mdx` — the broader
+  search context this pipeline lives in.

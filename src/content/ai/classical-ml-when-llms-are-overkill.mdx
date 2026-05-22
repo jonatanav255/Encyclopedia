@@ -1,0 +1,268 @@
+export const level = 'mid';
+
+# Classical ML when LLMs are overkill
+
+A team I worked with built a "fraud detection co-pilot" that fed
+each transaction into GPT-4 with a 600-token prompt asking "is this
+fraudulent? respond yes/no with reasoning." It hit 91% accuracy at
+$0.04 per call and 1.2s p95. A weekend of XGBoost on the same
+labels hit 96% at &lt; $0.0001 per call and 3ms p95.
+
+This is the modal story of 2025-2026. **For tabular classification
+and regression, gradient-boosted trees beat LLMs on cost, latency,
+and usually accuracy.** This page is the decision frame for when to
+reach for classical ML and when an LLM is genuinely the right tool.
+
+## The use-case matrix
+
+The boring truth: most ML problems at backend companies are
+tabular. Rows have a fixed schema, columns are numbers or
+categoricals, and the question is "predict a number" or "predict a
+class."
+
+<Cheatsheet caption="Tabular problems and the right tool. LLM column is mostly empty for a reason.">
+| Problem | Right tool | LLM? |
+|---|---|---|
+| Fraud detection on transactions | Gradient boosting (XGBoost/LightGBM) | No |
+| Demand forecasting (next-day sales by SKU) | Boosted trees + time features, or Prophet | No |
+| Click-through prediction (ad ranking) | Logistic regression at scale, or deep CTR model (DLRM) | No |
+| Lead scoring (will this prospect convert?) | Boosted trees | No |
+| Churn prediction | Boosted trees | No |
+| Credit risk / default | Logistic regression (for explainability) or boosted trees | No |
+| Default rate on a small loan portfolio (200 rows) | Logistic regression | No |
+| Extract `{name, email, phone}` from a resume | Boosted trees on engineered features OR LLM with structured output | Maybe |
+| Classify a support ticket into 1 of 8 categories from free text | Fine-tuned BERT-class model, or LLM zero-shot | Yes |
+| Summarize a 10-page contract | LLM | Yes |
+| Answer a customer question over your docs | LLM + RAG | Yes |
+</Cheatsheet>
+
+The pattern: **if the input is a structured row, the answer is
+classical ML.** If the input is open-ended text or the output is
+generative, you have an LLM problem.
+
+## Why boosted trees win on tabular
+
+The Géron and Burkov textbooks both bury this lede: for the data
+shape that 80% of real businesses have — rows with a few dozen to
+a few thousand features, mostly numeric and categorical, with a
+labeled target — **gradient-boosted decision trees (XGBoost,
+LightGBM, CatBoost) are state of the art and have been since 2014**.
+Deep learning has never displaced them on this shape; LLMs do not
+even compete.
+
+The properties that make them win:
+
+- **Handle mixed types natively.** Numeric features, categoricals,
+  missing values — trees don't care. Neural nets need encoding and
+  normalization for every column.
+- **No feature scaling required.** A split on `age &lt; 35` works the
+  same whether age is in years or seconds.
+- **Capture non-linear interactions automatically.** A tree of
+  depth 6 can express "if `income > 80K` AND `region = NYC` AND
+  `age &lt; 30` then ...". You don't need to hand-engineer the
+  interaction.
+- **Train in minutes, not hours.** A million rows, 100 features,
+  on a laptop in a few minutes.
+- **Cheap to serve.** A trained model is a few MB, predicts in
+  microseconds per row.
+- **Feature importance for free.** Built-in importance scores plus
+  SHAP for per-prediction explanations. Try getting that from an
+  LLM.
+
+When to pick which:
+
+- **XGBoost** — the historical default. Mature, predictable,
+  excellent docs.
+- **LightGBM** — usually faster than XGBoost, especially on wide
+  data (many features). Leaf-wise growth, which converges faster
+  but is more prone to overfit on small data.
+- **CatBoost** — best handling of high-cardinality categoricals
+  (think "user_id" or "city_id" with 100K+ values). Slower to
+  train than LightGBM but often the best out-of-the-box quality.
+
+The honest take from Kaggle and from production: **try LightGBM
+first**, fall back to XGBoost if it overfits, fall back to CatBoost
+if you have brutal categoricals.
+
+## When logistic regression is genuinely the right answer
+
+Logistic regression is unfashionable. It's also the right tool more
+often than people admit.
+
+The cases:
+
+- **Small data** (&lt; 1000 rows). Boosted trees overfit on tiny
+  data; logistic regression with L2 is more stable.
+- **Linear-ish problems.** Credit risk, A/B test analysis, simple
+  conversion prediction — the relationship between features and
+  outcome really is mostly linear, and you're not buying any
+  modeling power from a tree ensemble.
+- **Explainability is the product.** Regulated industries
+  (lending, insurance, healthcare) need per-feature coefficients
+  you can defend to an auditor. SHAP values on an XGBoost model
+  are not the same legal standing as "this coefficient on income
+  was 0.43."
+- **Latency-critical CTR / ad ranking.** Google's ad system ran
+  on logistic regression at scale for over a decade. Linear models
+  serve in nanoseconds and scale to billions of features via
+  feature hashing.
+
+Murphy is explicit on this in *Probabilistic ML*: logistic
+regression with good features beats a deep model with raw features
+on most tabular tasks. The investment goes into feature
+engineering, not architecture.
+
+## The "we used an LLM to extract a known schema" anti-pattern
+
+The specific failure that prompted this page:
+
+```ts
+// Bad: $0.02 per call, 800ms latency, 95% accuracy
+const result = await llm.complete({
+  prompt: `Extract {name, email, phone} from:\n${resume}`,
+  responseFormat: 'json',
+})
+
+// Good: $0.00001 per call, &lt;5ms, 99%+ accuracy
+const result = {
+  name: extractName(resume),    // regex + NER on a small spaCy model
+  email: extractEmail(resume),  // regex
+  phone: extractPhone(resume),  // libphonenumber
+}
+```
+
+When you know the schema, and the input has predictable structure
+(addresses, phone numbers, dates, currencies, product codes, error
+codes), **a small model or a regex beats an LLM on every axis**.
+The LLM looks attractive because it ships in an hour. Three months
+later you're paying $40K/month for what a 100-line script does for
+free.
+
+The rule: **LLMs are for ambiguity**. If the extraction is
+deterministic — "find the email address" — don't pay for an LLM to
+do regex.
+
+## Where LLMs DO win on tabular
+
+There are real cases. They're rarer than people think.
+
+- **Small datasets with strong prior knowledge encoded in language.**
+  You have 20 labeled examples of "is this medical query about
+  cardiology?" Zero-shot or few-shot LLM classification beats
+  training a classifier on 20 examples. (Above ~1000 examples, the
+  classical model wins.)
+- **Semi-structured text inputs.** "Categorize this 500-word
+  customer complaint into one of 12 buckets, with explanation."
+  The LLM extracts and classifies in one step. Boosted trees
+  need feature engineering on the text first (TF-IDF, embeddings)
+  and don't give the explanation.
+- **One-shot tasks where the cost of building a model is the
+  bottleneck.** Internal tools, exploratory analysis, "we need
+  this answer for a board meeting Thursday." Cost-per-call doesn't
+  matter when you make 50 calls total.
+- **Zero-label problems.** You have no labels yet. The LLM gives
+  you weak labels that bootstrap a real model (Snorkel-style weak
+  supervision).
+
+The pattern: LLMs win when **data is small, inputs are text-shaped,
+or labels are absent**. Classical ML wins when you have labels and
+a tabular schema.
+
+## A decision frame
+
+<Steps>
+<Step n="1" title="Is the input a row with a fixed schema?">
+If yes, you're in classical ML territory. Default to LightGBM and
+make the LLM team justify their pitch.
+</Step>
+
+<Step n="2" title="Do you have ≥1000 labeled examples?">
+Yes → train a model. Boosted trees for tabular, fine-tuned BERT for
+short text classification, deep models for images/audio.
+
+No → can you get them? Active learning, weak supervision, LLM-
+generated labels followed by human review. Don't deploy an LLM as
+your forever model just because you didn't label.
+</Step>
+
+<Step n="3" title="Is explainability a hard requirement?">
+Yes → logistic regression. SHAP-on-XGBoost is a distant second.
+LLM "reasoning" is post-hoc rationalization, not explanation.
+
+No → use the most accurate model that fits the latency budget.
+</Step>
+
+<Step n="4" title="Is the request latency budget under 50ms?">
+Yes → classical ML, served from a model server or as a library.
+LLMs cannot meet sub-50ms p95 reliably at meaningful scale.
+
+No → LLM is on the table if other criteria say so.
+</Step>
+
+<Step n="5" title="Is the output generative or open-ended?">
+Yes → LLM. This is what they're for.
+
+No → classical ML almost certainly wins.
+</Step>
+</Steps>
+
+## The cost arithmetic
+
+The arithmetic that sells classical ML to a CFO:
+
+- **GPT-4o-mini at $0.15/M input, $0.60/M output.** A 500-token
+  prompt + 50-token response = ~$0.0001 per call. Sounds tiny.
+- **A million calls/day = $100/day = $36K/year.** Now it's not
+  tiny.
+- **A LightGBM model serves a million predictions on a single CPU
+  in seconds.** Marginal cost: the electricity. Tens of dollars a
+  year on a small instance.
+- The 1000× cost ratio is real. It compounds on every product
+  decision that goes "let's use an LLM."
+
+The case for the LLM has to clear that 1000× bar. Sometimes it
+does (the LLM is genuinely more accurate, or solves the only
+version of the problem that exists). Often it doesn't, and the
+team picked the LLM because nobody on the team remembered XGBoost
+exists.
+
+## Common failure modes
+
+<Cheatsheet caption="Patterns of misuse seen in production reviews.">
+| Symptom | Root cause | Fix |
+|---|---|---|
+| LLM call in a hot path with p95 > 500ms | Used LLM where a classifier would do | Train LightGBM on logged inputs/labels |
+| $50K/month LLM bill for extraction | Schema is fixed, input is structured | Replace with regex/NER/structured parser |
+| "Our LLM hallucinates fraud rates" | LLMs can't do calibrated probabilities | Use logistic regression for calibrated P(fraud) |
+| "We tried fine-tuning, it's still 87%" | Wrong tool entirely | Try gradient boosting before fine-tuning anything |
+| Model interpretability complaints from compliance | Reached for LLM "reasoning" as explanation | Use logistic regression or SHAP on tree model |
+| Forecasting eval is unstable | Time-series in a non-time-aware model | Walk-forward CV with time features (cyclical hour/day) |
+</Cheatsheet>
+
+## The discipline
+
+- **The default for tabular is gradient boosting**, not an LLM, not
+  even a neural net.
+- **Logistic regression is not obsolete.** It's the right tool for
+  small data, linear problems, and regulated explainability.
+- **If you know the schema, don't pay an LLM to extract it.**
+  Regex, NER, structured parsers.
+- **LLMs earn their place on ambiguous text and generative
+  outputs.** They lose on tabular classification 99% of the time.
+- **Calculate cost-per-call at expected volume before picking.**
+  The 1000× ratio is real and compounds.
+- See `ai/feature-engineering-fundamentals.mdx` for the half of
+  classical ML where the wins actually live.
+- See `ai/bias-variance-and-regularization.mdx` for why your tree
+  ensemble overfits and what to do about it.
+
+## What to learn next
+
+- `ai/feature-engineering-fundamentals.mdx` — features matter more
+  than model choice for tabular problems.
+- `ai/bias-variance-and-regularization.mdx` — the mental model for
+  every overfitting symptom.
+- `ai/data-and-model-drift.mdx` — your XGBoost model is not
+  immortal; this is how it dies.
+- `ai/recommender-systems-in-prod.mdx` — where boosted trees still
+  outperform deep models at the ranker stage.

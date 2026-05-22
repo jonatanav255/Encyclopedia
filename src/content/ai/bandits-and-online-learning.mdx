@@ -1,0 +1,288 @@
+export const level = 'senior';
+
+# Bandits and online learning
+
+The honest take: most of what gets shipped as "personalization,"
+"recommender," or "smart ranking" in production is a **bandit**,
+not RL. Full reinforcement learning needs state transitions and
+delayed rewards over a horizon — the things that make Atari and
+robotics hard. A bandit is the degenerate case: one decision, an
+immediate reward, do it again. That's almost every product
+decision you'd want to learn online: which thumbnail, which
+notification copy, which email subject line, which of these 20
+candidate items goes in slot 1.
+
+You don't need policy gradients for this. You need to think
+clearly about explore-vs-exploit, and stop running A/B tests for
+problems that A/B is the wrong tool for.
+
+## The multi-armed bandit, plain
+
+K levers (arms). Each pull of arm `i` returns a reward drawn
+from an unknown distribution with mean `μ_i`. You don't know
+which arm has the highest `μ`. You pull arms one at a time and
+want to maximize total reward over T rounds.
+
+The tension is built into the setup:
+
+- **Exploit.** Pull the arm whose observed mean is highest so
+  far — you'll get the most reward *if your estimate is right*.
+- **Explore.** Pull a less-tried arm to improve your estimate
+  — you'll learn faster *but pay short-term reward*.
+
+If you only exploit, you lock in whatever looked good on the
+first 3 pulls and never discover the actually-best arm. If you
+only explore, you pull arms uniformly forever and waste reward
+you should have collected.
+
+A bandit algorithm is just a rule for picking the next arm that
+balances the two.
+
+## The four algorithms you'll actually use
+
+<Cheatsheet caption="Bandit algorithms in increasing order of how often they're the right pick">
+| Algorithm | Rule | Knob | When |
+|---|---|---|---|
+| Epsilon-greedy | With prob ε pull random; else best-so-far | ε (typically 0.05–0.1) | Baseline; works; tune ε by hand |
+| Decaying epsilon | ε shrinks over time (e.g. 1/sqrt(t)) | initial ε | When traffic is steady and arms don't change |
+| UCB1 | Pull `argmax μ̂_i + sqrt(2 ln t / n_i)` | None (parameter-free) | When you want a defensible, no-tuning default |
+| Thompson sampling | Sample θ_i from posterior of each arm, pull argmax | Prior (usually Beta(1,1)) | The modern default; Bayesian, smooth, robust |
+</Cheatsheet>
+
+Two things that bite people new to this:
+
+- **Epsilon-greedy is genuinely fine** for most product
+  decisions. It is not embarrassing to ship. It loses ~5–10%
+  of optimal reward to its random exploration, which is much
+  less than you'll lose to a broken metric or a wrong reward
+  signal.
+- **Thompson sampling** is the one I'd reach for if I were
+  doing this from scratch in 2026. It naturally pulls arms in
+  proportion to the probability they're best — no tuning, no
+  weird step-function behavior, and the math composes cleanly
+  with Bayesian priors when you have informative beliefs about
+  new arms.
+
+UCB is great in papers. In production its bonus term
+(`sqrt(2 ln t / n_i)`) is unintuitive to operate and Thompson
+sampling does the same job with fewer surprises.
+
+## Contextual bandits: the version that pays the bills
+
+The vanilla MAB assumes arms have a single fixed reward
+distribution. In a real product, the reward depends on **who's
+asking**. A thumbnail that works for one user demographic
+bombs for another. So you add features.
+
+A **contextual bandit** is a MAB where each round you observe a
+feature vector `x_t` (user, device, time, session history) and
+you want to learn a function `μ_i(x)` — the expected reward of
+arm `i` given context `x`. You pull the arm with highest
+predicted reward, with some exploration.
+
+Two common implementations:
+
+- **LinUCB** — linear model per arm, UCB-style bonus on the
+  predicted variance. Cheap, interpretable.
+- **Neural / GBM contextual bandit** — train a model that takes
+  `(x, arm)` features and predicts reward. Pick by argmax over
+  arms, with Thompson sampling via dropout or ensembling for
+  exploration. This is what most production "personalization"
+  systems are under the hood.
+
+If you've ever seen a job posting that says "Personalization ML
+Engineer," it's almost always asking for a contextual bandit
+plus the infrastructure to log impressions, rewards, and run
+the loop online. Sutton &amp; Barto call it the bridge between
+supervised learning and full RL; in practice it's its own thing.
+
+## Why bandits beat A/B tests for ranking-shaped problems
+
+A/B test logic:
+
+1. Pick variant A or B uniformly at random.
+2. Collect data for N days.
+3. Compute lift, decide winner, ship.
+
+That's a bandit with `ε = 1` and a single decision point at the
+end. You explored maximally the entire time. If A was 50% worse
+than B, you served the bad variant to half your users for the
+full test duration. That's the *intended* tradeoff — you bought
+a clean statistical estimate.
+
+For "which of these 20 candidate items goes in slot 1," that
+tradeoff is awful. You have:
+
+- **Many arms** (every item, every layout, every ranking
+  weighting).
+- **Cheap exploration cost per arm** (one impression).
+- **No need for a clean treatment-effect estimate** — you don't
+  care *why* item 7 is winning, you just want to keep showing
+  it.
+
+Bandits dominate here. Epsilon-greedy with ε=0.05 spends 5% of
+traffic exploring and 95% exploiting; A/B testing spends 100%
+exploring until the test concludes. Over a year, bandits
+collect roughly an order of magnitude more reward.
+
+<Callout type="info">
+The mental model that helped me: A/B testing is bandit with
+ε=1 forever. Bandits are A/B with ε that decreases as you learn.
+Same family, different settings.
+</Callout>
+
+## When NOT to use bandits
+
+The honest counter-cases. You want A/B when:
+
+- **You need a counterfactual estimate of business impact.**
+  "Did this feature lift revenue 2%?" requires a clean
+  treatment / control split with no contamination. Bandits
+  contaminate by design — the policy adapts during the
+  experiment, so the variants weren't sampled independently.
+- **You're shipping a single, durable decision.** New checkout
+  flow vs old. You won't keep both forever; you'll pick one.
+  Get a clean estimate, ship the winner.
+- **The reward signal is delayed by days.** Bandits assume you
+  observe reward soon after the action. If "did this user
+  retain" takes 30 days, the bandit can't learn fast enough to
+  beat A/B's clean statistical machinery.
+- **You're going to make policy / legal / fairness claims** on
+  the result. Adaptive sampling complicates the statistics
+  enough that you'll spend more time defending the analysis
+  than running the experiment.
+
+The pattern teams converge on: **bandits for the within-product
+"which item, which copy, which slot" decisions, A/B for "did
+this big-bet feature work."** Falk's *Practical Recommender
+Systems* and AI Engineering both make this split explicit.
+
+## The "exploration looks like a bug to the PM" problem
+
+A real conversation that will happen to you:
+
+> PM: "User 12345 keeps seeing weird items recommended. Item
+> 47 has nothing to do with their history."
+>
+> You: "We're allocating ~5% of impressions to exploration. We
+> need to learn whether item 47 works for users like 12345."
+>
+> PM: "That looks broken. Can you turn it off?"
+
+The political problem with bandits is that exploration looks
+like a bug. A user sees a recommendation that doesn't fit their
+history; the PM thinks the system is malfunctioning. The
+explanation — "we are deliberately taking short-term suboptimal
+actions to learn long-term optimal ones" — is real but doesn't
+land in a Slack thread.
+
+What helps:
+
+- **Bound exploration tightly on high-stakes slots.** Top slot
+  on the home page is mostly exploit. Lower slots and "more
+  like this" rows can carry more exploration.
+- **Log exploration vs exploitation as a metric.** "Today we
+  spent 4.7% of impressions on exploration; expected lift from
+  this learning over 30 days is X." Makes the cost visible
+  and accountable.
+- **Cap the surprise factor.** Don't let exploration pull from
+  the whole catalog uniformly; restrict to a "candidate set"
+  the user might plausibly like. Pure random recs *do* feel
+  broken.
+- **Reserve a small holdout** that gets no exploration — pure
+  exploit — and report the gap. Lets you defend the
+  exploration spend with data.
+
+## The infrastructure you actually need
+
+Bandits look simple in pseudocode and require non-trivial
+infra in production.
+
+<Steps>
+<Step title="Impression logging">
+Every recommendation you serve must be logged with: arm picked,
+context features at decision time, exploration vs exploit flag,
+the bandit's predicted reward. Sample logging is not enough —
+biased toward exploit. You need every impression.
+</Step>
+<Step title="Reward attribution">
+Map user events (click, purchase, dwell) back to the
+impressions that caused them. Position bias, attribution
+windows, multi-touch — all the standard analytics traps.
+Without this you have no reward signal.
+</Step>
+<Step title="Policy refresh">
+The bandit's "what's the best arm" estimate has to update.
+Options: micro-batch (recompute every 5 min from a rolling
+window), online (per-event updates with a feature store), or
+nightly batch (cheap, slower learning). Pick by latency need.
+</Step>
+<Step title="Off-policy evaluation">
+Before deploying a new bandit policy, evaluate it on logged
+data from the old policy. Inverse propensity scoring (IPS) is
+the standard technique. Without OPE you're shipping policy
+changes blind.
+</Step>
+<Step title="Safe rollout">
+Same rules as ML model deploys — canary on a small slice,
+compare to the previous policy, automatic rollback on regression.
+See `ai/mlops-pipelines-and-feature-stores.mdx`.
+</Step>
+</Steps>
+
+If you can't do all five, you don't have a bandit system, you
+have a bandit-flavored heuristic. That's fine for prototypes;
+don't pretend otherwise.
+
+## Off-policy evaluation, briefly
+
+The trap: you trained a new policy that scores higher on
+offline metrics. Will it actually win in production? The
+naive comparison is unfair — the new policy wants to show
+different items, but you only have rewards for the items the
+*old* policy showed.
+
+The fix: **inverse propensity scoring**. Weight each logged
+reward by `1 / P(old policy would have shown this)`. The
+weighted reward is an unbiased estimate of the new policy's
+performance. Two practical caveats:
+
+- **Variance explodes** when the old policy almost never showed
+  what the new policy wants to show — small propensities, huge
+  weights, noisy estimate.
+- **You need to log propensities.** If your old policy didn't
+  record `P(arm | context)` at decision time, you can't compute
+  IPS retroactively. Log propensities from day one.
+
+Doubly-robust estimators (DR, SNIPS, switch-DR) trade some
+variance for some bias. In practice, IPS is the one you
+implement first; DR is the one you reach for when IPS variance
+is killing your signal.
+
+## The discipline
+
+- Bandits are MAB with explore/exploit. Contextual bandits are
+  MAB with features. Full RL needs state transitions and a
+  horizon — usually you don't have those.
+- Epsilon-greedy is fine. Thompson sampling is better. UCB is
+  a paper algorithm.
+- Use bandits for "which item / copy / slot," A/B for "did this
+  big feature work." Don't fight the tools.
+- Exploration looks like a bug. Make it visible, bound it,
+  defend it with numbers.
+- Log every impression with context, arm, propensity, exploit
+  flag. No logs, no learning, no OPE.
+- Off-policy evaluation with IPS before any policy change ships.
+- `ai/recommender-systems-in-prod.mdx` is where bandits live in
+  the larger recommender funnel — exploration slots and reranking.
+
+## What to learn next
+
+- `ai/recommender-systems-in-prod.mdx` — how bandits fit into
+  the four-stage pipeline and where they replace static
+  ranking.
+- `ai/data-and-model-drift.mdx` — bandits drift continuously
+  because the policy is part of the data-generating process;
+  monitor accordingly.
+- `ai/llm-eval-design.mdx` — eval design for online systems
+  where you can't replay history.

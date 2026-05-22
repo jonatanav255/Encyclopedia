@@ -1,0 +1,359 @@
+export const level = 'mid';
+
+# Caching LLM responses
+
+LLM calls are slow, expensive, and mostly cacheable. "Mostly"
+is doing a lot of work in that sentence — the catch is that
+there are **three different layers of caching** for LLMs, each
+with completely different mechanics, hit rates, and failure
+modes. Mixing them up is the most common reason a cost-cutting
+effort doesn't pan out.
+
+This page is the operational view. For the underlying token
+economics, see `ai/cost-modeling-and-budgets.mdx`; for what
+those tokens are, `ai/tokens-and-tokenizers.mdx`.
+
+## The three layers
+
+<Cheatsheet caption="Each layer caches a different thing, at a different layer of the stack">
+| Layer | Cache key | Where it lives | Typical hit rate | Failure mode |
+|---|---|---|---|---|
+| Exact-match | hash(prompt + model + params) | Your app / Redis | 5–15% in chat apps; 60%+ in agentic loops | None — it either hits or it doesn't |
+| Semantic | embedding(query) → ANN lookup | Your app + vector DB | 20–50% depending on threshold | False hits at low thresholds; bad answers ship |
+| Prompt (provider) | KV cache of token prefix | Provider's GPUs | 70–90% on stable prefixes | None for correctness; misses on prefix changes |
+</Cheatsheet>
+
+These compose. A request can hit exact-match cache (no LLM
+call), miss exact-match but hit semantic cache (no LLM call),
+miss semantic cache but hit prompt cache (LLM call at reduced
+rate), or miss everything (full-price LLM call). Most
+production systems with serious cost concerns run all three.
+
+## Layer 1: Exact-match cache
+
+The dumbest cache. Compute a hash of the full request and look
+it up.
+
+```ts
+const key = sha256(JSON.stringify({
+  model: 'claude-sonnet-4-5',
+  messages,
+  temperature: 0,
+  tools,
+  // include every parameter that affects output
+}));
+
+const cached = await redis.get(`llm:${key}`);
+if (cached) return JSON.parse(cached);
+
+const response = await llm.complete({ model, messages, ... });
+await redis.set(`llm:${key}`, JSON.stringify(response), 'EX', 86400);
+return response;
+```
+
+Three things to get right:
+
+- **Include every parameter that affects output in the key.**
+  Model name, temperature, top_p, tool definitions, system
+  prompt — all of them. Forget one and you serve stale
+  responses across model upgrades.
+- **Temperature &gt; 0 makes this nearly useless.** Non-zero
+  temperature means the same input produces different output.
+  You can cache anyway and accept that you're serving a
+  specific roll of the dice; just be honest that it's not
+  "the model's response" anymore, it's "a response."
+- **TTL matters.** A 5-minute TTL catches request bursts (refresh
+  loops, user double-clicks). A 24-hour TTL catches repeat
+  visits. Longer TTLs accumulate staleness as your prompts /
+  system messages drift.
+
+### Where exact-match cache wins big
+
+The honest hit-rate numbers from systems I've seen:
+
+- **User-facing chat assistants**: 5–15%. Most queries are
+  unique. The hits are mostly system / boilerplate routes —
+  "what can you do?", "hello," default-suggested prompts.
+- **Agentic loops** (`ai/agent-loops-and-tool-use.mdx`): 40–70%.
+  Agents repeatedly call the same tool with the same arguments
+  while debugging or looping. Same args, same model, same
+  result. Cache it.
+- **Internal tooling / classification jobs**: 60–95%. Batch
+  jobs over a deduped input set are nearly all cache hits on
+  retry.
+- **RAG with a small FAQ-ish corpus**: 20–40% on repeated
+  questions.
+
+If your hit rate is under 5%, exact-match cache is operationally
+not worth it. You're paying for Redis without saving money.
+Move on to the other two layers.
+
+## Layer 2: Semantic cache
+
+The idea: embed the query, look up similar past queries in a
+vector index, and if cosine similarity is above some threshold
+return the past answer.
+
+```ts
+const qvec = await embed(query);
+const hits = await vectorIndex.search(qvec, { topK: 1 });
+if (hits.length && hits[0].score > 0.95) {
+  return hits[0].metadata.response; // cached answer
+}
+
+const response = await llm.complete({ messages });
+await vectorIndex.upsert([{
+  id: uuid(),
+  vector: qvec,
+  metadata: { query, response },
+}]);
+return response;
+```
+
+Looks great on a demo. Catches `"What's our refund policy?"`
+matching `"How do I get a refund?"` and skips the LLM call.
+Hit rate doubles. PM is happy.
+
+### The threshold trap
+
+Here's how this fails in prod. You ship at threshold 0.95. The
+"hit rate doubled" claim shows up in the dashboard. A week
+later, someone notices customer support is sending wrong
+answers.
+
+The failure cases at threshold 0.95:
+
+- **Negation flips.** "Can I get a refund?" → cosine 0.96 with
+  "Can't I get a refund?" — semantically same vector, opposite
+  answer. CLIP / text embedders don't reliably encode negation.
+- **Entity swaps.** "What's the price of the Pro plan?" →
+  cosine 0.97 with "What's the price of the Enterprise plan?".
+  Answer was about Pro; you served it for Enterprise.
+- **Number swaps.** "Charge $500" vs "Charge $5,000". Same
+  shape, totally different action.
+- **Context-dependent answers.** "Is my order ready?" — the
+  cached answer was about a *different user's* order, but the
+  embedding is identical.
+
+The fundamental problem: **embedding similarity is not answer
+equivalence.** Two queries can be 0.97 similar and have
+opposite correct answers. The threshold knob doesn't really
+fix this — it just trades false-hit rate for true-hit rate.
+
+### When semantic cache actually works
+
+Despite all that, semantic cache earns its keep for narrow
+cases:
+
+- **High-volume FAQ-like flows.** Customer support entry
+  point, where the top 50 questions cover 80% of traffic and
+  the answers are version-controlled, not personalized.
+- **Read-only knowledge queries.** "What does PostgreSQL's
+  REPEATABLE READ isolation level do?" — facts that don't
+  depend on the user.
+- **Pre-LLM classification stages.** "Is this query about
+  billing, technical, or product?" — coarse semantic buckets
+  that cache trivially.
+
+Where to avoid it:
+
+- Anything personalized (user-specific data, account state).
+- Anything with negation, numbers, or proper-noun entity
+  swaps as load-bearing.
+- Anything where a wrong answer has cost (medical, legal,
+  financial).
+- Anything where the LLM is doing reasoning, not retrieval —
+  the embedder of the question doesn't capture how hard the
+  reasoning was.
+
+Practical knobs that help:
+
+- **Higher threshold + canary.** Set the threshold high (0.98)
+  and route a small % of "cache hits" through the LLM anyway,
+  comparing answers. If the disagreement rate exceeds X%, the
+  threshold is too low.
+- **Per-route thresholds.** Different parts of the product
+  tolerate different false-hit rates.
+- **TTL on cached answers.** Even when the question is the
+  same, the world's answer changes (prices, policies, product
+  state). Default TTL of an hour is sane; 24h is risky.
+
+## Layer 3: Prompt cache (provider-level)
+
+The 2024 cost lever that changed the economics. Providers now
+let you mark a prefix of your prompt as cacheable, and reuse
+the KV cache for the prefix on subsequent calls within a TTL.
+You pay reduced rates on cache hits.
+
+The mechanics differ by provider but the shape is the same:
+
+- **Anthropic** — Explicit cache_control on message blocks.
+  Default TTL 5 minutes (extendable to 1 hour with a different
+  rate). Cache hits cost ~10% of the standard input rate;
+  cache writes cost ~125% (one-time premium to populate).
+- **OpenAI** — Automatic prefix cache for prompts &gt;1024
+  tokens. No knob to control it. Cache hits at ~50% of input
+  rate. Cache lifetime 5–10 minutes idle.
+- **Gemini** — Explicit context caching API. Pay storage per
+  GB-hour; cached tokens at reduced rate.
+
+### What to cache
+
+The math: cache pays off when the prefix is **large** and
+**reused often within the TTL**. The right things to cache:
+
+- **System prompt.** Stable across all users. Cache it.
+- **Tool / function definitions.** Tens of tools, hundreds to
+  thousands of tokens, identical across every agent call.
+  Cache it.
+- **Long static instructions / examples / few-shot blocks.**
+  Multi-thousand-token "here are 20 examples of correctly
+  formatted output." Cache it.
+- **Retrieved RAG context that you'll ask multiple questions
+  about.** Same document loaded, three follow-up questions —
+  cache the document chunk.
+- **Conversation history up to the latest user turn.** For
+  multi-turn chat — cache the running history, only the new
+  user message is uncached.
+
+### Restructure the prompt
+
+The single highest-ROI move for any cost-sensitive LLM app:
+**put the long, static parts at the front and the dynamic
+parts at the back.** Prompt cache is prefix-based — it caches
+the leftmost matching tokens, not arbitrary tokens.
+
+Bad ordering — uncacheable:
+
+```
+[user_query] [system_prompt] [tools] [retrieved_docs]
+```
+
+The leftmost token is the user query, which changes every
+call. Nothing caches.
+
+Good ordering — fully cacheable prefix:
+
+```
+[system_prompt] [tools] [retrieved_docs] [user_query]
+```
+
+Now the system prompt, tools, and even retrieved docs (if
+stable across calls) cache. Only the user query is uncached.
+
+This refactor is **the** lever. A team I worked with cut their
+monthly LLM bill 60% by reordering — the system prompt was
+2,500 tokens, tools were 1,500 tokens, retrieved docs were
+3,000 tokens. 7,000 tokens × 1M calls/month at full input rate
+was $20k. At cache rate it was $2k. Code change: one diff in
+the message-builder.
+
+### What it can't cache
+
+- **Anything before the cached prefix.** Order matters; once
+  you put a dynamic token in, everything to its right is
+  uncached even if it's static.
+- **Slightly-different prefixes don't share cache.** A typo in
+  the system prompt invalidates the cache for every call until
+  the cache rebuilds.
+- **Cross-user prefixes only cache if all users see the same
+  prefix.** Per-user personalization in the system prompt
+  kills cross-user cache sharing — though it still caches
+  within a single user's session.
+
+<Callout type="info">
+The mental model: prompt cache rewards prompt discipline. If
+your team treats the system prompt as a stable contract that
+changes weekly with explicit reviews, you'll get most of the
+discount. If three PMs edit the system prompt daily, you'll
+churn the cache and pay full rate.
+</Callout>
+
+## Composing all three
+
+The full stack of a request in a cost-tuned LLM app:
+
+<Steps>
+<Step title="Exact-match cache check">
+Hash the request. If hit, return cached response. No LLM call,
+no embedding call.
+</Step>
+<Step title="Semantic cache check (optional)">
+Embed the query. ANN-lookup. If similarity &gt; threshold,
+return cached response. One embedding call, no LLM call.
+</Step>
+<Step title="Build the prompt with caching in mind">
+System prompt → tool definitions → stable context → dynamic
+context → user query. Mark cacheable spans (Anthropic) or rely
+on automatic prefix caching (OpenAI).
+</Step>
+<Step title="Call the LLM">
+Prompt cache hits at the provider give you a 50–90% discount
+on the prefix tokens. You only pay full rate on the dynamic
+tail.
+</Step>
+<Step title="Write back to caches">
+Store the response in exact-match cache (always) and semantic
+cache (if enabled).
+</Step>
+</Steps>
+
+A representative cost trajectory for a chat-assistant team:
+
+- No caching: $X (baseline).
+- Exact-match cache only: 0.92X (saves a few percent).
+- Prompt cache + reordered prompt: 0.4X (the big one).
+- Plus semantic cache on FAQ routes: 0.35X (a bit more,
+  carefully).
+
+The order of operations matters. **Do prompt cache first.**
+It's the largest lever, has no correctness risk, and only
+costs you a prompt-builder refactor.
+
+## When caching makes things worse
+
+The honest list of "don't cache" cases:
+
+- **Non-determinism is load-bearing.** Creative writing, brainstorming,
+  variations. Caching collapses to a single output.
+- **Personalized output that doesn't encode user in the prompt
+  hash.** You'll serve user A's response to user B. Either include
+  user ID in the key or skip caching.
+- **Tool-use side effects.** Caching a "send_email" tool call
+  response from a previous request means the email got sent
+  once; the cached response makes it look like it was sent
+  twice or zero times.
+- **A/B testing.** If you're trying to measure two prompts,
+  caching the old prompt's responses contaminates the new
+  prompt's traffic.
+- **Compliance / audit requirements.** Some regulated contexts
+  require every response to be a live model call with full
+  audit trail. Cache silently violates that.
+
+## The discipline
+
+- Three layers, three mechanisms. Don't confuse exact-match
+  with semantic with prompt cache.
+- **Prompt cache is the largest cost lever.** Reorder your
+  prompt — static prefix, dynamic tail — before doing anything
+  else.
+- Exact-match cache is cheap and worth it for agentic loops
+  and tooling, often not for user-facing chat.
+- Semantic cache is a sharp tool. Tune threshold against a
+  labeled set, canary the hits, never enable it for
+  personalized or numeric / negation-sensitive routes.
+- Caching writes can be skipped for non-deterministic outputs
+  or side-effect-bearing requests.
+- Include every output-affecting parameter in the cache key.
+  Mismatched cache keys serve wrong answers silently.
+
+## What to learn next
+
+- `ai/cost-modeling-and-budgets.mdx` — how to budget for an
+  LLM feature; caching is one of the levers.
+- `ai/tokens-and-tokenizers.mdx` — what's actually getting
+  cached, and why prompt length matters.
+- `ai/prompt-patterns.mdx` — prompt structuring for both
+  quality and cache-friendliness.
+- `ai/agent-loops-and-tool-use.mdx` — where exact-match cache
+  has its highest hit rate.

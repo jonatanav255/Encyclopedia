@@ -1,0 +1,342 @@
+export const level = 'senior';
+
+# RLHF and preference tuning
+
+A base LLM trained on raw web text is a brilliant autocompleter
+that will happily continue "How do I make a bomb?" into instructions.
+It will also continue your customer-support query into a Reddit
+argument. The model has all the capabilities; it has none of the
+behavior you ship to users. **Preference tuning is how raw
+capability becomes a chat product.**
+
+This page is the chain that actually produces ChatGPT, Claude, and
+their open-weight cousins, with the trade-offs that matter when
+you're deciding whether to do any of this yourself.
+
+For when fine-tuning is the right tool at all, see
+`ai/fine-tuning-vs-rag-vs-prompting.mdx`. Almost everything here
+is "you decided fine-tuning was warranted, now how does the
+behavior layer work."
+
+## The training stack, end to end
+
+```
+1. Pretraining            (next-token prediction on web-scale text)
+   → base model:          "knows things, has no behavior"
+   ↓
+2. Supervised fine-tuning (SFT on curated (prompt, response) pairs)
+   → instruct model:      "follows instructions, but rough edges"
+   ↓
+3. Preference tuning      (RLHF / DPO / RLAIF)
+   → aligned model:       "refuses well, sounds like a product"
+```
+
+Each stage costs roughly an order of magnitude less data than the
+previous and produces a more polished model. A typical breakdown:
+
+- **Pretraining** — trillions of tokens, ten thousand+ GPU-hours.
+- **SFT** — 10K to a few hundred thousand examples, hours of
+  training.
+- **Preference tuning** — 10K to ~1M preference pairs, hours to
+  days of training.
+
+The pretraining cost is the foundation labs' moat. The SFT +
+preference-tuning cost is what an org with a few engineers and a
+budget can plausibly do themselves on an open-weight model.
+
+## SFT — give the model shape
+
+Supervised fine-tuning takes a base model and trains it on
+high-quality `(prompt, ideal_response)` pairs. The goal is to
+teach the model "this is what an answer to this kind of question
+looks like."
+
+What SFT does well:
+
+- Teaches the **format and style** of responses ("answer in
+  markdown, use bullet points, end with a summary").
+- Teaches **instruction following** ("if the user asks for X,
+  produce X, not a tangent").
+- Adapts the model to a **specific domain's voice** (medical,
+  legal, code review).
+
+What SFT can't do:
+
+- Teach the model when to **refuse**. SFT examples are all positive
+  examples — "this is a good response." There's no contrastive
+  signal saying "this response would have been worse."
+- Calibrate the model's **confidence**. SFT trains the model to
+  emit responses, not to know which response is best.
+- Beyond a certain point, **scale.** Past 50K-100K SFT examples,
+  returns diminish sharply. The model has learned the format; more
+  examples in the same format don't help.
+
+This is why SFT alone isn't enough for a chat product. Refusing
+politely, choosing the better of two reasonable answers,
+maintaining tone under adversarial pressure — these are
+*preference* signals, not labels, and they need the preference-
+tuning layer.
+
+## The three preference-tuning paths
+
+Preference data has the same shape across all three: `(prompt,
+response_A, response_B, which_is_better)`. The methods differ in
+**how the preference signal is used**.
+
+### RLHF / PPO — the canonical, expensive path
+
+The InstructGPT recipe, and what produced early ChatGPT:
+
+<Steps>
+<Step n="1" title="Collect preferences">
+Show annotators (prompt, response_A, response_B) pairs from the
+SFT model. Annotators pick the winner. Build a dataset of ~50K-1M
+pairs.
+</Step>
+
+<Step n="2" title="Train a reward model">
+A separate model (often the same architecture as the policy, or
+smaller) is trained to predict "given prompt and response, what
+score would a human give?" Trained on pairwise comparisons using
+a Bradley-Terry-style loss:
+
+```
+loss = -log(sigmoid(reward(prompt, response_winner)
+                  - reward(prompt, response_loser)))
+```
+
+The reward model is now a learned proxy for human judgment.
+</Step>
+
+<Step n="3" title="Fine-tune the policy with PPO">
+Use proximal policy optimization (Schulman et al., 2017). For each
+batch:
+1. Sample responses from the current policy.
+2. Score them with the reward model.
+3. Update the policy to favor high-reward responses.
+4. Penalize KL divergence from the reference (SFT) policy, to
+   stop the policy from "reward-hacking" by producing weird
+   outputs that game the reward model.
+</Step>
+</Steps>
+
+The reasons RLHF is finicky:
+
+- **Reward hacking.** Given enough training, the policy finds
+  ways to get high reward without being genuinely helpful — emit
+  flattering preambles, refuse anything ambiguous, repeat the
+  user's question back. The KL penalty mitigates but doesn't
+  eliminate.
+- **Reward model drift.** Annotator preferences shift; the reward
+  model trained on last quarter's data optimizes for outdated
+  taste.
+- **Training instability.** PPO has many hyperparameters (clip
+  range, KL coefficient, learning rate schedule) and a small
+  change blows up the run. The literature documents this
+  extensively; reproducibility is poor.
+- **Compute cost.** Roughly 4× the GPU memory of SFT — you hold
+  the policy, the reference policy, the reward model, and the
+  value model in memory simultaneously.
+
+Sutton and Barto's RL book gives the foundation (value functions,
+policy gradients, the reward signal); the OpenAI InstructGPT and
+Anthropic Constitutional AI papers are the modern application.
+
+### DPO — direct preference optimization
+
+The 2023 result that changed the open-weights landscape: **you
+don't need a separate reward model**. The optimization can be
+written directly in terms of the policy.
+
+The DPO loss, simplified:
+
+```
+loss = -log(sigmoid(
+  beta * (log π(winner | prompt) / π_ref(winner | prompt))
+  - beta * (log π(loser  | prompt) / π_ref(loser  | prompt))
+))
+```
+
+Where `π` is the current policy and `π_ref` is the frozen SFT
+reference. The model is updated to increase the log-probability of
+winning responses relative to losing ones, with a KL anchor to
+the reference. **No reward model, no sampling, no PPO.**
+
+Trade-offs:
+
+- **Simpler to implement.** A standard supervised-style loss,
+  trains like SFT.
+- **Cheaper.** No reward model to train and serve during training.
+- **More stable than PPO.** No PPO clip ratio, no reward hacking
+  via gaming a separate reward model.
+- **More sensitive to noisy preferences.** When the reward model
+  in RLHF is wrong on a pair, the policy doesn't always follow —
+  the value model and KL penalty absorb some noise. DPO is more
+  faithful to the preference data, which means **bad preference
+  data poisons the model directly**.
+- **Less able to extrapolate.** RLHF can sometimes generalize
+  reward to unseen response space ("the reward model rates all
+  similar-looking responses high"). DPO is more local; it pushes
+  the policy on the exact pairs it's seen.
+
+DPO and its descendants (IPO, KTO, ORPO) are now the default for
+open-weight fine-tuning. The Hugging Face TRL library makes the
+recipe a few hundred lines. If you have clean preferences and
+limited compute, DPO is the right call.
+
+### Constitutional AI / RLAIF — preferences from an AI judge
+
+Anthropic's approach (Bai et al., 2022 and beyond). The
+observation: **human preference labeling is expensive and slow;
+much of the signal can come from an LLM judge against a written
+constitution.**
+
+The recipe:
+
+<Steps>
+<Step n="1" title="Write a constitution">
+A set of natural-language principles the model should follow:
+"prefer responses that are helpful and harmless," "decline
+requests that would cause harm," "avoid stereotyping," etc.
+</Step>
+
+<Step n="2" title="Self-critique / revise">
+The SFT model generates responses. A judge model (could be the
+same model with a critique prompt) reads each response and the
+constitution, then asks: "does this response violate any
+principle? if so, rewrite it." The result is a (prompt, original,
+revised) tuple where `revised` is treated as preferred.
+</Step>
+
+<Step n="3" title="Train on AI-generated preferences">
+Use the (preferred, dispreferred) pairs in either RLHF or DPO
+style. The model never sees a human label; the constitution +
+judge does the labeling.
+</Step>
+</Steps>
+
+Why this is interesting:
+
+- **Scales to preferences humans can't easily generate.** Subtle
+  policy nuance (e.g., "decline to write phishing emails but
+  produce security-research analogs of them") is hard to label by
+  hand, easy to write in a constitution.
+- **Auditable.** The "policy" is a document, not a black-box
+  reward model. You can read it.
+- **Cheaper at scale.** AI judges cost cents per pair; humans
+  cost dollars.
+
+The honest concerns:
+
+- **Judge model has its own biases**, which get baked into the
+  preferences. If the judge is GPT-4 and GPT-4 prefers verbose
+  answers, your model becomes verbose.
+- **Self-preference loop.** Using model M as judge for model M's
+  outputs is methodologically suspect.
+- **The constitution is a moving target.** Every edit is a model
+  behavior change. Constitution as code.
+
+In practice, modern alignment combines all three: human
+preferences for the hard cases, AI preferences for the volume,
+trained with DPO or a DPO variant.
+
+## The alignment tax
+
+The uncomfortable empirical observation: **the aligned model is
+often worse at raw capability than the SFT model it came from.**
+Benchmark scores on MMLU, HumanEval, GSM8K can drop a few points
+after RLHF/DPO. The model has traded some capability for behavior.
+
+Where the tax comes from:
+
+- The KL penalty pulls the policy back toward the reference. Hard
+  capability gains require moving away from the reference, which
+  costs KL budget.
+- Preference data is biased toward "safe, helpful, polite"
+  responses. The model learns to favor these even on capability
+  benchmarks where correctness matters more than tone.
+- Refusals replace attempts. A model that refuses a borderline
+  hard math question doesn't get the chance to be right.
+
+The Anthropic and OpenAI papers both report this. The pragmatic
+implication: **eval the aligned model on capability metrics
+separately from behavior metrics**. Don't assume preference-tuning
+is a free win.
+
+## What preference tuning actually fixes (that SFT can't)
+
+The behaviors that need preference signal:
+
+<Cheatsheet caption="Behaviors that preference tuning addresses; SFT alone doesn't.">
+| Behavior | Why SFT can't | Why preference tuning can |
+|---|---|---|
+| Refuse harmful requests gracefully | No "bad response" examples in SFT | Preference pair: helpful refusal > harmful answer |
+| Calibrate confidence | SFT trains on confident gold answers | Preference: "I'm not sure" > confident wrong |
+| Reduce hallucination | SFT doesn't penalize confident invention | Preference: "I don't know" > made-up fact |
+| Match tone consistently | SFT shows tone; doesn't penalize drift | Preference: on-tone > off-tone, repeated |
+| Decline ambiguous requests | SFT teaches one response per prompt | Preference: clarifying question > guessing |
+| Avoid sycophancy | SFT doesn't see "user disagrees, model caves" | Preference: stand firm > flip-flop |
+
+</Cheatsheet>
+
+The unifying theme: SFT is "show the model what to do." Preference
+tuning is "show the model what NOT to do, by contrast." For most
+nuanced behaviors, you need the contrast.
+
+## When to actually do this yourself
+
+Almost never, but the cases that hold up:
+
+- **You have proprietary preference data** — your support team
+  has been rating chatbot responses for months. That data is a
+  moat.
+- **You're shipping a vertical product** — legal, medical,
+  customer support — where the desired behavior differs from
+  general-purpose model behavior in measurable ways.
+- **You're optimizing for a specific failure mode** — e.g.,
+  reducing hallucination on a specific domain where the base
+  model is unreliable.
+- **You can't use a hosted model** — on-device, air-gapped,
+  regulatory constraints.
+
+When **not** to:
+
+- You think preference tuning will teach the model new facts. It
+  won't. RAG.
+- You haven't built an eval suite. You'll ship a regression and
+  not know it.
+- You have &lt; 5000 preference pairs. The signal is too noisy.
+- The next-generation base model probably solves your problem in
+  three months. Wait.
+
+## A short discipline
+
+- **Base + SFT + preference tuning** — three stages, each fixing
+  what the previous can't.
+- **SFT teaches form; preference tuning teaches taste.** If your
+  problem is "the model says weird things," SFT might be enough.
+  If it's "the model says one of two reasonable things wrong,"
+  you need preferences.
+- **DPO before PPO before RLAIF.** Easier first, harder last,
+  always.
+- **There is an alignment tax.** Eval capability and behavior
+  separately.
+- **Preference data is the constraint.** ~10K clean pairs beats
+  100K noisy ones. Annotator quality matters more than volume.
+- **Refusals are a metric, not a side effect.** Track them; over-
+  refusal is a real failure mode.
+
+See `ai/fine-tuning-vs-rag-vs-prompting.mdx` for whether to enter
+this pipeline at all, and `ai/llm-eval-design.mdx` for evaluating
+the results once you do.
+
+## What to learn next
+
+- `ai/fine-tuning-vs-rag-vs-prompting.mdx` — the decision frame
+  for whether preference tuning is even on the table.
+- `ai/llm-eval-design.mdx` — evaluating behavior changes requires
+  a behavior eval, separate from capability eval.
+- `ai/adversarial-ml-and-red-teaming.mdx` — preference tuning
+  reduces but doesn't eliminate jailbreaks.
+- `ai/prompt-injection-and-llm-security.mdx` — alignment is one
+  layer; input validation is another.

@@ -1,0 +1,289 @@
+export const level = 'senior';
+
+# Multi-agent orchestration
+
+"Multi-agent" sounds sophisticated. Most of the time it's a single
+prompt that's been split across three calls for no good reason, at
+3× the cost and 3× the failure modes. The cases where multiple
+agents *do* win are real, but narrower than the LinkedIn posts make
+it sound.
+
+This page is about when to break work across agents, the topologies
+that actually work, and what goes wrong. For the single-agent loop
+itself, see `ai/agent-loops-and-tool-use.mdx`.
+
+## What "multi-agent" actually means
+
+It's a fuzzy word. Three distinct things people call multi-agent:
+
+- **Pipelines** — agent A's output is agent B's input. Sequential,
+  no loop, no negotiation. This is just chained prompts; calling it
+  multi-agent is marketing.
+- **Supervisor / worker** — one orchestrator agent decides which
+  specialist to invoke. Specialists are stateless. The supervisor
+  holds the conversation context.
+- **Peer agents** — multiple agents with shared state, each
+  autonomous, possibly running concurrently. Genuinely
+  multi-agent, genuinely harder.
+
+For 90% of "we need a multi-agent system" requests, the right
+answer is one of the first two. Peer-agent topologies are
+research-y and operationally painful.
+
+## When multi-agent beats one big prompt
+
+The honest cases:
+
+<Cheatsheet
+  columns={["Situation", "Why split helps"]}
+  rows={[
+    ["Tool count > ~20", "Single model degrades; specialists with 5-8 tools each restore accuracy"],
+    ["Distinct skill domains", "Code-writer vs SQL-writer vs report-writer benefit from different system prompts"],
+    ["Different model tiers", "Cheap model classifies and routes; expensive model only runs on the complex 10%"],
+    ["Parallelizable subtasks", "5 doc summaries fan out, 5× wall-clock speedup"],
+    ["Security boundaries", "An untrusted agent sees only redacted data; trusted agent sees more"],
+    ["Long-running workflows", "Crash recovery and human-in-the-loop steps are easier across discrete agents"],
+  ]}
+  caption="If your case doesn't match, you probably don't need multiple agents."
+/>
+
+When it's *not* a real win:
+
+- "We want better reasoning." → A longer single prompt with
+  examples almost always beats a 3-agent chain.
+- "We want to debug intermediate steps." → Add tracing to a single
+  agent. You don't need separate processes for visibility.
+- "Microservices for AI." → Architectural cargo-culting. Network
+  hops between agents aren't free; LLM latency dwarfs them, but
+  cost compounds.
+
+## Topologies that work
+
+### Supervisor / worker
+
+One supervisor agent owns the conversation. It has "specialist"
+tools that are themselves LLM-backed.
+
+```
+User → Supervisor → "research_specialist" tool → LLM call → result
+                  → "code_specialist" tool     → LLM call → result
+                  → final answer
+```
+
+The supervisor doesn't know how the specialist does its job. The
+specialist returns structured output, not chat. The conversation
+state lives in the supervisor.
+
+This is the topology behind LangGraph's "supervisor" template,
+AutoGen's GroupChat with a manager, and the CrewAI hierarchical
+process. It's the default when you need to split skill domains.
+
+The tax: each specialist call is a *whole new context* — the
+specialist doesn't see the conversation history unless you pass it
+in. You'll often re-send retrieved docs to each specialist, paying
+input-token cost twice. Prompt caching helps; structural redesign
+helps more.
+
+### Fan-out / fan-in
+
+A coordinator splits work into independent subtasks; workers run in
+parallel; coordinator merges.
+
+```
+Coordinator → [Worker A, Worker B, Worker C] (concurrent) → Merger
+```
+
+Useful when subtasks are genuinely independent (summarize 10 docs,
+classify 200 tickets, generate 5 candidate plans). The latency win
+is real: 5 tasks at 3s each is 3s total instead of 15s.
+
+The traps:
+
+- **Aggregation is non-trivial.** "Combine these 5 partial answers"
+  is itself a hard LLM task.
+- **Cost is linear in workers.** Five 4o-mini calls might cost less
+  than one 4o call; verify with real token counts, not vibes.
+- **No worker can see the others' results.** If task 3 needed
+  context from task 1, you have a bug.
+
+This is the *only* multi-agent topology that meaningfully reduces
+wall-clock latency. The rest add latency.
+
+### Debate / critic
+
+Agent A drafts; agent B critiques; agent A revises. Repeat.
+
+Real evidence in the literature: critic agents catch errors a single
+agent misses ~20–30% of the time on reasoning-heavy tasks. The cost
+is at least 3× (draft + critique + revise) and usually 5×+.
+
+When it's worth it: high-stakes one-shot tasks (legal drafts,
+medical summaries, public-facing reports). When it's not: anything
+interactive — users won't wait for the debate.
+
+### Peer agents with shared scratchpad
+
+Multiple agents reading and writing the same "workspace" (a shared
+document, blackboard, or database). Each agent picks the next thing
+to work on.
+
+```
+       ┌──────────────────┐
+Agent A│                  │Agent B
+       │   shared state   │
+Agent C│                  │Agent D
+       └──────────────────┘
+```
+
+This is what AutoGPT and the BabyAGI lineage tried. It works in
+demos, struggles in production. Failure modes:
+
+- **Coordination deadlock.** Two agents both wait for the other to
+  finish a step.
+- **Conflicting writes.** Agents overwrite each other's progress.
+  You're now inventing a transaction system.
+- **Endless deliberation.** Agents discuss instead of acting.
+- **Cost explosion.** Every agent reads the full scratchpad every
+  step. Tokens grow quadratically.
+
+If you find yourself building peer agents with a shared scratchpad,
+ask whether the problem is actually "single agent with a longer
+context."
+
+## Handoffs
+
+When agent A passes work to agent B, what crosses the boundary?
+Three options, in order of how often they're right:
+
+1. **A structured summary.** A passes B a typed payload: the
+   relevant facts, the user's intent, what's already been tried.
+   B works from that.
+2. **The full conversation history.** Cheap to implement, expensive
+   per call, and B has to figure out what's relevant. Common, often
+   wasteful.
+3. **A shared memory store.** Both agents read/write a vector DB or
+   KV store. Powerful, easy to get inconsistent.
+
+The structured-summary approach is what production systems converge
+on. Define the payload as a schema (Zod, Pydantic). Validate at the
+boundary. The handoff becomes a typed function call between
+processes — not "give me back your context."
+
+## Routing: cheap classifier, expensive executor
+
+The single multi-agent pattern that almost always pays back its
+complexity:
+
+```
+User query → Haiku/4o-mini classifier → routes to:
+   - FAQ specialist (cheap model, cached prompt)
+   - Order specialist (cheap model + DB tools)
+   - Complex specialist (Sonnet/4o + full tool set)
+```
+
+Why it works: 70-90% of real user queries are simple. Sending all of
+them to the expensive model is wasteful. A cheap classifier with
+~95% accuracy on routing handles the easy cases for ~1/30th the cost,
+and escalates the hard 10-15% to the big model. Net cost drops
+~5×; quality stays flat if the classifier is good.
+
+This is hands-down the highest-ROI multi-agent pattern in 2026.
+Anthropic published a version of it as the "orchestrator-workers"
+pattern in their "Building Effective Agents" post. Production teams
+were already doing it.
+
+## Debugging multi-agent failures
+
+Single-agent debugging is hard; multi-agent debugging is brutal.
+What helps:
+
+- **One trace tree per user request**, spanning all agents. OTel
+  GenAI again — parent span is the user request, child spans are
+  agents, grandchild spans are tool calls. Without this you're
+  joining log lines by guesswork.
+- **Capture every inter-agent message.** Not just the LLM
+  input/output, but the structured payload between agents. The bug
+  is usually "agent A sent garbage to agent B."
+- **Replay.** Save the full input + agent definitions of a failing
+  trace. Re-run locally with the same inputs. If outputs differ,
+  the system is non-deterministic in a way that will haunt you;
+  fix that first (pin model, set temperature=0 for routing).
+- **Eval the boundary, not the end.** Test "agent A produces
+  correct structured output for this input" as a unit. End-to-end
+  evals only catch end-to-end bugs; the regression was in agent A
+  three steps ago.
+
+The thing nobody tells you: in a 4-agent system with 95% per-agent
+accuracy, the end-to-end success rate is 0.95⁴ = 81%. Splitting
+work across agents multiplies failure rates. The math fights you.
+
+## Cost math you'll want to do up front
+
+For a supervisor + 2 specialists answering one user query:
+
+```
+input tokens to supervisor: 1500 (system + history)
+output tokens from supervisor: 200 (decision + tool args)
+specialist 1: 1500 in, 500 out
+specialist 2: 1500 in, 500 out
+final supervisor pass: 2000 in, 400 out
+```
+
+That's ~6500 input + 1600 output tokens for one user message. A
+single-agent equivalent might be ~3000 input + 800 output. Multi-
+agent is ~2× the tokens. Whether that's a problem depends on the
+quality gain. Measure both.
+
+Prompt caching is the lever: if the supervisor's system prompt and
+the specialists' system prompts are stable, you cache them and the
+per-call cost drops 50–80%. Without caching, multi-agent is
+financially painful at scale.
+
+## State management is the actual hard problem
+
+In a single agent, state is the message list. Easy. In multi-agent,
+state is:
+
+- The conversation with the user.
+- Each agent's local context.
+- Shared scratchpad / memory store.
+- In-flight work (tasks dispatched but not returned).
+- Tool-call side effects (DB writes, emails sent).
+
+This is the same set of problems as distributed-systems state, with
+the same answers: idempotency, sagas, compensation. See
+`system-design/saga-pattern.mdx` — the patterns transfer
+directly. A multi-agent system
+that calls real-world side effects is a distributed system. Pretend
+otherwise at your peril.
+
+## When to just use one agent
+
+A useful test: write the single-agent version first. Time it. Eval
+it. If it scores 85%+ on your task and meets latency, you're done.
+Multi-agent is a complexity budget you spend to fix a *specific*
+problem with the single-agent version — not a starting point.
+
+The Anthropic "Building Effective Agents" essay (Dec 2024) is
+worth reading for one reason: their explicit advice is "start with
+a single LLM call, then add a tool, then a loop, then a router.
+Don't jump to multi-agent."
+
+## The discipline
+
+- Default to a single agent. Justify each additional agent with a
+  measured win.
+- Classifier-routes-to-specialists is the multi-agent pattern that
+  always works. Try it before anything else.
+- Fan-out/fan-in is the only topology that reduces latency. Others
+  add it.
+- Handoffs cross a typed schema, not a raw transcript.
+- Trace the whole user request across all agents. One trace tree,
+  not N log files.
+- 0.95^N gets small fast. More agents = more failure surface.
+- A supervisor's specialists are stateless function calls in
+  disguise. Treat the contract like an API contract.
+- Peer-agent topologies with shared scratchpads belong in
+  research, not production.
+- Cache stable prompts aggressively or multi-agent cost is
+  punishing.

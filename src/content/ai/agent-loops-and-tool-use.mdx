@@ -1,0 +1,307 @@
+export const level = 'senior';
+
+# Agent loops and tool use
+
+An "agent" is a loop. The model picks a tool, you execute it, you
+feed the result back, the model picks another tool, repeat until
+done or stop. That's it. The complexity isn't in the concept; it's
+in deciding when to stop, what to do when the model calls the wrong
+tool with wrong arguments, and how to debug a run that produced
+twelve tool calls and a confidently wrong answer.
+
+This page is the inside view of a single-agent loop. For when to
+break work across multiple agents, see
+`ai/multi-agent-orchestration.mdx`.
+
+## The loop, in 20 lines
+
+Stripped of provider-specific noise, every agent looks like this:
+
+```ts
+async function runAgent(task: string, tools: Tool[]) {
+  const messages = [{ role: 'user', content: task }];
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const resp = await llm.complete({ messages, tools });
+    messages.push(resp.message);
+    if (!resp.tool_calls?.length) return resp.message.content; // done
+    for (const call of resp.tool_calls) {
+      const result = await dispatch(call, tools);
+      messages.push({ role: 'tool', tool_call_id: call.id, content: result });
+    }
+  }
+  throw new AgentTimeoutError('step cap exceeded');
+}
+```
+
+Three things that are easy to miss:
+
+1. The model decides termination. *You* decide the cap. Don't
+   collapse those into one variable.
+2. Tool results go back as messages. The context grows every step.
+   Step 20 sees 20 tool calls of history. Token cost is quadratic
+   in steps if you're not careful.
+3. The loop *is* the agent. There's no magic state machine. The
+   model's job is to pick the next action; your code's job is to
+   execute it and not lose the thread.
+
+## ReAct vs plan-and-execute vs raw tool calls
+
+Three patterns you'll see in the literature, in rough chronological
+order:
+
+<Cheatsheet
+  columns={["Pattern", "Shape", "When it fits"]}
+  rows={[
+    ["ReAct (Yao et al. 2022)", "Thought → Action → Observation, in plain text", "Pre-tool-calling APIs; debugging visibility"],
+    ["Plan-and-execute", "Generate a plan up front, then execute steps", "Long tasks (>5 steps); plan can be reviewed"],
+    ["Native tool calling", "Model emits structured tool_calls, runtime dispatches", "Modern APIs (OpenAI, Anthropic, Gemini); default in 2026"],
+    ["Reflexion / self-critique", "After each step, model critiques its own output", "High-stakes single-shot tasks; doubles cost"],
+  ]}
+  caption="Native tool calling is the default. ReAct-style reasoning happens inside the model's hidden CoT; you don't ask for it explicitly."
+/>
+
+ReAct was useful when models didn't have native tool calling and you
+had to coax structured output out of plain text. With Anthropic's
+`tool_use` blocks and OpenAI's `tools` parameter, the model emits
+typed tool calls directly. You don't parse "Action:" lines anymore.
+
+Plan-and-execute is genuinely useful for long-horizon tasks because
+the plan is reviewable *before* anything executes. The agent says
+"here's my 8-step plan"; you decide whether to run it. For tasks
+under ~5 tool calls, the upfront plan is overhead.
+
+## Tool design that doesn't bite
+
+The model is reading your tool definitions as documentation. Bad
+docs → wrong calls. Specific traps:
+
+- **Vague parameter names.** `data: string` invites garbage. Use
+  `customer_email: string` and describe the format.
+- **Free-form `query` parameters.** The model will write SQL
+  injection-looking strings, prompt-injection payloads, or just
+  nonsense. Constrain with enums or structured schemas.
+- **Tools that overlap.** Two tools that both "search the database"
+  with different scopes is a flip-a-coin situation. Pick one.
+- **Tools that are too coarse.** `do_anything(action: string)` is
+  not a tool. The model will call it with `action: "be helpful"`.
+- **Tools that are too fine.** 47 tools for "add row," "delete row,"
+  "update row 1," "update row 2"… The model gets confused above ~20
+  tools. Group them.
+- **Missing error contracts.** Define what failure looks like.
+  `{ "error": "user_not_found" }` lets the model recover;
+  `Error: ER_1004` does not.
+
+The sweet spot: 5–15 tools with clear, non-overlapping purposes and
+typed arguments. Anthropic, OpenAI, and Google all suggest the same
+ceiling. Past 20, accuracy drops noticeably.
+
+<Callout type="warn">
+The most expensive bug in your agent will be a tool description.
+"Searches the user database" vs "Searches the user database. Use
+this when you need a user's email, name, or signup date. Do NOT use
+this for orders or payments." The second one prevents whole
+categories of wrong tool selection.
+</Callout>
+
+## Termination, step caps, and the "infinite search" failure
+
+Without a step cap, agents loop forever on impossible tasks. The
+canonical failure:
+
+```
+step 1: search("customer 12345 order history")
+        → no results
+step 2: search("customer 12345")
+        → no results
+step 3: search("customer ID 12345")
+        → no results
+step 4: search("user 12345")
+        ...
+step 47: search("12345 records")
+        → bill: $80
+```
+
+The model has no concept of "I've already tried this." It keeps
+generating slightly different queries. Always have:
+
+- **A hard step cap** (typically 10–25 for production tasks). Loop
+  exits, returns whatever's accumulated.
+- **A wall-clock timeout** independent of step count. One step can
+  itself hang.
+- **A token budget cap.** Cost is the real limit. Track cumulative
+  input + output tokens; abort over threshold.
+- **Duplicate-call detection.** If the same tool is called with the
+  same args twice in a row, return a synthetic message: "You just
+  called this with these arguments. The result is unchanged. Try
+  something different or stop." Cheap, hugely effective.
+
+```ts
+const seen = new Map<string, number>();
+// before dispatch:
+const key = `${call.name}:${stableStringify(call.arguments)}`;
+const count = (seen.get(key) ?? 0) + 1;
+seen.set(key, count);
+if (count >= 3) {
+  return injectMessage('You have called this tool with these exact arguments 3 times. Stop or change your approach.');
+}
+```
+
+## Recovering from bad tool arguments
+
+Models hallucinate field names, swap argument order, send strings
+where numbers are expected, and confidently violate enums. Your
+dispatch layer should:
+
+1. **Validate against a schema** (Zod / Pydantic / JSON Schema).
+2. **On validation failure, return a structured error to the model,
+   not a thrown exception.** The model can recover from "missing
+   required field: customer_id"; it cannot recover from a 500.
+3. **Quote back what was received.** "You called `update_user` with
+   `{name: 'Alice'}` but `user_id` is required."
+
+```ts
+try {
+  const args = schema.parse(call.arguments);
+  return await tool.execute(args);
+} catch (e) {
+  if (e instanceof ZodError) {
+    return {
+      error: 'validation_failed',
+      message: e.errors.map(formatZodError).join('; '),
+      received: call.arguments,
+    };
+  }
+  throw e;
+}
+```
+
+The model usually self-corrects on the next step. If it doesn't
+after two attempts, give up and surface to the user — looping on
+schema errors is just paying for entropy.
+
+## Side effects and idempotency
+
+The biggest source of "production agent regret" is irreversible
+tool calls fired by a confused model. The fixes are old systems-
+design ideas:
+
+- **Mark dangerous tools clearly** in the schema (`destructive:
+  true`). Require an explicit confirmation step for those — the
+  agent must emit `confirm_action` first, then the destructive
+  tool. Forces a second model decision before damage.
+- **Idempotency keys** on every write. The model retries; you
+  dedupe. See `system-design/idempotency-keys.mdx` for the general
+  pattern; for agents it's mandatory, not optional.
+- **Dry-run mode.** For irreversible work (delete files, send
+  emails, charge cards), the tool returns "would have done X" by
+  default; an explicit flag commits. Lets you replay a trace
+  without burning it down.
+- **Rate-limit dangerous tools** at the dispatcher. If `send_email`
+  was called 30 times in one run, something has gone wrong.
+
+The pattern that keeps biting: agent in a loop deletes the wrong
+resource because the model misidentified the target. The right
+question is not "how do I make the model never wrong" — it's "what
+safety net catches the model when it's wrong."
+
+## Structured logging for traces
+
+You cannot debug an agent run from a prose transcript. You need a
+structured trace. Per step, log:
+
+- Step index, wall-clock timestamp, cumulative tokens, cumulative
+  cost.
+- The tool call(s) the model emitted, with arguments and the
+  tool_call_id.
+- The tool result(s), full content. Truncated logs lose the bug.
+- The model's text output for the step.
+- Any validation failures, retries, or injected synthetic messages.
+
+In 2026, **OpenTelemetry GenAI semantic conventions** are the
+standard. Span name `gen_ai.agent.run`, child spans per tool call,
+attributes `gen_ai.system`, `gen_ai.request.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`. LangSmith,
+Phoenix, Langfuse, Helicone, and Braintrust all consume these.
+Pick one early; switching tracers later costs days.
+
+The one thing manual logging always forgets: **the request that came
+back from the model, not just the request you sent.** When the bug
+is "the model called the wrong tool," you need the raw response
+including its hidden reasoning blocks.
+
+See `observability/distributed-tracing.mdx` for the general shape;
+agent traces are a special case where steps are sequential and the
+trace tree is shallow.
+
+## Where agents actually fail
+
+Five failure shapes ranked by how often they cause incidents:
+
+### 1. Wrong tool selection
+
+Two similar tools; model picked the wrong one. Almost always a tool-
+description problem, not a model problem. Fix the docs and the
+selection accuracy improves immediately.
+
+### 2. Argument hallucination
+
+Model passes `user_id: "user_12345"` when the actual user IDs are
+UUIDs. The schema rejects, the model retries with another guess,
+loops. Fix: never let the model invent IDs. Pass them in via context
+or have a "find" tool that returns the actual IDs.
+
+### 3. Premature "I'm done"
+
+Model returns a final answer after 3 steps when 6 were needed.
+"I've found the customer's name, the answer is X" — except the
+question was about their last order. Fix: make the final-answer path
+go through a `submit_final_answer` tool that includes a checklist
+parameter; the model has to declare what it did.
+
+### 4. Hallucinated success
+
+Tool failed; model claims it succeeded. Common with email-send,
+file-write, anything where the tool returns "queued." Fix: tool
+results should distinguish "accepted" from "completed." If you can't
+confirm completion, don't say you did.
+
+### 5. Context window blow-up
+
+Long traces stuff the context with raw tool outputs (search results,
+file contents, API responses). By step 15 the context is 90K
+tokens and the model is hunting for the original question. Fix:
+summarize tool outputs older than N steps; carry a short
+"working memory" summary alongside the raw history.
+
+## Streaming agents
+
+Streaming the *final* answer is easy. Streaming the agent loop is
+harder: you want to surface "calling tool X..." messages as they
+happen so the user knows what's going on. The pattern:
+
+- Emit a structured event when each tool call starts/finishes.
+- Render those as progress UI (chips, log lines), not as part of
+  the answer text.
+- Cancel the underlying run on user disconnect — otherwise you keep
+  paying.
+
+Frontends that just stream raw model output and call it done miss
+this. The user stares at a blank screen for 8s while the agent calls
+three tools; better to show "Searching customer database... Reading
+order... Drafting response..."
+
+## The discipline
+
+- The agent is a loop with a step cap, a time cap, and a token cap.
+  Set all three.
+- Tool descriptions are documentation the model reads. Treat them
+  with the same care as API docs.
+- Validate tool arguments against a schema; return validation
+  errors as structured messages, not exceptions.
+- Detect duplicate-call loops and inject a synthetic stop hint.
+- Destructive tools require confirmation and idempotency keys.
+- Trace every step structurally (OTel GenAI). You will not debug
+  from chat logs.
+- Summarize old tool outputs once history grows long.
+- Most agent bugs are tool-design bugs. Fix the tools first; tune
+  the model last.

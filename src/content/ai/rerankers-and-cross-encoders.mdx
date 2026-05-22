@@ -1,0 +1,259 @@
+export const level = 'mid';
+
+# Rerankers and cross-encoders
+
+A reranker is a small model that re-scores retrieved candidates
+by reading the query and each candidate *together*. Adding one in
+front of the LLM call is the single biggest quality lift available
+in a RAG system per dollar of engineering time. It's also the most
+under-used technique in tutorials, because LangChain's quickstart
+doesn't ship with one wired up.
+
+The whole pitch in one line:
+
+> Use a fast bi-encoder to retrieve K=50 candidates. Use a slow
+> cross-encoder to rerank them down to top-5. Pass those to the
+> LLM.
+
+This page is what a cross-encoder is, why it works, when it pays
+for its latency, and which families of rerankers are worth knowing
+in 2026.
+
+## Bi-encoders vs cross-encoders
+
+The embedding model that built your vector index is a
+**bi-encoder**. It encodes the query and the document separately
+and compares the resulting vectors. The comparison is fast (one
+dot product per candidate) but the encoder never saw the query
+and document in the same forward pass.
+
+```
+Bi-encoder:
+  query  ─→ [encoder] ─→ q_vec
+  doc    ─→ [encoder] ─→ d_vec
+  score = q_vec · d_vec        ← cheap, sees pair only as vectors
+```
+
+A **cross-encoder** concatenates query and document and runs a
+single forward pass over the joined sequence. Every token of the
+query can attend to every token of the document.
+
+```
+Cross-encoder:
+  [CLS] query [SEP] document [SEP]  ─→ [encoder] ─→ relevance score
+                                                     ↑
+                                             one number per pair
+```
+
+The cross-encoder sees the pair. The bi-encoder doesn't. That
+difference is everything — the cross-encoder learns relevance
+features the bi-encoder geometrically can't (e.g., "the document
+literally contains the query phrase," "the document answers the
+query's question rather than discussing the topic").
+
+The catch: a cross-encoder must run *per candidate*. You can't
+precompute document scores — the score depends on the query you
+haven't seen yet. So you can't use a cross-encoder as the primary
+index. You use it on a small candidate set.
+
+## Why two stages, not one
+
+Why not cross-encode every document and skip the vector index?
+
+```
+1M documents × 50ms cross-encoder per query = 50,000 seconds per query
+```
+
+You'd never finish. The bi-encoder + ANN does the wide cheap pass
+(1M → 50 in a few ms). The cross-encoder does the narrow accurate
+pass (50 → 5 in tens of ms). Each stage is the right tool for
+its scale.
+
+This is **cascade ranking** — exactly the architecture every
+serious search engine has used for decades, just with a learned
+last stage instead of a hand-tuned one.
+
+## The latency budget
+
+Realistic numbers in 2026:
+
+<Cheatsheet caption="Reranker latency at K=20 candidates, single query, common deployments.">
+| Reranker | Where | Latency at K=20 | Quality (Δ nDCG@10) |
+|---|---|---|---|
+| Cohere `rerank-3.5` | Hosted API | 30–60 ms | +5 to +15 |
+| BGE `bge-reranker-v2-m3` | Self-hosted GPU | 15–40 ms | +5 to +12 |
+| ColBERT v2 (late interaction) | Self-hosted | 5–15 ms | +3 to +10 |
+| `ms-marco-MiniLM-L-6-v2` | Self-hosted CPU | 80–150 ms | +3 to +8 |
+| Cross-encoder large (DeBERTa) | Self-hosted GPU | 100–200 ms | +6 to +15 |
+</Cheatsheet>
+
+The nDCG numbers are typical lifts over a dense-only retriever on
+real RAG corpora. Public benchmark numbers (BEIR) tend to be
+similar. The point: 30–50ms of latency for a meaningful precision
+lift is one of the best ROI knobs in the entire pipeline.
+
+For comparison, the LLM call that follows is usually 500–3000ms.
+Reranker latency is in the noise.
+
+## ColBERT — late interaction
+
+A category of its own. ColBERT (Contextualized Late Interaction
+over BERT) precomputes **per-token** embeddings for every document
+chunk, then at query time computes per-token similarities between
+query tokens and document tokens.
+
+```
+score(q, d) = Σ max(q_token_i · d_token_j  for j in doc)
+              i ∈ query tokens
+```
+
+The "MaxSim" operator. Each query token finds its best-matching
+document token; you sum the maxes.
+
+**Why it matters:** ColBERT gets cross-encoder-level relevance at
+sub-cross-encoder latency, because the document tokens are
+precomputed. It's the bridge between the bi-encoder (separate
+encoding, dot product) and cross-encoder (joint encoding,
+expensive) regimes.
+
+**The cost:** storage. Instead of one 1024-d vector per chunk you
+have ~100 of them. A chunk that took 4KB now takes 400KB. Stores
+that ship ColBERT-style indexes (Vespa, some pgvector extensions,
+Jina ColBERT) have to commit serious storage for it. PLAID is the
+compression scheme that makes this viable at scale (typically
+~20× compression).
+
+For most teams: ignore ColBERT until you've tried a normal
+reranker and either found its latency unacceptable or its
+quality insufficient.
+
+## When a reranker is worth it
+
+Almost always for RAG. Specifically:
+
+- **Your retriever returns "topically related" hits rather than
+  "answers."** A reranker fixes this. Common failure mode of
+  pure dense retrieval.
+- **You're already running hybrid search and want a clean
+  precision boost.** Reranker on top of fused candidates is the
+  standard production stack.
+- **Your LLM cost dominates and you want to send it fewer, better
+  chunks.** Smaller K to the LLM = lower input cost + better
+  quality from less context dilution.
+
+When it might not pay:
+
+- **Your corpus is small and homogeneous** (e.g., 500 FAQ
+  entries). Dense retrieval is already near-perfect; the
+  reranker adds latency for a tiny lift.
+- **Latency budget is sub-50ms total.** Hard real-time systems
+  (autocomplete, type-ahead) might not afford it.
+- **You haven't built a basic eval yet.** You won't be able to
+  prove the reranker helped, so you'll get a false sense of
+  whether it did.
+
+## Reranker families worth knowing
+
+**Cohere Rerank.** Hosted API, "drop-in works." `rerank-3.5` is
+the current generation. Multilingual. Pricing per 1000 documents.
+Sane default if you don't want to host a model.
+
+**BGE rerankers (BAAI).** Open-weight, MIT-licensed. `bge-
+reranker-v2-m3` is a strong multilingual choice. Smaller variants
+fit on a CPU; larger ones want a GPU. The standard self-hosted
+pick for cost-sensitive workloads.
+
+**Jina reranker.** Open-weight family targeting long-context (8K)
+reranking. Useful if your chunks are large or if you can't chunk
+finely.
+
+**Sentence-Transformers cross-encoders.** The `ms-marco-MiniLM-L-
+*` family. Tiny, CPU-friendly, decent quality. The starter pick
+for prototyping on a laptop.
+
+**LLM-as-reranker.** Pass the candidates to an LLM and ask it to
+score them. Surprisingly competitive on quality, ridiculous on
+cost and latency. Use only for offline eval or low-volume
+specialty cases.
+
+## Implementation shape
+
+```ts
+// After hybrid retrieval gives you 20 candidates:
+const reranked = await cohere.rerank({
+  model: 'rerank-3.5',
+  query,
+  documents: candidates.map(c => c.text),
+  topN: 5,
+  returnDocuments: false,
+});
+
+// reranked.results[i] = { index, relevanceScore }
+const final = reranked.results.map(r => candidates[r.index]);
+```
+
+Or self-hosted (Python on a GPU server, exposed over HTTP):
+
+```ts
+const res = await fetch('http://reranker:8000/rerank', {
+  method: 'POST',
+  body: JSON.stringify({ query, documents: texts, topN: 5 }),
+});
+```
+
+Operational notes:
+
+- **Batch the candidates in one call.** Don't call the reranker
+  once per document — that's K round trips.
+- **Cache by (query, candidate-set) hash.** Cheap to invalidate
+  (TTL), saves significant cost on repeated queries.
+- **Set a hard timeout.** If the reranker is down, fall back to
+  the fused-but-unranked candidates rather than failing the
+  request.
+
+## A reranker is cheaper than fine-tuning
+
+This is the framing that matters when someone wants to "fine-tune
+the embedding model."
+
+Fine-tuning an embedding model is expensive: collecting query/doc
+pairs, training, evaluating, deploying, and re-embedding every
+document if the model changes. The lift is real but small —
+typically +2 to +5 nDCG.
+
+A reranker is a hosted API call away, or a one-week project to
+self-host. The lift is +5 to +15 nDCG on most corpora.
+
+The pragmatic order of operations:
+
+1. Hybrid search.
+2. Reranker.
+3. Better chunking and retrieval.
+4. **Then** consider fine-tuning the embedding model — if you
+   still have a quality gap and the eval supports it.
+
+Skipping straight to fine-tuning is a common mistake. You burn
+months chasing the smallest available knob.
+
+## The discipline
+
+- A reranker is the cheapest path to better RAG quality. Add
+  one before you optimize anything else.
+- Retrieve K=20–50, rerank to top-5. Smaller K to the LLM beats
+  larger K every time.
+- Cohere if you want hosted; BGE if you want self-hosted; the
+  others have niches but those two are the defaults.
+- Cross-encoders see the pair. Bi-encoders don't. That's the
+  whole intuition.
+- ColBERT is the middle option — cross-encoder quality at
+  bi-encoder latency, at a storage cost. Save for later.
+
+## What to learn next
+
+- `rag-retrieval-pipeline.mdx` — where rerankers sit in the
+  pipeline.
+- `hybrid-search-bm25-plus-vectors.mdx` — what feeds the
+  reranker.
+- `vector-search-and-anns.mdx` — the wide retrieval stage.
+- `llm-eval-design.mdx` — measuring whether the reranker
+  actually helped.

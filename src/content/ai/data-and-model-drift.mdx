@@ -1,0 +1,272 @@
+export const level = 'senior';
+
+# Data and model drift
+
+A model trained on Tuesday's world performs on Wednesday's. The
+question is *how different is Wednesday*. If the answer is "not
+much," the model is fine. If the answer is "a lot," your metrics
+silently rot until a holiday, a new device launch, a regional
+outage, or a marketing campaign makes the gap unignorable.
+
+Drift detection is the discipline of noticing the rot before
+users do. The hard part isn't the statistics — there are five
+tests everyone uses. The hard part is **knowing what to alert on**
+and what to do when the alert fires.
+
+For the broader MLOps shape this slots into, see
+`ai/mlops-pipelines-and-feature-stores.mdx`. This page assumes you
+already have a feature store and a way to compare distributions.
+
+## Three kinds of drift, named precisely
+
+The terms get muddled in practice. Use them precisely; the
+remediation differs.
+
+<Compare>
+<thead>
+<tr><th>Name</th><th>What shifted</th><th>Concretely</th><th>Remediation</th></tr>
+</thead>
+<tbody>
+<tr><td>**Covariate drift**</td><td>P(X), the input distribution</td><td>Users now upload 4K images instead of 1080p. Features are out-of-distribution.</td><td>Often retrain on recent data. Model may still be valid.</td></tr>
+<tr><td>**Label drift**</td><td>P(Y), the output distribution</td><td>Fraud rate jumped from 0.5% to 3% because a new attack started.</td><td>Retrain; rebalance; investigate root cause.</td></tr>
+<tr><td>**Concept drift**</td><td>P(Y\|X), the relationship</td><td>Same input now means a different outcome. Pandemic-era buying habits broke pre-2020 demand models.</td><td>Hard. The model's learned mapping is wrong. Retrain — and consider whether retraining alone is enough.</td></tr>
+</tbody>
+</Compare>
+
+Most teams default to "drift = covariate drift" because it's
+easiest to measure. Concept drift is usually the one that hurts
+worst and the hardest to detect — you only see it when ground-truth
+labels arrive, which can lag by days or weeks.
+
+## The four tests everyone uses
+
+You don't need a new statistical method. You need to apply the
+standard ones consistently.
+
+### PSI (Population Stability Index)
+
+The credit-risk industry's standard. Bin the feature into deciles
+(or fixed bins), compare expected % vs actual %:
+
+```
+PSI = Σ (actual_pct - expected_pct) * ln(actual_pct / expected_pct)
+```
+
+Rough rule of thumb (used widely in financial-services ML):
+
+- **PSI < 0.1** — no significant shift.
+- **0.1 ≤ PSI < 0.25** — moderate shift, investigate.
+- **PSI ≥ 0.25** — large shift, action required.
+
+PSI is cheap, interpretable, and works on a single feature at a
+time. Industry default for production drift dashboards.
+
+### KS (Kolmogorov–Smirnov)
+
+For continuous features. Compares two empirical CDFs and reports
+the maximum vertical distance between them. Two-sample KS is the
+common form:
+
+```
+D = sup |F_train(x) - F_prod(x)|
+```
+
+The test gives a p-value, which is tempting and dangerous: with
+enough traffic, *every* feature is "significantly" different from
+training. Use the **D statistic itself** as the alarm threshold
+(e.g., D > 0.1 for a feature), not p-values.
+
+### Chi-squared
+
+For categorical features. Compares observed counts to expected
+counts across categories. Same caveat as KS: at scale, every
+chi-squared p-value is < 0.001. Threshold on effect size, not
+significance.
+
+### Jensen–Shannon divergence
+
+Symmetric, bounded version of KL divergence. Returns a value in
+[0, 1] (with log base 2) which makes it comparable across
+features. Good for embedding distributions where PSI/KS don't
+apply naturally — bin the embedding's PCA components, compute JS
+divergence per dimension.
+
+<Callout variant="warn">
+At any reasonable scale, p-values are useless for drift detection.
+A KS test on 10 million samples will flag a meaningless 0.5%
+shift as "p < 1e-50." Threshold on **effect size** (D, PSI, JS
+value), not p-value. The standard mistake.
+</Callout>
+
+## What to monitor
+
+You can't track every distribution at every granularity. Pick the
+ones that pay rent.
+
+<Steps>
+<Step n="1" title="Input feature distributions">
+For each feature in the model, monitor PSI (categorical/binned
+continuous) or KS (continuous) against the training distribution.
+Alert thresholds: PSI > 0.25 or KS D > 0.1 for any feature that
+the model weights heavily.
+</Step>
+<Step n="2" title="Prediction distribution">
+The output of the model. If yesterday the model predicted
+"fraud" on 0.4% of transactions and today it predicts 4%, *something*
+changed — covariate drift, label drift, or a bug in upstream
+data. Alert on day-over-day change in prediction histogram.
+</Step>
+<Step n="3" title="Performance metrics (when labels arrive)">
+Accuracy, precision, recall, AUC against ground truth — bucketed
+by week, by segment, by region. Concept drift only shows up here.
+Lag is unavoidable; live with it.
+</Step>
+<Step n="4" title="Feature null / missing rates">
+Often the first sign something broke upstream. A feature that was
+2% null in training and is 40% null today is a data pipeline bug,
+not "drift" — but the drift detector catches it first.
+</Step>
+<Step n="5" title="Segment-level metrics">
+Aggregate metrics can be flat while a specific segment is on
+fire. Monitor per-region, per-platform, per-customer-tier at
+minimum.
+</Step>
+</Steps>
+
+## Shadow scoring
+
+The most honest way to know your replacement model is better:
+run it alongside the live model in production traffic, log both
+predictions, score both against ground truth once it arrives.
+
+```ts
+async function predictFraud(tx: Transaction) {
+  const live = await models.fraudV3.predict(tx);
+  // fire-and-forget shadow
+  models.fraudV4
+    .predict(tx)
+    .then((shadow) => logShadow({ tx, live, shadow }))
+    .catch(() => {});
+  return live;
+}
+```
+
+Shadow scoring is also the cleanest detector for training-serving
+skew: if v4 in shadow disagrees wildly with v3 from day one, your
+features are different in the two paths, not your model.
+
+Costs:
+
+- 2x inference compute during the shadow window.
+- Storage for the log of both predictions.
+- Engineering discipline to not let the shadow path call any side
+  effects.
+
+The discipline matters: a shadow that emails the user or charges
+their card is no longer a shadow.
+
+## Retrain triggers
+
+The two failure modes:
+
+- **Retrain too rarely**: the model rots until prod fires.
+- **Retrain too often**: every retrain costs eng time, GPU
+  hours, and risks introducing a regression. New models are not
+  free.
+
+Triggers that work in practice:
+
+- **Time-based**: weekly, monthly, quarterly. Cheap to reason
+  about. Often wrong — you retrain when nothing changed, or fail
+  to retrain when everything changed.
+- **Performance-based**: precision/recall on labelled prod data
+  drops below a threshold. The right trigger when ground truth
+  is fast (clicks, conversions). Useless when labels lag (fraud
+  chargebacks come in 60–90 days later).
+- **Drift-based**: PSI on key features exceeds 0.25. Useful as a
+  *warning* but not a sufficient cause to retrain — sometimes the
+  model is robust to the drift.
+- **Composite**: drift signal + offline shadow eval. Drift fires
+  the alarm; you run the candidate retrain in shadow; you
+  promote only if it actually wins.
+
+For most teams, **schedule + drift alarm + on-call review** is
+the boring answer that ships.
+
+## The failure mode: "everything looks fine until X"
+
+Black Friday. The first iPhone with a new aspect ratio. A
+competitor launches and changes user mix. COVID. A new ad
+campaign that doubles a specific user segment overnight.
+
+Production ML models routinely fail on these because:
+
+1. The training data didn't include the new regime.
+2. Aggregate metrics smoothed over the affected segment.
+3. The drift detector wasn't watching the right slice — overall
+   feature distributions looked stable while a specific cohort
+   was completely different.
+4. Ground-truth labels lagged the event by days, so by the time
+   the performance drop showed up, the damage was done.
+
+Defenses:
+
+- **Slice-aware monitoring.** Track drift and performance per
+  segment, not just overall.
+- **Calendar-aware alerting.** Lower thresholds during known
+  high-variance windows (peak shopping, product launches).
+- **Fallback predictions.** When the model's input is
+  far-out-of-distribution, return a conservative baseline
+  instead of trusting the model.
+- **Human escalation paths.** When the model is uncertain (low
+  confidence, OOD input) on a high-stakes decision, route to a
+  human. The model doesn't have to handle everything.
+
+## Drift is not (always) a bug
+
+Drift sometimes just means the world changed. Users use your
+product differently in winter. Mobile share grew. A new feature
+launched and people use it. The model has to adapt, but the
+drift itself is *information*, not always pathology.
+
+The decision tree at 2 AM:
+
+<Cheatsheet caption="Triage flow when a drift alarm fires">
+| Signal | Likely cause | First action |
+|---|---|---|
+| One feature spikes, others stable | Upstream pipeline bug (nulls, schema change) | Check the feature pipeline, not the model |
+| All features shift, prediction distribution shifts | Real population change | Validate; retrain if performance drops |
+| Predictions shift, features stable | Concept drift, or a serving-path bug | Check the model version pin; sample raw outputs |
+| Performance drops, features stable | Concept drift — the relationship changed | Retrain; investigate the world |
+| Drift in shadow model only | Bug in candidate model's feature pipeline | Don't promote |
+</Cheatsheet>
+
+## What good looks like
+
+- PSI / KS dashboards per feature with thresholds wired to
+  alerting (`observability/alerting-fundamentals.mdx` for the
+  general alerting discipline).
+- Prediction distribution monitored per-segment.
+- Ground-truth labels fed back into a daily-or-better performance
+  pipeline.
+- Shadow scoring lane available for any candidate replacement
+  model.
+- Retrain trigger that is *not* purely time-based.
+- An on-call who routinely answers "is the model OK?" using a
+  dashboard, not a notebook.
+
+## The discipline
+
+- **Three kinds of drift, three remediations.** Don't conflate
+  covariate, label, and concept drift.
+- **Threshold on effect size, not p-value.** PSI, KS D, JS
+  divergence. P-values lie at scale.
+- **Monitor predictions, not just inputs.** A stable input
+  distribution with a shifted prediction distribution means a
+  bug or a model-internal change.
+- **Slice everything.** Aggregate metrics will hide the failing
+  segment until it's the whole business.
+- **Shadow before promote.** Offline eval isn't enough; shadow
+  scoring catches the skew that offline misses.
+- **Calendar-aware thresholds.** Black Friday is not a normal
+  Friday and your model knows it.

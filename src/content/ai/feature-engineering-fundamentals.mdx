@@ -1,0 +1,314 @@
+export const level = 'mid';
+
+# Feature engineering fundamentals
+
+The unglamorous half of ML quality. Every Kaggle grandmaster will
+tell you the same thing and most teams will not believe them:
+**features beat models**. A logistic regression with thoughtful
+features routinely beats a boosted tree with raw features, and a
+boosted tree with thoughtful features routinely beats a neural net
+with raw features.
+
+This page is the working set of techniques that pay rent. None of
+it is novel. All of it is forgotten by 40% of teams within six
+months of their last successful project.
+
+## Categorical encoding: the four choices
+
+The question is "how do I turn `country = 'CA'` into a number?"
+The answers, in order of when to reach for each:
+
+<Cheatsheet caption="Categorical encoding cheat-sheet. Pick by cardinality and model type.">
+| Encoding | Best for | Watch out for |
+|---|---|---|
+| One-hot | Low cardinality (&lt; 50), linear models, NNs | Explodes width with high cardinality; sparse |
+| Ordinal (label encoding) | Tree models, or genuinely-ordered categories | Linear models will infer false ordering |
+| Target / mean encoding | High cardinality with strong predictive signal | LEAKAGE — must encode on train fold only |
+| Hashing | Very high cardinality (10K+), streaming, online learning | Hash collisions; can't invert for explainability |
+| Embedding | Deep models on high-cardinality categoricals | Needs lots of data to learn good embeddings |
+</Cheatsheet>
+
+The single most-broken one: **target encoding**.
+
+## The target-encoding leakage trap
+
+Target encoding replaces a category with the mean of the target for
+that category. `country = 'CA'` becomes `0.23` if 23% of Canadian
+rows had `label = 1`. This is a powerful encoding because it injects
+the target signal directly into the feature.
+
+It is also the most common source of "my validation AUC is 0.99,
+why is production 0.71" bugs. Here's why:
+
+```ts
+// WRONG — this leaks the target
+const meanByCountry = computeMeanLabelPerCountry(allData)
+allData.forEach(row => {
+  row.country_encoded = meanByCountry[row.country]
+})
+trainTestSplit(allData)
+// Every validation row's encoded value was computed using
+// THAT row's own label. AUC will be unrealistically high.
+```
+
+The right shape:
+
+```ts
+// 1. Split FIRST.
+const { train, val } = trainTestSplit(allData)
+
+// 2. Compute mean per country on TRAIN only.
+const meanByCountry = computeMeanLabelPerCountry(train)
+
+// 3. Apply to both train and val.
+//    Val rows that were NEVER in train get a fallback
+//    (global mean, or "unseen" bucket).
+[train, val].forEach(set => {
+  set.forEach(row => {
+    row.country_encoded = meanByCountry[row.country] ?? globalMean
+  })
+})
+```
+
+Even within training, plain mean-encoding leaks: row R's encoding
+contains R's own label. The proper fix is **out-of-fold target
+encoding**: compute means using a held-out fold for each row.
+sklearn's `TargetEncoder` and category-encoders do this for you.
+Roll your own at your peril.
+
+The rule: **anything derived from the target must be computed on
+train and applied to val/test, never the reverse**. This is the
+single most-violated rule in feature engineering.
+
+## Scaling and normalization: who actually needs it
+
+Half the team will normalize everything by reflex. The other half
+will skip it. Both are wrong. The right answer depends on the model
+class:
+
+<Compare
+  left={{
+    title: "Models that NEED scaling",
+    points: [
+      "Linear models (logistic, linear, ridge, lasso) — gradient steps are sensitive to feature scale",
+      "SVMs — kernel distances change with scale",
+      "k-NN, k-means — distance-based, so unit-dependent",
+      "Neural networks — large-scale features dominate gradients, slow training",
+      "PCA and SVD — eigenvectors aligned with high-variance directions",
+    ],
+  }}
+  right={{
+    title: "Models that DON'T need scaling",
+    points: [
+      "Decision trees — split on threshold, scale-invariant",
+      "Random forests — same",
+      "Gradient boosting (XGBoost, LightGBM, CatBoost) — same",
+      "Naive Bayes — uses raw distributions",
+      "Rule-based models — invariant by definition",
+    ],
+  }}
+/>
+
+The practical rule: **scale if you're using a model that takes a
+weighted sum of features; don't bother if you're using tree
+ensembles**. Most production tabular models are gradient boosting,
+which is why senior practitioners often skip scaling entirely.
+
+When you do scale:
+
+- **StandardScaler** (z-score) — assumes roughly normal. Default
+  for most cases.
+- **MinMaxScaler** — bounded [0, 1]. Use when you need a bounded
+  range (e.g., NN with sigmoid activations on input).
+- **RobustScaler** — uses median and IQR. Better when outliers
+  are real and you can't drop them.
+- **Log transform** — for skewed positive features (income,
+  counts, durations). `log1p(x)` for `x ≥ 0`. The single most
+  underused feature transform.
+
+Fit the scaler **on train only**. Apply to val and test. Same rule
+as target encoding.
+
+## Time features: stop one-hot encoding the hour
+
+The most common time-feature bug: `hour` encoded as one-hot over 24
+buckets. The model now treats hour 23 and hour 0 as completely
+unrelated, when in fact they're adjacent. Same for day of week,
+month, day of year.
+
+The fix is **cyclical encoding**:
+
+```ts
+const hourSin = Math.sin((2 * Math.PI * hour) / 24)
+const hourCos = Math.cos((2 * Math.PI * hour) / 24)
+// Now hour 23 and hour 0 are neighbors in (sin, cos) space.
+```
+
+Two features replace 24. The model sees the periodicity. Same
+trick works for:
+
+- Hour of day (period 24)
+- Day of week (period 7)
+- Day of month (period 28-31, use 30.44 for "average")
+- Day of year (period 365.25)
+- Month of year (period 12)
+
+Other time features that earn their keep:
+
+- **Time since last event** for each user/entity. The most
+  predictive feature in churn and fraud — gets forgotten because
+  it requires a join over history.
+- **Rolling aggregates** — `purchases_last_7d`, `mean_amount_30d`.
+  Compute on training data with a strict cutoff to avoid leaking
+  future into past.
+- **Is-weekend, is-holiday, is-business-hour.** Cheap, powerful
+  in retail/B2C.
+
+The leakage trap: when computing rolling aggregates, **the cutoff
+must be the prediction time, not the row time**. If your row is "at
+2pm Tuesday, will the user click?" your 7-day rolling features must
+end at 2pm Tuesday — not include data from later that day. The
+sklearn ecosystem has been bitten by this enough times that there
+are explicit "time-series cross-validation" splitters now.
+
+## Interaction features
+
+A linear model can't learn `if income > 80K AND region = NYC`
+without your help. You give it the interaction explicitly:
+
+```ts
+row.income_x_nyc = row.region === 'NYC' ? row.income : 0
+```
+
+Trees do this automatically. So do MLPs and transformers. So this
+matters most when:
+
+- You're using a linear model (logistic regression, linear SVM).
+- You're using a tree model but want to *control* which
+  interactions exist (e.g., for explainability).
+- You suspect a specific interaction matters and want to give the
+  model the strongest possible signal.
+
+The mistake is creating all pairwise interactions blindly with
+`PolynomialFeatures(degree=2)` — explodes the feature space, most
+interactions are noise, and you'll overfit. Pick interactions from
+domain knowledge or feature-importance-driven exploration.
+
+## Missing values
+
+The two big mistakes:
+
+1. **Dropping rows with any missing values.** You just biased your
+   training set toward the rows that happen to be complete, which
+   are rarely a random sample.
+2. **Imputing with the mean (silently).** Now your model can't
+   distinguish "actually 35" from "missing, imputed to 35."
+
+The fix: **impute AND add a missingness indicator**:
+
+```ts
+row.age_was_missing = row.age == null ? 1 : 0
+row.age = row.age ?? medianAge  // or 0, or whatever default
+```
+
+Two features replace one. The model can now decide whether
+"missing" is itself signal. (Spoiler: it almost always is. Missing
+income on a loan application is not random.)
+
+Tree models can handle missing values natively — XGBoost and
+LightGBM have explicit support for `NaN`. Use that if your model
+allows.
+
+## The validation-AUC-is-0.99 pattern
+
+The single biggest leak in feature engineering is **deriving a
+feature from the target**, often by accident. The patterns:
+
+<Cheatsheet caption="Leakage smells. If your validation AUC is suspiciously high, check these first.">
+| Smell | What's happening | Catch it by |
+|---|---|---|
+| Validation AUC > 0.98 on a real-world problem | Target leaked into a feature | Drop features one at a time, see which one's removal collapses AUC |
+| `is_fraud` feature for predicting fraud | Literally the label | Audit feature list |
+| `closed_at` for predicting `did_close` | Future leaks into past | Cutoff features by `event_time` |
+| `account_lifetime_value` for predicting churn | LTV is computed using future data | Recompute LTV-as-of-prediction-time |
+| Target-encoded category leaking | Same row's label used in its own encoding | Out-of-fold target encoding |
+| Train-test contamination from group structure | Same user in train and val | GroupKFold by user_id |
+| Feature engineered on full dataset before split | Scaler/encoder fit on val data | Split first, fit on train only |
+| Outlier removal on full dataset before split | Val distribution influenced training | Split first, then remove outliers from train only |
+</Cheatsheet>
+
+The discipline: when your validation score looks too good, it
+probably is. Sane AUCs on real classification tasks are 0.70-0.90.
+Above 0.95, audit before celebrating.
+
+## Feature selection
+
+You collected 500 features. The model trains on 500 features.
+You're probably overfitting on most of them. The standard
+approaches, in order of effort:
+
+- **Drop near-constant features.** If 99% of rows have the same
+  value, it carries no signal.
+- **Drop highly correlated pairs.** Two features with `|r| > 0.95`
+  are providing the same information; keep one. Reduces variance
+  in coefficient estimates for linear models.
+- **L1 (Lasso) regularization** — drives weights of irrelevant
+  features to exactly zero. Works for linear models; partial
+  effect via L1 in neural nets.
+- **Tree-based feature importance.** Train a quick LightGBM, look
+  at gain importance, drop the long tail. Crude but fast.
+- **Permutation importance.** For each feature, shuffle its
+  values in the validation set and measure performance drop. The
+  honest way to measure "how much does this feature matter."
+- **Recursive feature elimination (RFE).** Train, drop weakest,
+  retrain, repeat. Expensive but defensible.
+
+Don't use **forward selection on the training set** without
+cross-validation — you'll select features that overfit to noise.
+
+## Feature stores: where this lives at scale
+
+Once feature engineering is more than "one notebook, one model,"
+you need a feature store. The core problem it solves:
+
+- **Train/serve consistency.** The features used at training time
+  must be computed the same way at serving time. If `is_weekend` is
+  computed with `dayjs` in training and a SQL `EXTRACT(DOW)` in
+  serving, you have a drift bug waiting to fire.
+- **Point-in-time correctness.** For each (entity, prediction
+  time), reconstruct features as they would have been known then.
+  Naive joins leak future into past.
+- **Reuse.** "Mean purchase amount in last 30 days" is useful for
+  10 models. Compute once, serve everywhere.
+
+See `ai/mlops-pipelines-and-feature-stores.mdx` for the operational
+half.
+
+## A short discipline
+
+- **Split before you do anything else.** Scalers, encoders,
+  outlier filters — all fit on train, applied to val/test.
+- **Target encoding is a sharp knife.** Out-of-fold or don't use it.
+- **Cyclical encoding for time** — sin/cos, not one-hot.
+- **Scale only for models that need it.** Trees don't.
+- **Impute AND flag missingness.** Two features replace one.
+- **Audit suspiciously high validation scores.** Leakage is the
+  default explanation.
+- **Features beat models.** A senior practitioner with 20 hours of
+  feature work usually beats a junior with a transformer.
+- See `ai/data-and-model-drift.mdx` — features that worked at
+  training time can stop working in production, even when the
+  model is identical.
+- See `ai/bias-variance-and-regularization.mdx` for what to do
+  when your model overfits the engineered features.
+
+## What to learn next
+
+- `ai/classical-ml-when-llms-are-overkill.mdx` — the model side of
+  this story; features are most of the win in tabular ML.
+- `ai/bias-variance-and-regularization.mdx` — controlling
+  overfitting once you have lots of features.
+- `ai/data-and-model-drift.mdx` — features can drift even when the
+  model doesn't.
+- `ai/mlops-pipelines-and-feature-stores.mdx` — making features
+  reproducible across train and serve.

@@ -1,0 +1,347 @@
+export const level = 'mid';
+
+# Cost modeling and budgets
+
+The first month of any LLM feature in production goes one of
+two ways: either the team built a back-of-envelope cost model
+up front and it predicted the bill to within 30%, or they
+didn't and the CFO sends a Slack message about the $40k
+surprise charge. Both happen often enough that "did you model
+the cost?" is a real engineering question, not a finance one.
+
+This page is the model and the failure patterns. For the
+mechanics of saving money once you have a model, see
+`ai/caching-llm-responses.mdx`. For where the tokens come from,
+`ai/tokens-and-tokenizers.mdx`.
+
+## The cost formula, plain
+
+Every LLM call costs:
+
+```
+cost_per_call = (input_tokens × input_rate) + (output_tokens × output_rate)
+```
+
+Rates as of late 2026 — round numbers, check current docs for
+exact pricing:
+
+<Cheatsheet caption="Order-of-magnitude pricing — get exact numbers from the provider before invoicing">
+| Tier | Input ($/M tok) | Output ($/M tok) | Ratio |
+|---|---|---|---|
+| Frontier (Opus / o-series / Gemini Ultra) | $15 | $75 | 1:5 |
+| Workhorse (Sonnet / GPT-4-class / Gemini Pro) | $3 | $15 | 1:5 |
+| Cheap (Haiku / GPT-4o-mini / Gemini Flash) | $0.25 | $1.25 | 1:5 |
+| Open-weights self-hosted | (your GPU cost / throughput) | (same) | depends |
+</Cheatsheet>
+
+Three things to internalize:
+
+- **Output is 3–5x more expensive than input across every
+  hosted provider.** Optimizing the right side of the
+  multiplication is the highest-leverage move. A 30% reduction
+  in output tokens beats a 50% reduction in input tokens.
+- **The cheap tier is roughly 60x cheaper than the frontier
+  tier.** "What model do you use" is the biggest cost lever,
+  before any prompt-engineering or caching work.
+- **Self-hosting open-weights changes the cost shape entirely.**
+  You pay for GPU-hours, not tokens. Cost-effective only if
+  you have steady, predictable throughput; awful for bursty
+  traffic.
+
+## The back-of-envelope model
+
+Scale a single call's cost to a monthly bill in four
+multiplications:
+
+```
+$ / month
+  = avg_calls_per_user_per_day
+  × avg_cost_per_call
+  × DAU
+  × 30
+```
+
+Worked example. A chat assistant on Workhorse tier:
+
+```
+avg_input_tokens          = 3,000   // system + history + user query
+avg_output_tokens         = 400     // typical chat response
+avg_calls_per_user_per_day = 8       // 8 turns per session
+DAU                       = 50,000
+
+cost_per_call = (3000 / 1e6 × $3) + (400 / 1e6 × $15)
+              = $0.009 + $0.006
+              = $0.015
+
+monthly = 0.015 × 8 × 50000 × 30
+        = $180,000
+```
+
+$180k/mo for a chat assistant with 50k DAU at modest usage. Now
+you know whether to negotiate volume pricing, ship the cheap
+tier, or kill the feature. Run this model **before** building.
+
+Specific advice on filling in the numbers:
+
+- **Always count tokens, don't estimate from words.** See
+  `ai/tokens-and-tokenizers.mdx`. The "4 chars per token"
+  heuristic is wrong by 20–40% for code, non-English, and
+  structured output.
+- **The system prompt + tool definitions are larger than you
+  think.** A serious agent with 10 tools easily reaches
+  4,000 tokens of static prompt before the user has said
+  anything.
+- **avg_output_tokens has a long tail.** A chat assistant
+  averages ~400 tokens output but has a tail of multi-thousand-
+  token responses (long explanations, code blocks, summaries).
+  Use p95 if you want a less rosy number; use p99 if your
+  finance team is twitchy.
+- **avg_calls_per_user_per_day is the most variable input.**
+  A toy "AI helper" tab nobody uses might be 0.5 calls/user/day.
+  An agentic copilot used heavily can be 200. Get this from
+  product analytics, not from your intuition.
+
+## Where the cost actually goes
+
+The shape of cost is different for different application types.
+Naming the patterns helps you optimize the right thing.
+
+### Chat assistants — output-heavy
+
+User sends short messages, model writes long ones. Input is
+maybe 30% of cost; output is 70%.
+
+What to optimize:
+
+- **Output length.** Hard caps via `max_tokens`. Prompt the
+  model to be concise. Most "the bot is too chatty" complaints
+  also save money.
+- **Cheap tier for short-form responses.** "Was this helpful?
+  Yes / No / Tell me more." doesn't need a frontier model.
+- **Streaming + early cancel.** If the user navigates away
+  mid-response, cancel the request. Output tokens stop, billing
+  stops (depending on provider — most actually charge for what
+  was streamed, but you save tail latency / cost).
+
+### Agentic systems — input-heavy
+
+Agents do many short steps. Each step adds tool calls and tool
+results to the message history. By step 10, the input is
+50,000 tokens of history and the output is one tool call. Input
+dominates — often 80%+ of cost.
+
+What to optimize:
+
+- **Prompt cache.** This is the highest-ROI lever in agentic
+  systems by a wide margin. See
+  `ai/caching-llm-responses.mdx`.
+- **Step caps and timeouts.** A 50-step run is rarely a 5x
+  better answer than a 10-step run; it's usually a stuck loop.
+  See `ai/agent-loops-and-tool-use.mdx`.
+- **Truncate or summarize tool outputs.** A search tool that
+  returns 5,000 tokens of raw API response per call eats your
+  budget. Summarize before adding to history.
+- **Drop the cheap tier for the routing step.** A small model
+  deciding "which tool to call next" is often as good as a
+  big model and 60x cheaper.
+
+### RAG systems — input-heavy and bursty
+
+Retrieved context adds thousands of tokens per call. A 5-chunk
+retrieval at 800 tokens/chunk = 4,000 tokens added to every
+input. Most RAG bills are 70–80% input cost.
+
+What to optimize:
+
+- **Chunk smarter, retrieve fewer.** 3 great chunks beat 10
+  okay ones. See `ai/chunking-strategies.mdx`.
+- **Reranker.** Pull 50, rerank, send 5. The reranker cost is
+  rounding error vs the LLM cost of stuffing 50 chunks.
+- **Prompt cache the retrieved chunks when the same doc is
+  asked multiple questions in a session.**
+
+### Classification / extraction — input-heavy, low output
+
+JSON-output tasks: take a long input, return a short structured
+output. Input is 90%+ of cost.
+
+What to optimize:
+
+- **Cheap tier.** Classification rarely needs a frontier
+  model.
+- **Batch.** Multiple records per call, structured output.
+- **Cache aggressively** — same input, same output, deterministic.
+
+## The "free tier turned into $40k" failure patterns
+
+The specific ways teams overshoot their budget. Almost always
+one of these.
+
+### Pattern 1: agentic loops without step caps
+
+The most common ten-thousand-dollar bug. An agent runs unbounded
+on a hard task. Each step costs ~$0.10. Step 1, 2, 3 look
+fine; by step 200 the agent is in a loop calling the same
+search tool with slightly varied arguments. You discover this
+when the invoice arrives, not when it happens.
+
+Fix: every agent has a step cap, a wall-clock timeout, *and*
+a per-run token budget. Hit any of them, abort. See
+`ai/agent-loops-and-tool-use.mdx`.
+
+### Pattern 2: context that grew silently
+
+A team launches a chat feature at 2,000 avg input tokens. Over
+3 months PMs add to the system prompt ("and also, please be
+encouraging"; "remember the user's name"), engineers add tools,
+RAG context grows from 3 chunks to 8. Six months in, average
+input is 7,500 tokens and nobody priced for it.
+
+Fix: alert on **p50 and p95 input tokens per route**. Drift in
+either is a cost incident. Treat the system prompt and tool
+schema as a thing under change control, not a free-for-all.
+
+### Pattern 3: retries that aren't retries
+
+A bug in the JSON parser causes the app to retry on "I think
+the JSON is malformed but actually it's fine, the parser is
+strict." Two requests get charged for every "successful" one.
+Cost doubles silently.
+
+Fix: instrument retry counts as a metric. p95 retries should
+be 0, p99 should be 1, anything above is a bug. Alert.
+
+### Pattern 4: misclassified users
+
+A free tier offers an LLM feature. One user is actually a
+script calling the endpoint 10,000 times a day. Your average
+calls-per-user is fine, but the **p99 user** is destroying the
+budget. Average cost hides the whale.
+
+Fix: track $/user p99 as a first-class metric, not just
+average. Rate limit on per-user basis, not just global.
+
+### Pattern 5: dev / staging traffic on prod billing
+
+Devs testing locally hit the prod LLM provider key. Load tests,
+CI runs that exercise an LLM, an integration test suite that
+spins up agents. None of this is real product usage; all of it
+shows up on the same invoice.
+
+Fix: separate provider API keys for prod vs non-prod, with
+different rate limits and budgets. Tag every call with
+environment in metadata so you can split the bill by source.
+
+## Per-route, per-user, per-feature budgets
+
+The org-level discipline that keeps this from compounding.
+Don't manage a single "LLM budget" — split it.
+
+<Steps>
+<Step title="Per-route budget">
+Every endpoint that calls the LLM has a budget assigned. "Chat
+route: $0.02 / call avg, $0.10 p95. Classification route:
+$0.001 / call." Logged as metrics; deviation pages the on-call.
+</Step>
+<Step title="Per-user budget">
+Per-user p99 cost / day. This catches the "one whale destroyed
+us" case. Rate-limit by cost, not just request count.
+</Step>
+<Step title="Per-feature budget">
+"Auto-summary feature is allowed $5k/month." Hit 80% of the
+budget, page someone. Hit 100%, the feature degrades (cheaper
+model, shorter outputs) or disables. Build this circuit breaker
+before launch, not after the invoice.
+</Step>
+<Step title="Per-tenant / per-customer budget">
+For B2B SaaS: meter cost per tenant. Either pass it through as
+a usage charge or know which customers are unprofitable. "We
+discovered customer X is costing us 3x what they pay" is a
+common conversation 6 months in.
+</Step>
+</Steps>
+
+## Alerting on the right percentile
+
+The mistake I see most: alerting on average cost-per-call. The
+average hides everything important.
+
+<Compare
+  left={{
+    title: "Average ($/call avg)",
+    points: [
+      "Smoothly trending — looks healthy",
+      "Hides the long-tail of expensive calls",
+      "Hides per-user whales",
+      "Cannot detect prompt-length drift in worst cases",
+      "Useful only for top-line invoice forecasting",
+    ],
+  }}
+  right={{
+    title: "Percentile ($/call p95, p99)",
+    points: [
+      "Spikes when a single route degrades",
+      "Catches agent loops, runaway context, retries",
+      "Aligned with what the on-call needs to see",
+      "Pairs with $/user p99 to find whales",
+      "The actual operational metric",
+    ],
+  }}
+/>
+
+Specific alerts to wire up early:
+
+- **$/call p95 by route**, alert on &gt;20% week-over-week
+  increase.
+- **$/user/day p99**, alert on absolute threshold (e.g. $5/user
+  for B2C, $50 for B2B; depends on your unit economics).
+- **Daily total spend** vs forecast. A daily forecast is a
+  trailing 7-day average; alert on deviation &gt;30%.
+- **Token count p95** per route. Cost is proportional, but
+  token drift detects content changes that pricing alone misses.
+
+## What to tell the finance team
+
+Specific numbers that a non-engineer can use:
+
+- **Unit cost.** "$0.015 per chat session." Lets them model
+  per-user economics.
+- **Scaling shape.** "Linear in DAU, sub-linear in DAU if
+  prompt-cache hit rate grows." Helps them forecast at 10x scale.
+- **Tail risk.** "p99 user costs us 8x the average. The top
+  100 users by usage are 30% of the bill." Forces a
+  conversation about rate limits before it's a crisis.
+- **Levers and their size.** "Switching from Workhorse to
+  Cheap tier saves 60% with ~10pt quality drop on our eval set.
+  Caching the system prompt saves 30%."
+
+## The discipline
+
+- Build the cost model **before** building the feature. Four
+  multiplications on a napkin. Refuse to start without it.
+- Output tokens are 3–5x input. Optimize the right side first.
+- Different app shapes have different cost shapes. Know
+  whether you're chat-shaped (output-heavy), agent-shaped
+  (input-heavy with cache opportunity), or
+  classification-shaped (cheap-tier-friendly).
+- Instrument $/call, $/user, $/feature as metrics. Alert on
+  percentiles, not averages.
+- Wire a circuit breaker per feature — when the budget is
+  blown, the feature degrades, doesn't surprise-bill.
+- Separate prod and non-prod billing. Treat the production API
+  key like production database credentials.
+- Token-count drift is a cost incident. Treat it like a latency
+  regression.
+
+## What to learn next
+
+- `ai/caching-llm-responses.mdx` — the three caching layers and
+  how to use them.
+- `ai/tokens-and-tokenizers.mdx` — count tokens correctly, not
+  by word.
+- `ai/agent-loops-and-tool-use.mdx` — step caps, token caps,
+  duplicate-call detection.
+- `ai/llm-observability-and-tracing.mdx` — the instrumentation
+  these alerts ride on top of.
+- `ai/model-serving-and-inference-latency.mdx` — when
+  self-hosting starts to pencil out.

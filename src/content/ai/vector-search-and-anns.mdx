@@ -1,0 +1,299 @@
+export const level = 'mid';
+
+# Vector search and ANN
+
+You have 10 million embedding vectors in `R^1536`. The user sends
+a query vector and wants the 10 nearest by cosine similarity, in
+under 100ms. Exact nearest-neighbor is O(N) — 10M dot products of
+1536 floats. Even fully vectorized that's a few hundred
+milliseconds on a single core, and it scales linearly. You can't
+ship that.
+
+**Approximate Nearest Neighbor (ANN)** algorithms trade exact
+recall for sublinear query time. The big three are HNSW, IVF, and
+ScaNN. Each is a different bet on what to give up.
+
+`nosql/time-series-and-vector.mdx` covers the storage side — which
+database to put vectors in. This page is about the index inside
+those databases. Same algorithms, whether you're using pgvector,
+Qdrant, Pinecone, Elasticsearch, or Milvus.
+
+## Why exact search is hopeless at scale
+
+A cosine similarity between two `R^d` vectors is one dot product —
+`d` multiplies, `d-1` adds. With `d=1536`, that's about 3000 FLOPs
+per comparison. SIMD gets you ~10–20× speedup. At 10M vectors:
+
+```
+10,000,000 × 3,000 / 16 (AVX-512) ≈ 1.9B operations per query
+At ~50 GFLOPs/core sustained ≈ ~40 ms/query, single-core
+At 1000 QPS ≈ 40 cores
+```
+
+Doable for a tech demo, not for a service answering 10K QPS over
+500M vectors. And recall is only 100% if you actually compared
+*everything*, which is the cost you're trying to avoid.
+
+ANN flips the deal: hit 95–99% recall with 10–100× less work per
+query. For RAG and semantic search that's fine — your downstream
+reranker doesn't care about the 1% you missed.
+
+## HNSW — the default
+
+Hierarchical Navigable Small World. A multi-layer graph where each
+vector is a node connected to its near neighbors. Higher layers
+have fewer nodes and longer edges (highways); the bottom layer has
+every vector.
+
+```
+Layer 3:   o-----------------o
+            \               /
+Layer 2:    o---o-------o---o
+            |   |       |   |
+Layer 1:    o-o-o-o---o-o-o-o
+            ||||| | | | |||||
+Layer 0:   o-o-o-o-o-o-o-o-o-o   (every vector)
+```
+
+A query starts at the top layer, greedily walks to the nearest
+node, descends a layer, walks again, descends, until layer 0.
+The walk visits O(log N) nodes total. Cosine comparisons happen
+only on visited nodes — not on the whole corpus.
+
+The knobs:
+
+- **`M`** — neighbors per node. Build-time. Higher M = better
+  recall, more memory. Default 16; 32 for higher quality.
+- **`ef_construction`** — search width during indexing. Higher =
+  better graph, slower build. Default 200; 400 for quality.
+- **`ef_search`** — search width at query time. The runtime
+  recall/latency knob. Default 40–100. Bigger ef = higher recall,
+  slower query.
+
+Tuning `ef_search` is the dial you actually turn in production.
+Plot recall@10 vs query latency across `ef_search ∈ {16, 32, 64,
+128, 256, 512}` on your corpus and pick the elbow.
+
+**Strengths:**
+
+- Best-in-class recall/latency tradeoff at most scales.
+- No retraining when you add vectors — inserts are incremental.
+- Robust across vector dimensions and distributions.
+
+**Costs:**
+
+- Memory: the graph keeps every vector in RAM plus M neighbor
+  pointers per node. At 1536 dims with M=16, expect ~7–10 KB per
+  vector. 10M vectors ≈ 70–100 GB RAM.
+- Build is sequential and slow at scale. Building a 100M-vector
+  HNSW index can take hours.
+- Hard to delete from. Most implementations soft-delete (tombstone)
+  and only reclaim on rebuild.
+
+This is what pgvector, Qdrant, Weaviate, Elasticsearch, OpenSearch,
+and Pinecone all use as their primary index. If you don't know
+which to pick, pick HNSW.
+
+## IVF — when you need fast builds at scale
+
+Inverted File index. Cluster the vectors with k-means into K
+*cells* (typically `K ≈ √N`). At query time, find the closest
+`nprobe` cells and do exact search only inside them.
+
+```
+nprobe = 8 of K = 1024 cells
+Visited fraction ≈ 8/1024 = 0.8% of the corpus
+```
+
+The knobs:
+
+- **`nlist`** (K) — number of cells. Build-time. Typically `√N`.
+- **`nprobe`** — cells visited per query. The runtime knob.
+  Higher = better recall, slower.
+
+**Strengths:**
+
+- Fast to build — k-means clustering scales much better than
+  HNSW graph construction.
+- Lower memory than HNSW (no graph).
+- Excellent fit for batch workloads where build time matters.
+
+**Costs:**
+
+- Lower recall than HNSW at the same query latency. The cluster
+  boundary matters — vectors near the edge of a cell might have
+  their true nearest neighbors in an adjacent cell.
+- Cluster centroids drift as you add vectors. At some point you
+  re-cluster.
+- Performance degrades when query distribution differs from build
+  distribution (cells are sized for the original data).
+
+Combined as **IVF-PQ** (IVF + product quantization), this is the
+go-to for billion-scale workloads where HNSW's memory becomes
+prohibitive. FAISS popularized this combination.
+
+## ScaNN — Google's answer
+
+Asymmetric Hashing + anisotropic vector quantization +
+partitioning. ScaNN is the descendant of the indexing work
+inside Google's production search.
+
+**Strengths:**
+
+- Often the highest recall/latency Pareto frontier on benchmarks
+  at billion scale.
+- Very memory-efficient via quantization.
+
+**Costs:**
+
+- More complex to tune than HNSW or IVF.
+- Less ubiquitous — fewer vector DBs ship a ScaNN backend.
+- Mostly used inside Google's own systems (Vertex AI Matching
+  Engine).
+
+In practice: HNSW unless you're explicitly building at Google
+scale, in which case you'd already have someone on the team who
+knows ScaNN inside out.
+
+## PQ — orthogonal compression
+
+Product Quantization isn't an index — it's a vector compression
+trick that any of HNSW, IVF, or ScaNN can stack on.
+
+Split each 1536-d vector into M sub-vectors of `1536/M` dimensions
+(say M=64 sub-vectors of 24 dimensions each). For each sub-space,
+cluster all sub-vectors into 256 centroids. Replace each
+sub-vector with the 1-byte index of its centroid. A 1536-d
+`float32` vector (6144 bytes) becomes 64 bytes.
+
+```
+Compression: 6144 → 64 bytes ≈ 96× smaller
+Recall cost: typically 3–10% drop at the same latency
+```
+
+The recall hit is real but often acceptable, especially when you
+have a reranker. PQ is how vector DBs fit hundreds of millions of
+vectors on a single machine.
+
+## Recall vs latency — the actual numbers
+
+For a typical 1M-vector corpus at d=1536:
+
+<Cheatsheet caption="Realistic recall@10 vs query latency across ANN choices on a 1M-vector corpus.">
+| Index | `ef_search` / `nprobe` | Recall@10 | Latency (single-core) |
+|---|---|---|---|
+| Exact (baseline) | — | 100% | ~150 ms |
+| HNSW M=16 | ef=40 | 92% | ~2 ms |
+| HNSW M=16 | ef=128 | 98% | ~5 ms |
+| HNSW M=32 | ef=200 | 99.5% | ~8 ms |
+| IVF nlist=1024 | nprobe=8 | 85% | ~3 ms |
+| IVF nlist=1024 | nprobe=32 | 95% | ~10 ms |
+| IVF-PQ nlist=1024 | nprobe=32 | 88% | ~4 ms |
+</Cheatsheet>
+
+These are rough orders of magnitude. Your numbers will differ —
+benchmark on your own data, on your own hardware, with your own
+recall target. Library benchmarks are honest but rarely match
+your distribution.
+
+## Filtered vector search
+
+The realistic query isn't "nearest 10 vectors." It's "nearest 10
+vectors *where `tenant_id = X` and `published_at > Y`*." This is
+where vector search gets operationally interesting.
+
+Two basic strategies — both are wrong in different ways:
+
+<Compare
+  left={{
+    title: "Pre-filter",
+    points: [
+      "Apply WHERE filters first, then ANN over the filtered subset",
+      "Correct results — no candidates can leak through",
+      "Breaks ANN: the index is built over all vectors, not the filtered subset",
+      "If the filter is very selective (1% of corpus), the index is useless",
+      "Falls back to brute force",
+    ],
+  }}
+  right={{
+    title: "Post-filter",
+    points: [
+      "ANN over everything, then drop vectors that don't match the filter",
+      "Fast — uses the index normally",
+      "May return fewer than K results, or zero",
+      "You over-fetch (K' >> K) and hope enough survive",
+      "Breaks when the filter is selective",
+    ],
+  }}
+/>
+
+**Modern vector DBs implement neither naively.** They do
+*filtered ANN* — the index walk is filter-aware. Qdrant builds
+per-payload sub-graphs. Pinecone has metadata-aware indexing.
+Weaviate uses the same approach. pgvector lags here — its filter
+support is "post-filter with overfetch."
+
+**The rule of thumb that bit me:** when a filter is more than 99%
+selective (less than 1% of the corpus matches), no ANN strategy
+performs well. Exact brute-force scan on the filtered subset
+becomes the right answer. Some vector DBs make this switch
+automatically; some don't.
+
+## When pgvector stops being enough
+
+pgvector is the right default — see
+`nosql/time-series-and-vector.mdx`. The point where it starts
+hurting:
+
+- **~50M vectors** at d=1536: HNSW build times become hours,
+  memory pressure becomes serious. Postgres isn't optimized for
+  this workload.
+- **High write rate combined with high query rate:** HNSW inserts
+  contend with query traffic on the index lock. A purpose-built
+  vector DB handles this better.
+- **Selective metadata filtering:** pgvector post-filters; Qdrant
+  and Pinecone do filter-aware ANN.
+- **Multi-tenancy with very different tenant sizes:** dedicated
+  namespaces in a purpose-built DB beat building per-tenant
+  indexes in Postgres.
+
+If your workload hits any of these, the migration is real but
+not enormous. You're moving an index, not a data model.
+
+## The dimensionality question
+
+Higher-dimensional embeddings carry more information but cost
+more to store, index, and search.
+
+```
+1536-d float32 vector: 6144 bytes
+3072-d float32 vector: 12288 bytes (2× index size, 2× compare cost)
+```
+
+OpenAI's `text-embedding-3-*` models support **Matryoshka
+truncation** — you can keep only the first 512 or 1024 dimensions
+and lose ~3–5% recall. That's an enormous storage and latency
+win at a small quality cost. If you're cost-sensitive, truncate.
+
+## The discipline
+
+- Pick HNSW unless you have a specific reason not to.
+- Tune `ef_search` for the recall/latency curve your application
+  needs. Plot it; don't guess.
+- Expect the index to be in RAM. Budget 7–10 KB per vector for
+  HNSW at d=1536.
+- Filter-aware ANN matters as soon as queries have WHERE clauses.
+  Test with your actual filter selectivity.
+- Truncate dimensions when you can. Matryoshka embeddings make
+  this almost free.
+- Re-evaluate the index choice when corpus crosses 50M and again
+  at 500M. Different scales reward different bets.
+
+## What to learn next
+
+- `nosql/time-series-and-vector.mdx` — picking a vector DB.
+- `rag-retrieval-pipeline.mdx` — where the index sits.
+- `hybrid-search-bm25-plus-vectors.mdx` — when ANN alone isn't
+  enough.
+- `rerankers-and-cross-encoders.mdx` — what cleans up the 1–5%
+  ANN recall miss.

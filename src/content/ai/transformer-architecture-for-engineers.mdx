@@ -1,0 +1,307 @@
+export const level = 'mid';
+
+# Transformer architecture for engineers
+
+Enough transformer architecture to read a model card, size a GPU,
+debug a deployment, and not be the person in the meeting who
+confuses parameters with context length. This is not a derivation
+of self-attention. If you want the math, Tunstall, Werra & Wolf's
+*Natural Language Processing with Transformers* and Alammar's
+*Hands-On Large Language Models* both do it well.
+
+You're a backend engineer. The questions you actually face are:
+
+- "We want to self-host this 70B model — what GPU do I need?"
+- "MoE vs dense — what's the difference for me?"
+- "Why does this Llama-3.1-70B have 8 KV heads but 64 attention
+  heads?"
+- "The vendor advertises a 7B model but it's 56B on disk — what?"
+
+Those are the questions this page answers.
+
+## The shape of a decoder-only model
+
+Modern chat LLMs (GPT-4, Claude, Llama, Mistral, Qwen, DeepSeek)
+are **decoder-only transformers**. The shape is:
+
+```
+input tokens
+   ↓
+token embeddings   ← lookup table: vocab_size × d_model
+   ↓
+[transformer block] × N_layers
+   ↓
+final layer norm
+   ↓
+LM head            ← linear: d_model × vocab_size
+   ↓
+logits over vocabulary → softmax → next token
+```
+
+Each transformer block is the same shape repeated N times:
+
+```
+x' = x + Attention( LayerNorm(x) )      # residual around attn
+x'' = x' + MLP( LayerNorm(x') )         # residual around MLP
+```
+
+Two sub-layers — attention and a feed-forward MLP — each wrapped in
+a residual connection. That's it. The "deep learning magic" is
+this same block 32 or 80 times.
+
+## Where the parameters actually live
+
+For a typical dense LLM, parameter count breaks down roughly as:
+
+<Cheatsheet
+  columns={['Component', 'Share of params', 'What it does']}
+  rows={[
+    ['Token embeddings + LM head', '5–15%', 'Map tokens ↔ vectors; often tied weights'],
+    ['Attention (Q, K, V, O projections)', '~25–35%', 'Mixing across positions'],
+    ['MLP / feed-forward', '~55–65%', 'Per-token transformation; "where knowledge lives" (Geva et al.)'],
+    ['LayerNorm / RMSNorm', '&lt; 0.1%', 'Numerical stability; almost free'],
+    ['Positional encodings', '0 or tiny', 'RoPE/ALiBi are computed, not learned; absolute pos embeddings are a small table'],
+  ]}
+  caption="The MLP is where most parameters sit. Attention is where most attention goes (pun acknowledged)."
+/>
+
+Counterintuitive but important: **most of a model's weight is in
+the MLP, not the attention layers.** Mechanistic interpretability
+work (Geva, Schuster, Berant et al.) localizes a lot of factual
+knowledge to MLP weights. That's why MoE — which scales only the
+MLP — is so effective at adding capacity without proportionally
+scaling cost.
+
+## Parameter count → memory, roughly
+
+The rule of thumb every backend engineer needs:
+
+```
+ram_for_weights ≈ params × bytes_per_param
+```
+
+For a 7B-parameter model:
+
+<Cheatsheet
+  columns={['Precision', 'Bytes / param', 'Memory for 7B', 'Memory for 70B']}
+  rows={[
+    ['fp32', '4', '28 GB', '280 GB'],
+    ['fp16 / bf16', '2', '14 GB', '140 GB'],
+    ['int8', '1', '7 GB', '70 GB'],
+    ['int4 (AWQ/GPTQ)', '0.5', '3.5 GB', '35 GB'],
+  ]}
+  caption="Add ~20% for activations and KV cache at runtime. fp16 is the training default; int4 is the self-host default."
+/>
+
+So when someone says "we'll run 70B on a single H100 (80 GB)" —
+they mean quantized to int4 or int8, with a modest context budget.
+At fp16, 70B needs two H100s with tensor parallelism.
+
+This is also why **"7B model" tells you almost nothing about
+quality**. A 7B Mistral and a 7B Qwen-2.5 score wildly differently
+on the same eval; a 2024 7B beats a 2022 70B on most tasks. Params
+predict memory, not capability.
+
+## Attention heads: MHA, MQA, GQA
+
+The original Transformer (2017) used **Multi-Head Attention (MHA)**
+— `H` independent attention heads, each with its own Q, K, V
+projections. KV cache per layer is `H × d_head × seq_len × 2 (K
+and V) × bytes`.
+
+For long context, that KV cache eats memory. Two optimizations:
+
+<Compare
+  left={{
+    title: 'MQA (Multi-Query Attention)',
+    points: [
+      'All query heads share ONE K head and ONE V head',
+      'KV cache shrinks by factor of H (e.g. 64×)',
+      'Quality drops noticeably — heads can no longer specialize on different relations',
+      'Used in PaLM, Falcon; mostly abandoned',
+    ],
+  }}
+  right={{
+    title: 'GQA (Grouped-Query Attention)',
+    points: [
+      'Group query heads, each group shares one K/V pair',
+      'Llama 3 70B: 64 query heads, 8 KV heads → 8 groups',
+      'KV cache shrinks by 8× with near-zero quality loss',
+      'The 2026 default — Llama, Mistral, Qwen, DeepSeek all use GQA',
+    ],
+  }}
+/>
+
+When you see "8 KV heads, 64 attention heads" in a model card,
+that's GQA with group size 8. Each group of 8 query heads shares
+one K/V projection. The win is memory, not compute — and for
+decode (which is memory-bandwidth-bound), that translates directly
+to throughput.
+
+**Engineering consequence:** GQA is the reason a Llama-3 70B fits
+the same KV budget as a much smaller MHA model at long context.
+If you're comparing models for self-host, look at KV head count,
+not just parameter count.
+
+## Encoder, decoder, encoder-decoder
+
+Three architectural patterns, each used for different things:
+
+<Cheatsheet
+  columns={['Family', 'Examples', 'What it does well', 'Where it fits']}
+  rows={[
+    ['Encoder-only', 'BERT, RoBERTa, DeBERTa, ModernBERT', 'Classification, embeddings, NER', 'Search, retrieval, content moderation. Bidirectional attention.'],
+    ['Decoder-only', 'GPT-4, Claude, Llama, Mistral, Qwen', 'Generation, chat, code', 'Everything LLM-shaped in 2026. Causal mask.'],
+    ['Encoder-decoder', 'T5, BART, Flan-T5', 'Translation, summarization, structured transduction', 'Less common now; some specialized fine-tunes'],
+  ]}
+  caption="If you say 'LLM' you almost always mean decoder-only. Embeddings come from encoder-only models."
+/>
+
+The reason decoder-only won: it's a single unified architecture
+that handles generation, classification (via prompting), and
+in-context learning. Encoder-decoder models are technically nicer
+for translation-shaped tasks but lost the platform war.
+
+Embedding models (see `ai/embeddings-fundamentals.mdx`) are still
+mostly encoder-only — bidirectional attention is genuinely better
+for "compress this text to a vector" than causal attention is.
+
+## Mixture of Experts (MoE)
+
+This is the architecture that confuses everyone, so worth a
+careful walk-through.
+
+A **dense** model uses all its parameters on every token. A 70B
+dense model does ~70B floating-point operations per token (per
+layer, simplified).
+
+An **MoE** model has an MLP layer that's actually `E` separate
+"expert" MLPs plus a small **router** network. For each token,
+the router picks the top `k` experts (usually `k=2`); only those
+`k` experts run.
+
+Mixtral 8x7B is the canonical example:
+
+- **8 experts × 7B per expert = ~47B total params** (not 56B —
+  attention layers are shared across experts).
+- **Top-2 routing**: each token activates 2 of 8 experts.
+- **Active params per token: ~13B.**
+
+What this gives you:
+
+- **Compute** like a 13B model (only 2 experts run per token).
+- **Memory** like a 47B model (all 8 experts must be loaded).
+- **Quality** between 13B and 47B — often closer to the latter
+  on knowledge-heavy tasks.
+
+So "Mixtral 8x7B" is correctly read as "47B params, 13B active."
+That's the number that matters for latency. The 47B is the number
+that matters for RAM and GPU footprint.
+
+DeepSeek V3 takes this further: **671B params, 37B active**. You
+serve a model with frontier-class capability for the compute cost
+of a 37B model — but you need ~700 GB of GPU memory to load the
+weights. Different bottleneck shape than dense.
+
+<Callout type="info">
+The number you care about depends on what you're sizing. **Active
+params** → throughput and latency. **Total params** → GPU memory
+and serving cost. **Both** when comparing across architectures.
+</Callout>
+
+When MoE makes sense: high-throughput serving where you want
+quality near a much larger dense model but can't afford the
+compute. When it doesn't: edge / on-device deployment (the total
+weight is the bottleneck), or fine-tuning (MoE routing is hard
+to fine-tune well — most teams stick with dense for SFT).
+
+## Positional encoding: how the model knows about order
+
+Attention by itself is **permutation-invariant** — `[A, B, C]` and
+`[C, B, A]` produce the same attention output if you don't tell
+the model about position. The fix is positional encoding.
+
+The two you'll see in modern models:
+
+- **RoPE (Rotary Position Embeddings)** — Llama, Mistral, Qwen,
+  Gemma, DeepSeek. Rotates the Q and K vectors by an angle
+  proportional to position. Has nice mathematical properties for
+  extrapolation: you can "stretch" RoPE (linear scaling, YaRN,
+  NTK-aware scaling) to extend a model's context window without
+  full retraining.
+- **ALiBi (Attention with Linear Biases)** — used in some older
+  models like BLOOM. Adds a position-dependent bias to attention
+  scores. Extrapolates naturally past training length but is
+  largely out of fashion.
+
+The engineering reason RoPE matters: when a provider extends a
+model's context from 8K → 128K via "RoPE scaling," they're not
+retraining from scratch. They're rescaling the rotation angles and
+doing a light fine-tune. That's why context-extended variants are
+common and cheap, but quality past the original training length
+often degrades on hard tasks.
+
+## Tokenizer and vocab
+
+The tokenizer is technically not part of the transformer, but it
+shapes everything. See `ai/tokens-and-tokenizers.mdx` for the
+deep dive. The architecture-relevant bits:
+
+- **Vocab size** sets the size of the embedding table and LM head.
+  Bigger vocab = bigger model in those two layers. Llama 3 jumped
+  from 32K → 128K vocab and gained ~1B params from that alone.
+- **Tokenizer must match the model.** You cannot use the Llama
+  tokenizer with a Qwen model. Mismatched tokenizers produce
+  garbage.
+- **Tokenizers are not portable across model families** for
+  speculative decoding either — see
+  `ai/model-serving-and-inference-latency.mdx`.
+
+## Reading a model card
+
+When you see a card like:
+
+```
+Llama 3.1 70B Instruct
+- params: 70.6B
+- layers: 80
+- d_model: 8192
+- attention heads: 64
+- KV heads: 8 (GQA, group size 8)
+- vocab: 128K
+- context: 128K (RoPE scaled from 8K)
+- precision: bf16 (training)
+```
+
+You can immediately infer:
+
+- **bf16 weight size**: 70.6B × 2 = ~141 GB. Won't fit one H100;
+  needs 2× H100 with tensor parallelism, or quantization.
+- **GQA group size 8**: KV cache is ~1/8 of an equivalent MHA
+  70B. Long context is cheaper than it would otherwise be.
+- **RoPE-scaled context**: real recall past ~16K may degrade
+  faster than NIAH scores suggest (see
+  `ai/attention-and-context-windows.mdx`).
+- **128K vocab**: a couple-GB of weights are in the embedding
+  table and LM head alone. Quantization gains are not as
+  dramatic on those layers.
+
+That's the level of reading a model card needs to support real
+sizing decisions.
+
+## What we tell people
+
+- Decoder-only is the LLM architecture. Encoder-only is the
+  embeddings architecture. Encoder-decoder is mostly historical.
+- Parameter count predicts memory, not capability. A 2024 7B
+  beats a 2022 70B on most tasks.
+- MoE: active params for compute, total params for memory.
+  Quote both when comparing.
+- GQA is the reason long context fits on one GPU. Look at KV
+  head count in the model card.
+- Most parameters live in the MLP. Most factual knowledge does
+  too. This is why MoE — scaling the MLP — works so well.
+- The LM head and embedding table aren't free. Big vocabularies
+  cost real memory.
+- RoPE-scaled context windows are cheap to produce and easy to
+  over-trust. Always benchmark recall at the depth you need.

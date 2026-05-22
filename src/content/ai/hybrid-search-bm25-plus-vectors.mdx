@@ -1,0 +1,278 @@
+export const level = 'mid';
+
+# Hybrid search: BM25 + vectors
+
+Pure vector search is great at semantic matching and bad at exact
+matches. Pure keyword search is the opposite. **Hybrid search**
+combines them — BM25 for lexical signal, dense vectors for
+semantic signal — and on essentially every real corpus, hybrid
+beats either alone.
+
+The mechanism is simple. The trap is the eval set you used to
+convince yourself pure vector was good enough.
+
+## Why pure vector misses obvious queries
+
+A user searches "OAuth 2.1 token endpoint". A vector index returns
+chunks about "authentication flows," "authorization codes," and
+"OpenID Connect." All semantically related. None mention "2.1"
+specifically. The user wanted the page about 2.1.
+
+This isn't a bug — it's how embeddings work. Embeddings compress
+meaning into 1536 floats. Specific tokens — version numbers, SKUs,
+proper nouns, error codes, identifiers — get smoothed into the
+surrounding semantic context. "OAuth 2.1" and "OAuth 2.0" are
+near-identical in embedding space.
+
+Pure vector retrieval is consistently weak on:
+
+- Version numbers, model numbers, part numbers.
+- Proper nouns, especially novel ones not in pretraining.
+- Error codes (`E_NOMEM`, `ECONNREFUSED`, HTTP status numbers).
+- Acronyms with multiple expansions.
+- Out-of-vocabulary or domain-specific identifiers.
+- Exact-phrase queries the user wrote in quotes.
+
+BM25 nails every one of these. It's literally matching strings —
+of course it does.
+
+## What BM25 actually is
+
+BM25 is the lexical retrieval workhorse — it's what every search
+engine since the late 1990s has been built around, with various
+tweaks. Given a query of terms and a document:
+
+```
+score(q, d) = Σ IDF(t) × tf(t,d) × (k₁ + 1) / (tf(t,d) + k₁ × (1 - b + b × |d|/avgdl))
+              t ∈ q
+```
+
+Don't memorize the formula. Memorize the shape:
+
+- **IDF(t)** — rare terms are worth more. "the" scores ~0; a SKU
+  appearing in 3 documents scores high.
+- **tf(t,d)** — more occurrences in the doc help, with diminishing
+  returns past ~3.
+- **Length normalization** — long documents don't get a free
+  pass; their TF gets discounted by length.
+
+BM25 is fast (the index is an inverted file), interpretable, and
+honestly correct on the cases where embeddings are weak. It also
+gives you absolutely nothing on a paraphrase: "how do I keep my
+JS object safe" doesn't match "TypeScript readonly modifier"
+without a vector to bridge them.
+
+The two methods are complementary by construction.
+
+## Combining the scores
+
+You retrieve K candidates from each system, then fuse. Two
+mainstream approaches:
+
+### Reciprocal Rank Fusion (RRF)
+
+Forget the scores. Use only the *rank* each system assigned.
+
+```
+RRF_score(d) = Σ  1 / (k + rank_i(d))
+              i ∈ retrievers
+```
+
+`k` is a smoothing constant, typically 60 (from the original
+paper). A doc ranked 1st by BM25 contributes `1/61 ≈ 0.0164`. A
+doc ranked 10th contributes `1/70 ≈ 0.0143`. Sum across
+retrievers and re-sort.
+
+```ts
+function rrf(rankings: number[][], k = 60): Map<string, number> {
+  const scores = new Map<string, number>();
+  for (const ranked of rankings) {
+    ranked.forEach((docId, i) => {
+      const rank = i + 1;
+      scores.set(docId, (scores.get(docId) ?? 0) + 1 / (k + rank));
+    });
+  }
+  return scores;
+}
+```
+
+**Why this works:** RRF is robust to score-scale mismatches. BM25
+scores can be 0–30. Cosine similarity is bounded 0–1. Their raw
+sums make no sense; their rank sums do.
+
+**Why this is the default:** zero tuning. Drop it in, get hybrid
+search that's almost always better than either input. The "k=60"
+constant is the only knob and the default is good enough for
+production.
+
+### Weighted score fusion
+
+Normalize each system's scores, then weighted-sum.
+
+```
+final = α × normalize(bm25_score) + (1-α) × normalize(vector_score)
+```
+
+**The hard part is `normalize`.** BM25 scores have no natural
+upper bound. Options:
+
+- **Min-max** over the top-K results — bounded but unstable
+  per-query.
+- **z-score** — better, still per-query.
+- **CDF-based** — calibrate offline against a sample query
+  distribution.
+
+Tuning α is corpus-specific. Typical values are 0.3–0.7. Lower α
+means trust the vectors more.
+
+**When to prefer weighted over RRF:** when you have a labeled
+eval set and the budget to tune. Otherwise RRF is the unbeatable
+default.
+
+<Compare
+  left={{
+    title: "Reciprocal Rank Fusion",
+    points: [
+      "No score normalization needed — uses ranks",
+      "Zero tuning",
+      "Robust across heterogeneous retrievers",
+      "Discards score magnitude information",
+      "Default for hybrid search",
+    ],
+  }}
+  right={{
+    title: "Weighted score fusion",
+    points: [
+      "Uses raw similarity / BM25 scores",
+      "Higher quality when tuned on a labeled set",
+      "Sensitive to score normalization choice",
+      "Requires per-corpus tuning",
+      "Worth it only with proper evaluation",
+    ],
+  }}
+/>
+
+## Implementation shape
+
+```ts
+// 1. Retrieve K from each system independently
+const [vecHits, lexHits] = await Promise.all([
+  vectorIndex.search(await embed(query), { topK: 50 }),
+  bm25Index.search(query, { topK: 50 }),
+]);
+
+// 2. Fuse with RRF
+const fused = rrf([
+  vecHits.map(h => h.id),
+  lexHits.map(h => h.id),
+]);
+
+// 3. Sort by fused score and take top N
+const topN = [...fused.entries()]
+  .sort((a, b) => b[1] - a[1])
+  .slice(0, 20)
+  .map(([id]) => id);
+
+// 4. (Optional, recommended) Rerank top-N with a cross-encoder
+const reranked = await rerank(query, topN, { topN: 5 });
+```
+
+Two operational notes:
+
+- **Run the two retrievals in parallel.** They share no state.
+  Total latency is `max(bm25, vector)`, not sum.
+- **K per system is bigger than your final K.** Each retriever
+  may miss the gold answer in its own top-5 but include it in
+  its top-50. Fusion recovers it. Typical values: K=50 per
+  retriever → top-20 fused → rerank → top-5.
+
+## Native support in stores
+
+You almost never implement hybrid search from scratch in 2026 —
+every serious search engine ships it:
+
+- **Elasticsearch / OpenSearch** — first-class. `rrf` and weighted
+  fusion both built in. `_search` with a `knn` clause + a
+  `match` clause + `rank: { rrf: {} }`.
+- **Weaviate** — `hybrid` operator with `alpha` for weighted
+  fusion.
+- **Qdrant** — query API supports prefetch + fusion across
+  vector and sparse retrievers.
+- **Vespa** — the original hybrid-first engine; ranking
+  expressions fuse arbitrary scorers.
+- **Pinecone** — hybrid via sparse-dense indexes.
+- **pgvector + Postgres** — manual. Run a `tsvector` `@@`
+  query and an `ORDER BY embedding <=>` query, fuse in
+  application code. Honest but not turn-key.
+
+Pick the engine first; the hybrid mechanism is usually included.
+
+## The eval-set trap
+
+This is the most common way hybrid search fails to land in
+production.
+
+Public benchmarks (BEIR, MS MARCO) are dominated by paraphrase-
+style queries. Dense retrievers win on those benchmarks. You
+read papers, you build pure-vector retrieval, you ship.
+
+Then real users arrive. Their queries are:
+
+- "VEXP-1138" (a SKU).
+- "error code 0x80070005" (an error code).
+- "GPT-4o" (a model name your embedding model saw rarely).
+- '"connection reset by peer"' (an exact phrase in quotes).
+
+BM25 nails all of these. Your dense-only system returns chunks
+about "products," "exceptions," "language models," and "network
+errors" — all *related*, none *correct*. Recall plummets, users
+call it broken.
+
+The trap was the eval set. BEIR-style benchmarks underweight
+exact-match queries because that's not what they were designed
+to measure. **Build an eval set from your own users' queries.**
+The query distribution decides which retriever wins. See
+`llm-eval-design.mdx`.
+
+## Sparse-dense hybrids
+
+A modern twist: **learned sparse retrievers** like SPLADE encode
+queries and documents into sparse vectors over the vocabulary
+(thousands of nonzero terms, expanded with related vocabulary
+the model thinks is implied). They run on inverted indexes like
+BM25 but they handle paraphrases like dense vectors.
+
+- **SPLADE** — query/document expansion via masked language
+  modeling on BERT.
+- **uniCOIL**, **DeepImpact** — alternative learned sparse
+  approaches.
+
+For most teams in 2026, BM25 + dense + RRF is still the right
+default. Learned sparse is a bigger investment that pays off
+mainly when you're already operating at scale and have an eval
+pipeline tight enough to detect 2-point nDCG improvements.
+
+## The discipline
+
+- **Default to hybrid.** Pure-vector retrieval is almost always
+  the wrong choice once a real product ships.
+- **RRF first, weighted fusion only with proper eval.** Saves
+  you from tuning a knob you can't measure.
+- **K per retriever is much bigger than final K.** Cheap insurance
+  against either retriever individually missing a hit.
+- **Build the eval set from real queries.** BEIR-style benchmarks
+  lie about the relative value of dense vs lexical for your
+  specific corpus.
+- **Add a reranker on top of fused candidates.** Hybrid + RRF +
+  cross-encoder rerank is the well-trodden production stack.
+
+## What to learn next
+
+- `rag-retrieval-pipeline.mdx` — where hybrid sits in the
+  bigger system.
+- `rerankers-and-cross-encoders.mdx` — the precision step that
+  follows fusion.
+- `llm-eval-design.mdx` — building the eval set that tells you
+  hybrid is actually better.
+- `nosql/time-series-and-vector.mdx` — vector stores that
+  ship native hybrid.

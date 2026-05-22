@@ -1,0 +1,283 @@
+export const level = 'senior';
+
+# MLOps pipelines and feature stores
+
+The two artifacts an ML team ships are the **trained model** and the
+**features that fed it**. Getting either one to production is a
+distributed-systems problem dressed up as a notebook. This page is
+about the plumbing — pipelines, feature stores, registries,
+shadow deploys — and the recurring failure mode where the model
+trained on data the production app can't actually see.
+
+If you're new to the whole job, start at
+`ai/what-is-ai-engineering.mdx` for the AI-eng vs ML-eng split.
+This page is about the ML-eng side: you own the model, you trained
+it, you can change it. The pain is operational.
+
+## Training-serving skew is the bug
+
+The single failure mode that bites every team at least once. The
+model performs beautifully in offline eval and worse — sometimes
+*much* worse — in production. The cause is almost never the model
+weights. The cause is that **a feature the trainer saw is not the
+same value the serving path sees**.
+
+Concrete shapes it takes:
+
+- **Different code paths.** The training pipeline computes
+  `time_since_last_purchase` in a SQL job over a warehouse table.
+  The serving path computes it in a Python service using a
+  different timestamp column. The two disagree by a timezone.
+- **Different point-in-time semantics.** Training joined a feature
+  using *today's* value of an attribute that has drifted by the time
+  the model serves a request. The model effectively trained on
+  the future.
+- **Different data lineage.** The trainer used a 7-day rolling
+  average computed nightly. The serving path computes a 24-hour
+  rolling average computed on the fly. Same name. Different number.
+
+The fix is **one feature definition, used by both paths**. That is
+the entire pitch for a feature store.
+
+## Feature stores: the actual idea
+
+Forget the vendor pitches. A feature store is two things stuck
+together:
+
+1. **A registry of feature definitions** — code or config that
+   says "this feature is named `user.purchase_count_7d`, it is
+   computed by *this* SQL/Python, with *these* freshness and
+   staleness rules."
+2. **A serving layer with two backends**:
+   - **Offline store** (a warehouse — BigQuery, Snowflake,
+     Redshift, Delta) for batch feature retrieval at training
+     time, with **point-in-time correct** joins.
+   - **Online store** (a low-latency KV — Redis, DynamoDB,
+     Cassandra, ScyllaDB) for single-row reads at serving time.
+
+The whole point is that **both stores are populated from the
+same definition**. The trainer reads features by `(entity_id,
+event_time)` from the offline store; the serving path reads the
+*current* features by `entity_id` from the online store; the
+values agree because they came from one source of truth.
+
+Feast (open source) and Tecton (commercial) are the names you'll
+see. Databricks Feature Store, Vertex AI Feature Store, and
+SageMaker Feature Store are the cloud-native versions. They all
+implement the same idea with different opinions.
+
+## Point-in-time joins are the hidden hard part
+
+The single most-leaked-in-trainers bug:
+
+```sql
+-- WRONG: this joins today's value of address, not the address
+-- the user had at the time of the order
+SELECT o.*, u.country
+FROM orders o
+JOIN users u ON u.id = o.user_id
+WHERE o.created_at > '2024-01-01';
+```
+
+If a user moves between countries, you trained the model on
+country labels from the future. The model will look good in
+offline eval and bad in prod because at inference time, you
+don't know the user's *future* country.
+
+A point-in-time join uses the feature value **as of the event
+timestamp**:
+
+```sql
+SELECT o.*, uh.country
+FROM orders o
+JOIN user_history uh
+  ON uh.user_id = o.user_id
+ AND uh.valid_from <= o.created_at
+ AND (uh.valid_to IS NULL OR uh.valid_to > o.created_at);
+```
+
+Feature stores do this for you given a slowly-changing-dimension
+schema. Doing it by hand in raw SQL is fine; doing it
+*correctly across 80 features* is what tooling earns its keep on.
+
+## The pipeline shape
+
+The actual flow, roughly:
+
+<Diagram caption="A typical training and serving topology with a feature store in the middle.">
+<DBox x={20} y={10} w={120} h={50} label="Raw data" sub="warehouse, events, CDC" />
+<DBox x={170} y={10} w={140} h={50} label="Feature pipeline" sub="batch + streaming" />
+<DBox x={340} y={10} w={120} h={50} label="Feature store" sub="offline + online" />
+
+<DBox x={20} y={100} w={140} h={50} label="Training pipeline" sub="point-in-time joins" />
+<DBox x={190} y={100} w={120} h={50} label="Model registry" sub="versioned artifacts" />
+<DBox x={340} y={100} w={120} h={50} label="Serving" sub="reads online store" />
+
+<DArrow from={{x: 140, y: 35}} to={{x: 170, y: 35}} />
+<DArrow from={{x: 310, y: 35}} to={{x: 340, y: 35}} />
+<DArrow from={{x: 400, y: 60}} to={{x: 90, y: 100}} label="offline read" />
+<DArrow from={{x: 400, y: 60}} to={{x: 400, y: 100}} label="online read" />
+<DArrow from={{x: 160, y: 125}} to={{x: 190, y: 125}} />
+<DArrow from={{x: 310, y: 125}} to={{x: 340, y: 125}} />
+</Diagram>
+
+The boxes are real services. The arrows are network calls and
+batch jobs that have to be observable, retryable, and rerunnable
+without corrupting state.
+
+## Orchestration: Airflow, Kubeflow, the rest
+
+The same DAG problem as any data pipeline. You need:
+
+- **Idempotent steps** — rerunning yesterday's job should produce
+  the same artifact, not a duplicate.
+- **Backfill** — when you add a new feature, you have to compute
+  it for historical events so the trainer can use it.
+- **Lineage** — given a model, you can trace back through every
+  feature definition, dataset version, and code SHA that produced
+  it.
+
+Tool choices:
+
+- **Airflow** — the default. Python DAGs. Mature, opinionated,
+  ugly UI. Fine for batch.
+- **Kubeflow Pipelines** — Kubernetes-native, container-per-step.
+  Heavier; pays off when you have many GPU-bound steps.
+- **Prefect / Dagster** — newer, more Pythonic, opinionated
+  about lineage. Dagster's asset model maps neatly onto features
+  and models.
+- **Metaflow** — Netflix's. Great DX, sparse on operational
+  features.
+
+For LLM-era teams, the orchestrator is increasingly a thin layer
+because most of the work is "call a hosted API, log the
+response." But for a classical ML team training and retraining
+models, you will own a DAG engine.
+
+## Model registry: what it actually stores
+
+A model registry is the **artifact store for trained models** —
+weights + metadata + lineage. The metadata is the part that
+matters at 2 AM:
+
+- **Training run ID** and the code SHA that produced it.
+- **Dataset version** (a hash of the input data slice).
+- **Feature definitions** (versions of every feature used).
+- **Hyperparameters** and **metrics** from the run.
+- **Eval results** on the standard suite.
+- **Approval status** — who signed off on this model going to prod.
+
+MLflow is the open-source default. Weights & Biases, Vertex AI,
+SageMaker, Databricks all have their own. The thing they buy you
+is **one URL per model version that resolves to the artifact**,
+so the serving path can pin `model_uri = "models:/fraud/42"`
+instead of "the file on Jenny's laptop."
+
+## Deploy strategies that matter
+
+Shipping a model is shipping code, with extra steps. The patterns
+that earn their keep:
+
+<Steps>
+<Step n="1" title="Shadow deploy">
+The new model runs alongside the old one on real traffic, but its
+output is logged and *not* returned to the user. You compare the
+two outputs offline. Catches training-serving skew and large
+behavioral shifts before any user is affected. Costs 2x compute
+during the shadow window — budget for it.
+</Step>
+<Step n="2" title="Canary / staged rollout">
+1% of traffic to the new model, then 10%, then 50%, then 100%.
+Same as a regular service deploy. The catch with ML: 1% may not
+be enough to detect a regression on a metric that fires once
+per 10k requests. Pick traffic share based on the metric you're
+gating on, not by habit.
+</Step>
+<Step n="3" title="A/B with online metrics">
+Run new and old in parallel for a fixed window, measure
+business metrics (CTR, conversion, watch time), gate on
+statistical significance. This is the only deploy step that
+gives you online lift — offline eval is necessary but not
+sufficient.
+</Step>
+<Step n="4" title="Rollback path">
+Make sure you can pin back to the previous model with one
+config change. A model is a dependency; treat the rollback as
+seriously as a service rollback.
+</Step>
+</Steps>
+
+## Data lineage you'll actually want during an incident
+
+When a model goes bad in prod, the questions you'll be asked, in
+order:
+
+1. **What changed?** Code? Features? Upstream data?
+2. **What did this version see during training?** Which dataset,
+   which features, which time window?
+3. **What's it seeing now?** Are the feature distributions in
+   the online store the same as during training?
+4. **Can we reproduce the training run?** Same code, same data,
+   same hyperparameters — do we get the same model?
+
+If you can't answer those in under an hour, your lineage tooling
+isn't paying for itself. The minimum bar: code SHA + dataset
+hash + feature version pinned in the model registry entry.
+
+## The notebook-trained-on-prod-invisible-data failure
+
+The most common shape of training-serving skew in practice:
+
+A data scientist trains a model in a notebook against the
+warehouse. The warehouse has 90 days of history including
+features computed nightly by ETL: `user_lifetime_value`,
+`account_age_days`, `last_5_orders_avg`. The model performs
+well in eval. It ships.
+
+In production, the model is called from a service that has
+**no access to those features**. Maybe the ETL output isn't in
+the online store. Maybe the service is in a different VPC.
+Maybe the on-call team didn't realize those columns weren't in
+the request payload. Either way, the serving path fills them
+in with zeros or nulls, the model sees an input distribution
+it has literally never seen, and the predictions are garbage.
+
+This failure mode has at least three names depending on who's
+writing — "training-serving skew" (Google ML guide), "feature
+availability gap" (Huyen, *Designing ML Systems*), "the
+notebook problem" (Treveil et al., *Introducing MLOps*). It is
+the single biggest argument for a feature store: **you cannot
+train on a feature unless it is also available at serving time
+through the same definition.**
+
+## What good looks like
+
+<Cheatsheet caption="Minimum viable MLOps for a serious model in prod">
+| Concern | What's in place |
+|---|---|
+| Feature definitions | One source of truth, versioned, used by training and serving |
+| Offline store | Warehouse with point-in-time-correct joins for training |
+| Online store | &lt;10ms p99 KV reads for the features the serving path needs |
+| Pipeline orchestration | Idempotent DAG; backfill and rerun are routine |
+| Model registry | Every prod model traces back to code SHA + dataset hash + feature versions |
+| Eval gate | New model has to beat current on a fixed offline suite before any deploy |
+| Shadow deploy | New models see real traffic in shadow for a fixed window before going live |
+| Rollback | One config change reverts to the previous model |
+| Monitoring | Feature distributions and prediction distributions monitored in prod (see `ai/data-and-model-drift.mdx`) |
+</Cheatsheet>
+
+## The discipline
+
+- **One feature definition, used by both training and serving.**
+  Skew is the bug; the feature store is the cure.
+- **Point-in-time joins or it didn't happen.** Joining on today's
+  value of a mutable attribute is training on the future.
+- **Lineage from model back to dataset back to code.** If you
+  can't reproduce the training run, you can't debug the model.
+- **Shadow deploy non-trivial model changes.** Offline eval is
+  necessary, not sufficient.
+- **The notebook is not the production path.** Anything that
+  works in the notebook but can't be served from the same
+  feature definitions is not yet a feature.
+- **A model is a versioned, pinned artifact.** Not "the file in
+  s3://models/latest."
