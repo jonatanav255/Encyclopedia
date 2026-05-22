@@ -1,0 +1,173 @@
+export const level = 'senior';
+
+# Dependency Inversion
+
+> High-level modules should not depend on low-level modules. Both
+> should depend on abstractions. Abstractions should not depend on
+> details. Details should depend on abstractions. — Robert C. Martin
+
+The point of the "inversion" is the *direction of source-code
+dependencies*. Normally a high-level policy module (e.g., the
+checkout flow) imports a low-level mechanism (e.g., the SMTP
+client). DIP flips it: both depend on an abstraction owned at the
+policy level.
+
+## What "inversion" actually means
+
+Before DIP — direct dependency:
+
+```
+checkout.ts ─────────► smtp-client.ts
+```
+
+`checkout` imports `smtp-client`. The policy code knows about the
+specific email transport.
+
+After DIP — abstraction in the middle:
+
+```
+checkout.ts ─────────► EmailSender (interface)
+                              ▲
+                              │ implements
+                       smtp-client.ts
+```
+
+`checkout` imports `EmailSender`. `smtp-client` *also* imports
+`EmailSender` (it implements it). The interface is typically owned
+by the policy module — that's the "inversion": the low-level detail
+now depends on a contract defined by the high-level code.
+
+## DIP vs DI
+
+These get conflated constantly.
+
+- **Dependency Inversion (DIP)** is the *design shape*: policy
+  depends on abstractions, details implement them.
+- **Dependency Injection (DI)** is the *technique* of passing a
+  collaborator in (via constructor, parameter, or property) instead
+  of constructing it internally.
+- **DI containers / frameworks** are tools that automate wiring.
+
+You can apply DIP without a container: pass the interface in as a
+constructor argument. You can use a DI container without applying
+DIP: just resolve concrete classes. The principle is about
+direction; the technique is about wiring.
+
+## A worked example
+
+A checkout module that needs to send a confirmation email:
+
+```ts
+// Bad: high-level checkout depends on a concrete low-level transport.
+import { SmtpClient } from './smtp-client';
+
+class Checkout {
+  private smtp = new SmtpClient(/* host, port, ... */);
+  finish(order: Order) {
+    // ... process payment ...
+    this.smtp.send(order.email, 'Thanks for your order');
+  }
+}
+```
+
+Two problems: `Checkout` is hard to test (every test sends real
+email or needs heavy mocking of `SmtpClient`), and swapping
+transports (SES, Mailgun) means editing `Checkout`.
+
+DIP-shaped:
+
+```ts
+// Interface owned by the policy layer.
+interface EmailSender { send(to: string, body: string): Promise<void>; }
+
+class Checkout {
+  constructor(private email: EmailSender) {}
+  async finish(order: Order) {
+    // ... process payment ...
+    await this.email.send(order.email, 'Thanks for your order');
+  }
+}
+
+// Adapter lives in the infrastructure layer.
+class SmtpEmailSender implements EmailSender {
+  async send(to: string, body: string) { /* SMTP call */ }
+}
+
+// Wiring at the edge of the program.
+new Checkout(new SmtpEmailSender());
+```
+
+Tests pass an in-memory `EmailSender` that records calls. Adding
+SES is a new adapter, not an edit to `Checkout`.
+
+## The "ownership" subtlety
+
+A common mistake: define `EmailSender` *inside the SMTP package*.
+That still puts the abstraction next to the detail; the policy
+layer ends up importing from infrastructure. That's not inversion,
+it's just an interface.
+
+The full DIP shape: the *consumer* (policy) defines the interface.
+Implementers (infrastructure) import from the consumer's package
+and provide the implementation. The direction of `import` flips at
+the seam.
+
+This shape underlies **Hexagonal / Ports-and-Adapters** and **Clean
+Architecture**. The "port" is the interface owned by the domain;
+the "adapter" is the infrastructure that implements it.
+
+## Where DIP earns its keep
+
+- **Cross-cutting concerns**: logging, metrics, persistence,
+  external APIs. The domain shouldn't know which library you picked.
+- **Testability**: a domain class that takes interfaces is trivial
+  to test with fakes.
+- **Vendor swaps**: payment processor, mail transport, storage
+  backend. Adapter pattern in front of these means a swap is
+  isolated.
+
+## Where DIP is overhead
+
+- **Internal-only modules** with no plausible alternative
+  implementation. An `IUuidGenerator` interface with one
+  implementation is just paperwork.
+- **One-off scripts** that don't have tests or alternative
+  configurations.
+- **Static utilities** with no state. Inverting `Math.max` doesn't
+  help anyone.
+
+A useful test: would you actually swap this dependency in a test,
+in a different environment, or in a configuration? If not, the
+indirection is theoretical.
+
+## DIP in functional and structurally typed code
+
+In a function-first style, DIP often looks like **higher-order
+functions**:
+
+```ts
+function checkout(send: (to: string, body: string) => Promise<void>) {
+  return async (order: Order) => {
+    // ...
+    await send(order.email, 'Thanks');
+  };
+}
+```
+
+Same idea, no `class` needed. The "interface" is the function
+type. TypeScript's structural typing makes this nearly free; Rust
+does the same with closures and `Fn` traits.
+
+In Go, DIP often appears as interfaces *declared at the consumer*:
+the domain package declares `type EmailSender interface { ... }`;
+the adapter package's struct satisfies it implicitly. No
+explicit `implements` keyword required.
+
+## Relationship to other principles
+
+- **OCP**: DIP gives you a clean extension point — new variants
+  arrive as new adapter implementations.
+- **ISP**: the abstractions DIP creates should be small role
+  interfaces, not god types.
+- **Composition over inheritance**: DIP's natural wiring is "pass
+  the dependency in," which is composition.

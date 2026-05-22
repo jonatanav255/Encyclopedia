@@ -1,0 +1,206 @@
+export const level = 'mid';
+
+# Immutability and persistent data
+
+**Immutability** says: once a value is created, it never
+changes. Operations that look like mutation (push, set, update)
+return a **new** value instead, leaving the old one intact.
+
+The point isn't aesthetic — it's about reasoning. Mutable
+shared state is the source of most concurrency bugs, most
+"who changed this?" debugging sessions, and a lot of subtle
+aliasing errors. Take away mutation and entire categories of
+bug go with it.
+
+## Mutation, by example
+
+```ts
+// Mutable
+const users = [{ name: 'Ada' }, { name: 'Bob' }];
+users[0].name = 'Ada Lovelace';   // mutates in place
+```
+
+If a hundred other places in your program hold a reference to
+`users[0]`, every single one of them now sees the new name —
+whether they expected to or not. That's **aliasing**, and it's
+where invisible coupling sneaks into a codebase.
+
+Immutable version:
+
+```ts
+const users = Object.freeze([
+  Object.freeze({ name: 'Ada' }),
+  Object.freeze({ name: 'Bob' }),
+]);
+const updated = [{ ...users[0], name: 'Ada Lovelace' }, users[1]];
+// users is unchanged; updated is a new array with one new object
+```
+
+No alias surprises. Anyone still pointing at `users` sees the
+same data. The new state lives in `updated`.
+
+## The two parts: language-level and convention-level
+
+Immutability has two layers:
+
+- **Language-level.** The language or library makes mutation
+  impossible (or hard). Haskell defaults to immutable
+  everything. Rust has `let` vs `let mut` and the borrow
+  checker. Clojure's core data structures are immutable.
+- **Convention-level.** The language allows mutation but the
+  team agrees not to do it. JavaScript with spread/rest, Redux
+  reducers, immer producers, "all our domain objects are
+  frozen at construction." Discipline-enforced.
+
+Both work; the trade is enforcement strength vs flexibility.
+Convention can fail if a teammate gets sloppy. Strict
+language-level immutability is bulletproof but can be
+ceremonious for problems that genuinely *are* about state
+evolving.
+
+## The performance objection (and the answer)
+
+The instinct: "if I can't mutate, I have to copy the whole
+data structure every time I update one field. That's
+quadratic."
+
+The answer: **persistent data structures**. They share
+structure between versions, so updating a 10,000-element
+vector doesn't copy 10,000 elements — it copies a logarithmic
+number of nodes plus the new value.
+
+### Persistent vectors / hash maps
+
+Clojure's vector and hash-map are the canonical example.
+They're implemented as **trees with 32-way branching** (HAMTs
+— hash array mapped tries — for maps). Updating one element:
+
+- Walk down the tree to the leaf.
+- Copy *only the nodes on that path* (log_32 n ≈ 4 nodes for a
+  million-element collection).
+- Point all other branches at the existing nodes.
+
+The new version "shares" almost everything with the old. Old
+references stay valid (they see the old version). Memory
+overhead is small because most nodes are shared.
+
+```
+old:   root ── nodeA ── nodeB ── leafX
+                  \
+                   nodeC ── leafY
+
+new:   root' ── nodeA' ── nodeB' ── leafX'
+                  \   \
+                   \   nodeC ── leafY    ← shared with old
+                    \
+                     ... (other branches shared)
+```
+
+For typical collection sizes (thousands to millions of
+elements), persistent structures are within a small constant
+factor of mutable equivalents on read, and they win on
+**concurrency**: no locking needed because the data is
+literally read-only.
+
+JavaScript libraries with this model: **Immutable.js**,
+**Immer** (uses ES proxies + copy-on-write to *feel* mutable
+while being immutable underneath). Clojure, Scala, and Elm
+have it built in.
+
+## Persistent vs immutable — same thing?
+
+Mostly synonymous in casual use; technically:
+
+- **Immutable**: the value never changes.
+- **Persistent**: previous versions remain accessible after
+  updates. Implies immutable.
+- **Fully persistent**: you can update any past version, not
+  just the latest.
+
+In day-to-day work the distinction rarely matters. "Persistent
+data structure" specifically signals the structural-sharing
+implementation.
+
+## What immutability buys you
+
+- **No aliasing surprises.** Pass a value anywhere; it can't
+  be changed under you.
+- **Safe concurrency.** No locks needed to read. Two threads
+  can hold references to the same immutable value forever.
+- **Trivial undo / time travel.** Old versions are still valid
+  values. Redux DevTools and React's "time-travel debugging"
+  are exactly this.
+- **Cheap equality (sometimes).** Reference equality can stand
+  in for value equality when you know nothing has changed.
+  React's reconciler uses this — if `props.user === oldUser`,
+  skip rerendering.
+- **Cleaner diffing.** Compute "what changed" by comparing two
+  immutable values directly.
+
+## The costs, honestly
+
+- **Garbage and allocation pressure.** Persistent structures
+  allocate. GCs handle it well, but in very hot inner loops
+  (graphics, audio, parsers), mutating an in-place buffer can
+  beat allocating a new structure per iteration.
+- **Verbose nested updates.** `{ ...state, user: { ...state.user,
+  name: 'Ada' } }` for a two-level update gets old fast. Libraries
+  like Immer (`produce`) fix this by letting you *write* mutating
+  code that's *executed* as immutable updates.
+- **Confusion when you genuinely want one thing to mutate.**
+  Identity in an OOP sense (a `Connection`, a session) is
+  fundamentally stateful. Forcing it into an immutable shape
+  becomes "version 47 of this connection," which is silly.
+
+The general rule: **values are immutable; entities have
+identity and may mutate.** A `Money` is a value (1 USD doesn't
+become 2 USD — there's just 2 USD). A `BankAccount` is an
+entity (the same account's balance changes over time).
+Confusing the two leads to either fighting the language or
+fighting the domain.
+
+## Const, readonly, frozen, etc.
+
+A few JavaScript/TypeScript landmines worth knowing:
+
+- `const x = [1, 2, 3]` — only forbids *rebinding* `x`. The
+  array is still mutable. `x.push(4)` works fine.
+- `readonly` (TypeScript) — compile-time check that callers
+  don't reassign or push. Disappears at runtime.
+- `Object.freeze(obj)` — shallow freeze. Top-level properties
+  can't be reassigned; nested objects are *not* frozen.
+- A truly immutable object in JS needs **deep freeze** + a
+  team agreement not to remove the freeze. Or use a library
+  (Immutable.js) where the types simply don't allow mutation.
+
+In practice, most TS codebases lean on `readonly` types +
+discipline + spread-based updates, accepting that you can't
+*prove* nothing mutates but you can make it hard to do so by
+accident.
+
+## Where immutability is essential
+
+A short list of places where immutability isn't optional:
+
+- **React state and props.** React's diffing trusts that
+  you didn't mutate. Mutating state in place is one of the
+  most common React bugs.
+- **Redux / Zustand-style stores.** Reducers must return new
+  state. The whole DevTools time-travel story depends on it.
+- **Concurrent code.** Anything shared across threads or
+  fibers without locks. Java's `String`, Go's strings, Rust's
+  `Arc<T>` (where `T` is read-only after construction).
+- **Cache keys / map keys.** A key that can mutate after
+  insertion silently corrupts the map. Strings, frozen
+  objects, tuples — fine. Mutable objects — danger.
+
+## The takeaway
+
+Immutability is the discipline of returning new values instead
+of mutating old ones. The win is no aliasing surprises, safe
+concurrency, easy undo, and clearer code. The cost — extra
+allocations and verbose nested updates — is mostly solved by
+persistent data structures and helper libraries. Use immutable
+**values** by default; let **entities** have controlled
+mutation through encapsulation. That blend covers most real
+code without going full Haskell.

@@ -1,0 +1,156 @@
+export const level = 'mid';
+
+# Separation of Concerns
+
+Coined (in the form we still use) by Edsger Dijkstra in *On the
+Role of Scientific Thought* (1974). The idea predates him — it
+shows up in Parnas's modularity work and in Knuth's writing — but
+the slogan is Dijkstra's.
+
+A *concern* is a single dimension along which a program varies:
+business logic, persistence, presentation, configuration,
+authorization, logging. Separation of concerns says: **each concern
+should live in its own module**, so each can be reasoned about,
+modified, and tested without dragging the others along.
+
+## What "a concern" looks like
+
+A simple web request typically touches several concerns:
+
+- **Transport**: parsing HTTP, writing status codes, serializing
+  JSON.
+- **Authentication / authorization**: who is the caller, what may
+  they do.
+- **Domain logic**: the actual rule the request implements.
+- **Persistence**: reading and writing to a database.
+- **Observability**: logging, metrics, tracing.
+
+A function that does all five inline is the classic
+"god-handler":
+
+```ts
+app.post('/orders', async (req, res) => {
+  if (!req.headers.authorization) return res.status(401).end();
+  const user = verifyJwt(req.headers.authorization);
+  if (!user) return res.status(401).end();
+  const body = req.body;
+  if (typeof body.total !== 'number') return res.status(400).end();
+  log.info('order request', { user, body });
+  const row = await db.query('INSERT INTO orders ...', [user.id, body.total]);
+  metrics.inc('orders_created');
+  res.status(201).json({ id: row.id });
+});
+```
+
+Five concerns interleaved in 8 lines. Each is shouting over the
+others; none of them is testable on its own.
+
+Separated:
+
+```ts
+app.post('/orders',
+  requireAuth,                        // auth concern
+  validateBody(OrderSchema),          // input concern
+  asyncHandler(createOrderHandler),   // transport ↔ domain bridge
+);
+
+async function createOrderHandler(req, res) {
+  const order = await orderService.create(req.user, req.body);
+  res.status(201).json(order);
+}
+```
+
+Auth lives in `requireAuth`; validation in `validateBody`; the
+domain in `orderService`. The handler is short and obvious.
+Observability and persistence are inside the service, behind their
+own seams.
+
+## Layered architectures
+
+The most common embodiment of separation of concerns is a *layered*
+design: presentation → application → domain → infrastructure. Each
+layer depends only on the one below; cross-cutting concerns
+(logging, metrics, error handling) are handled with explicit
+mechanisms (middleware, decorators, aspects) rather than scattered
+through every method.
+
+Common variants:
+
+- **MVC / MVP / MVVM** — separate presentation concerns from
+  domain/state.
+- **Hexagonal / Ports-and-Adapters** — separate domain from
+  infrastructure via interfaces (see **Dependency Inversion**).
+- **Clean Architecture** — the same idea with stricter rules about
+  which direction imports may go.
+
+The variants differ in detail; they agree that **the domain should
+not know about HTTP, databases, or queues**.
+
+## "Vertical" vs "horizontal" separation
+
+Two complementary axes:
+
+- **Horizontal (layered)**: presentation / domain / persistence.
+  Useful for keeping infrastructure out of business logic.
+- **Vertical (feature-sliced)**: orders / billing / inventory. Each
+  feature ships its own UI, API, and storage code together.
+
+Modern codebases often combine both: feature folders at the top
+level, layered concerns inside each feature. This avoids two
+failure modes — a flat layered codebase where everything-orders is
+spread across `controllers/`, `services/`, `repos/`, and a flat
+feature codebase where every feature reinvents transport and
+persistence.
+
+## Cross-cutting concerns
+
+Some concerns don't fit a single layer because they touch
+*everywhere*: logging, authentication, retries, error handling,
+metrics. The naive approach — putting calls to `log.info(...)` and
+`metrics.inc(...)` in every function — defeats separation.
+
+The standard tools to handle this without sprinkling:
+
+- **Middleware** (Express, Koa, FastAPI). Cross-cutting concerns
+  run around the handler instead of inside it.
+- **Decorators** (Python, TypeScript) wrapping individual
+  functions or methods.
+- **Aspect-oriented programming** in heavier OO ecosystems. Less
+  common today, but the lineage.
+- **Structured logging / context propagation** so that the request
+  carries metadata that downstream code can use without explicit
+  threading.
+
+A good architecture lets you add or remove a cross-cutting concern
+in one place.
+
+## Where separation overshoots
+
+Separation of concerns has the same failure mode as the rest of
+this list: over-application.
+
+- **Three-line functions in five files.** The "logic" of a feature
+  is so dispersed across "thin layers" that no one file tells you
+  what it does.
+- **Anemic domain models.** A `User` object with no behavior;
+  everything lives in a `UserService`. Sometimes this is what you
+  want; often it's a sign you've separated *too* aggressively, and
+  the logic that conceptually belongs to `User` lives somewhere
+  else.
+- **Premature layering.** A two-week prototype with a "service
+  layer," "repository layer," and "DTO layer" is going to be
+  painful to change while you're still figuring out what the
+  product is.
+
+The pragmatic version of the principle: **separate concerns that
+change for different reasons or that you want to test
+independently**. Concerns that always travel together aren't worth
+splitting.
+
+## Relationship to other principles
+
+- **SRP** is the class-level version of separation of concerns.
+- **DIP** lets concerns at different layers depend on each other
+  through abstractions, not concrete types.
+- **YAGNI**: don't pre-split concerns that haven't actually
+  diverged.

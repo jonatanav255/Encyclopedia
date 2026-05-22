@@ -1,0 +1,242 @@
+export const level = 'senior';
+
+# Event-driven programming
+
+**Event-driven** programs don't follow a single, straight-line
+script. Instead they:
+
+1. Set up handlers for events they care about.
+2. Hand control to a loop or scheduler.
+3. React when events arrive.
+
+The shape is "wait for something to happen, then respond,"
+repeated forever. It's the dominant paradigm for **GUIs**,
+**Node.js servers**, **game loops**, **embedded controllers**,
+**message-driven backends**, and most things that aren't a
+batch script.
+
+Event-driven is sometimes lumped with reactive — they overlap
+but aren't the same. Reactive is about *values* propagating
+through a dataflow graph. Event-driven is about *discrete
+occurrences* being dispatched to handlers. Most modern stacks
+use both, layered.
+
+## The mental shift
+
+A batch script is *agentive*: you tell the program what to do,
+top to bottom, and it does it. An event-driven program is
+*reactive* in the everyday sense — it's mostly idle, waking up
+when poked.
+
+```js
+// Agentive
+const data = readInput();
+const result = process(data);
+writeOutput(result);
+// done, exit
+```
+
+```js
+// Event-driven
+button.addEventListener('click', onClick);
+server.on('request', onRequest);
+// no straight-line "end" — the program runs until killed
+```
+
+The hard part about writing event-driven code isn't the syntax.
+It's that **the control flow lives somewhere else** — in a
+loop you didn't write, dispatching to handlers in an order you
+don't fully control. Your code is a bag of handlers; the
+program's *logic* is spread across when and in what order they
+fire.
+
+## The event loop (the load-bearing piece)
+
+Every event-driven runtime has some version of this:
+
+```
+while running:
+    event = wait_for_next_event()
+    handler = lookup(event.type)
+    handler(event)
+```
+
+Concretely:
+
+- **The browser** has an event loop driven by user input,
+  network events, timers, and microtasks. JS handlers run on
+  the main thread; long handlers block rendering — hence the
+  perennial advice not to do CPU-heavy work in handlers.
+- **Node.js** has libuv's event loop. Network I/O, file I/O
+  (via thread pool), timers, immediate callbacks, microtasks
+  — all funnel through it. One thread serves thousands of
+  connections because it's almost always *waiting*. See
+  `eventloop.mdx` in the Node topic for the gory detail.
+- **GUI frameworks** (Win32, Cocoa, Qt, GTK) all have an event
+  pump. The OS funnels mouse/keyboard/window events; your
+  code subscribes.
+- **Game engines** have a tight loop at a fixed framerate
+  (60Hz, 144Hz, …), processing input, updating state,
+  rendering — every frame.
+- **Embedded controllers** with no OS still have a "main loop"
+  that polls peripherals and dispatches.
+
+The event loop is a *single thread* in most of these (browser,
+Node.js, classic GUI). Concurrency is achieved by **never
+blocking** — handlers must return quickly so the loop can move
+on to the next event.
+
+## Why event-driven scales
+
+A blocking I/O model uses one thread per connection. With
+10,000 concurrent connections, you have 10,000 threads — each
+costing memory and scheduler attention. The event-driven
+alternative uses one (or a few) threads that handle thousands
+of connections by *interleaving*: while connection A is
+waiting on a database response, the loop services B and C.
+
+This is what nginx, Node.js, Redis, Envoy, and many high-
+concurrency servers do. The cost is a more contorted
+programming style — your function doesn't just "read from the
+network"; it registers a callback and lets the loop call it
+later.
+
+That style has evolved from raw callbacks → promises → async/
+await. The runtime is still event-driven; the syntax just
+hides the callback management. `await fetch(url)` is "register
+a continuation to run when this response arrives, then yield
+control."
+
+## Handlers, queues, and ordering
+
+Real event-driven systems care a lot about *which queue an
+event lands in and in what order it runs*. JS has at least:
+
+- **Microtask queue** — promise continuations, `queueMicrotask`.
+  Run after the current task, before any rendering.
+- **Task queue (macrotask)** — `setTimeout`, I/O callbacks,
+  `MessageChannel`. Run between rendering frames.
+- **Render** — the browser pretends this is also "an event,"
+  fired at most ~60Hz.
+- **Idle callbacks** (`requestIdleCallback`) — for low-priority
+  work.
+
+Misunderstanding queue ordering is the source of most "why
+isn't my UI updating?" / "why did this promise resolve before
+that setTimeout(0)?" confusion. Worth studying the model once
+and remembering forever.
+
+## Push vs poll
+
+Two underlying mechanics for "find out about events":
+
+- **Push**: the OS/runtime tells you. Interrupts, signals,
+  `epoll`, `kqueue`, browser event listeners, websockets. The
+  default for modern event-driven systems because it doesn't
+  burn CPU when idle.
+- **Poll**: you ask repeatedly. Game loops *poll* input state
+  every frame. Embedded systems without interrupts *poll*
+  pins. Polling is simpler but wastes work; push is more
+  efficient but requires the source to support it.
+
+Sometimes you need both. Browser games often poll input
+state per frame (because they want the freshest possible
+keyboard state at render time), while network events come in
+via push.
+
+## State machines: the event-driven sibling
+
+Event-driven code with non-trivial state quickly becomes
+spaghetti unless you organize it as a **state machine**. A
+canonical example: a network connection.
+
+```
+DISCONNECTED ──connect──> CONNECTING ──ok──> CONNECTED ──disconnect──> DISCONNECTED
+                              │
+                              └──error──> DISCONNECTED
+```
+
+Each handler asks: "what state am I in?" and reacts
+accordingly. UI components, network sockets, multiplayer game
+entities, retry/backoff loops — all benefit from being
+modeled explicitly as state machines instead of a tangle of
+boolean flags.
+
+Tools like XState (TS), Statecharts, and FSM libraries in
+many languages make this concrete. Even without a library,
+just naming the states and writing the transitions on paper
+is most of the win.
+
+## Backpressure: the failure mode
+
+Event-driven systems are vulnerable to **producer-consumer
+mismatch**. If events arrive faster than handlers can process
+them, queues grow, latency rises, and eventually the process
+dies (OOM) or starts dropping events.
+
+Counter-strategies:
+
+- **Bounded queues** — drop or block when full.
+- **Pull-based streams** — consumer requests N items; producer
+  doesn't send faster.
+- **Rate limiting / throttling** at the boundary.
+- **Backpressure protocols** — Node streams, gRPC streams,
+  Reactive Streams spec.
+
+This is one of the lessons that distinguishes "I wrote an
+event handler" from "I built an event-driven system that
+holds up at scale." Backpressure isn't optional — it's just
+unhappily implicit if you don't design for it. The
+concurrency topic has a dedicated page on this.
+
+## Event-driven architectures (backend)
+
+Beyond per-process event loops, **event-driven architecture**
+(EDA) is a pattern at the system level:
+
+- Services publish **events** ("OrderPlaced", "PaymentReceived")
+  to a broker (Kafka, RabbitMQ, NATS, Redis Streams).
+- Other services subscribe and react.
+- No service directly calls another by name; the broker is
+  the medium.
+
+Pros: services decouple in time and space. New consumers can
+join without redeploying producers. Easier to audit (every
+event is a record).
+
+Cons: implicit data flow ("who's listening to OrderPlaced?
+…we'd have to check the broker config"), eventual
+consistency, retries and deduplication, transactional
+boundary issues. The architecture topic has more on this.
+
+## When event-driven is the right paradigm
+
+- **UIs.** Always.
+- **High-concurrency I/O servers.** Nginx, Node, Envoy,
+  Tornado, asyncio — all event-driven for the same reason.
+- **Realtime systems.** Games, robotics, audio/video pipelines.
+- **Asynchronous integrations.** Webhooks, queues, pub/sub.
+- **Anything reactive to external stimuli** — user actions,
+  network input, sensor data.
+
+## When it isn't
+
+- **CPU-bound batch jobs.** A loop that processes a CSV.
+  Event-driven adds nothing.
+- **Straight-line scripts.** Migrations, one-off tools, build
+  steps. Just write them imperatively.
+- **Small programs where simplicity wins.** A 50-line tool
+  doesn't need an event loop architecture.
+
+## The takeaway
+
+Event-driven programming inverts control: the runtime drives,
+your code waits to be called. It's the right paradigm wherever
+the program has to react to many concurrent external stimuli
+— UIs, network servers, games, integrations. The wins are
+scalability (one thread handling thousands of waiting things)
+and naturalness (the world *is* event-driven). The costs are
+diffuse control flow, queue/ordering subtleties, and
+backpressure if you don't design for it. State machines and
+async/await are the two tools that tame most of the
+complexity.

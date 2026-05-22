@@ -1,0 +1,215 @@
+export const level = 'mid';
+
+# Pure functions and side effects
+
+A **pure function** is a function whose output depends only on
+its arguments and which does nothing else to the outside world.
+"Does nothing else" is the load-bearing phrase — it's the part
+that turns a function into something you can reason about
+algebraically.
+
+Pure functions are the building block of FP. They're also a
+useful idea in any paradigm: the more of your code is pure,
+the less of it has hidden interactions.
+
+## The definition, precisely
+
+A function `f(x, y) -> z` is pure if:
+
+1. **Determinism.** The same arguments always produce the
+   same return value. No clock, no RNG, no environment
+   variables, no `process.argv` peeked at internally.
+2. **No observable side effects.** It doesn't mutate any
+   argument, doesn't write to any external state, doesn't
+   perform I/O (network, disk, console), doesn't throw or
+   catch exceptions in ways that affect outside state.
+
+The two are usually summarized as **referential
+transparency**: the call `f(x, y)` and the value it returns
+are interchangeable. Anywhere you see the call, you can
+substitute the value, and the program behaves identically.
+
+## Examples — and almost-examples
+
+```ts
+// Pure
+const add = (a: number, b: number) => a + b;
+const upper = (s: string) => s.toUpperCase();
+const head = <T>(xs: T[]) => xs[0];
+```
+
+```ts
+// NOT pure — reads the clock
+const isWeekend = () => [0, 6].includes(new Date().getDay());
+
+// NOT pure — mutates input
+const sortInPlace = (xs: number[]) => xs.sort();
+
+// NOT pure — throws (in some FP definitions this disqualifies; in
+// most practical ones, throwing is fine as long as it's deterministic)
+const head2 = <T>(xs: T[]) => {
+  if (xs.length === 0) throw new Error('empty');
+  return xs[0];
+};
+
+// NOT pure — logs
+const addLogging = (a: number, b: number) => {
+  console.log(a, b);
+  return a + b;
+};
+
+// Sneaky: NOT pure — uses module-level state
+let counter = 0;
+const nextId = () => ++counter;
+```
+
+`nextId` is the most insidious of these. It looks pure (no
+arguments, returns a number), but each call mutates `counter`
+and returns a different value. Module-level state turns
+everything that touches it impure.
+
+## Side effects, ranked by danger
+
+Not all impurity is equal. Roughly, in order of how badly it
+breaks reasoning:
+
+1. **Modifying global mutable state** — anyone, anywhere, can
+   be affected, and the link is invisible.
+2. **Modifying shared collaborators** (a logger, a metrics
+   client) — narrower scope, but still hidden coupling.
+3. **Modifying the arguments** — the caller sees changes they
+   didn't ask for; defensive copies become necessary.
+4. **I/O** (network, disk, console, env, clock) — pure
+   functions can't do useful end-to-end work without it, so
+   the question isn't "no I/O" but "is the I/O at the edges or
+   smeared through the code?"
+5. **Throwing exceptions** — sometimes counted as impure
+   (Haskell would say so); pragmatically, throwing on invalid
+   inputs is often fine and routine.
+
+Languages differ on how strict they are. Haskell forbids
+anything in category 1–4 inside a pure function — it has to
+be declared `IO`. TypeScript lets you do whatever; the
+discipline is on you. Most working codebases live somewhere
+in between: be strict about category 1 (no shared globals),
+relaxed about category 5 (throw freely on invalid input).
+
+## Why purity pays off
+
+A pure function gives you several superpowers at once:
+
+- **Testable without setup.** Pass arguments, assert return.
+  No `beforeEach`, no mocks, no environment fakes. The shape
+  of the test mirrors the shape of the function.
+- **Cacheable.** `memoize(f)` is a one-liner that works for
+  any pure `f`. `useMemo` and `useCallback` in React are
+  betting on this. SQL query planners cache subexpressions
+  for the same reason.
+- **Parallelizable safely.** Two pure calls can run on two
+  cores with no synchronization. Many graph algorithms parallelize
+  trivially the moment you remove the shared accumulator.
+- **Reorderable.** Two independent pure expressions can run in
+  any order. The compiler can reorder them; you can refactor
+  freely without subtle ordering bugs.
+- **Easier to debug.** A bug in a pure function reproduces
+  with just its inputs. Print them once, paste them into a
+  test, fix the bug in five minutes. A bug in a function that
+  depends on hidden state can take an afternoon to reproduce.
+
+## Side effects, made explicit
+
+The standard FP move is: don't pretend you can avoid effects;
+make them **explicit** so they show up at boundaries instead
+of being smeared through every function.
+
+Three common patterns:
+
+**1. Functional core, imperative shell.** Push I/O to the
+edges. The HTTP handler reads the request and writes the
+response; the database adapter talks to Postgres; in between,
+a pure core does all the actual decision-making.
+
+```ts
+// Imperative shell
+async function handleSignup(req: Request, res: Response) {
+  const existing = await db.user.findByEmail(req.body.email);
+  // Pure core
+  const result = decideSignup(req.body, existing);
+  // Imperative shell again
+  if (result.kind === 'create') await db.user.insert(result.user);
+  res.status(result.status).json(result.body);
+}
+
+// Pure core — no DB, no res, no I/O
+function decideSignup(input: SignupInput, existing: User | null): Decision {
+  if (existing) return { kind: 'reject', status: 409, body: { error: 'taken' } };
+  // ...validation, password hashing prep, etc.
+  return { kind: 'create', user: { /* ... */ }, status: 201, body: { /* ... */ } };
+}
+```
+
+`decideSignup` is unit-testable in five lines. The
+imperative shell is *trivial* and barely needs testing once
+the core is right.
+
+**2. Return descriptions of effects, don't perform them.**
+Instead of `sendEmail(user)`, return `{ kind: 'sendEmail',
+to: user.email, body: ... }`. A thin runner at the top of
+the program executes the descriptions. This is what Redux
+actions are, what Elm's update returns, and what Haskell's
+`IO` values are. You can log them, queue them, retry them,
+test them — they're just data.
+
+**3. Effect tracking via types.** ZIO (Scala), Effect (TS),
+or Algebraic Effects (OCaml 5) put effect *kinds* in the
+function signature: `Effect<NetworkError | DBError, User>`.
+Callers see exactly which effects a function can perform.
+
+You don't have to adopt #2 or #3 to get most of the win.
+Just doing #1 — keeping a pure core — already moves the
+needle a lot.
+
+## The "honest signature" test
+
+A useful litmus test for purity: can someone reading the
+function's signature predict what it does, with no surprises?
+
+- `function discount(price: number, percent: number): number`
+  — clearly returns a discounted price. No surprise.
+- `function getUser(id: string): User`
+  — might do a network call, might cache, might block, might
+  fail. The signature *lies*: there's a `Promise` and an
+  effect hiding.
+- `async function getUser(id: string): Promise<User>`
+  — better. Now the caller knows there's I/O.
+
+Pure functions have honest signatures by construction. Their
+signatures *can't* lie, because there's nothing happening
+outside the arguments and the return.
+
+## When impurity is fine — and named
+
+Some functions *are* the impurity. `console.log`, `Date.now`,
+`fetch`, `db.query`. The advice isn't to pretend these don't
+exist; it's to:
+
+- **Keep them in named places** (a `db.ts`, a `time.ts`, a
+  request handler). Then a reader looking for "where does this
+  app touch the outside world?" can answer in seconds.
+- **Inject them** so the pure core takes a clock or a
+  `Database` as a parameter (or a function). Now even the
+  parts that *use* I/O can be tested with fake collaborators.
+
+This is the same lesson as the **abstraction-and-interfaces**
+page: depend on what the impure thing *promises*, not on its
+identity.
+
+## The takeaway
+
+Pure functions are deterministic with no side effects. They're
+testable, cacheable, parallelizable, and honest about what
+they do. Real programs can't be 100% pure — they have to do
+I/O — but they can keep purity as the default and push effects
+to a thin shell. That single move makes most code easier to
+test, easier to reason about, and easier to change, regardless
+of whether the rest of the codebase calls itself FP.
