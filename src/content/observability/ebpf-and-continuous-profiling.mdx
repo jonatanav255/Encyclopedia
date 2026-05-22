@@ -1,0 +1,216 @@
+export const level = 'staff';
+
+# eBPF and continuous profiling
+
+eBPF (extended Berkeley Packet Filter) is one of the most
+consequential Linux features of the last decade for observability.
+It lets you safely run sandboxed programs in the kernel — observing
+syscalls, network traffic, scheduler events, function calls —
+without modifying application code.
+
+For observability, this enables a generation of tools that produce
+signals the application is unaware it's emitting:
+
+- **Continuous profiling** of every process on every node.
+- **Network observability** at the level of every connection.
+- **Latency tracing** that captures kernel-level waits.
+- **Security monitoring** that sees syscalls in real time.
+
+This page is about the practical impact of eBPF on observability
+practice, especially continuous profiling.
+
+## What eBPF is, briefly
+
+A in-kernel virtual machine. You write a small program in C or a
+high-level frontend; the kernel verifier checks it for safety;
+the kernel runs it attached to a hook point.
+
+Hook points include:
+
+- **Tracepoints**: stable points in the kernel for events
+  (syscalls, scheduler events).
+- **Kprobes / uprobes**: dynamic probes on any kernel function
+  or user-space function.
+- **XDP / TC**: network packet processing.
+- **Perf events**: sampling at intervals.
+
+The program runs in-kernel, can't crash the kernel (verifier
+ensures this), can't loop forever (bounded execution), can pass
+data to user-space via maps.
+
+The technology is the substrate; what's interesting for
+observability is the tools built on top.
+
+## Continuous profiling
+
+The most consequential observability shift of the eBPF era.
+
+Traditional profiling: developer runs `perf` on a process during a
+test, gets a flame graph, analyzes it. Manual, one-shot, in dev.
+
+Continuous profiling: the eBPF profiler samples **every process on
+every node**, all the time, at low overhead. Profiles are
+aggregated, indexed by service / version / region, and queryable.
+
+```
+Pyroscope agent (eBPF)
+   ↓ samples 100Hz per CPU
+   ↓ aggregates by service
+   ↓
+Pyroscope backend
+   ↓ indexed flame graphs
+   ↓
+UI: "show me the CPU profile of api-gateway, prod, last hour"
+```
+
+Tools: Grafana Pyroscope (open source), Polar Signals Parca,
+Datadog Continuous Profiler, Google Cloud Profiler.
+
+### What you can suddenly do
+
+- **Diff profiles across deploys**. "v2.31 added 12% CPU to
+  `serialize_response`." Find the regressing function before it
+  hits user-visible latency.
+- **Profile production without instrumenting**. The eBPF agent
+  attaches via uprobes; no library changes, no recompilation.
+- **Correlate with traces**. From a slow trace span, jump to the
+  flame graph from that exact time period. See *which functions
+  inside* the span consumed time.
+- **Identify costly libraries you didn't write**. If your JSON
+  serializer is 30% of your CPU, you see it without having to
+  guess.
+- **Find dead code with cost**. Functions that are running
+  unnecessarily.
+
+### Overhead
+
+eBPF-based continuous profiling samples at 100Hz per CPU. At low
+sampling rates, overhead is < 1% — well within the noise of
+running production workloads. Some platforms claim sub-half-percent.
+
+Compare to alternatives:
+
+- **Always-on instrumentation profilers** (Java Flight Recorder):
+  3-10% overhead.
+- **Trampoline-based** (older sampling tools): variable, often
+  several %.
+- **Bytecode rewriting**: high overhead and risk.
+
+eBPF's safety and efficiency make "profile production always" a
+realistic policy where it wasn't before.
+
+## Network observability
+
+eBPF programs at the network layer (XDP, TC, kprobes on socket
+functions) can:
+
+- **Trace every connection** with low overhead. Source / dest /
+  duration / bytes.
+- **Detect DNS issues, TCP retransmits, connection failures**
+  at the kernel level.
+- **Build a service-to-service dependency map** without
+  application instrumentation.
+- **Identify slow connections** that don't show in app-level
+  metrics.
+
+Tools: Cilium Hubble, Pixie, Grafana Beyla. These produce
+"network telemetry as observability" — what's actually flowing,
+not what the app thinks is flowing.
+
+For complex microservices, this layer catches issues that pure
+app-level observability misses: a service that *thinks* it called
+another but the call never left the host (DNS timeout, broken
+mesh routing).
+
+## Auto-instrumentation via eBPF
+
+A newer category: tools that instrument applications *without
+code changes* by attaching eBPF uprobes to language runtimes.
+
+- **Beyla** (Grafana): produces RED metrics and traces for
+  HTTP/gRPC apps without changing code.
+- **Pixie**: full APM via eBPF.
+
+The trade: works out of the box; less detail than manual
+instrumentation; works best for HTTP/gRPC, less well for
+custom protocols.
+
+For teams without observability infrastructure but with eBPF-capable
+nodes, this offers a fast path to baseline visibility. Not a
+replacement for purposeful instrumentation, but a useful floor.
+
+## What eBPF doesn't fix
+
+- **Application-level semantics**. eBPF sees syscalls and
+  function calls; it doesn't understand "this request was part
+  of an order" or "this user is enterprise tier." Business
+  context still requires app instrumentation.
+- **Outside Linux**. macOS has DTrace; Windows has ETW; eBPF is
+  Linux-only. For multi-platform observability, you need
+  multiple substrates.
+- **Recent enough kernels**. Older kernels lack the eBPF features
+  needed for modern profiling. Most production setups now have
+  this, but it's a prerequisite.
+
+## A production deployment pattern
+
+For a Linux-based fleet:
+
+- **Per-node DaemonSet**: an eBPF agent (Pyroscope, Beyla, Parca,
+  Cilium, depending on goal).
+- **Aggregation tier**: collects per-node data, indexes globally.
+- **Storage**: hot recent data + S3-backed archive.
+- **UI**: integrated with metrics/trace dashboards via deeplinks.
+
+A typical investment: 1-2 nodes' worth of compute for the
+aggregation; per-node agents are essentially free. Tradeable
+against vendor APM bills.
+
+## A worked example: GC investigation
+
+You see Java services with high p99 latency spikes. The traces
+show "the request was slow" but don't say why — there's no
+obvious downstream call to blame.
+
+With continuous profiling:
+
+- Open the Java service's flame graph for the affected time
+  window.
+- See significant time in `G1GC threads / parallel_marking`.
+- Switch to off-CPU flame graph: see threads in `Parker.park`
+  during GC pauses.
+- Confirmed: GC is the cause.
+
+Without continuous profiling, this investigation requires
+enabling GC logging on prod, waiting for another occurrence,
+correlating timestamps. Hours instead of minutes.
+
+## Future direction
+
+Active areas:
+
+- **Cross-language profiling correlation** — link Python and C
+  code in the same flame graph.
+- **Profile-guided optimization** integrated with continuous
+  profiles — the build system uses prod profiles to optimize.
+- **eBPF for tracing across kernel and user space** — connect
+  network events to application spans seamlessly.
+- **Wider language runtime coverage** — currently strongest on
+  compiled (Go, Rust, C++) and JVM languages.
+
+The trajectory: more observability data with less per-app cost.
+"Auto-instrument" becomes more capable; manual instrumentation
+focuses on business semantics.
+
+## When to invest
+
+- **Always**, if you're large enough to have a platform team and
+  Linux-based workloads. The leverage is real.
+- **Not yet**, if you're a startup with few services and basic
+  observability gaps still unfilled. Get the basics first.
+- **Selectively**, if you have specific blind spots that
+  continuous profiling or eBPF tracing would solve. Often a
+  small pilot reveals the value clearly.
+
+eBPF is no longer experimental. It's the substrate of modern
+Linux observability. The question now is what you build with it.

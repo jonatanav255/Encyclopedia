@@ -1,0 +1,254 @@
+export const level = 'senior';
+
+# Debugging with traces
+
+Most observability documentation focuses on instrumentation:
+*how* to produce traces. This page is about the other half —
+how to *use* them when something's wrong.
+
+The trace UI is unfamiliar at first. Once you build the muscle,
+it's the fastest way to debug distributed systems. The flowchart
+of "metric anomaly → trace → logs" is more about pattern recognition
+than tool features.
+
+## The investigation workflow
+
+A canonical investigation in a traced system:
+
+<Steps>
+<Step n="1" title="Confirm the symptom">
+Alert fires: "p99 latency on `GET /products` spiked to 2.4s."
+
+Open the latency histogram for the endpoint. Confirm: yes, p99 is
+2.4s, normally 200ms. Time of onset: 14:32.
+</Step>
+
+<Step n="2" title="Find a representative trace">
+Two paths:
+
+- **Click an exemplar** on the latency histogram. Trace UI opens
+  to a slow trace.
+- **Open trace UI directly**, filter by endpoint + time range +
+  duration > 1s. Pick one.
+
+Either way, you have a specific bad trace in front of you in
+seconds.
+</Step>
+
+<Step n="3" title="Identify the slow span">
+Look at the trace's Gantt-style view. Where's the wide bar?
+
+```
+GET /products  ────────────────────────────────────  (2.4s total)
+  ├─ validate_token                                  (3ms)
+  ├─ fetch_product   ────────────────────────────    (2.3s)
+  │   ├─ db_query                                    (45ms)
+  │   ├─ cache_get                                   (4ms)
+  │   └─ enrich_pricing   ────────────────────────   (2.2s)
+  │       └─ fx_convert   ────────────────────────   (2.2s)
+  └─ render_response                                 (50ms)
+```
+
+The wide bar is `fx_convert`. Slow today, was fast yesterday.
+That's the bug's location.
+</Step>
+
+<Step n="4" title="Compare to a fast trace">
+Filter by the same endpoint but duration < 200ms. Look at one.
+The `fx_convert` span is 12ms instead of 2200ms.
+
+You've confirmed: `fx_convert` is the regression site. Other
+services are fine.
+</Step>
+
+<Step n="5" title="Jump to logs / metrics for fx service">
+From the slow `fx_convert` span, click into logs for that trace
+or filter the fx service's logs at the same time.
+
+Logs show: "warning: fallback to backup currency feed." That's
+the bug — primary feed is slow today.
+</Step>
+
+<Step n="6" title="Investigate fx service">
+Open fx service's dashboard. Confirm the downstream call to the
+currency feed is timing out. Check the upstream provider's
+status page. Confirm outage.
+</Step>
+
+<Step n="7" title="Mitigate">
+Disable the slow feed, fall back to cached values, page the
+provider. Whatever's appropriate.
+</Step>
+</Steps>
+
+Total time: 5-10 minutes if traces are good. Without them: an
+hour or more of correlating timestamps across services.
+
+## Trace UI features worth knowing
+
+Most trace UIs (Jaeger, Tempo, Honeycomb, Datadog APM) share core
+features:
+
+- **Gantt view**: spans laid out by time. The default view.
+- **Tree view**: spans as a hierarchical list. Useful for very
+  deep traces.
+- **Service map**: who called whom, with aggregate latency on the
+  edges. Useful for understanding architecture.
+- **Trace search**: by service, operation, status, duration,
+  attribute. The first stop for "find me a trace where X."
+- **Trace comparison**: load two traces side by side. Diff them.
+- **Flame graph view**: spans as a flame graph (depth × duration).
+  Useful for finding wide hot leaves.
+
+## Patterns to recognize
+
+A short field guide of shapes in traces:
+
+<Steps>
+<Step n="1" title="Serial waterfall (high latency, low parallelism)">
+Many short spans, each waiting for the previous to finish:
+
+```
+op1 ──
+   op2 ───
+       op3 ──
+           op4 ───
+```
+
+The fix: parallelize. Calls that don't depend on each other should
+run concurrently.
+</Step>
+
+<Step n="2" title="Long tail (one slow span dominates)">
+One wide span surrounded by many short ones. The wide span is
+the bottleneck.
+
+The fix: focus on that span. Profile its internals, check
+downstreams, look for a code change in its service.
+</Step>
+
+<Step n="3" title="N+1 in trace form">
+Many identical short spans in sequence:
+
+```
+db_query ──
+db_query ─
+db_query ─
+db_query ─
+...
+```
+
+The fix: batch the queries. Classic N+1 problem (see the
+performance topic).
+</Step>
+
+<Step n="4" title="Retry storm">
+Multiple spans for the same downstream call, all failed except
+the last:
+
+```
+http_call (error) ───
+http_call (error)    ───
+http_call (success)     ─────
+```
+
+The fix: investigate why the downstream is unreliable; also
+investigate whether retries are appropriate (sometimes they
+amplify outages).
+</Step>
+
+<Step n="5" title="Cold cache / first-of-kind">
+The first span of a kind in a window is much wider than the
+others.
+
+The fix: warm-up logic, deferred initialization, or pre-loading.
+</Step>
+
+<Step n="6" title="Lock contention shape">
+Many spans, each with a similar narrow critical bit, but
+randomly extending out:
+
+```
+acquire_lock ──        op ── release ──
+acquire_lock ───────   op ── release ──    (waited for prev)
+acquire_lock ─────────  op ── release ──   (waited)
+```
+
+The fix: investigate the lock. Either parallelize by partitioning,
+or shrink the critical section.
+</Step>
+</Steps>
+
+## Bisecting bugs with traces
+
+A useful trick: when you have a slow trace, **search for similar
+traces from before the regression**. If they exist and look
+identical except for duration, you've localized the change to
+something between the two timestamps.
+
+Combined with deploy markers on dashboards, this narrows the
+suspect window to a single deploy quickly.
+
+## What traces don't show
+
+A real-world limitation list:
+
+- **What happened inside an unsampled trace**. If you're sampled
+  at 10%, the trace for the request you actually care about may
+  be missing. Tail sampling for errors / slow helps.
+- **Pure intra-process performance**. A 500ms span tells you
+  something is slow inside it; a profile tells you which code
+  inside.
+- **Hardware-level issues** (network jitter, disk latency). The
+  trace shows the symptom; perf tooling like `eBPF` or kernel
+  traces show the cause.
+- **Async work that lost context propagation**. The fire-and-forget
+  job that was supposed to be linked to your request isn't.
+
+In these cases, traces tell you where to look next.
+
+## Reading aggregated trace data
+
+Beyond single traces, modern trace UIs let you aggregate:
+
+- "What's the median time spent in `db_query` across all traces
+  in the last hour?"
+- "Which operations have the highest error rate?"
+- "Which services are the slowest downstream callees of `gateway`?"
+
+These are essentially queries over the spans-as-events. Honeycomb's
+strength; Tempo's recent metrics generator features support
+similar.
+
+This view lets you answer "is this systemic?" instead of "show
+me one trace." Both questions matter.
+
+## A debugging discipline
+
+A few habits that compound:
+
+- **Start with traces** for distributed latency issues. Don't reach
+  for logs first; you'll spend 20 minutes correlating timestamps.
+- **End with code**. The trace points to a span; the span points
+  to a function; the function is what you fix.
+- **Save useful queries**. The "trace where endpoint X errored in
+  the last 24h" query is reusable; save it. Most trace tools
+  support saved queries.
+- **Annotate spans with context**. A span that says only
+  `db_query` is less useful than one that says `db_query` with
+  `db.statement` attribute set.
+- **Always correlate traces with deploys**. Most regressions land
+  with a deploy; deploy annotations on dashboards plus trace
+  filtering make this fast.
+
+## When traces aren't worth the time
+
+- A single-service issue with no downstream calls. A profiler is
+  faster.
+- A genuine code bug (NullPointerException). The error tracker has
+  the stack trace; you don't need the trace.
+- A non-latency issue (memory leak, disk space). Logs and metrics
+  are the right tools.
+
+Use traces where they earn their cost: cross-service latency, where
+the call graph is non-trivial. For those, they're irreplaceable.

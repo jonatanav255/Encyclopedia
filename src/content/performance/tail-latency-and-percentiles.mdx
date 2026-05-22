@@ -1,0 +1,178 @@
+export const level = 'senior';
+
+# Tail latency and percentiles
+
+The most consequential idea in service performance after Little's
+Law. Once you internalize it, you stop reporting averages.
+
+## Why averages mislead
+
+Real latency distributions are heavily right-skewed. Most requests
+are fast; a small fraction are dramatically slow. Their *mean*
+sits below the slow tail; their *median* sits even lower.
+
+A real-shape histogram:
+
+```
+count
+  ^
+  | *
+  | **
+  | ***
+  | ****
+  | *****
+  | ******    *                              *
+  +---------------------- latency ----------------->
+   1ms                 50ms       250ms          2s
+```
+
+Mean ≈ 60ms. Median ≈ 30ms. p99 ≈ 800ms. Max ≈ 2s.
+
+The mean tells you the wrong story. **The slowest 1% of requests
+is where every real customer-impact event lives.**
+
+## Percentiles, properly
+
+A percentile p`N` is the value below which `N%` of observations fall.
+
+- **p50** (median): half of requests faster, half slower.
+- **p95**: 95% of requests are faster. 5% are slower.
+- **p99**: 1% of requests are slower. *One in a hundred.*
+- **p99.9** ("three nines"): 1 in 1,000.
+- **p99.99**: 1 in 10,000.
+
+Reporting two percentiles is more honest than one. A useful
+baseline summary: **p50, p95, p99**. Add p99.9 when you have the
+volume to estimate it (you need at least 10,000 samples for a
+stable p99.9; less than that and your "p99.9" is noise from
+individual events).
+
+## Why tail latency is dispproportionately important
+
+Three reasons:
+
+<Steps>
+<Step n="1" title="Users feel the slowest, not the typical">
+A user who experiences a slow request remembers it. The user who
+got the median doesn't think about it. Tail experiences shape
+product perception.
+</Step>
+
+<Step n="2" title="Tail amplification on fan-out">
+Modern services fan out: one user request becomes 10 internal
+calls. The user waits for the slowest. If each backend's p99 is
+800ms but they're independent, the **p99 of the slowest of 10**
+is approximately p99.9 of one call — substantially worse.
+
+```
+P(at least one slow) = 1 - (1 - 0.01)^10 ≈ 0.096
+
+≈ 10% of user requests get the "p99 experience"
+```
+
+The user sees the **slowest of 10 backends' tails** as their
+latency. The p99 of the user-facing service is much closer to
+the p99.9 of any individual backend than to its p99.
+</Step>
+
+<Step n="3" title="Retries make it worse">
+A request times out at p95 → retry. The retry adds latency. A
+naive setup turns slow requests into doubly-slow requests.
+Without hedging or careful retry policies, tail goes from p99 to
+"forever."
+</Step>
+</Steps>
+
+## What causes tail spikes
+
+Tails are made of *correlated* slow events:
+
+- **GC pauses.** A GC stops the world for 50-200ms. Anything
+  running at that moment lands in the tail. Languages with
+  generational/concurrent collectors push these to the high
+  percentiles but they're still there.
+- **Lock contention.** Most requests don't fight for the lock;
+  one in a hundred does. That one waits.
+- **CPU scheduling.** Your thread was de-scheduled. Modern Linux
+  CFS is usually fine, but cgroup CPU limits cause exactly this:
+  steady-state fine, occasional throttling spikes.
+- **Network glitches.** A retransmit costs the request 200ms.
+  Doesn't happen often; when it does, it's the tail.
+- **Cold caches / first-of-its-kind requests.** First request to
+  a new partition fetches from disk; second through Nth hit the
+  buffer.
+- **Coordinated omission** — see below.
+
+## Measuring percentiles correctly
+
+The hidden trap: **you can't average percentiles**. Two services
+each at p99=200ms have *some* combined p99, but it isn't 200ms,
+isn't 400ms, and you can't derive it from the individual p99s.
+
+To measure correctly, you store the distribution (histogram, HDR
+histogram, t-digest) and compute percentiles globally. Storing
+"p99 per minute" and averaging across minutes is wrong.
+
+Tools that do this right:
+
+- **HdrHistogram** — high-precision histograms, mergeable. The
+  gold standard.
+- **t-digest** — approximate, very mergeable. Used by Datadog,
+  AWS CloudWatch.
+- **Prometheus histograms** — fixed bucket boundaries; merging
+  works but accuracy depends on bucket choice.
+- **Prometheus summaries** — pre-computed quantiles per instance;
+  **not** mergeable. Don't use for service-wide percentiles.
+
+## Coordinated omission
+
+The most pernicious tail-latency measurement bug, named by Gil
+Tene. A client issues one request per second; if the server
+stalls for 10s, the client only issues one request during the
+stall (because the previous one blocked). Result: the 10s outage
+is recorded as **one slow request**, not 10. The percentile reports
+near-zero impact from a 10-second outage.
+
+Two fixes:
+
+- **Open-loop load**: requests fire on schedule regardless of
+  whether the previous one returned. wrk2 and many other modern
+  load testers default to this.
+- **CO correction in the recorder**: HdrHistogram has a
+  "record with expected interval" API that interpolates missing
+  samples during stalls.
+
+If you've ever measured "p99 = 30ms" while users complained,
+coordinated omission is the likely cause.
+
+## Working on the tail
+
+Reducing tail latency is structurally different from reducing
+mean latency. Three approaches:
+
+- **Reduce the variance.** Smaller GC pauses, smaller lock
+  hold times, smaller per-request work. The tail is dominated
+  by variance, not by mean.
+- **Hedge or speculate.** Issue the same request twice to two
+  backends after a short delay; take whichever returns first.
+  Used by Google for tail amplification. Doubles load on the
+  tails, drops the tail dramatically.
+- **Cap the work.** Time-budgeted requests: cancel below tier
+  if the request has consumed N ms. The user sees a less-detailed
+  answer, but it arrives in time.
+
+A useful framing: **the tail is what your worst-case dependency
+plus your worst-case GC plus your worst-case CPU schedule looks
+like, simultaneously.** Lowering it means cutting each contributor
+or designing around them.
+
+## Reporting in practice
+
+A useful default dashboard panel:
+
+- Top line: p50, p95, p99 over time.
+- Second line: max over time (the worst single event).
+- Histogram heatmap: distribution shape per minute.
+
+Anyone who looks at a mean-latency dashboard and concludes "we're
+fine" is missing the user-felt experience.

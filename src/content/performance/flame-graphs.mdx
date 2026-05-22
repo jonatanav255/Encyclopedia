@@ -1,0 +1,138 @@
+export const level = 'mid';
+
+# Flame graphs
+
+Brendan Gregg's invention from 2011 and still the best
+single-screen way to understand "where is my program spending
+time." If you can read one, you can find most production CPU
+problems in minutes.
+
+## Anatomy
+
+A flame graph aggregates stack traces collected by a sampling
+profiler. Every horizontal bar is a function. Every bar's width
+is **proportional to the time spent in it (and its callees)**.
+
+```
+       [render_page]            <- top of stack at the moment of the sample
+   [render_template]            <- caller
+        [handler]
+        [middleware]
+        [main loop]             <- bottom of stack
+```
+
+Now imagine 10,000 such stack samples, with each function placed
+on the same y-level whenever it appears in a stack. Functions
+called from many places stack into a wide bar at the appropriate
+depth. The result looks like flames.
+
+Key conventions:
+
+- **x-axis**: NOT time. It's an alphabetical or aggregation order.
+  Width of a bar = fraction of total samples that included this
+  function.
+- **y-axis**: stack depth. Bottom = root of every stack (typically
+  `main`, or an event loop). Top = leaf function actually running
+  at the sample instant.
+- **Color**: usually meaningless (random, for distinguishability).
+  Differential flame graphs use red/blue to show "got worse" vs
+  "got better."
+
+## How to read one in 30 seconds
+
+<Steps>
+<Step n="1" title="Look at the top of the flame, not the bottom">
+The bottom always says "main consumed 100%" — useless. The
+**plateaus near the top** are where the CPU was actually executing.
+Wide bars at the top = hot leaf functions.
+</Step>
+
+<Step n="2" title="Look for surprises">
+A wide top-level bar that you didn't expect is the bug. "Why is
+`JSON.stringify` 30% of my request?" "Why is `Date.now()` 8%?"
+"Why is `Math.random()` showing up at all?"
+</Step>
+
+<Step n="3" title="Trace the surprise downward">
+Click the wide bar (in interactive flame graphs) to zoom in. The
+sub-tree below shows you which call paths reached this function.
+Now you know *where* in your code to fix it.
+</Step>
+
+<Step n="4" title="Estimate the win">
+A 25% bar is at most a 25% win, and that's if you eliminate the
+call entirely. A 4% bar isn't worth refactoring around.
+</Step>
+</Steps>
+
+## What flame graphs are *not* good at
+
+- **Time-ordered analysis.** A flame graph aggregates. "When did
+  the slow phase start?" is not a question it answers; you need
+  a flame *chart* (time on x-axis, like Chrome DevTools' Performance
+  tab) or a tracing tool.
+- **Sequential causation.** "Did A cause B?" — no, flame graphs
+  show co-occurrence, not order.
+- **I/O wait time** (with a CPU profiler). Standard flame graphs
+  only see CPU-on samples. For wait time, use an **off-CPU flame
+  graph** that samples the scheduler instead.
+
+## Differential flame graphs
+
+The killer feature for performance regression hunting. Take two
+profiles (before deploy / after deploy, or v1 / v2), and color
+each function by the delta:
+
+- Red = this function got *wider* (slower).
+- Blue = this function got *narrower* (faster).
+- White = roughly unchanged.
+
+You can find regression-introducing changes in seconds: "Deploy
+3pm added 12% to `validate_payload`, blue everywhere else." Then
+you go look at what changed in `validate_payload`.
+
+## Variants
+
+- **On-CPU flame graph**: standard. Sampled when threads are
+  running.
+- **Off-CPU flame graph**: sampled when threads are *blocked*.
+  Reveals what's waiting — lock contention, I/O waits, mutex
+  holds. Sometimes harder to interpret because waits are normal,
+  but invaluable for "why is this slow if CPU is idle?"
+- **Memory flame graph**: width = bytes allocated, not time.
+  Reveals allocation hotspots, which often dominate in GC'd
+  languages.
+- **Icicle graph**: flipped flame graph (root on top). Same data,
+  some people prefer it.
+- **Flame chart**: time on x-axis. Different beast entirely;
+  same name unfortunately. Browser perf tools use this.
+
+## Common reading mistakes
+
+- **Mistaking a deep stack for "slow."** A tall narrow tower might
+  be 1% of runtime. Width is the signal, not height.
+- **Optimizing the bottom of the flame.** "Look how wide `main`
+  is!" — `main` is always wide. You can't optimize `main`.
+- **Reading the x-axis as time.** It isn't. Two adjacent bars at
+  the leaf aren't sequential in time; they're sorted for display.
+- **Forgetting it's sampled.** Functions that run a million times
+  fast might not show up. Functions that run once but slowly are
+  easy to find. The opposite isn't always true.
+
+## Tools
+
+- **Brendan Gregg's `flamegraph.pl`** — the original. Pairs with
+  `perf` on Linux.
+- **`perf` + `FlameGraph` repo** — `perf record -F 99 -a -g`,
+  then convert.
+- **async-profiler** (JVM) — built-in flame graph output, very low
+  overhead.
+- **`pprof`** (Go and others) — `go tool pprof -http=:8080`
+  serves an interactive flame graph in the browser.
+- **Pyroscope / Grafana Pyroscope** — continuous profiling that
+  serves diffable flame graphs from prod traffic.
+- **Chrome DevTools Performance tab** — flame *chart* (time-ordered)
+  for frontend.
+
+If you're hunting a one-off slow request, use a tracer. If you're
+hunting *what your service spends time on*, use a flame graph.

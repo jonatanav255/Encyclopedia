@@ -1,0 +1,168 @@
+export const level = 'junior';
+
+# Caching fundamentals
+
+A cache is a smaller, faster copy of a slower source of truth.
+Every cache is fundamentally trying to win on the ratio:
+
+```
+gain  =  (hit_rate × time_saved_per_hit)
+         - (miss_overhead + invalidation_cost + memory_cost)
+```
+
+If hit rate is low, your cache is overhead. If invalidation is wrong,
+your cache is a bug factory. The two hard problems remain naming
+things and cache invalidation.
+
+## Why caching works at all
+
+Three observed properties of real workloads:
+
+- **Temporal locality** — if you touched it, you'll touch it again
+  soon. The same user reloads the page, the same hot row is read.
+- **Spatial locality** — if you touched X, you'll touch X+1 soon.
+  Memory addresses; rows in a clustered index; sequential reads.
+- **Heavy-tail popularity** — a tiny fraction of items account for
+  most of the traffic. Zipf-like distributions are everywhere.
+
+A cache for items 1–100 that absorb 80% of traffic is a 100-item
+cache with 80% hit rate. That ratio is the win.
+
+## The cache hierarchy
+
+Latency varies by orders of magnitude depending on *where* the
+data is. Approximate numbers (will vary by hardware):
+
+<Compare>
+<thead>
+<tr><th>Layer</th><th>Typical latency</th><th>Capacity</th></tr>
+</thead>
+<tbody>
+<tr><td>CPU register</td><td>~0.3ns</td><td>32–64 of them</td></tr>
+<tr><td>L1 cache</td><td>~1ns</td><td>32–64 KB</td></tr>
+<tr><td>L2 cache</td><td>~3ns</td><td>256 KB – 1 MB</td></tr>
+<tr><td>L3 cache</td><td>~10ns</td><td>2–32 MB</td></tr>
+<tr><td>DRAM</td><td>~100ns</td><td>GBs</td></tr>
+<tr><td>SSD</td><td>~100µs</td><td>TBs</td></tr>
+<tr><td>HDD</td><td>~10ms</td><td>TBs</td></tr>
+<tr><td>Network (same DC)</td><td>~0.5ms</td><td>—</td></tr>
+<tr><td>Network (cross-region)</td><td>~50–150ms</td><td>—</td></tr>
+</tbody>
+</Compare>
+
+Caching at the right level pays. A 10ns L1 hit instead of a 100ns
+DRAM access is a 10× speedup. Pulling something into in-process
+memory from Redis is a ~0.5ms → ~1µs jump — 500×.
+
+## Cache patterns
+
+The four common patterns for application-level caches:
+
+<Steps>
+<Step n="1" title="Cache-aside (lazy loading)">
+The app checks the cache. On miss, fetches from DB, stores in cache,
+returns. **The cache is dumb** — it doesn't know about the DB. The
+app owns consistency.
+
+```
+get(key):
+  v = cache.get(key)
+  if v is None:
+    v = db.get(key)
+    cache.set(key, v, ttl)
+  return v
+```
+
+The most common pattern. Easiest to reason about, but vulnerable
+to **stampedes** when many requests miss at once (see below).
+</Step>
+
+<Step n="2" title="Read-through">
+The cache layer fetches from DB on miss. The app only talks to the
+cache. Pushes the loading logic into the cache library. Same
+semantics as cache-aside; different code organization.
+</Step>
+
+<Step n="3" title="Write-through">
+On write, the app writes to *both* cache and DB synchronously. The
+cache is never stale. Slower writes, but reads are always fresh
+on entries that have been written recently.
+</Step>
+
+<Step n="4" title="Write-behind (write-back)">
+On write, app writes only to cache; the cache flushes to DB
+asynchronously. Fast writes, but the cache *is* the source of
+truth for a window. If it crashes, you lose data. Used rarely in
+app caches — common in CPU and OS caches where durability is
+handled elsewhere.
+</Step>
+</Steps>
+
+## Eviction policies
+
+The cache is full, you need to make room. Common policies:
+
+- **LRU** (Least Recently Used) — evict the entry you touched
+  longest ago. Good default; matches temporal locality.
+- **LFU** (Least Frequently Used) — evict the entry you've touched
+  least often. Better for stable hot sets; worse for sudden shifts.
+- **FIFO** — evict the oldest entry by insertion time. Simple,
+  doesn't track access. Used when access tracking is too expensive
+  (some CPU caches).
+- **TinyLFU** / **W-TinyLFU** (Caffeine library) — modern hybrid.
+  Uses a frequency sketch to admit only "frequently accessed"
+  entries, plus a small LRU window for fresh entries. Higher hit
+  rate than pure LRU on real workloads.
+
+For most application caches: LRU with a TTL is a fine starting
+point. Switch only when you have evidence.
+
+## Cache invalidation
+
+The hard problem. Three approaches, ordered by difficulty:
+
+- **TTL** — entries expire after N seconds. Simplest, "eventually
+  consistent." Pick TTL = how stale you can tolerate.
+- **Explicit invalidation on write** — when you update the DB,
+  also delete the cache entry. Reads after the delete repopulate
+  it. Works for single-record updates; falls apart when one DB
+  write affects many derived cache entries.
+- **Event-based invalidation** — a CDC stream (changefeed,
+  binlog, Kafka) tells caches what changed. Used at scale; complex
+  to set up.
+
+The two failure modes:
+
+- **Forgetting to invalidate on a write path.** Now reads return
+  stale data forever (or until TTL).
+- **Invalidating before the DB write commits.** Brief window
+  where readers re-populate the cache with the *old* value. The
+  fix is **invalidate-after** plus a re-read after a delay, or
+  use a version stamp.
+
+## Stampede / thundering herd
+
+A popular entry expires. 1,000 requests miss the cache simultaneously,
+all hit the DB, all re-populate. The DB falls over.
+
+Mitigations:
+
+- **Locking / single-flight** — only one request fetches; others
+  wait. Built into Go's `singleflight`, Caffeine, Caddy, etc.
+- **Probabilistic early expiration** — start refreshing the entry
+  *before* it expires, with probability that increases as TTL
+  approaches. Smooths the herd.
+- **Stale-while-revalidate** — serve stale value, refresh in
+  background. Used in HTTP caching (`Cache-Control:
+  stale-while-revalidate=30`).
+
+## When *not* to cache
+
+- The data changes faster than you can usefully serve it.
+- Hit rate is low — most requests are unique keys.
+- The fetch is already very cheap (< 1ms in-memory lookup).
+- Correctness requires strict consistency and you don't have a
+  reliable invalidation channel.
+
+A cache that mostly misses is overhead with extra steps. Measure
+hit rate before celebrating.

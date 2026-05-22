@@ -1,0 +1,155 @@
+export const level = 'mid';
+
+# Performance budgets
+
+A **performance budget** is a number you commit to, written down,
+enforced in CI. "p95 latency stays under 200ms." "Bundle size stays
+under 250KB gzipped." "Cold start under 800ms."
+
+Without a budget, performance work has no end condition. With a
+budget, you have a binary: is the system in or out of budget? If
+out, it's a regression to fix; if in, ship.
+
+## Why "always fast" doesn't work
+
+Two failure modes you've probably seen:
+
+- **No budget → no urgency.** Latency drifts up 5% per quarter. No
+  one notices because each commit is small. A year later, the
+  endpoint is 2× slower and nobody can identify the change.
+- **No budget → endless optimization.** Engineers keep optimizing
+  past the point of diminishing returns because there's no
+  "we're done" signal. Other work suffers.
+
+A budget answers both: "this is the line, we don't cross it, and
+we don't optimize beyond it without a reason."
+
+## What to budget
+
+The budget depends on what the user actually feels:
+
+<Compare>
+<thead>
+<tr><th>Layer</th><th>What to budget</th><th>Typical target</th></tr>
+</thead>
+<tbody>
+<tr><td>Web frontend</td><td>LCP, INP, CLS, JS bundle size</td><td>LCP &lt; 2.5s, JS &lt; 200KB</td></tr>
+<tr><td>API endpoints</td><td>p50, p95, p99 latency; error rate</td><td>varies by endpoint</td></tr>
+<tr><td>Backend job</td><td>End-to-end runtime; throughput</td><td>"complete by N AM"</td></tr>
+<tr><td>Background queue</td><td>Queue depth; oldest message age</td><td>&lt; 30s lag at p99</td></tr>
+<tr><td>Cold start (serverless)</td><td>Time from request to first byte</td><td>&lt; 1s p95</td></tr>
+</tbody>
+</Compare>
+
+Avoid budgeting things users don't feel:
+
+- "CPU utilization < 60%" — only matters as a leading indicator,
+  not a goal in itself.
+- "Memory < 500MB" — same; matters if it causes OOMs or evictions.
+- "Number of DB queries per request" — useful in dev, not as a
+  prod SLI.
+
+The budget should be **observable from outside the service**. If
+the user can't tell, neither should your budget.
+
+## Choosing the number
+
+Three honest approaches, in order of preference:
+
+<Steps>
+<Step n="1" title="Match what users perceive">
+Research from Nielsen, Google, Akamai: ~100ms feels instant, ~300ms
+feels responsive, >1s users notice the wait. Pick a budget on the
+right side of the user-perception threshold for that interaction.
+</Step>
+
+<Step n="2" title="Match what competitors deliver">
+If three competing tools render the same page in 800ms p95, your
+budget can't be 4s. Users will notice.
+</Step>
+
+<Step n="3" title="Match the SLO you've committed to">
+If your SLO says "99% of requests under 250ms," your budget is
+250ms p99. The SLO is the externally-visible contract; the budget
+is how you keep it.
+</Step>
+</Steps>
+
+## Enforcing it in CI
+
+A budget is a number on a wiki until something blocks bad changes.
+The shapes that work:
+
+- **Pre-merge benchmark.** A small synthetic load runs against
+  every PR; if median or p95 regresses by more than X%, fail the
+  build. Works for stable APIs.
+- **Bundle size check.** Bot comments on PRs with size deltas;
+  failing builds when bundle exceeds budget. (`bundlesize`,
+  `bundlewatch`, `size-limit`.)
+- **Synthetic monitoring with rollback.** A post-deploy probe runs
+  the canonical user flow; if metrics breach budget, the deploy
+  auto-rolls back.
+- **Periodic load test.** Nightly k6/locust run with assertions.
+  Doesn't block PRs but catches drift quickly.
+
+The CI check matters more than the dashboard. A dashboard you have
+to look at gets ignored; a build that won't merge gets attention.
+
+## Multiple budgets per request
+
+A single budget number is suspicious because requests aren't
+uniform. A useful breakdown for an API endpoint:
+
+```
+total p95             < 250ms
+  middleware/auth     < 10ms
+  DB queries          < 100ms
+    of which fastest  < 5ms
+  serialization       < 20ms
+  network egress      < 30ms
+```
+
+Now a regression has a *location*. "Total went from 180 to 230ms,
+the DB sub-budget went from 60 to 110ms — look at the queries."
+
+## Performance budgets for the frontend
+
+Frontend is where budgets are easiest to commit to because the
+metrics are well-defined:
+
+- **Largest Contentful Paint (LCP)**: largest visible element
+  painted. < 2.5s = good.
+- **Interaction to Next Paint (INP)**: time from a user input to
+  the next paint. < 200ms = good.
+- **Cumulative Layout Shift (CLS)**: how much the page jumps as
+  it loads. < 0.1 = good.
+- **JS bundle size**: kilobytes of JS users have to download. The
+  budget is debate-worthy but anything > 500KB gzipped is suspect
+  on mobile.
+
+Tools: Lighthouse CI, WebPageTest, sitespeed.io. All can fail
+builds on budget breaches.
+
+## What a budget *isn't*
+
+- **It's not a target to hit.** It's a ceiling not to cross. Being
+  comfortably under budget is the win; being just at budget is
+  one bad day away from breaching.
+- **It's not forever.** Re-negotiate when the product changes. A
+  new endpoint that does much more work needs a new budget, not a
+  failing build.
+- **It's not the same as an SLO.** SLO is the user-facing
+  commitment; budget is the internal headroom you give yourself
+  to keep it.
+
+## When you've been busted
+
+Budget breach in CI. What now?
+
+1. **Don't bypass the check.** That makes the budget a suggestion.
+   Fix or revert.
+2. **Diff with the previous run.** Differential flame graph,
+   per-sub-budget breakdown, query log diff.
+3. **Verify the new baseline if it was intentional.** Sometimes
+   the new feature legitimately costs more. Update the budget
+   *deliberately*, with sign-off, not silently.

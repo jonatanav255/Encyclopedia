@@ -1,0 +1,207 @@
+export const level = 'junior';
+
+# Structured logging
+
+A log line that's a string is data that needs parsing every time
+you want to ask a question. A log entry that's a structured
+object (JSON, logfmt, etc.) is queryable by field directly. **The
+difference between "I need to write a regex" and "I can filter and
+group."**
+
+This is the single biggest leverage point in logging hygiene.
+Adopt structured logging on day one of a service.
+
+## The two formats
+
+**JSON:**
+
+```json
+{
+  "ts": "2026-05-22T14:32:01Z",
+  "level": "info",
+  "msg": "user logged in",
+  "user_id": 42,
+  "ip": "203.0.113.7",
+  "duration_ms": 18,
+  "request_id": "abc123"
+}
+```
+
+**logfmt** (still structured, less verbose):
+
+```
+ts=2026-05-22T14:32:01Z level=info msg="user logged in" user_id=42 ip=203.0.113.7 duration_ms=18 request_id=abc123
+```
+
+Both are searchable by field in modern log indexers. JSON wins
+for tooling support (every log shipper handles it). logfmt wins
+for human readability and storage size. Pick one, stick with it.
+
+## What every log entry should have
+
+Mandatory fields:
+
+- **timestamp** — ISO-8601 with timezone, ideally UTC. "ts" or
+  "timestamp."
+- **level** — info / warn / error / debug. Used for filtering and
+  alerting.
+- **message** — short human-readable summary. Lowercase, no
+  trailing punctuation by convention.
+- **service** — which service emitted this. Critical when many
+  services log to the same store.
+- **trace_id / request_id** — for correlation across services.
+
+Recommended fields:
+
+- **logger / module** — where in the code this came from.
+- **environment** — prod, staging, dev.
+- **version** — your service's deployed version.
+- **host / instance** — which pod or instance.
+
+Per-event fields (the interesting ones):
+
+- **user_id** (carefully — see PII below)
+- **operation** — what action this was
+- **duration_ms** — how long it took
+- **status** — success / error / status code
+- **error** — the error message if applicable (separate field
+  from message)
+- **error.type, error.stack** — structured error info
+
+## Levels, properly used
+
+The standard hierarchy:
+
+- **DEBUG** — diagnostic detail. Off in prod.
+- **INFO** — significant events worth recording.
+- **WARN** — something unusual but not an outage. Investigate.
+- **ERROR** — something went wrong. Should be rare in prod and
+  should always include enough context to diagnose.
+- **FATAL / CRITICAL** — about to crash or has crashed.
+
+Common abuses:
+
+- **Logging at ERROR for things that aren't errors** ("user not
+  found" on a lookup endpoint isn't an error of the service; it's
+  a normal outcome). Spams the on-call channel; trains people to
+  ignore errors.
+- **Logging too much at INFO**. Every cache hit at INFO = 100GB of
+  logs per day for no value. Sample, or move to DEBUG.
+- **Logging at DEBUG and turning it off when investigating**. You
+  needed the data; turning DEBUG on in prod is invasive. Use
+  DEBUG sparingly; use INFO with sampling for the path you care
+  about.
+
+## Context propagation
+
+The most useful field across all logs in a request is the
+**request_id** (or trace_id). Generate it at the edge; pass it
+through every layer; log it on every entry.
+
+```js
+// At the edge
+app.use((req, res, next) => {
+  req.id = req.headers['x-request-id'] || crypto.randomUUID();
+  res.setHeader('x-request-id', req.id);
+  log.info({ request_id: req.id, method: req.method, path: req.path }, 'request received');
+  next();
+});
+
+// Every subsequent log
+log.info({ request_id: req.id, user_id: user.id }, 'user fetched');
+```
+
+Now `request_id:abc123` finds every log entry from every service
+touched by that request. Without this, debugging a slow request
+means correlating by timestamp, which is unreliable.
+
+Modern observability stacks do this automatically with OpenTelemetry
+trace context (`traceparent` header). The header propagates;
+your logging library reads it; every log automatically includes
+the trace context. Use it.
+
+## Sampling and volume
+
+A service doing 100k req/s, logging 3 entries per request, makes
+~26 billion log entries per day. Cost is real.
+
+Tactics for volume control:
+
+- **Drop DEBUG in prod**. Default level is INFO or WARN.
+- **Sample high-volume entries**. Log every 100th cache miss
+  instead of every one. Maintain count separately as a metric.
+- **Aggregate before logging**. Summarize "we served 1000
+  requests in the last 10 seconds" rather than 1000 individual
+  entries.
+- **Move from logs to metrics**. If you're counting something,
+  it's a metric, not a log entry.
+- **Always log errors and outliers in full**. Sampling is fine
+  for normal traffic; abnormal events should be unsampled.
+
+## What not to log
+
+- **Passwords, tokens, API keys, secrets** — ever, anywhere.
+  Once leaked, your log store is the breach.
+- **Credit card numbers, PII at unnecessary detail** — comply
+  with your jurisdiction's data laws; default to redacting.
+- **Full request/response bodies on user-data endpoints** — same
+  reason.
+- **Large blobs** — base64'd images, file contents. Bloats your
+  index, doesn't help debugging.
+
+Most logging libraries have **redaction config** for known
+sensitive fields. Use it; don't rely on developers remembering.
+
+## A logger config that works
+
+A library-agnostic config:
+
+```yaml
+level: info
+format: json
+fields:
+  service: api
+  environment: prod
+  version: ${GIT_SHA}
+redact:
+  paths: [req.headers.authorization, req.body.password, *.creditCard]
+  replacement: "[REDACTED]"
+sampling:
+  enabled: true
+  rate: 0.1  # 10% of info logs
+  errors: never_sampled
+```
+
+Adapt to your library (pino, winston, zap, slog, log4j, structlog,
+etc.). The shape is the same.
+
+## How to query well
+
+Once logs are structured, useful queries become routine:
+
+```
+# All errors in the last hour for this service
+service:api AND level:error AND ts:>1h
+
+# Requests slower than 1s for a specific user
+service:api AND user_id:42 AND duration_ms:>1000
+
+# Group error rate by endpoint
+service:api AND level:error
+  | stats count() by endpoint
+
+# Find the slowest 1% of requests
+service:api
+  | stats p99(duration_ms) by endpoint
+```
+
+Most log indexers (Splunk, Elastic, Loki, Datadog, Honeycomb)
+have a query language that does this. The syntax varies; the
+ideas don't.
+
+## One signal that you're doing it right
+
+If a teammate asks "what happened to user 42's request at
+14:30?" and you can answer in 30 seconds without writing a regex,
+your logging is in good shape. If it takes 20 minutes, sampling
+and structuring need work.

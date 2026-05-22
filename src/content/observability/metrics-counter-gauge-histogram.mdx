@@ -1,0 +1,230 @@
+export const level = 'junior';
+
+# Counter, gauge, histogram, summary
+
+Four metric types. They behave differently, store differently, and
+each answers different questions. Picking the right one matters
+because the wrong one is either expensive (cardinality explosion)
+or misleading (averaged percentiles).
+
+This page covers the four basic types in the Prometheus/OpenMetrics
+family. The vocabulary is broadly shared across vendors (Datadog,
+CloudWatch, etc.) with minor terminology shifts.
+
+## Counter
+
+A monotonically increasing number. It only goes up. Resets when
+the process restarts (which the system handles gracefully).
+
+```
+http_requests_total{endpoint="/users",status="200"}  4234
+http_requests_total{endpoint="/users",status="500"}  12
+```
+
+What you do with it:
+
+- **Rate**: `rate(http_requests_total[1m])` → requests per second
+  over the last minute. The most common operation.
+- **Sum**: total over a period.
+- **Increase**: how much it grew over a window.
+
+When to use:
+
+- "Number of times event X happened" — requests served, errors
+  emitted, jobs processed, retries triggered.
+- Any cumulative count that can only grow.
+
+When *not* to use:
+
+- Something that can go down — that's a gauge.
+- A duration — that's a histogram.
+
+## Gauge
+
+A current value that can go up *or* down.
+
+```
+process_resident_memory_bytes  82345678
+queue_depth                     143
+active_connections              22
+```
+
+What you do with it:
+
+- Instantaneous reads ("how full is the queue right now?").
+- Min/max/avg over time.
+- Alerts on threshold.
+
+When to use:
+
+- Saturation signals (memory, queue depth, in-flight requests).
+- Cached values where "current state" matters.
+- Anything that goes up and down.
+
+A common confusion: people use a gauge to track "number of total
+requests" by manually incrementing — that's a counter, even
+though it goes up via a gauge mechanism. Use the right primitive;
+your alerting library cares about the type.
+
+## Histogram
+
+A counter plus a *distribution* of observations.
+
+```
+http_request_duration_seconds_bucket{le="0.005"}  100
+http_request_duration_seconds_bucket{le="0.01"}   180
+http_request_duration_seconds_bucket{le="0.025"}  410
+http_request_duration_seconds_bucket{le="0.05"}   780
+http_request_duration_seconds_bucket{le="0.1"}    950
+http_request_duration_seconds_bucket{le="0.25"}   985
+http_request_duration_seconds_bucket{le="0.5"}    998
+http_request_duration_seconds_bucket{le="+Inf"}  1000
+http_request_duration_seconds_count               1000
+http_request_duration_seconds_sum                 23.4
+```
+
+Each row is "the count of observations that fell into a bucket
+with upper bound `le`." `+Inf` is the total count. The buckets are
+**cumulative**: the 0.05s bucket includes all observations ≤ 50ms.
+
+What you do with it:
+
+- **Percentile queries**: `histogram_quantile(0.99,
+  rate(http_request_duration_seconds_bucket[5m]))` → p99 over 5
+  min.
+- **Mean**: sum / count.
+- **Throughput**: rate(count).
+
+The critical property: **histograms can be merged across instances
+and time ranges**. You can compute a service-wide p99 from
+per-instance histograms. (Summaries can't — see below.)
+
+When to use:
+
+- Latencies, durations, sizes.
+- Anything where you want percentiles, averages, and counts.
+
+Bucket choice matters. Too few or too coarse → percentile estimates
+are inaccurate. Too many → cardinality cost. A typical default
+for HTTP latency: `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+2.5, 5, 10]`. Cover the range you expect; refine where you care.
+
+## Summary
+
+Like a histogram, but with **pre-computed quantiles** per instance
+instead of buckets.
+
+```
+http_request_duration_seconds{quantile="0.5"}   0.012
+http_request_duration_seconds{quantile="0.95"}  0.080
+http_request_duration_seconds{quantile="0.99"}  0.220
+http_request_duration_seconds_count             1000
+http_request_duration_seconds_sum               23.4
+```
+
+What you do with it:
+
+- Read the pre-computed quantile directly.
+
+When to use:
+
+- When you only ever need a fixed set of percentiles from a
+  single source.
+
+The catch: **summaries can't be merged across instances**. The
+p99 across two instances isn't computable from the per-instance
+p99s. If you have 10 instances each reporting their p99, your
+"service-wide p99" can't be derived; you can only report
+per-instance.
+
+**Prefer histograms** for almost all use cases. Summaries make
+sense only for single-instance services or when you genuinely
+can't afford the histogram storage.
+
+## A quick chooser
+
+<Compare>
+<thead>
+<tr><th>I want to track…</th><th>Use…</th></tr>
+</thead>
+<tbody>
+<tr><td>How many of X have happened</td><td>Counter</td></tr>
+<tr><td>Current value of X</td><td>Gauge</td></tr>
+<tr><td>Distribution of X (durations, sizes)</td><td>Histogram</td></tr>
+<tr><td>Quantiles of X on a single instance</td><td>Summary (or histogram if you need to aggregate)</td></tr>
+</tbody>
+</Compare>
+
+If you're not sure: it's probably a counter or a histogram. Those
+two cover ~80% of useful metrics.
+
+## Cardinality
+
+Every unique combination of label values is a separate time
+series. The system stores history per series. Cardinality
+explosion = storage explosion.
+
+A safe set of labels:
+
+- `endpoint` (low cardinality: a few dozen)
+- `method` (~5 values)
+- `status` (~10 values)
+- `region` (a handful)
+- `version` (a few; rotates)
+
+A cardinality-explosion set:
+
+- `user_id` (millions)
+- `request_id` (per request — infinite)
+- `url` with query string (essentially unique)
+- `error_message` (free text)
+
+If you find yourself wanting per-user metrics, that's almost
+always a sign you want **logs or traces with user_id**, not a
+metric. Metrics are for aggregate behavior; logs and traces are
+for individual cases.
+
+## Conversion: log to metric
+
+A common evolution: you start with logs for an event, then realize
+you want to alert on its rate. Convert it to a metric:
+
+```python
+# Before: log only
+log.info("payment captured", amount=amount, currency=currency)
+
+# After: log AND metric
+log.info("payment captured", amount=amount, currency=currency)
+metrics.counter("payments_captured_total", labels={"currency": currency}).inc()
+metrics.histogram("payment_amount", labels={"currency": currency}).observe(amount)
+```
+
+Now `rate(payments_captured_total[5m])` gives you payment
+throughput; the histogram gives you the distribution. Cheap to
+emit, cheap to store, alertable.
+
+## Anti-patterns
+
+- **Counter for things that go down** — use a gauge.
+- **Summary when you need a service-wide percentile** — use a
+  histogram.
+- **High-cardinality labels** — `user_id` in a label = millions
+  of series.
+- **One huge histogram with bad bucket boundaries** — buckets all
+  bunched at low values won't measure your tail.
+- **Reading raw counters in alerts** — alert on rates, not raw
+  counts. "5 errors" is meaningless context-free.
+
+## A reasonable default for a service
+
+For a typical HTTP service:
+
+- Counter: `http_requests_total` with labels {endpoint, method,
+  status}.
+- Histogram: `http_request_duration_seconds` with the same labels.
+- Gauge: `http_inflight_requests`, `worker_pool_busy`,
+  `connection_pool_in_use`.
+
+These three families produce the four golden signals plus
+saturation. They're cheap, low-cardinality, and answer most
+questions you'll have.

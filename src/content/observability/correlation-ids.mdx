@@ -1,0 +1,209 @@
+export const level = 'junior';
+
+# Correlation IDs (request and trace IDs)
+
+The single most valuable instrumentation idea in a multi-service
+system. Without it, debugging a slow or failed request means
+joining logs by timestamps across N services — slow, error-prone,
+sometimes impossible.
+
+With it, you have one ID that ties together every log entry,
+metric exemplar, and trace span belonging to a single request,
+no matter how many services it touched.
+
+## The basic shape
+
+<Steps>
+<Step n="1" title="The edge generates an ID">
+The first service to see the request (gateway, load balancer, or
+edge service) generates a unique ID:
+
+```
+X-Request-ID: 4f3a2c1b-9d8e-4a7c-b6d1-08e739a2c1b9
+```
+
+Or honors one if the client sent it. Either way, every request
+has exactly one ID by the time it leaves the edge.
+</Step>
+
+<Step n="2" title="Every internal request passes it">
+Every HTTP call from one internal service to another forwards
+the ID:
+
+```
+GET /internal/users/42
+X-Request-ID: 4f3a2c1b-...
+```
+
+This requires plumbing: an HTTP middleware that reads the
+incoming header and attaches it to outgoing calls. Done once per
+language/framework, used by everything.
+</Step>
+
+<Step n="3" title="Every log entry includes it">
+Application logs are configured to attach the current request
+ID automatically:
+
+```json
+{"ts": "...", "level": "info", "msg": "user fetched", "request_id": "4f3a2c1b-..."}
+```
+
+Now `request_id:4f3a2c1b-...` in your log search returns every
+log from every service touched by this request.
+</Step>
+
+<Step n="4" title="Every trace and metric exemplar carries it">
+If you use distributed tracing (OpenTelemetry), the trace ID is
+the correlation ID — it's standardized. Spans, metric exemplars,
+and logs all reference the same ID.
+</Step>
+</Steps>
+
+## Why this matters
+
+Without a correlation ID, "the user reported a slow checkout at
+14:32" means:
+
+- Search the gateway logs around 14:32 — too many entries to
+  scan.
+- Filter by IP if you have it; might not be uniquely identifying.
+- Find a candidate gateway log, copy timestamps, search the next
+  service for that time window.
+- Hope no concurrent requests confuse you.
+- Repeat for each downstream service.
+
+With a correlation ID:
+
+- Find the gateway log for the user (one or two filters).
+- Copy the request_id.
+- Search every other service's logs for that request_id.
+- Done.
+
+The speedup is 10× to 100× for any cross-service investigation.
+
+## Request ID vs trace ID
+
+Two slightly different things that often coexist:
+
+- **Request ID** (`X-Request-ID`, `X-Correlation-ID`): historically
+  an HTTP-only concept. One ID per top-level request.
+- **Trace ID**: the W3C Trace Context standard
+  (`traceparent` header). The trace ID identifies the whole
+  request trace; each span within it has its own span ID. Trace
+  IDs are 16 bytes; the format is standardized.
+
+Modern best practice: **use the W3C trace context for everything**.
+The trace ID becomes the correlation ID. Logging libraries pull
+it from the context automatically. Tracing systems index by it
+natively. Vendor APIs use it.
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                |         trace_id (16 bytes)        | span_id  |flag
+```
+
+If you have legacy `X-Request-ID` plumbing, keep it for backward
+compatibility but transition new code to W3C.
+
+## Propagation in detail
+
+The propagation has to happen at every layer:
+
+- **HTTP clients**: middleware that injects the header into all
+  outgoing requests. Most modern HTTP libraries have a hook
+  (interceptor / middleware / RoundTripper).
+- **gRPC**: built-in metadata propagation with OpenTelemetry
+  instrumentation.
+- **Message queues**: harder. The trace context lives in message
+  headers (Kafka headers, RabbitMQ headers, SQS message
+  attributes). Consumer reads it; new trace context lives in
+  the consumer's scope.
+- **Background jobs**: pass the trace context as part of the job
+  payload. Worker reads it before starting.
+- **Async / callbacks within a process**: language-specific.
+  Async/await typically propagates context naturally; threads
+  may need explicit context passing.
+
+A request that crosses an async boundary without propagating loses
+the chain. The downstream logs and spans aren't correlated to the
+parent. This is a common failure mode; fix it with explicit
+context propagation.
+
+## The user ID is not the request ID
+
+Confused often. The user ID identifies *who*; the request ID
+identifies *which request*. A user makes many requests over time;
+each has a distinct request ID. Search by user ID to find all
+requests by a user; search by request ID to find one specific
+request's trail.
+
+Both belong in logs as separate fields:
+
+```json
+{"user_id": 42, "request_id": "4f3a...", "msg": "fetched profile"}
+```
+
+## When you can't get an ID
+
+The pragmatic edge cases:
+
+- **Direct client → service calls without a gateway.** The first
+  service generates the ID.
+- **Crons and scheduled jobs.** Generate an ID at job start; pass
+  to all downstream calls.
+- **Replays / batch processing.** Generate a batch ID, plus
+  per-item IDs.
+- **Internal-only ops (cleanup, migration scripts).** Same — give
+  the script-run an ID, log it everywhere.
+
+The rule: **every chain of work has exactly one ID at the top**.
+Generate it if no one else did.
+
+## A practical setup
+
+For a Node.js / Express service:
+
+```js
+import { randomUUID } from 'crypto';
+import { context, trace } from '@opentelemetry/api';
+
+app.use((req, res, next) => {
+  // honor existing or generate
+  req.id = req.headers['x-request-id'] || randomUUID();
+  res.setHeader('x-request-id', req.id);
+
+  // attach to logger context
+  req.log = logger.child({ request_id: req.id });
+  next();
+});
+
+// outgoing HTTP calls
+function callDownstream(req, url) {
+  return fetch(url, { headers: { 'x-request-id': req.id } });
+}
+```
+
+In a Go service: use `context.Context` plus an HTTP middleware.
+In Python: use contextvars + a request middleware. Every language
+has the equivalent.
+
+With OpenTelemetry's auto-instrumentation libraries, much of this
+is handled automatically — the SDK injects the trace context into
+outgoing HTTP/gRPC calls.
+
+## When IDs aren't unique enough
+
+For very high-volume systems, even UUIDv4 can have rare collisions
+in practical query windows; tighter constraint: include a short
+timestamp prefix. But for almost any service, UUIDv4 is fine.
+
+## Sanity-check: have you wired it everywhere?
+
+A simple test for any service: send a request with a known ID
+(`X-Request-ID: testing-123`); after 30 seconds, search your log
+backend for `testing-123`. The number of entries should match
+what you'd expect for one request — and the entries should span
+*every service that participated*, including downstream ones.
+
+If services are missing, your propagation is broken somewhere
+between them. That's the place to fix.

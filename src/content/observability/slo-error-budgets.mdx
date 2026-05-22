@@ -1,0 +1,208 @@
+export const level = 'senior';
+
+# SLOs and error budgets
+
+A **Service Level Objective** (SLO) is a target for a measurable
+service quality (usually reliability or latency). An **error
+budget** is what's left between the SLO and 100%. Together they
+turn "is the service reliable enough?" from a debate into a
+calculation.
+
+This page focuses on the practical use of SLOs and error budgets
+in day-to-day engineering. The terminology overlaps with
+`devops/slo-sli`; this one is the observability-side view.
+
+## SLI, SLO, SLA
+
+Three terms in the same family:
+
+- **SLI** (Service Level Indicator) — a measurement. The
+  fraction of requests that succeed; the p99 latency.
+- **SLO** (Service Level Objective) — a target for the SLI.
+  "99% of requests successful over 30 days."
+- **SLA** (Service Level Agreement) — a contract. "If we miss
+  99% over 30 days, we pay you back X."
+
+SLI is the metric; SLO is the internal target; SLA is what
+you've sold to customers. SLA is usually weaker than SLO (you
+miss SLO sometimes; you really don't want to miss SLA, ever).
+
+## The error budget
+
+If the SLO is "99.9% of requests successful in a 30-day window,"
+the error budget is **0.1%**.
+
+```
+30 days × 86400 seconds × ... ÷ 1000 ≈ 43 minutes of "down" allowed
+```
+
+(More precisely: 0.1% of all requests in the window can fail.
+Calendar time matters less than request count.)
+
+What the budget enables:
+
+- A "fast" deploy that causes 10 minutes of degraded latency
+  burns ~25% of the month's budget. Acceptable if you have
+  budget; concerning if you've already had two such deploys.
+- A planned migration that needs an hour of degraded service
+  is feasible if budget allows.
+- The number is concrete enough to argue with. "Should we
+  freeze releases?" becomes "How much budget is left?"
+
+## Burn rate
+
+A budget consumed at 1× burn rate would run out exactly at
+the end of the window. Higher rates run out sooner.
+
+```
+burn rate = (current error rate) / (allowed error rate)
+```
+
+- Burn rate 1: on track.
+- Burn rate 10: at this pace, 30 days of budget gone in 3 days.
+- Burn rate 100: gone in 7 hours.
+
+The classic burn-rate alert pattern (from Google's SRE workbook):
+
+- **Page** if 5% of budget burns in 1 hour (very fast burn).
+- **Page** if 10% burns in 6 hours (sustained burn).
+- **Ticket** if 2% burns in 24 hours (slow burn).
+
+The thresholds reflect: you want to be alerted before the
+budget runs out, but only for burns severe enough that a
+human should act.
+
+## Multi-window, multi-burn-rate alerts
+
+The recommended pattern:
+
+```
+Fast (5% / 1h)    AND   Slow (5% / 5m)
+Fast (10% / 6h)   AND   Slow (10% / 30m)
+```
+
+A burn must be sustained over both windows to trigger. Avoids
+flapping on momentary blips while catching genuine sustained
+problems.
+
+The Prometheus expression looks like:
+
+```
+(
+  job:slo_errors_per_request:ratio_rate5m{job="api"} > 14.4 * 0.001
+  and
+  job:slo_errors_per_request:ratio_rate1h{job="api"} > 14.4 * 0.001
+)
+or
+(
+  job:slo_errors_per_request:ratio_rate30m{job="api"} > 6 * 0.001
+  and
+  job:slo_errors_per_request:ratio_rate6h{job="api"} > 6 * 0.001
+)
+```
+
+The multipliers (14.4, 6) and durations are calibrated so that
+14.4% / 1h gives roughly "5% of monthly budget burned" given a
+99.9% SLO. Most SLO-aware tools generate this.
+
+## Choosing the SLO
+
+Two failure modes:
+
+- **Too lax**: "99% latency under 5 seconds" — easily met, doesn't
+  reflect a quality goal.
+- **Too strict**: "99.999% successful" — impossible to meet; team
+  burns out chasing five nines.
+
+The right SLO is **slightly above what users find acceptable,
+but achievable with reasonable effort**.
+
+A useful test:
+
+- What latency do users start complaining at? p95 should be
+  comfortably under that.
+- What error rate do users find frustrating? Set the threshold
+  a bit better than that.
+- Can the current architecture meet this without heroic effort?
+  If yes, fine. If no, either invest in the architecture or
+  lower the target.
+
+99.9% is a reasonable starting point for most public services.
+99.99% is for critical paths (auth, payments). 99.999% is
+exceptional and very expensive.
+
+## SLOs and feature work
+
+An honest SLO + error budget integration changes how the team
+decides what to work on.
+
+- **Budget intact**: you have permission to ship features
+  aggressively. Burn budget on changes.
+- **Budget exhausted**: stop shipping features; invest in
+  reliability until budget recovers. Make this an explicit policy,
+  not a debate per incident.
+
+This is the SRE book's "freeze releases" approach. The team
+sometimes resists it (everyone wants to ship). The policy works
+because it's pre-agreed and quantitative — you're not debating
+in the heat of an incident.
+
+## SLO panels on dashboards
+
+A typical "service health" dashboard panel:
+
+```
+SLO: 99.9% success over 30 days
+Current 30-day: 99.84%   (40 minutes used of 43-min budget)
+Burn rate (1h): 0.5×     (healthy)
+Burn rate (24h): 0.8×    (healthy)
+[time series: budget remaining over 30 days]
+```
+
+The single time-series chart of "budget remaining over time"
+is the killer visualization. A team can see at a glance: budget
+healthy, gradual burn, sudden spike, etc.
+
+## Common pitfalls
+
+- **Choosing SLOs from infrastructure metrics, not user
+  experience**. "CPU below 80%" is not an SLO; it's a saturation
+  signal. SLOs come from user-felt quality.
+- **One SLO per metric per service**, leading to dozens. Too
+  many makes triage hard. Pick 1-3 critical SLOs per service.
+- **Calendar-based windows that reset abruptly**. "December 1
+  resets the budget" → a December 2 outage takes the team by
+  surprise because budget had been near zero. Rolling 30-day
+  windows handle this.
+- **SLO is the actual SLA**. Then you can't ever burn budget
+  without contractual consequences. Set SLO tighter than SLA.
+- **Not enforcing the policy**. The team agreed to freeze
+  releases on exhausted budget, then doesn't. The mechanism
+  dies; back to ad-hoc decisions.
+
+## Multiple SLOs and weighted budgets
+
+A service with multiple SLIs (success, latency-p95,
+latency-p99) has multiple budgets. Some teams keep them
+separate ("we have budget for latency, no budget for errors").
+Others combine into a single composite.
+
+Separate is simpler to reason about. Combined makes alerting
+cleaner.
+
+A useful compromise: **one composite SLO at the top** (e.g.,
+"successful and fast"), plus per-SLI views for debugging which
+component is breaching.
+
+## When SLOs aren't worth the ceremony
+
+- For internal-only tools where no one really cares about
+  uptime metrics.
+- Pre-product-market-fit; the product is changing too fast for
+  SLOs to mean anything.
+- Where the service has no measurable quality (rare).
+
+For everything else, SLOs are the most useful management
+construct in observability. They turn "is this good enough?"
+into a number that everyone — engineers, managers, business —
+can agree on.

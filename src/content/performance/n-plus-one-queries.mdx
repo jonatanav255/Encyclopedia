@@ -1,0 +1,167 @@
+export const level = 'junior';
+
+# The N+1 query problem
+
+The textbook performance bug for any app that talks to a database.
+You write code that looks linear, you ship it, and at any non-trivial
+data size your endpoint takes seconds because it's running hundreds
+of small queries instead of one.
+
+## The shape of the bug
+
+```js
+const users = await db.query('SELECT id, name FROM users');     // 1 query
+
+for (const user of users) {
+  user.posts = await db.query(                                  // N queries
+    'SELECT id, title FROM posts WHERE user_id = ?', user.id
+  );
+}
+```
+
+For 100 users you ran **101 queries**, hence "N+1." Each one is
+small and fast — say 2ms — but you're paying 2ms × 101 = ~200ms
+just in round-trip overhead, ignoring the actual DB work. The CPU
+was idle for most of that time.
+
+It looks innocent because the loop is straightforward and the SQL
+is simple. The bug is structural, not local — no single line is
+wrong.
+
+## Why it's so easy to write
+
+ORMs make it almost the default. In Django, Rails, Sequelize,
+Prisma, Hibernate — accessing a related field issues a query on
+demand:
+
+```python
+# Django
+posts = Post.objects.all()        # 1 query
+for p in posts:
+    print(p.author.name)          # 1 query each. N queries total.
+```
+
+The relation looks like a property access. It isn't. It's a
+network round-trip dressed up as a getter.
+
+## The fixes
+
+<Steps>
+<Step n="1" title="Eager loading / join">
+Load the related rows in the original query.
+
+```sql
+SELECT u.id, u.name, p.id, p.title
+FROM users u
+LEFT JOIN posts p ON p.user_id = u.id
+```
+
+ORM equivalents:
+
+```python
+# Django
+Post.objects.select_related('author')
+
+# Sequelize
+User.findAll({ include: Post })
+
+# Hibernate
+SELECT u FROM User u LEFT JOIN FETCH u.posts
+```
+
+One query. Some overhead in row duplication (parent fields repeat
+once per child), but usually a huge win.
+</Step>
+
+<Step n="2" title="Batch with IN(...)">
+Sometimes you can't join cleanly (different tables, complex
+filtering). Two queries:
+
+```sql
+SELECT id, name FROM users WHERE ...;                           -- IDs collected
+SELECT user_id, id, title FROM posts WHERE user_id IN (?,?,?...);
+```
+
+This is what Django's `prefetch_related` and Sequelize's `include`
+do under the hood for many-to-many relations. Two round-trips
+instead of N+1.
+</Step>
+
+<Step n="3" title="DataLoader (GraphQL and beyond)">
+The DataLoader pattern: collect every `load(id)` call within one
+event-loop tick, then issue a single batched query, then resolve
+each individual `load` with its slice. Originally Facebook for
+GraphQL; now ubiquitous.
+
+```js
+const userLoader = new DataLoader(async (ids) => {
+  const rows = await db.query(
+    'SELECT * FROM users WHERE id IN (?)', [ids]
+  );
+  return ids.map(id => rows.find(r => r.id === id));
+});
+
+// Called from N resolvers; results in 1 query.
+await userLoader.load(42);
+```
+
+The exact tool for the N+1 problem in GraphQL, where each resolver
+runs independently and naively.
+</Step>
+</Steps>
+
+## Detecting it
+
+You won't notice in dev — the loop runs against three users in
+50ms. The bug hides until you have real data.
+
+Three ways to catch it:
+
+- **Log every query** in dev with the SQL and the call site. If you
+  see 50 lookups by primary key in a single request, you have N+1.
+- **Query count assertions in tests.** Django and Rails both have
+  helpers; you can wrap a request and assert `query_count <= 5`.
+  Catches regressions automatically.
+- **APM tools** (Datadog, New Relic, Sentry) detect repeated
+  patterns and flag them as "N+1 detected."
+
+## When it isn't actually N+1
+
+A loop with one query per iteration isn't automatically N+1 if:
+
+- The number of iterations is bounded and small (≤ 10).
+- The queries are different *kinds* of queries (different tables,
+  different filters) that don't decompose to a single batch.
+- Each query is doing meaningful, distinct work (not just "look up
+  ID X by primary key").
+
+The bad case is **"the same query shape repeated N times with
+different parameters."** That's almost always batchable.
+
+## Tail extensions
+
+Once you fix one layer, you'll find the same shape one level deeper:
+
+```
+1 query for projects
+N queries for users-per-project (fixed with IN)
+N×M queries for posts-per-user (oops)
+```
+
+Each layer of the graph can independently N+1. Audit the whole
+chain when you find one.
+
+## Related: N+1 over HTTP
+
+The pattern isn't database-specific. Same bug:
+
+```js
+const users = await fetch('/api/users').then(r => r.json());
+for (const u of users) {
+  u.posts = await fetch(`/api/users/${u.id}/posts`).then(r => r.json());
+}
+```
+
+Same fix: a bulk endpoint, or batched queries, or a `?include=posts`
+parameter. Same diagnosis: count the network calls one user request
+makes.

@@ -1,0 +1,154 @@
+export const level = 'mid';
+
+# Compression and payload size
+
+The cheapest performance optimization that still moves the needle.
+You don't have to write a smarter algorithm or upgrade a database;
+you just send fewer bytes. Bandwidth is finite, especially on
+mobile networks; the time saved scales with payload size and
+network distance.
+
+Two ideas: **send less** (smaller payloads) and **send it
+compressed**. They compose.
+
+## How compression fits in the request
+
+```
+your service             gateway/CDN              user
+─────────────             ───────────             ──────
+ 200 OK (raw)             gzip the body           accept-encoding: gzip
+   body=1.2MB     →       body=180KB        →     decompress, render
+```
+
+The compression doesn't have to happen in your app. Doing it at
+the gateway/CDN is usually cheaper (they're built for it) and
+lets the cache store one compressed version.
+
+But you do have to **not break it**. Forcing `identity` encoding,
+returning binary unset content-types, or compressing already-compressed
+content (images, video) can all waste effort.
+
+## The compression algorithms worth knowing
+
+<Compare>
+<thead>
+<tr><th>Algorithm</th><th>Speed</th><th>Ratio</th><th>Use for</th></tr>
+</thead>
+<tbody>
+<tr><td>gzip (deflate)</td><td>Fast</td><td>~60–70% reduction on JSON/HTML</td><td>The safe default. Universally supported.</td></tr>
+<tr><td>br (Brotli)</td><td>Slower compress, fast decompress</td><td>~80%+ on JSON/HTML, better than gzip</td><td>Static assets, served from CDN. Worth the build-time cost.</td></tr>
+<tr><td>zstd</td><td>Very fast, tunable</td><td>~75% on JSON/HTML</td><td>Internal RPC, log shippers, blob storage.</td></tr>
+<tr><td>snappy / lz4</td><td>Extremely fast, lower ratio</td><td>~40–50%</td><td>Hot internal paths where CPU > bytes.</td></tr>
+</tbody>
+</Compare>
+
+For HTTP responses to browsers, the choice is essentially **gzip
+vs Brotli**. Both are supported by all modern browsers via
+`Accept-Encoding`. Brotli wins on ratio by ~15–25%; serve it where
+you can, especially for pre-compressed static assets.
+
+## What *not* to compress
+
+Compression has CPU cost. Doing it twice is pure waste:
+
+- **Images** (JPG, PNG, WebP, AVIF) — already compressed. gzipping
+  them shrinks the payload by maybe 1% at significant CPU cost.
+- **Video / audio** — same. Already encoded.
+- **Pre-compressed binaries** (zip, tar.gz, parquet snappy/zstd) —
+  redundant.
+- **Tiny payloads** — overhead can exceed savings. Most servers
+  skip compression below a threshold (e.g., 1KB).
+
+For HTTP, the right call is content-type aware: compress
+`text/*`, `application/json`, `application/javascript`, SVG; skip
+the rest.
+
+## Send less in the first place
+
+Compression hides bloat. The right first move is removing payload,
+not compressing it.
+
+<Steps>
+<Step n="1" title="Don't return what callers don't need">
+The classic JSON API anti-pattern: return every column of every
+row "in case." A list endpoint returns 200 fields per row when
+the UI uses 5. Field selection (`?fields=id,name,price`),
+GraphQL, or hand-shaped response DTOs cut payload dramatically.
+</Step>
+
+<Step n="2" title="Paginate">
+An endpoint that returns 50,000 rows at once is a worse problem
+than one that pages 100. Page; cap maximum page size; require
+cursor or offset.
+</Step>
+
+<Step n="3" title="Avoid embedded duplicates">
+Lists with nested objects often repeat the same nested object
+N times. Restructure with a separate `included` array and IDs
+(JSON:API does this) or normalize the response.
+</Step>
+
+<Step n="4" title="Strip nulls / defaults from outputs">
+A field whose value is `null` or matches its default can often be
+omitted. Saves bytes on every row.
+</Step>
+
+<Step n="5" title="Pick a denser format where it makes sense">
+JSON is verbose. For high-volume internal RPC, MessagePack, Protobuf,
+or CBOR are 2–4× smaller and faster to parse. Worth it when the
+size genuinely matters and consumers can handle binary.
+</Step>
+</Steps>
+
+## How to verify compression is on
+
+Look at the response headers:
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Encoding: gzip      ← this is the signal
+Content-Length: 18234       ← compressed bytes on the wire
+```
+
+No `Content-Encoding`? Compression isn't happening. Reasons:
+
+- Server config disabled it (often the default for old setups).
+- Client didn't send `Accept-Encoding: gzip, br` (always does in
+  modern browsers; sometimes missing in code clients).
+- A proxy stripped it.
+- Content-type wasn't in the "compress these" list.
+
+In Chrome DevTools, the Network panel shows both transferred (wire)
+and resource (decompressed) sizes. A 200KB resource transferred at
+200KB means it isn't compressed.
+
+## CPU cost — when it matters
+
+Compression is generally cheap on a modern CPU. For most services
+it's a few percent of overall CPU at most. But two cases where it
+becomes the bottleneck:
+
+- **Very high QPS, small responses**. Per-request gzip overhead
+  dominates. Use connection-level compression (HTTP/2 has limited
+  built-in compression; HTTP/3 with QPACK).
+- **Encoding very large payloads on hot paths**. Streaming + zstd
+  often beats batch + gzip when payloads are MB-sized.
+
+Server config knob: compression *level*. Gzip has 1-9, Brotli has
+0-11. Higher = smaller payload, more CPU. The sweet spot for
+dynamic content is usually 4-6 for gzip, 4-6 for Brotli. **Use
+the highest level for static assets compressed at build time
+(level 11 brotli)** — you pay the CPU once, then everyone gets
+the small payload forever.
+
+## Decompression matters too
+
+On low-end mobile devices, the *client's* CPU spent decompressing
+your response is part of total latency. Brotli decompresses faster
+than gzip per byte saved, so the trade is generally favorable. zstd
+decompresses even faster (one reason it's popular for big data).
+
+For a tiny payload, the overhead of *starting* decompression can
+exceed the time saved. This is why servers skip compression below
+a size threshold (~1KB).

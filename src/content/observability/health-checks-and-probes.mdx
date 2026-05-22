@@ -1,0 +1,236 @@
+export const level = 'mid';
+
+# Health checks and probes
+
+A service's "am I healthy?" answer affects more things than
+people realize: load balancer routing, autoscaler decisions,
+Kubernetes pod lifecycle, deploy success / failure. Get the
+health check wrong and the platform makes bad decisions in your
+service's name.
+
+This page is about how to design health checks that produce useful
+signals — and the failure modes when they're wrong.
+
+## What health checks are actually for
+
+Three distinct consumers, each wanting a different question
+answered:
+
+<Compare>
+<thead>
+<tr><th>Consumer</th><th>Question</th><th>Effect of "unhealthy"</th></tr>
+</thead>
+<tbody>
+<tr><td>Load balancer</td><td>Should I send traffic to this instance?</td><td>Stop routing to it (drained)</td></tr>
+<tr><td>Kubernetes liveness</td><td>Is the process stuck and should be killed?</td><td>Kubelet restarts the container</td></tr>
+<tr><td>Kubernetes readiness</td><td>Is this pod ready to serve traffic?</td><td>Removed from Service endpoints</td></tr>
+<tr><td>Kubernetes startup</td><td>Has the process finished booting?</td><td>Other probes deferred until startup passes</td></tr>
+<tr><td>Monitoring / alerting</td><td>Is this instance up?</td><td>Alerts the team</td></tr>
+</tbody>
+</Compare>
+
+These need different endpoints. A single `/health` that tries to
+serve all of them gets the trade-offs wrong.
+
+## The Kubernetes probe trio
+
+Kubernetes formalizes the three roles cleanly. Use them as
+defined:
+
+<Steps>
+<Step n="1" title="Startup probe">
+"Has the application finished starting up?" Used during boot.
+
+Long-grace, lenient. Slow-starting JVMs / migrations might take
+5-10 min. Don't let the liveness probe kill the pod during this.
+
+```yaml
+startupProbe:
+  httpGet: { path: /health/startup, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 30   # allows 5 minutes
+```
+
+Once it passes, liveness and readiness take over.
+</Step>
+
+<Step n="2" title="Liveness probe">
+"Is the process wedged and should be killed?" If it fails
+repeatedly, Kubernetes restarts the container.
+
+Must be **simple and reliable**. Common implementation: a basic
+"can the HTTP server respond at all?" check. Should NOT include
+downstream dependency checks — a database outage shouldn't
+restart your pods (see below).
+
+```yaml
+livenessProbe:
+  httpGet: { path: /health/live, port: 8080 }
+  periodSeconds: 30
+  failureThreshold: 3
+```
+</Step>
+
+<Step n="3" title="Readiness probe">
+"Should this pod receive traffic right now?" Failing readiness
+removes the pod from the Service's endpoints list — traffic stops,
+but the pod isn't restarted.
+
+This is where you can include dependency checks. If your DB is
+down and you can't serve requests usefully, fail readiness so the
+load balancer stops sending traffic. The pod stays alive; when
+dependencies recover, readiness passes again.
+
+```yaml
+readinessProbe:
+  httpGet: { path: /health/ready, port: 8080 }
+  periodSeconds: 5
+  failureThreshold: 2
+```
+</Step>
+</Steps>
+
+## The cascading failure
+
+The single most common health-check mistake: **liveness check
+includes downstream dependency**.
+
+```
+livenessProbe checks: "can I query the database?"
+DB has a transient outage.
+All instances' liveness probes fail simultaneously.
+Kubernetes restarts all instances.
+Instances come up, hit the still-down DB, fail liveness again.
+Crash loop across the entire fleet.
+```
+
+The DB outage cascades into a full service outage that survives
+the original DB recovery. Lesson: **liveness checks should only
+fail when the *process itself* is wedged**, not when external
+dependencies are unhealthy.
+
+Readiness can — and should — include dependency checks. Failing
+readiness drains traffic without restarting; recovery happens
+automatically.
+
+## Self-healing vs honest signals
+
+Two design philosophies:
+
+- **Optimistic**: report healthy unless something is catastrophic.
+  Goal: keep traffic flowing.
+- **Honest**: report unhealthy whenever any sub-system is degraded.
+  Goal: don't lie to the load balancer.
+
+The right answer depends on the role of the probe.
+
+- **Liveness**: optimistic. Don't restart unless you're truly dead.
+- **Readiness**: honest. If you can't serve requests usefully, say
+  so.
+- **Load balancer health check**: honest. Lying causes user
+  errors.
+
+A common pitfall: a service that "self-heals" by reporting healthy
+when it can't actually serve. Users get 500s; the platform doesn't
+shed traffic; alarms don't fire because health is green.
+
+## What to include in a readiness check
+
+Reasonable:
+
+- Can we connect to our database (with a short, cheap query)?
+- Can we connect to our cache?
+- Is our worker thread pool not entirely saturated?
+- Are our in-memory caches loaded (if necessary for service)?
+
+Unreasonable:
+
+- Comprehensive testing of every downstream service (too slow,
+  too brittle).
+- Business logic checks (some users seeing errors is not the same
+  as the pod being unable to serve).
+- Anything that takes more than 100ms.
+
+The readiness check runs every few seconds; it has to be cheap.
+
+## Cache the dependency check
+
+A naive readiness implementation:
+
+```python
+def health_ready():
+    db_ok = check_database()       # 50ms
+    cache_ok = check_cache()       # 5ms
+    auth_ok = check_auth_service() # 30ms
+    return all([db_ok, cache_ok, auth_ok])
+```
+
+Running this every 5 seconds adds 85ms of latency to every probe,
+plus 85ms × (DB, cache, auth) of dependency load just from health
+checks. At 100 instances, that's 100 health probes / 5 seconds =
+20 dep checks per second per dependency, *just from health
+checks*.
+
+Better: **a background goroutine / async task** periodically (e.g.,
+every 30s) checks dependencies and updates an in-memory health
+state. The probe endpoint reads that state — sub-millisecond and
+no dependency load.
+
+## Graceful shutdown
+
+Closely related. When a pod is terminating:
+
+1. Receives SIGTERM.
+2. **Readiness should immediately fail** (so the LB stops sending
+   traffic).
+3. Wait for in-flight requests to complete (with a deadline).
+4. Close connections cleanly.
+5. Exit.
+
+Without step 2, the pod gets traffic up to the moment it's killed,
+and in-flight requests fail. The pattern is "fail readiness on
+shutdown signal" + "drain delay" before actually exiting.
+
+In Kubernetes, this is the **preStop hook + terminationGracePeriod**
+plus a readiness flip:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 15"]  # let LB drain
+terminationGracePeriodSeconds: 30
+```
+
+The app should also handle SIGTERM and flip its own readiness
+state to false immediately on receipt.
+
+## TCP / TCP-failure-aware vs HTTP probes
+
+- **TCP probe**: just opens a socket. Cheap but only catches
+  "process is completely dead."
+- **HTTP probe with status check**: invokes the application's
+  HTTP server, checks 200. Catches deadlocks in the HTTP server
+  itself.
+- **gRPC health check** (a standardized service): for gRPC
+  services. Uses the standard `grpc.health.v1.Health` service.
+
+HTTP is the default for HTTP services. The check should run on a
+**separate port** from user traffic, so it isn't blocked by
+load-shedding or saturation in the main request pipeline.
+
+## External monitoring
+
+In addition to platform-level probes (LB, K8s), have an external
+synthetic monitor that hits the service from outside. This
+catches:
+
+- Network reachability issues from outside the cluster.
+- TLS certificate problems.
+- DNS issues.
+- Issues that only manifest at the edge.
+
+Tools: Pingdom, Datadog Synthetics, UptimeRobot, Cloudflare
+healthchecks, or a script in a separate region. The external
+monitor's "down" signal is the most user-relevant — if the user
+can't reach you, that's the truth.

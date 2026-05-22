@@ -1,0 +1,219 @@
+export const level = 'mid';
+
+# Alerting fundamentals
+
+An alert that doesn't lead to action is noise. Noise erodes trust,
+trains people to ignore the alert channel, and eventually causes
+the *real* alert to be missed.
+
+The hardest part of alerting isn't writing rules. It's deciding
+**which alerts are worth firing** and making sure each one is
+clearly actionable when it does.
+
+## Symptoms vs causes
+
+The SRE book's most useful framing. Two ways to alert:
+
+- **Symptom-based**: "users are getting errors." Triggers on user
+  pain. Doesn't depend on knowing what specific subsystem broke.
+- **Cause-based**: "the database is down." Triggers on a known
+  failure mode of an underlying component.
+
+Prefer symptom-based. A user-pain alert fires whether or not
+the cause is one you've thought to monitor. Cause-based alerts
+miss when the cause is novel.
+
+But cause-based alerts have their place: as **early warnings**,
+before symptoms cascade. "DB CPU >90% for 10 min" is a leading
+indicator of latency that hasn't yet hit the user.
+
+The right structure:
+
+- **Symptom alerts → page (urgent)**.
+- **Cause alerts → ticket (work, not 3am)**.
+
+## Alert quality criteria
+
+Every alert worth firing meets these:
+
+<Steps>
+<Step n="1" title="Indicates a real user problem (or imminent one)">
+A "CPU at 50%" alert is not a problem. A "p99 latency over SLO
+threshold for 5 min" alert is.
+</Step>
+
+<Step n="2" title="Has a clear, single owner">
+The recipient knows it's their responsibility. If five teams could
+own it, no one does.
+</Step>
+
+<Step n="3" title="Is actionable">
+The recipient can do something about it. "There's a problem with
+the universe" alerts don't help.
+</Step>
+
+<Step n="4" title="Has a runbook">
+A document that says: "this alert means X; investigate by doing Y;
+escalate to Z if Y doesn't work." Without one, every alert is a
+fresh investigation.
+</Step>
+
+<Step n="5" title="Fires rarely">
+If it fires every day, it's not signaling an exceptional state —
+it's signaling that you tuned the threshold wrong.
+</Step>
+</Steps>
+
+If an alert fails any of these, the right action is to **fix or
+delete** the alert, not silence it.
+
+## The four-window pattern
+
+For SLO-based alerting, the standard pattern uses **multi-window
+burn rates**:
+
+- **Fast window** (5 min): catches sudden, severe burns.
+- **Slow window** (60 min or 6 hours): catches gradual, sustained
+  burns.
+
+Both have to fire for the alert to trigger. This combination
+reduces false positives (a single 5-min blip doesn't page) and
+catches gradual degradation (a small but persistent burn).
+
+A typical configuration: page if 2% of error budget burns in 1
+hour, OR if 5% burns in 6 hours. Alertmanager and similar systems
+implement this directly.
+
+## Severity levels
+
+Don't have only "alert" and "no alert." A common hierarchy:
+
+- **Page (P0/P1)**: wake the on-call. User-visible outage, SLO
+  burning fast, data loss risk.
+- **Ticket (P2/P3)**: file an issue; address next business day.
+  Saturation rising, individual endpoints degraded, slow
+  resource leak.
+- **Info / dashboard only**: log it; don't notify. Used for
+  context during investigations.
+
+Only P0/P1 wake someone up. Everything else waits for business
+hours. This is the single most important alerting policy: **most
+"alerts" should not page**.
+
+## On-call sustainability
+
+A useful health metric for an on-call rotation: **pages per shift**.
+
+- 0-1 pages per shift: healthy.
+- 2-5 pages per shift: tolerable but accumulating burnout.
+- 5+ pages per shift: broken. Stop adding features and fix
+  alerting + reliability.
+- 10+ pages per shift: the on-call is being trained to ignore
+  alerts. Page fatigue is a real safety issue.
+
+When a rotation gets noisy:
+
+- Audit recent pages. Were they actionable? Did the action work?
+- For false-positive pages: tune the threshold or delete the
+  alert.
+- For real pages of recurring issues: invest in the underlying
+  reliability, not in better alerting on the symptom.
+
+## Suppression and dependencies
+
+Two related ideas, often confused:
+
+- **Inhibition / suppression**: when alert A is firing, suppress
+  alert B because B is a known downstream symptom of A. Avoids
+  a single failure paging everyone.
+- **Dependency-aware alerting**: an alert from a downstream
+  service is automatically muted if its upstream is also alerting.
+
+Both reduce alert storms. Both are also hard to get right —
+suppression rules are themselves code that can be wrong.
+
+Default to fewer, broader symptom alerts at the top, instead of
+narrow alerts everywhere with complex suppression. The simpler
+model usually wins.
+
+## Alert payload
+
+A well-formed alert message includes:
+
+- **Title** — what's wrong, in a few words.
+- **Severity** — P0/P1/P2.
+- **Service** — which one.
+- **Brief detail** — current metric value, threshold, time
+  range.
+- **Runbook link** — direct URL.
+- **Dashboard link** — to the relevant panels.
+- **Recent events** — last deploy, last config change.
+
+Example:
+
+```
+[P1] api-gateway: error rate above SLO
+
+Service: api-gateway (prod)
+Current: 4.2% errors, p99 = 1.8s
+Threshold: 1% errors, p99 < 500ms
+Window: 5 min sustained
+Recent deploys: api-gateway v2.31 deployed 18 min ago
+
+Runbook: https://wiki/runbooks/api-gateway-errors
+Dashboard: https://grafana/d/api-gateway-health
+```
+
+The 3am on-call gets context in seconds, not minutes.
+
+## Common anti-patterns
+
+- **Threshold alerts on noisy metrics.** "If memory > 80% alert."
+  Flaps endlessly. Either use sustained windows or fix the metric.
+- **Alerts copy-pasted from another team's dashboard.** Without
+  understanding the service. They fire wrong, get muted, become
+  silent forever.
+- **No window / sustain duration.** "If error rate spikes above
+  1% for 1 second" — fires on every blip. Use `for: 5m` or
+  similar.
+- **No deprecation.** Alerts about services that no longer exist.
+  Audit annually.
+- **Per-instance alerts.** "Pod-7 has high CPU" — usually
+  irrelevant; aggregate before alerting.
+- **Alerting on dashboards instead of SLIs.** Dashboards are
+  for humans; alerts should run on a small set of SLIs whose
+  thresholds are documented and meaningful.
+
+## The healthy alert process
+
+A reasonable cadence:
+
+- **After every page**: write or update the runbook. If the page
+  was wrong, fix or delete it. If the action was unclear, refine
+  the runbook.
+- **Weekly**: review the page count by team. Spikes get
+  investigated.
+- **Quarterly**: full alert audit. Delete what hasn't fired in 6
+  months and is unlikely to. Tune what fires often without
+  causing action.
+- **After incidents**: postmortem includes an "alerting review"
+  — did the right alert fire? Did the team respond appropriately?
+  Can we tune?
+
+Alerting is engineering. Treat it with the same hygiene as any
+other code: version controlled, reviewed, tested, deprecated.
+
+## Tools and patterns
+
+- **Prometheus Alertmanager** — routing, grouping, inhibition.
+  Plus PagerDuty / Opsgenie for delivery.
+- **Grafana Alerting** — built into Grafana, integrates with same
+  destinations.
+- **Datadog Monitors** — integrated with their metrics. SLO
+  monitors built-in.
+- **PagerDuty / Opsgenie** — escalation policies, on-call
+  schedules, business-hours routing.
+
+For multi-window burn-rate SLO alerts: PromQL has the patterns
+documented in Google's SRE workbook. Use those — they've been
+shaken out.

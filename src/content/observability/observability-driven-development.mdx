@@ -1,0 +1,275 @@
+export const level = 'staff';
+
+# Observability-driven development
+
+A philosophy that promotes treating observability as a first-class
+property of the system, designed in before deploy, not bolted on
+after incidents. Popularised by Charity Majors and Honeycomb;
+Cindy Sridharan and others have written extensively on the same
+ideas.
+
+The framing changes how features get built. Instead of "write code,
+ship, monitor when it breaks," it's "before shipping, decide how
+you'd know whether it's working. Build that into the code."
+
+## The core idea
+
+Production is the only environment where the real workload runs.
+Most bugs that matter are bugs you couldn't have predicted in
+dev. The discipline is to **build the means of understanding
+production into the code that runs there**.
+
+Concretely, this means:
+
+- Every feature ships with the instrumentation needed to verify
+  it's working.
+- Engineers can answer "is my new feature behaving correctly?"
+  in production within minutes, without needing to instrument
+  after the fact.
+- Investigations follow the data; new questions don't require
+  new code, because the high-cardinality, high-dimensionality
+  events already capture what's needed.
+
+## Wide events as the substrate
+
+The Honeycomb argument: instead of three separate signals
+(logs/metrics/traces), emit one **structured wide event** per
+unit of work. Each event has many dimensions:
+
+```json
+{
+  "trace_id": "4f3a...",
+  "service": "checkout",
+  "duration_ms": 220,
+  "user.id": 42,
+  "user.tier": "enterprise",
+  "user.cohort": "experiment_a",
+  "http.method": "POST",
+  "http.route": "/orders",
+  "http.status": 200,
+  "feature_flag.new_checkout": true,
+  "downstream.payment.duration_ms": 120,
+  "downstream.payment.provider": "stripe",
+  "downstream.inventory.duration_ms": 45,
+  "cart.size": 3,
+  "cart.total_cents": 4599,
+  "deploy.version": "2.31.4",
+  "deploy.commit": "abc123",
+  ...
+}
+```
+
+Now any aggregation, breakdown, or comparison can be done at
+query time:
+
+- "Latency per user.tier" — aggregate at query time.
+- "Latency per feature_flag.new_checkout = true vs false" —
+  side-by-side.
+- "Errors per deploy.version" — see exactly which deploy regressed.
+- "Slow requests where downstream.payment.provider = stripe and
+  user.tier = enterprise" — combine high-cardinality filters.
+
+You don't need to have *anticipated* these breakdowns at
+instrumentation time. The event has the dimensions; the query
+adds the aggregation.
+
+This is the strongest argument for the wide-event model: the
+unknown-unknowns become knowable.
+
+## The Charity Majors framing
+
+A summarized version of the argument:
+
+- **Cardinality is a feature**, not a bug. The more dimensions
+  you can pivot on, the more questions you can answer.
+- **Aggregation belongs at the query layer**. Pre-aggregating at
+  the source loses information you didn't know you'd need.
+- **Observability is about novel questions**. Monitoring is
+  about known failure modes. Both matter, but observability is
+  the harder, more valuable one.
+- **The first question of a new bug should be answerable from
+  the data**, not from new instrumentation deployed after the
+  fact.
+
+## How it changes the development workflow
+
+<Steps>
+<Step n="1" title="During design">
+"How will I know this works in production?" is asked alongside
+"how will this work technically?" The answer informs both the
+design and the instrumentation.
+</Step>
+
+<Step n="2" title="During implementation">
+Spans, attributes, and structured logs are added with the feature
+code, not after. The feature's PR includes its observability.
+</Step>
+
+<Step n="3" title="During code review">
+Reviewers check the instrumentation, not just the logic. Missing
+context, hardcoded "magic" without a span, unattributed errors —
+all called out.
+</Step>
+
+<Step n="4" title="At deploy time">
+The engineer who shipped the feature watches the relevant
+queries. "Are requests through the new code path succeeding?
+What's the latency distribution? Are there errors?" They have a
+fast feedback loop, not a "we'll see in the incident report" loop.
+</Step>
+
+<Step n="5" title="During investigation">
+When something goes wrong, the engineer can query by the
+dimensions that distinguish the bug. The data was already there;
+they're forming hypotheses, not adding instrumentation reactively.
+</Step>
+</Steps>
+
+## Concrete practices that follow
+
+A team operating on ODD typically:
+
+- **Spans every meaningful business operation** with rich attributes.
+- **Includes user_id, customer_id, feature flags, and version**
+  on every event.
+- **Uses high-cardinality fields** (user_id is fine in events,
+  not in metric labels).
+- **Logs are wide events**, not free text. Logs and traces are
+  closely integrated; the distinction blurs.
+- **Tests in production** with feature flags. Small percentage
+  rollout, observe the wide events, increase.
+- **Postmortems include "what new dimension would have made this
+  faster to find?"** with explicit follow-up.
+
+## The instrumentation hierarchy
+
+Layered, in order:
+
+1. **Automatic per-request fields**: trace_id, request_id,
+   user_id, deploy version, env, region.
+2. **Framework-level fields**: HTTP method, route, status,
+   duration.
+3. **Application-level fields**: business identifiers (order_id,
+   product_id, cohort, feature flags).
+4. **Per-feature attributes**: anything specific to the path
+   being executed.
+
+Each layer is added once and propagates automatically through
+the others. New features add layer-4 fields; the rest are free.
+
+## When wide events aren't enough
+
+ODD's strength is novel-question answering. Its weakness is
+**aggregate trends over long time windows at scale**:
+
+- "Average request latency over the last 90 days" with billions
+  of events is expensive to compute from raw events. A pre-aggregated
+  metric is much cheaper.
+- "Has the error rate increased since last quarter?" — metrics
+  are more efficient for long-window comparisons.
+
+The pragmatic answer: **emit both**. The wide event for novel
+questions; the aggregated metric (counter/histogram) for
+long-window trends and alerting.
+
+## Cost considerations
+
+Wide events at scale are expensive in storage. Mitigations:
+
+- **Sampling**. Honeycomb's argument: dynamic sampling that keeps
+  outliers fully, samples normal traffic. Combined with the wide
+  data model, this preserves most analytical value.
+- **Tiered retention**. Hot/warm/cold the same as logs.
+- **Aggregation at query time**, not write time, but cache common
+  query results.
+
+A typical mature ODD stack costs more than a typical "three
+pillars" stack but earns it back in faster incident response and
+better feature observability.
+
+## Comparison to traditional observability
+
+<Compare>
+<thead>
+<tr><th></th><th>Three pillars</th><th>Observability-driven (wide events)</th></tr>
+</thead>
+<tbody>
+<tr><td>Data shape</td><td>Logs, metrics, traces separately</td><td>One unified event stream</td></tr>
+<tr><td>Aggregation</td><td>At write time (metric labels chosen up front)</td><td>At query time</td></tr>
+<tr><td>Cardinality</td><td>Tight limits</td><td>Embraced</td></tr>
+<tr><td>Novel questions</td><td>Often require new instrumentation</td><td>Often answerable from existing events</td></tr>
+<tr><td>Trends and alerting</td><td>Easy via pre-aggregated metrics</td><td>Less efficient for long windows</td></tr>
+<tr><td>Cost</td><td>Lower for trend data, higher overall instrumentation effort</td><td>Higher for storage, lower for new instrumentation</td></tr>
+<tr><td>Vendor</td><td>Anything (Prom, Datadog, vendor APM)</td><td>Honeycomb is canonical; others adapting</td></tr>
+</tbody>
+</Compare>
+
+The two aren't mutually exclusive. Most mature teams have both:
+metrics for alerts and dashboards, wide events for investigations.
+
+## The cultural shift
+
+The biggest delta isn't technical. It's **who owns understanding
+production**.
+
+- Old model: ops / SRE owns production. Devs throw code over the
+  wall.
+- ODD model: devs are responsible for understanding their code in
+  production. Tooling makes that practical.
+
+This requires:
+
+- **Engineers having production access** (read-only minimum).
+- **Tools fast enough to investigate during development**, not
+  just during incidents.
+- **A culture that rewards understanding over guessing**.
+
+Without these, ODD remains aspirational.
+
+## Adoption path
+
+Realistic for an existing team:
+
+<Steps>
+<Step n="1" title="Add wide events alongside existing metrics/logs">
+Don't rip out what works. Emit a structured wide event per
+significant operation, in addition to existing logs and metrics.
+</Step>
+
+<Step n="2" title="Use them during one investigation">
+The next incident, try answering it from the wide event stream.
+Notice what's missing; add fields.
+</Step>
+
+<Step n="3" title="Standardize fields">
+Trace_id, user_id, deploy version, env. Make them automatic.
+</Step>
+
+<Step n="4" title="Introduce in code review">
+"Did you add the right attributes to this new operation?"
+becomes part of the checklist.
+</Step>
+
+<Step n="5" title="Iterate">
+Each investigation reveals what would have been useful. Add it.
+</Step>
+</Steps>
+
+A team that's two years into this has wide-event coverage that
+makes the next incident dramatically faster. A team that hasn't
+started has the option to start.
+
+## Why it matters at staff level
+
+A staff engineer's most leveraged work is often *making the
+team faster at understanding production*. ODD is one of the
+clearest paths to that:
+
+- Better feature delivery (fast feedback on what's working).
+- Faster incident response (questions answered from data).
+- Lower instrumentation churn (existing data answers new
+  questions).
+
+The technical investment is real. The cultural investment is
+larger but pays back longer. Both are within a staff engineer's
+remit to drive.

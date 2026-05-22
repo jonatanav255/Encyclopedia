@@ -1,0 +1,144 @@
+export const level = 'mid';
+
+# HTTP caching
+
+The HTTP spec includes a full caching protocol that browsers, CDNs,
+and reverse proxies already implement. Configuring it correctly is
+often a bigger win than anything in your application code, because
+**the request that never reaches your server is the fastest one**.
+
+## The two cache decisions
+
+Every cache between client and origin asks two questions per request:
+
+<Steps>
+<Step n="1" title="Can I serve from cache without asking the origin?">
+"Yes" = **fresh**. Return the cached response immediately. No
+network round-trip to the origin.
+
+"No" = **stale**. We *might* have a copy, but we have to check
+with the origin before serving it.
+</Step>
+
+<Step n="2" title="If stale, can I avoid sending the full response again?">
+The origin says "your copy is still fine" (304 Not Modified) →
+cache returns its copy. Saves bandwidth and origin work.
+
+Or origin says "here's a new version" → cache stores it, returns
+it. Full round-trip.
+</Step>
+</Steps>
+
+Fresh = zero origin work. Stale-with-revalidation = one fast round
+trip. Cold = full round trip.
+
+## Cache-Control: the only header that matters
+
+`Cache-Control` is how you tell every cache (browser, CDN, proxy)
+what to do. The directives worth knowing:
+
+<Compare>
+<thead>
+<tr><th>Directive</th><th>What it means</th></tr>
+</thead>
+<tbody>
+<tr><td>`max-age=N`</td><td>Fresh for N seconds. (Standard cache lifetime.)</td></tr>
+<tr><td>`s-maxage=N`</td><td>Like max-age but only for *shared* caches (CDNs, proxies). Browser ignores.</td></tr>
+<tr><td>`public`</td><td>Any cache may store this response.</td></tr>
+<tr><td>`private`</td><td>Only the user's browser may cache it. CDN/proxy must not.</td></tr>
+<tr><td>`no-cache`</td><td>**May store, but must revalidate before serving.** Not "don't cache."</td></tr>
+<tr><td>`no-store`</td><td>**Don't store at all.** What people usually mean when they say "no-cache."</td></tr>
+<tr><td>`must-revalidate`</td><td>Once stale, must revalidate; don't serve stale on origin errors.</td></tr>
+<tr><td>`immutable`</td><td>Content will never change; don't even revalidate. Pair with hashed URLs.</td></tr>
+<tr><td>`stale-while-revalidate=N`</td><td>Serve stale for up to N seconds while refreshing in background.</td></tr>
+<tr><td>`stale-if-error=N`</td><td>Serve stale up to N seconds if origin returns 5xx.</td></tr>
+</tbody>
+</Compare>
+
+`no-cache` and `no-store` are the most misused. Use `no-store` when
+you mean "this response should never be saved" (PII, financial,
+auth). Use `no-cache` when you mean "save but always check before
+using" (e.g., HTML pages whose body might change but where stale
+is unacceptable).
+
+## Validators: ETag and Last-Modified
+
+When a stale cache asks the origin "is your copy still fine?", it
+sends a validator:
+
+- **ETag**: a string the origin assigned to the resource. Strong
+  ETags mean byte-identical; weak (`W/"abc"`) mean semantically
+  equivalent. The cache sends `If-None-Match: "abc"`; the origin
+  returns 304 if unchanged.
+- **Last-Modified**: a timestamp. The cache sends
+  `If-Modified-Since: ...`; origin returns 304 if no change.
+
+ETags are stronger and don't lose precision the way timestamps do
+(1-second granularity, clock skew). Prefer them where you can
+compute them cheaply (e.g., from a row's version column or
+content hash).
+
+## Hashed-URL pattern (the bundle trick)
+
+For static assets, the dominant pattern in modern web tooling:
+
+- Build emits `main.4f3a2c1b.js` (filename includes content hash).
+- Server sets `Cache-Control: public, max-age=31536000, immutable`.
+- The HTML page references the hashed filename.
+
+The asset can be cached for a year because if it changes, its
+filename changes — the new file is a different URL. No
+invalidation needed; the URL itself is the version.
+
+This pattern is what makes modern SPAs fast on repeat visits. The
+HTML is short and revalidated; everything else loads from cache.
+
+## CDN-specific considerations
+
+CDNs are HTTP caches with extra knobs:
+
+- **Surrogate-Control** / vendor-specific headers (CDN-Cache-Control,
+  CloudFront-specific): override `Cache-Control` for the CDN only,
+  not for browsers. Lets you cache aggressively at the edge while
+  telling browsers to revalidate.
+- **Cache key**: by default, URL. But you can include
+  cookies/headers via `Vary`. **`Vary: Cookie` is a common
+  footgun** — every unique cookie set is its own cache entry,
+  shattering hit rate. Be specific (`Vary: Accept-Encoding`).
+- **Purge / invalidation API**: how you tell the CDN "forget this
+  URL." Used when you can't change the URL on every content change.
+
+## Common bugs
+
+- **Caching authenticated responses**. A response with personal
+  data was served as `public`; the CDN stored it; the next user
+  saw someone else's profile. Always set `private` or `no-store`
+  for authenticated, user-specific responses, or include the auth
+  in the cache key.
+- **HTML cached with a long TTL**. Now your deploy doesn't roll
+  out — users see the old HTML pointing at *old* hashed assets
+  for the cache lifetime. Default HTML to short TTL or
+  `no-cache`.
+- **Vary header missing.** You serve different responses based on
+  `Accept-Language`, but didn't add `Vary: Accept-Language`. All
+  languages get whichever the cache saw first.
+- **stale-while-revalidate without limits**. Used to be a clever
+  way to serve forever-fresh content. Now the cache happily
+  serves a months-old version because nothing forced
+  revalidation. Cap with `max-age`.
+
+## A working pattern for an API
+
+For most JSON APIs (read-heavy):
+
+- Public collection endpoints: `Cache-Control: public, max-age=60,
+  stale-while-revalidate=120` + an ETag.
+- Per-user resources: `Cache-Control: private, no-cache` + an ETag.
+  Cache locally, always revalidate.
+- Write responses (POST/PATCH/DELETE): `Cache-Control: no-store`
+  in case any cache treats POSTs the way it shouldn't.
+- 4xx/5xx: `Cache-Control: no-store` unless the error is
+  intentionally cacheable.
+
+Test it. Cache behavior is invisible to your service; it shows up
+as a hit-rate metric at the CDN and as latency at the user.

@@ -1,0 +1,185 @@
+export const level = 'junior';
+
+# Logs, metrics, and traces
+
+The "three pillars of observability" — a useful starting frame
+even if practitioners now talk about them as overlapping signals
+rather than separate things. Each answers a different question
+about what your system is doing.
+
+## What each is for
+
+<Compare>
+<thead>
+<tr><th></th><th>Logs</th><th>Metrics</th><th>Traces</th></tr>
+</thead>
+<tbody>
+<tr><td>Question they answer</td><td>"What happened on this specific request?"</td><td>"How is the system doing overall?"</td><td>"Where in the request chain did time go?"</td></tr>
+<tr><td>Granularity</td><td>Per event</td><td>Aggregated counts/durations</td><td>Per request, broken into spans</td></tr>
+<tr><td>Cardinality</td><td>High (arbitrary fields)</td><td>Low (must be bounded)</td><td>High (one trace per request)</td></tr>
+<tr><td>Storage cost</td><td>Highest</td><td>Lowest</td><td>Medium-high</td></tr>
+<tr><td>Query latency</td><td>Slow (text search)</td><td>Fast (time-series DB)</td><td>Medium (indexed by ID)</td></tr>
+<tr><td>Alerting</td><td>Possible, awkward</td><td>The natural fit</td><td>Possible via derived metrics</td></tr>
+</tbody>
+</Compare>
+
+A practical rule: **metrics for alerting and dashboards, logs
+for incident forensics, traces for understanding distributed
+latency**. Each has a sweet spot.
+
+## Logs
+
+A log entry is an event recorded in time. Traditionally a line of
+text; modern practice is **structured logs** — JSON or key-value
+pairs — that machines can parse.
+
+```json
+{"ts": "2026-05-22T14:32:01Z", "level": "info", "msg": "user logged in",
+ "user_id": 42, "ip": "203.0.113.7", "duration_ms": 18}
+```
+
+Versus the unstructured equivalent:
+
+```
+2026-05-22 14:32:01 INFO user logged in id=42 ip=203.0.113.7 dur=18ms
+```
+
+The structured version is searchable by field (`user_id:42`,
+`duration_ms:>100`), groupable, and joinable across services.
+The text version requires regex.
+
+Logs are great when: you need to know exactly what happened to a
+specific request, or you don't yet know what to measure (the field
+is in the log; the metric requires foresight). They're bad when:
+you want to ask aggregate questions across millions of events
+(slow), or you want to alert on rates (metrics are better).
+
+## Metrics
+
+A metric is a numeric value sampled over time. The most common
+types:
+
+- **Counter**: monotonically increasing count. "Number of requests
+  served." You compute rates (req/sec) by differentiation.
+- **Gauge**: a snapshot value that can go up or down. "Current
+  memory usage." "Active connections."
+- **Histogram**: a count plus a distribution of values. "How many
+  requests had latency in each bucket?" The basis for percentile
+  computation.
+- **Summary**: a histogram-like structure with pre-computed
+  quantiles per source. Less mergeable than histograms.
+
+Metrics are cheap because they're aggregated **at the source**. A
+histogram with 20 buckets is 20 numbers per scrape, no matter
+how many requests fed into it. Compare to logs: one entry per
+request, possibly millions per minute.
+
+The catch: metrics have **cardinality limits**. Each unique
+combination of labels (`endpoint=/api/users, status=200,
+region=us-east`) is a separate time series. Putting user IDs in
+labels = millions of series = storage explosion.
+
+## Traces
+
+A trace is the record of one request as it travels through a
+distributed system. The unit is a **span**: an operation with a
+start, end, parent, and metadata.
+
+```
+trace 4f3a... ─ "GET /products"
+  ├─ span: gateway       0ms - 2ms
+  ├─ span: api           2ms - 180ms
+  │   ├─ span: db_query    5ms - 50ms
+  │   ├─ span: cache_get  55ms - 60ms
+  │   └─ span: render    60ms - 175ms
+  └─ span: cdn return  180ms - 182ms
+```
+
+A trace answers "where did time go on this slow request?" Without
+traces, slow distributed requests are mysterious — your service
+shows 50ms p99, the next service downstream shows 50ms p99, but
+the user waits 2s. The trace shows which call in the chain was
+actually slow.
+
+OpenTelemetry is the dominant standard for emitting traces today.
+Vendors (Datadog, Honeycomb, Tempo, Jaeger, etc.) collect and
+display them.
+
+## How they overlap
+
+The "three pillars" framing is increasingly fuzzy:
+
+- **Exemplars** link metrics to traces: "this 99th-percentile
+  latency bucket includes a trace at this ID."
+- **Wide structured events** (Honeycomb-style) blur logs and
+  traces: every span is also a structured log entry.
+- **Span events** are logs attached to traces, with the trace
+  context.
+- **Histogram-derived alerts** are metrics queries that surface
+  spans for inspection.
+
+The deeper view: you have a stream of events about your system.
+Logs are the unfiltered version; metrics are aggregations; traces
+are connected sequences. All three derive from the same underlying
+observation.
+
+## What to start with
+
+If you have nothing, pick in this order:
+
+<Steps>
+<Step n="1" title="Structured logs">
+Almost free to add; immediately useful for debugging. JSON or
+logfmt format. Include a request ID, timestamp, level, message,
+and contextual fields.
+</Step>
+
+<Step n="2" title="The 4 golden metrics">
+Latency, traffic (request rate), errors, saturation. For every
+service. Even one dashboard with these four per service is
+substantial.
+</Step>
+
+<Step n="3" title="Distributed traces">
+Once you have multiple services calling each other, traces become
+essential. Otherwise you're correlating timestamps across logs
+forever.
+</Step>
+
+<Step n="4" title="Profiling">
+For squeezing the last 20% of perf understanding. See the
+performance topic for more.
+</Step>
+</Steps>
+
+## Common confusions
+
+- **"We have logs, do we need metrics?"** Yes. Logs are individual
+  events; metrics are aggregates. Computing a real-time rate from
+  logs at 100k events/sec works only with heavy infrastructure.
+  Metrics give you the same answer with much less cost.
+- **"We have metrics, do we need traces?"** If you're a single
+  service, maybe not. If you have N services calling each other,
+  traces are the only way to see end-to-end latency clearly.
+- **"Aren't logs more flexible? Why not just log everything?"**
+  Cost. A high-traffic service logging every request at full
+  detail can spend more on log storage than compute. Logs are
+  high-value at low volume; high-volume logging is anti-pattern.
+
+## What good looks like
+
+A production service has all three:
+
+- **Metrics**: 4 golden signals + per-endpoint breakdown +
+  resource utilization. Dashboards anyone can scan in 30 seconds.
+- **Logs**: structured, sampled at high volume, kept for 7-30
+  days. Searchable by trace ID, user ID, endpoint, error code.
+- **Traces**: sampled (often 1-10% of requests, plus 100% of
+  errors). Indexed by service, endpoint, and trace ID.
+- **All correlated**: a trace ID in a log lets you jump from log
+  to trace; an exemplar in a metric lets you jump from metric to
+  trace.
+
+The correlation is the killer feature. "This metric spiked at
+14:30 → these are the spans involved → here's a representative
+trace → here are the logs for that trace's request."

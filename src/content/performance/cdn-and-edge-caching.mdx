@@ -1,0 +1,172 @@
+export const level = 'mid';
+
+# CDN and edge caching
+
+A CDN is a globally distributed cache that sits between users and
+your origin. The win is twofold: **shorter network paths** (the
+edge is closer than your origin) and **fewer origin requests** (the
+edge serves cached responses without calling you).
+
+For static assets the win is obvious. The interesting modern
+question is what else can live at the edge — partial pages, API
+responses, even compute.
+
+## Why latency wins are huge
+
+A request from a user in Sydney to an origin in `us-east-1` involves
+~150ms of RTT just from the speed of light over the Pacific. No
+amount of server optimization closes that gap. A CDN with a
+Sydney POP serves cached content with ~5ms RTT. **30× faster
+before any code runs.**
+
+For static, this is uncontroversial. For dynamic, the question is
+"how much can I cache at the edge without breaking correctness?"
+
+## The cache hierarchy a CDN adds
+
+```
+user → edge POP (city)  ← cache: full hit fastest
+       ↓ miss
+       regional shield   ← cache: regional aggregation
+       ↓ miss
+       origin            ← your servers
+```
+
+Modern CDNs (Cloudflare, Fastly, CloudFront, Akamai) all have at
+least two tiers. The **shield** layer absorbs origin pressure when
+many edge POPs miss simultaneously. Without it, a cold viral link
+could trigger 100s of POPs hitting origin in parallel.
+
+## What's cacheable at the edge
+
+<Compare>
+<thead>
+<tr><th>Class</th><th>Cacheable?</th><th>Strategy</th></tr>
+</thead>
+<tbody>
+<tr><td>Static assets (JS, CSS, images)</td><td>Yes</td><td>Hashed URLs + `max-age=31536000, immutable`</td></tr>
+<tr><td>Public HTML (marketing pages)</td><td>Yes</td><td>Short max-age, purge on deploy</td></tr>
+<tr><td>Public JSON / RSS</td><td>Yes</td><td>Short max-age + ETag</td></tr>
+<tr><td>API responses, anonymous</td><td>Often</td><td>Cache by URL+query; varies by Accept</td></tr>
+<tr><td>Authenticated user data</td><td>No</td><td>`private, no-store`</td></tr>
+<tr><td>Personalized HTML</td><td>Sometimes</td><td>Hole-punch with ESI / edge-side composition</td></tr>
+</tbody>
+</Compare>
+
+## The Vary footgun
+
+CDNs cache by URL by default. To vary on headers (e.g., serve
+different content per language), you add `Vary: Accept-Language`.
+
+The bug: too generous a Vary fragments the cache.
+
+- `Vary: Accept-Encoding` — fine, a few variants (gzip, br,
+  identity).
+- `Vary: Accept-Language` — manageable, ~5-20 variants.
+- `Vary: User-Agent` — catastrophic. Thousands of unique
+  user-agents → near-zero hit rate.
+- `Vary: Cookie` — usually catastrophic. Every unique cookie
+  value is its own cache entry.
+
+Be conservative. Normalize before varying when possible (strip
+cookies you don't need, map UAs to a small set of categories).
+
+## Edge computing
+
+Modern CDNs run code at the edge: Cloudflare Workers, Fastly
+Compute, AWS Lambda@Edge. The pattern:
+
+```
+request arrives at edge
+  → worker runs (auth, rewrite, A/B, geo, personalization)
+  → fetch from cache or origin
+  → worker post-processes
+  → response to user
+```
+
+What edge compute is good for:
+
+- **Auth at the edge**: validate JWT, reject unauthorized requests
+  without reaching origin.
+- **A/B / personalization shims**: rewrite a small portion of an
+  HTML response based on user signal.
+- **Geo routing**: send user to nearest backend, geo-block by
+  region.
+- **Lightweight API endpoints**: especially read-heavy ones.
+- **Origin shield logic**: collapse identical concurrent requests
+  before hitting origin.
+
+What it's bad for:
+
+- **CPU-heavy work**. Edge workers have very limited CPU/memory
+  budgets per request.
+- **Stateful work**. Edge has no shared mutable state. Use a
+  proper backend.
+- **Anything needing tail-of-request consistency** (write-once
+  semantics on shared data).
+
+## Cache invalidation at the CDN
+
+Three options, ordered by speed and complexity:
+
+- **TTL**: the laziest. Wait for expiration. Use short TTLs for
+  content that changes; long TTLs for hashed assets.
+- **Purge by URL**: tell the CDN "evict this exact URL." Fast for
+  one resource; slow if you have to purge thousands.
+- **Surrogate keys / tags**: tag responses with logical IDs
+  (`product-42`, `user-list`); purge by tag. The CDN walks its
+  index and evicts everything tagged. Powerful for invalidation
+  of many entries at once.
+
+Surrogate keys are the modern best practice for dynamic content
+caching (Fastly's term; other CDNs have equivalents). They turn
+"I edited product 42" into "purge `product-42`" → all pages that
+showed product 42 evict.
+
+## Stale-while-revalidate at the edge
+
+The killer feature for dynamic content. When a cache entry expires:
+
+- Serve the stale copy immediately (no user-visible latency).
+- Asynchronously fetch a fresh copy in the background.
+- Future requests get the fresh copy when it lands.
+
+Pair with `stale-if-error`: if the origin is down, keep serving
+stale. The CDN absorbs origin outages for as long as the
+stale-if-error window allows.
+
+```
+Cache-Control: public, max-age=60,
+  stale-while-revalidate=600, stale-if-error=86400
+```
+
+Reads as: "fresh for 1 minute, may serve stale for up to 10 min
+while refreshing, and up to 24 hours if origin is down."
+
+## Edge vs origin trade-offs
+
+When a request *must* go to the origin:
+
+- It's slower (full RTT to your DC + origin processing).
+- It hits your application logic, DB, dependencies.
+- It costs more (origin egress + compute).
+
+Cache hit rate is the dominant metric. Going from 80% to 95% hit
+rate cuts origin load by 4×. Going from 95% to 99% cuts it by
+another 5×. The last few percent is hugely valuable.
+
+Measure: hit rate per route, p95 latency at edge vs origin,
+origin egress bytes, error rate from edge to origin. CDN dashboards
+expose all of these.
+
+## When *not* to put a CDN in front
+
+- Internal-only APIs (no global audience).
+- Long-lived bidirectional connections (WebSockets are often
+  passthrough — the cache layer doesn't help).
+- High-write workloads (POST/PUT/DELETE bypass cache anyway).
+- Anything where the latency saved (sub-100ms) is dwarfed by the
+  work being done (multi-second computation).
+
+For most user-facing read-heavy workloads, the CDN is the single
+biggest performance lever available.

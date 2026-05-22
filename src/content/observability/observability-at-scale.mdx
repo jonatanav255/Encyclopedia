@@ -1,0 +1,268 @@
+export const level = 'staff';
+
+# Observability at scale
+
+A two-engineer startup can run a basic Prometheus + Grafana setup
+on a single VM. A thousand-engineer company with hundreds of
+services and petabytes of telemetry has fundamentally different
+problems.
+
+This page covers what changes — operationally, organizationally,
+and architecturally — when observability itself becomes a large
+system.
+
+## What breaks first
+
+The order in which a naive setup fails as you grow:
+
+<Steps>
+<Step n="1" title="Single Prometheus runs out of memory">
+A few thousand series is fine. Past ~1 million active series,
+memory pressure starts. Past ~10 million, a single instance is
+infeasible.
+</Step>
+
+<Step n="2" title="Log volume exceeds budget">
+A few GB/day is cheap. A few TB/day starts hurting. At 10s of
+TB/day, log retention windows shrink to fit the budget, and
+people start losing the ability to investigate older incidents.
+</Step>
+
+<Step n="3" title="Cardinality explodes">
+Someone adds a label with high-cardinality values. The TSDB
+starts struggling. Query latency goes from milliseconds to
+seconds.
+</Step>
+
+<Step n="4" title="Dashboards multiply">
+Every team made their own. Two thousand dashboards exist. No one
+knows which to look at during an incident.
+</Step>
+
+<Step n="5" title="Alert volume becomes unsustainable">
+Each new alert was reasonable on its own. The aggregate is
+hundreds of pages per week.
+</Step>
+
+<Step n="6" title="Tracing infrastructure costs more than compute">
+Spans at full sampling start outpacing application telemetry.
+Sampling becomes essential — but tail sampling needs centralized
+buffers, which become their own infrastructure problem.
+</Step>
+</Steps>
+
+Each is solvable, but the solutions are architectural changes,
+not "more of the same."
+
+## Architectural shifts
+
+What "observability at scale" looks like architecturally:
+
+<Compare>
+<thead>
+<tr><th>Component</th><th>Small scale</th><th>Large scale</th></tr>
+</thead>
+<tbody>
+<tr><td>Metrics storage</td><td>Single Prometheus</td><td>Federated Prometheus + Thanos/Mimir/Cortex</td></tr>
+<tr><td>Log storage</td><td>Single Elastic or Loki</td><td>Distributed Loki/Elastic + S3 archives</td></tr>
+<tr><td>Trace storage</td><td>Single Tempo or Jaeger</td><td>Distributed Tempo + S3</td></tr>
+<tr><td>Collectors</td><td>Per-pod sidecar</td><td>Sidecar + gateway aggregation layer</td></tr>
+<tr><td>Sampling</td><td>10% head everywhere</td><td>Tail-based at gateway</td></tr>
+<tr><td>Ownership</td><td>Single team or none</td><td>Platform team + service teams</td></tr>
+</tbody>
+</Compare>
+
+The pattern: **decouple collection from storage; tier storage by
+recency**. Hot, warm, cold. Object storage for cold (cheap, slow);
+SSD-backed indexes for hot (expensive, fast).
+
+## Federation and aggregation
+
+For metrics: a single Prometheus per cluster, federated up to a
+global Thanos/Mimir/Cortex that:
+
+- Indexes across clusters.
+- Stores history in object storage (S3, GCS).
+- Serves queries that span clusters.
+
+The same per-cluster Prometheus continues to handle local alerting
+and recent data; the federation layer answers historical and
+cross-cluster queries.
+
+For logs/traces: the OTel Collector acts as a similar aggregation
+point. Per-host agents → per-cluster gateway → global storage.
+
+## Cost as a first-class concern
+
+At scale, observability cost is real money. A typical breakdown:
+
+- **Logs**: 60-70% of total observability spend in many orgs.
+- **Traces**: 15-25%.
+- **Metrics**: 10-15%.
+- **APM agents and tooling**: 5-10%.
+
+Common reductions:
+
+- **Drop noisy log fields at the agent**. Whole categories of logs
+  (health checks, debug, info on hot paths) often shouldn't ship
+  past the agent.
+- **Tail sampling for traces**. Keep errors and slow traces;
+  drop the rest aggressively.
+- **Histogram metrics with fewer buckets**. Each bucket is a
+  series.
+- **Aggressive retention tiering**. 24 hours hot is enough for most
+  ops; 7 days warm; 30+ days archived to S3.
+- **De-duplicate metrics across services**. Multiple services
+  exposing the same low-value default metrics adds up.
+
+Targets to aim for: observability spend as a fraction of compute
+spend should be < 10-15%. Above that, audit.
+
+## Cardinality at scale
+
+The single largest hidden cost driver. Mitigations:
+
+- **Per-team cardinality budgets**. Each team owns a budget of
+  series. Auto-alert when 80% used.
+- **Linting / pre-commit checks**. Reject PRs that introduce
+  potentially high-cardinality labels.
+- **Quotas at the TSDB**. Reject writes from teams that exceed
+  their share.
+- **Stream-side aggregation**. Drop labels at recording-rule
+  level for low-value series.
+
+Cardinality discipline is one of the highest-leverage policies a
+platform team can enforce. Without it, costs grow exponentially
+with team count.
+
+## Standardization vs autonomy
+
+A tension at scale. Each team wants flexibility to instrument
+their service; the platform team wants consistency.
+
+The right balance:
+
+- **Standardize the data model and conventions**. Field names,
+  resource attributes, log formats, semantic conventions. Use
+  OTel as the lingua franca.
+- **Standardize the tools**. One trace backend, one log backend,
+  one metric backend. Multiple of each is operational overhead
+  with little benefit.
+- **Allow flexibility in what to instrument**. Teams choose
+  what business-logic spans to emit, what alerts to set, what
+  dashboards to build.
+
+The platform owns the substrate; the teams own the content.
+
+## Platform team's role
+
+A dedicated observability platform team at ~50+ engineer
+organizations becomes valuable. Their job:
+
+- **Operate the backends**. Prometheus, Loki, Tempo (or equivalent
+  vendor stack).
+- **Provide SDKs and templates**. Default instrumentation for new
+  services so each team doesn't reinvent.
+- **Set conventions**. Naming, fields, semantic conventions, log
+  formats.
+- **Enforce quotas and budgets**. Cardinality limits, retention
+  tiers.
+- **Operate dashboarding infrastructure**. Grafana, deploy
+  annotations, runbook standards.
+- **Train teams**. On reading traces, writing alerts, using SLOs.
+
+A common anti-pattern: the platform team treats observability as
+"infrastructure" with low-level focus on Prometheus internals,
+while teams struggle to use the stack effectively. The platform's
+deliverable is teams' productivity, not raw uptime of the metric
+store.
+
+## Multi-tenancy
+
+When one observability stack serves multiple teams or business
+units:
+
+- **Isolation**: one team's cardinality spike shouldn't crash
+  another team's queries. Per-tenant quotas and resource limits.
+- **Authorization**: teams see their data and only their data.
+- **Cost allocation**: teams see their own cost. Shows up on their
+  bill in some org structures. Drives discipline.
+- **Standard onboarding**: a "new service" template comes with
+  default dashboards, alerts, instrumentation hooks.
+
+Mimir, Cortex, Loki, and Tempo all have first-class multi-tenancy.
+Single-tenant tools (vanilla Prometheus) are insufficient at scale.
+
+## SLO discipline at scale
+
+At small scale, SLOs are nice-to-have. At large scale, they become
+critical for inter-team contracts:
+
+- "Service A's SLO is 99.9% successful." Service B depends on A
+  and has its own SLO of 99.9%. Math: B's max achievable SLO is
+  bounded by A's SLO. A's reliability is B's input.
+- "Platform's SLO" is the floor for any service built on it. If
+  the platform's logging SLO is 99.5%, no service can promise
+  better logging-correlated debugging.
+
+Inter-team SLO awareness changes architectural decisions:
+sometimes the right answer is to fail open (degrade rather than
+fail) rather than depending on a lower-SLO dependency.
+
+## Postmortem culture
+
+At scale, individual incidents compound into culture. A healthy
+observability culture has:
+
+- **Blameless postmortems** documented and shared.
+- **Pattern recognition across incidents** — recurring themes
+  drive systemic investments.
+- **Observability gaps identified in postmortems** lead to
+  follow-up work, not lip service.
+- **Stakeholder access to postmortems** — engineering, product,
+  leadership.
+
+A team that does N postmortems and produces ~N follow-up
+investments is improving. A team that documents incidents without
+following through is on a slow regression.
+
+## Vendor vs self-host
+
+A perennial question. The trade-offs:
+
+<Compare>
+<thead>
+<tr><th></th><th>Vendor (Datadog, Honeycomb, NR)</th><th>Self-host (Prom/Loki/Tempo)</th></tr>
+</thead>
+<tbody>
+<tr><td>Time to first value</td><td>Hours</td><td>Weeks</td></tr>
+<tr><td>Operational burden</td><td>Their problem</td><td>Yours</td></tr>
+<tr><td>Cost at low scale</td><td>Cheap (free tiers)</td><td>Cheap (one VM)</td></tr>
+<tr><td>Cost at large scale</td><td>Can become a top-3 line item</td><td>Cheaper in compute; expensive in headcount</td></tr>
+<tr><td>Lock-in</td><td>High (OTel mitigates)</td><td>Low</td></tr>
+<tr><td>Features</td><td>Polished, integrated</td><td>You assemble</td></tr>
+</tbody>
+</Compare>
+
+For most orgs, the inflection point is around 100M-1B events per
+day. Below: a managed vendor saves engineering time at acceptable
+cost. Above: a dedicated platform team operating open-source
+stacks usually wins on cost, with significant headcount investment.
+
+OpenTelemetry's existence makes this less of a one-way decision —
+the data model is portable.
+
+## The team's job, simplified
+
+A staff engineer responsible for observability at scale spends
+their time on:
+
+- **Standardization** — what conventions everyone follows.
+- **Quotas and budgets** — what limits prevent runaway cost.
+- **Tooling and templates** — what makes individual teams faster.
+- **Incidents and patterns** — what the recurring failure modes
+  reveal about the platform.
+- **Cost optimization** — what changes return more than they cost.
+
+Not on: writing the next alert rule, building one more dashboard,
+chasing one specific metric.

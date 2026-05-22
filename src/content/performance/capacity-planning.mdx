@@ -1,0 +1,197 @@
+export const level = 'staff';
+
+# Capacity planning
+
+Capacity planning is *deciding how much computer to buy* before
+you need it. Done well, it prevents outages from sudden growth
+and saves money from over-provisioning. Done poorly, it's either
+"we're paying 4× too much" or "we're on fire again."
+
+The basic shape: project demand, characterize cost per unit,
+compute headroom, decide when and how to add capacity.
+
+## The three honest questions
+
+Capacity planning answers three questions, in order:
+
+<Steps>
+<Step n="1" title="How much can each unit handle?">
+What's the peak throughput one instance / pod / shard can serve
+before it stops meeting SLO? **Not** "how fast can it go" — "how
+fast can it go *while staying within latency budget*."
+</Step>
+
+<Step n="2" title="What's demand going to look like?">
+Steady-state today, growth trajectory, daily/weekly seasonality,
+expected spikes from product events.
+</Step>
+
+<Step n="3" title="What's the safety margin?">
+Headroom for surprises. Typically 2-3× expected steady-state at
+peak.
+</Step>
+</Steps>
+
+The math is the easy part. Getting honest numbers for the first
+two is the hard part.
+
+## Measuring per-unit capacity
+
+The right number is **throughput at SLO**, not max throughput.
+Concrete procedure:
+
+- Run a load test against one instance.
+- Ramp arrival rate up; watch the latency distribution.
+- Find the rate where p99 hits the SLO ceiling.
+- That rate is "1 unit's capacity."
+
+For a service with `p99 < 300ms` SLO, an instance might max out
+at 600 req/s on raw throughput but only sustain 400 req/s while
+staying under 300ms p99. The capacity number is 400 req/s.
+
+Be honest about the variance: capacity isn't a single number,
+it's a distribution. A node provisioned today might serve 350
+req/s; another, 450 req/s. Plan for the median, alert on
+deviations.
+
+## Demand projection
+
+Three sources of demand:
+
+- **Organic growth** — usually fittable to an exponential or
+  logistic curve based on history. Linear extrapolation
+  over-estimates if you're in maturity, under-estimates if
+  you're in growth.
+- **Seasonality** — daily/weekly/yearly. Black Friday, holiday
+  retail, Monday morning login rush. Easy to forecast from
+  historical data.
+- **Event-driven spikes** — product launches, marketing
+  campaigns, news mentions. Pre-coordinate with product.
+
+A useful framing: **peak hour** (often 2-4× steady-state) drives
+your provisioning, not the average. Designing for average
+guarantees you're under-provisioned at peak.
+
+## The headroom factor
+
+How much buffer above peak? Conventional wisdom:
+
+- **2× peak**: standard for stateless services with fast scaling.
+- **3-4× peak**: for services with slow scaling (warm-up, leader
+  election, sharded state) or strict SLOs.
+- **Under 2× peak**: dangerous unless you're confident about
+  auto-scaling reacting fast enough.
+
+Reasons headroom matters even with auto-scaling:
+
+- **Scaling has latency**: new instances take 30s to 5 min to
+  warm up. The current instances need to handle the surge in the
+  meantime.
+- **Failure correlation**: AZ outage takes out 1/3 of capacity.
+  Remaining 2/3 needs to absorb the load.
+- **Latency-utilization curve**: at >80% utilization, latency
+  grows hyperbolic. You want to be on the linear part.
+
+## Stateful vs stateless
+
+Stateless services scale by adding instances. Stateful systems
+(databases, caches, queues) have more constraints:
+
+- **DB read replicas** scale reads but writes are still single-leader-bound.
+- **Sharded systems** scale by adding shards, but resharding is
+  expensive — you have to plan ahead.
+- **Caches** scale by adding nodes, but cold cache after scaling
+  causes thundering herd on the source of truth.
+
+For stateful systems, "capacity" includes write rate, storage
+volume, shard count, replication factor. Capacity planning takes
+longer (changes can take days to roll out) and matters more (you
+can't react in 5 min).
+
+## The cost dimension
+
+A capacity plan that ignores cost is incomplete. The structure:
+
+- **Per-unit cost** — what does one instance cost per hour?
+- **Marginal cost of headroom** — 50% headroom on 100 instances
+  = 50 idle instances of cost.
+- **Reserved vs on-demand** — long-term commits get 30-60%
+  discount. Useful for steady-state; on-demand for spikes.
+- **Spot / preemptible** — even cheaper, but can be reclaimed.
+  Use for batch / async workloads with retries.
+
+A typical cost-conscious shape: reserved for steady-state floor,
+on-demand for daily peak, spot for batch workloads, autoscaling
+to fill the gap.
+
+## Common failure modes
+
+- **Provisioning for the average.** Average is fine; peak is when
+  the outage happens.
+- **Forgetting compounding** — DB connection pool sized for 10
+  app servers, then you scale to 100 app servers. Now the DB has
+  10× the connection pressure, which it can't handle.
+- **Cliff effects.** Adding the 11th node trips the next limit
+  (DB max connections, kernel socket limit, S3 partition limit).
+  Capacity is non-linear once you cross a limit.
+- **Single-AZ planning** — capacity adequate when nothing fails,
+  insufficient when one AZ goes down.
+- **Cache effectiveness assumptions** — capacity per node assumes
+  current cache hit rate. New product feature changes the
+  access pattern; hit rate drops; effective capacity halves.
+- **Auto-scaling lag** — auto-scaling responds to current
+  metrics, which is the past. Lagging indicators can over-shoot
+  and under-shoot.
+
+## Modeling: Erlang and queueing
+
+For services where queueing is a major factor (call centers,
+real-time messaging, voice), Erlang C formulas estimate how many
+agents/servers are needed to keep wait times under a threshold,
+given arrival rate and service time distribution.
+
+For typical web services, M/M/c gets close enough. The key
+intuition: **more parallel servers beat faster servers at fixed
+total capacity**, because variance gets smoothed across more
+units. See `queueing-theory`.
+
+## A capacity planning checklist
+
+<Steps>
+<Step n="1" title="Measure current per-unit capacity">
+At SLO, not at max throughput. Update quarterly.
+</Step>
+<Step n="2" title="Forecast 1-quarter and 1-year demand">
+Include seasonality, expected launches. Mark uncertainty
+explicitly.
+</Step>
+<Step n="3" title="Compute provisioning at 2-3× peak">
+For each tier: app, DB, cache, queue. Don't forget the dependent
+systems.
+</Step>
+<Step n="4" title="Identify cliffs">
+Where do you hit a hard limit (max connections, AZ capacity,
+account quota)? File requests in advance.
+</Step>
+<Step n="5" title="Track utilization at peak">
+The leading indicator of when you'll need more.
+</Step>
+<Step n="6" title="Run a chaos exercise">
+Take out an AZ. Does remaining capacity sustain SLO? If not,
+you're not actually planning for the failure case.
+</Step>
+</Steps>
+
+## A reasonable cadence
+
+- **Monthly**: review utilization trends, top growth services.
+- **Quarterly**: full capacity plan refresh; reserved-capacity
+  decisions.
+- **Annually**: strategic limits — datacenter contracts, multi-region
+  decisions, big architectural changes (sharding strategy, CDN
+  tier).
+- **Event-driven**: ad-hoc reviews before known traffic events.
+
+Capacity planning isn't glamorous. It also isn't optional, and
+the cost of skipping it is the kind of incident that gets a
+postmortem.

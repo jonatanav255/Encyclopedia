@@ -1,0 +1,204 @@
+export const level = 'mid';
+
+# Synthetic monitoring
+
+Real-user monitoring (RUM) tells you what users *did* experience.
+Synthetic monitoring tells you what a user *would* experience
+right now if they tried. The difference is sometimes profound:
+synthetic catches outages before users notice; RUM catches
+issues only after they've hit real customers.
+
+Both belong in the stack. Synthetic is the canary; RUM is the
+truth.
+
+## What synthetics are
+
+A scheduled probe that exercises a user-visible path:
+
+```
+every 1 min from {Sydney, London, Virginia, Tokyo}:
+  GET https://api.example.com/health
+  expect: 200 in <500ms
+
+every 5 min from same regions:
+  POST https://api.example.com/auth/login (test user)
+  GET /api/profile
+  expect: profile contains test user's email
+```
+
+Each probe runs from outside your infrastructure. It hits the
+real service the way a real user would, including DNS, TLS, CDN,
+and all dependencies.
+
+## Why "outside" matters
+
+A probe inside your VPC tells you internal services are up. A
+probe from the customer's network path tells you the customer can
+reach you. The difference is everything that lives between them:
+
+- Public DNS (route 53, Cloudflare DNS) issues.
+- TLS certificate expiration.
+- Load balancer misconfiguration.
+- CDN cache or rule problems.
+- Geo-blocking or routing bugs.
+- BGP issues affecting one region but not others.
+
+Outages from these causes don't show up in internal monitoring at
+all. The service is "healthy" by all internal metrics — but users
+can't reach it.
+
+## The two flavors of synthetic
+
+<Steps>
+<Step n="1" title="Uptime checks (simple)">
+HTTP requests at intervals from multiple regions. Cheap, easy to
+set up, catches most "service is down" cases. Tools: Pingdom,
+UptimeRobot, Datadog, Cloudflare healthcheck.
+
+A basic uptime check answers: from N regions, can we reach the
+service? What's the latency? Did we get the expected status code?
+
+Run every 1-5 min from at least 3 geographic regions. More
+frequent helps you catch outages faster; more regions helps
+catch geo-specific issues.
+</Step>
+
+<Step n="2" title="Multi-step / scripted (richer)">
+A sequence of requests, often executing a full user flow:
+
+```js
+test('Checkout flow', async () => {
+  await page.goto('https://example.com/login');
+  await page.fill('#email', 'test@example.com');
+  await page.fill('#password', '...');
+  await page.click('#submit');
+  await page.waitForURL('**/dashboard');
+
+  await page.click('#add-to-cart');
+  await page.click('#checkout');
+  await page.click('#confirm');
+
+  await page.waitForSelector('.order-confirmation');
+});
+```
+
+Headless browser (Playwright, Puppeteer, Selenium) or HTTP-only
+script (k6, Datadog Synthetics). The browser version catches
+JS errors, missing assets, frontend bugs. The HTTP version is
+cheaper and catches backend issues.
+
+Multi-step synthetics catch what uptime checks miss: a "200 OK"
+home page with a broken login flow.
+</Step>
+</Steps>
+
+## What to probe
+
+Pick the **handful of paths that, if broken, would cause incident
+declarations**. Don't probe everything.
+
+For a typical SaaS:
+
+- Home page loads.
+- Login flow works end-to-end.
+- The primary user action of the product (post / order / search).
+- API authentication endpoint.
+- Critical endpoints accessed by 90% of users.
+
+For a backend API:
+
+- Health endpoint (cheapest sanity check).
+- Auth endpoint.
+- A couple of representative read endpoints.
+- A representative write endpoint.
+
+Don't probe every page; you're not load-testing. You're catching
+"is the user journey broken right now."
+
+## Synthetics vs real-user monitoring
+
+<Compare>
+<thead>
+<tr><th></th><th>Synthetic</th><th>RUM</th></tr>
+</thead>
+<tbody>
+<tr><td>Source of data</td><td>Probes you run</td><td>Real users' devices</td></tr>
+<tr><td>When alerts fire</td><td>Before users hit issue</td><td>After (sometimes only with delay)</td></tr>
+<tr><td>Geographic coverage</td><td>The regions you configured</td><td>Wherever users actually are</td></tr>
+<tr><td>Device variety</td><td>One or two probe configs</td><td>Whatever users have</td></tr>
+<tr><td>Network variety</td><td>Probe network only</td><td>Real ISPs, real mobile networks</td></tr>
+<tr><td>Catches "no users reach you"</td><td>Yes</td><td>Cannot — no users = no data</td></tr>
+<tr><td>Catches "your weirdest user's device breaks"</td><td>No</td><td>Yes</td></tr>
+</tbody>
+</Compare>
+
+Both. Use synthetics for outage detection; use RUM for user-experience
+trends and edge cases. They complement each other.
+
+## Common pitfalls
+
+- **Synthetics that are noisy at the latency level**. Network
+  jitter from a probe in Tokyo to a service in us-east is normal;
+  alerting on every blip is noise. Use sustained windows (3+
+  failures in a row) before alerting.
+- **Synthetics on staging instead of prod**. Tempting because
+  prod can be hard to test against. But the whole point is to
+  catch prod outages. Use a dedicated test account on prod.
+- **Synthetics that test paths real users don't use**. Wasted
+  effort; doesn't catch real problems.
+- **Probes from a single region**. Geographic blind spot. If
+  Cloudflare's London POP is broken, your "all green" synthetic
+  from Virginia tells you nothing.
+- **Probes accumulating side effects** (creating orders, sending
+  emails). Set up test accounts that are explicitly tagged and
+  cleaned up; never let synthetics impact real customer-visible
+  data.
+- **No alerting on synthetic failures**. They run, log results,
+  no one looks. Wire them to your alerting like any other signal.
+
+## Failure modes synthetics catch best
+
+- **Certificate expiration**. The most common "we forgot about
+  this" outage. A synthetic fails the day cert expires.
+- **DNS misconfigurations**. After a registrar change or DNS
+  edit, the synthetic catches the result before users do.
+- **Bad deploys that break public endpoints**. A synthetic
+  hitting your home page within a minute of deploy will fail if
+  you broke prod.
+- **Third-party dependency outages affecting your flow**. The
+  multi-step synthetic that involves third-party login (OAuth)
+  fails when the OAuth provider goes down.
+- **Regional outages**. Probes from multiple regions show one
+  region failing while others work.
+
+## Cost shape
+
+Pricing models vary, but commonly:
+
+- Per-probe-per-minute (simple HTTP): low cost.
+- Per-multi-step synthetic execution: more expensive (browser =
+  resources).
+- Per-API call to the synthetic service: small.
+
+A reasonable budget: a few dozen simple checks every minute, a
+handful of scripted browser tests every 5-10 minutes. Total cost
+for a mid-size SaaS: $100-500/month with typical vendors.
+
+For very high-volume teams, hosting your own (Playwright in
+Lambda from multiple regions) is feasible. For most teams, a
+vendor is cheaper than the engineering time.
+
+## Specific tools
+
+- **Datadog Synthetics** — integrated with their broader stack,
+  scriptable browser tests.
+- **Pingdom** — simplest uptime checks.
+- **Checkly** — modern, Playwright-based, multi-region.
+- **Cloudflare healthchecks** — basic, free up to a limit.
+- **UptimeRobot** — free tier for very small setups.
+- **k6 Cloud** — combined load testing + synthetic monitoring.
+- **Custom Lambda + cron** — for teams comfortable building.
+
+For day-1 setup of a new service: a vendor with basic HTTP
+checks from 3+ regions, one critical-path scripted test. Total
+investment: an afternoon.

@@ -1,0 +1,149 @@
+export const level = 'mid';
+
+# CPU-bound vs I/O-bound
+
+The first triage question for any slow workload. The answer
+changes every subsequent decision: which profiler to use, which
+scaling strategy works, whether async helps, whether more cores
+help.
+
+## Definitions worth being precise about
+
+- **CPU-bound**: the program is limited by how fast the CPU can
+  execute instructions. CPU utilization is high (close to 100% on
+  the busy threads).
+- **I/O-bound**: the program is limited by waiting for something —
+  disk, network, another process. CPU utilization is low while
+  wall-clock time is high.
+- **Memory-bound** (related to CPU-bound): the CPU is busy, but
+  most of that "busy" is waiting for cache misses to DRAM. The
+  pipeline stalls; instructions retire slowly.
+
+A workload can be CPU-bound *and* memory-bound. It can shift over
+time: cold start is I/O-bound (loading from disk), then steady-state
+is CPU-bound.
+
+## How to tell which you are
+
+The cheapest signal: compare **CPU time** to **wall time**.
+
+- `wall ≈ CPU` → CPU-bound. (Single thread.)
+- `wall < CPU` → CPU-bound, multithreaded. (Sum of CPU across
+  cores is more than wall.)
+- `wall >> CPU` → I/O-bound. Most of the time is waiting, not
+  computing.
+
+On Linux:
+
+```sh
+$ time my_program
+real    8.42s    # wall
+user    0.31s    # CPU in userland
+sys     0.05s    # CPU in kernel
+```
+
+8.42s wall, 0.36s CPU → wildly I/O-bound. Optimizing CPU work is
+useless here; find the wait.
+
+For multi-threaded:
+
+```sh
+$ /usr/bin/time -v my_program
+...
+User time (seconds): 12.4
+System time (seconds): 1.1
+Elapsed (wall clock) time: 4.2s
+Percent of CPU this job got: 322%
+```
+
+322% means it used ~3.2 cores' worth of CPU. CPU-bound and
+parallelized.
+
+## Scaling implications
+
+<Compare>
+<thead>
+<tr><th></th><th>CPU-bound</th><th>I/O-bound</th></tr>
+</thead>
+<tbody>
+<tr><td>Add more threads on same machine</td><td>Helps only up to #cores</td><td>Helps a lot (threads sleep on I/O)</td></tr>
+<tr><td>Add async / event loop</td><td>Doesn't help</td><td>Helps a lot</td></tr>
+<tr><td>Add a faster CPU</td><td>Helps directly</td><td>Doesn't help</td></tr>
+<tr><td>Scale horizontally (more boxes)</td><td>Helps if work is partitionable</td><td>Helps</td></tr>
+<tr><td>Cache</td><td>Sometimes (memoization)</td><td>Often massive win</td></tr>
+<tr><td>Better algorithm</td><td>Best lever (lower Big-O)</td><td>Helps only if it reduces I/O calls</td></tr>
+</tbody>
+</Compare>
+
+The mistake people make most often: throwing async at CPU-bound
+work. Async means "yield the thread while waiting." A CPU loop
+has nothing to yield on; it just hogs the event loop.
+
+## Why async helps I/O-bound work
+
+Concretely: a single OS thread doing 10,000 concurrent HTTP
+requests with blocking I/O needs 10,000 threads (~10GB of stack
+memory). With async, one thread handles 10,000 because each request
+**parks** on its socket and the OS notifies the event loop when
+data arrives. Same thread serves many sockets.
+
+For CPU work, there's no equivalent. The CPU is doing the work; it
+can't park while it's the one doing it.
+
+## Memory-bound — the third category
+
+A CPU profiler shows your code at 100%, but `perf stat` shows IPC
+(instructions per cycle) of 0.4 — well below the CPU's ~3.0 ceiling.
+The CPU is *waiting on memory*. Symptoms:
+
+- Linked-list-heavy code.
+- Random-access patterns over large arrays (no locality).
+- Per-element allocations in a hot loop (the allocator chases
+  pointers).
+
+The fix isn't "do less work" — the work is fine. It's "do the
+work over data that fits in cache." Switch to arrays of structs,
+not structs of pointers. Process in chunks. Sort before iterating.
+
+See `memory-low-level/cache-coherence-and-false-sharing` for the
+fuller picture.
+
+## The mixed case
+
+Realistic services aren't one or the other. A request handler might:
+
+- Parse JSON (CPU).
+- Hit Redis (I/O).
+- Query the DB (I/O).
+- Render a template (CPU, sometimes memory-bound).
+- Serialize response (CPU).
+
+The right design lets I/O steps overlap (async + connection pool)
+while CPU steps run on a thread pool sized to cores. The mistake
+is treating the whole thing as one kind.
+
+<Callout type="rule">
+The triage isn't "make it fast." It's "which kind of slow is this?"
+Then pick the lever that matches.
+</Callout>
+
+## Concrete examples
+
+- **Image resizing**: CPU-bound. More cores, SIMD, faster algorithms.
+- **API gateway**: I/O-bound. Async, connection pooling, batching.
+- **Stream processor over GBs of records**: usually memory-bound.
+  Layout matters more than algorithm.
+- **Hash-and-sign documents**: CPU-bound, especially crypto. Thread
+  pool sized to cores.
+- **Crawler**: I/O-bound. Async with a high concurrency cap.
+
+## What to measure once you know
+
+- **CPU-bound**: profile with a sampling CPU profiler, look at the
+  flame graph, find the hottest functions, look for algorithmic
+  wins.
+- **I/O-bound**: trace requests end-to-end with span timings, find
+  the slow downstream call, look at connection pool stats, look
+  at retries.
+- **Memory-bound**: `perf stat` for IPC and cache misses, look at
+  data layout, consider arena allocators.

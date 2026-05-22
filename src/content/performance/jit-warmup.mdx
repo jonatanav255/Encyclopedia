@@ -1,0 +1,160 @@
+export const level = 'senior';
+
+# JIT warmup
+
+A JIT-compiled runtime — JVM, V8, .NET, LuaJIT, the Python
+specializer in 3.11+ — interprets code at first, then progressively
+compiles hot paths to optimized machine code. The result is that
+the same code runs **dramatically differently after warmup** than
+on first invocation.
+
+The numbers vary by runtime but the pattern is universal:
+
+- **First 100 calls**: interpreted. Often 10–50× slower than
+  optimized.
+- **Next ~10k calls**: lightly compiled, no inlining or
+  speculative optimization. Maybe 2–4× slower than fully warm.
+- **After enough calls**: fully optimized — inlined, escape
+  analysis done, branches speculated.
+
+If you're shipping a service and your perf tests don't account
+for this, you'll over-report cold-start latency or under-report
+steady-state speed, sometimes both.
+
+## What the JIT does (compressed)
+
+JVM HotSpot, as the canonical example:
+
+<Steps>
+<Step n="1" title="Interpret with counters">
+Each method gets an invocation counter and a back-edge (loop)
+counter. The interpreter increments them.
+</Step>
+<Step n="2" title="Tier 1: C1 compile">
+When counters cross a threshold, the C1 (client) compiler produces
+quick, lightly-optimized machine code. Common-case fast, no
+expensive optimizations.
+</Step>
+<Step n="3" title="Tier 2: C2 compile">
+When the C1-compiled method runs hot, the C2 (server) compiler
+produces aggressively optimized code. Inlining, escape analysis,
+loop unrolling, devirtualization, speculative branches.
+</Step>
+<Step n="4" title="On-stack replacement (OSR)">
+For long loops, the runtime can swap from interpreter to
+compiled code *mid-loop*. Necessary for benchmarks where one
+function dominates.
+</Step>
+<Step n="5" title="Deoptimization">
+The optimizer makes assumptions (this branch is always taken,
+this call site only sees one class). If reality changes, the
+runtime jumps back to the interpreter and recompiles. Visible
+as latency spikes after deployment of code that loads new
+classes.
+</Step>
+</Steps>
+
+V8 (JavaScript) is similar in spirit: Ignition interpreter → Sparkplug
+baseline → Maglev mid-tier → TurboFan optimizing. .NET CoreCLR:
+tier 0 → tier 1 with profile-guided optimization.
+
+## Warmup symptoms in production
+
+- **Spikes after deploy**. The first few minutes of traffic after a
+  rolling deploy show elevated p95/p99. New instances haven't warmed
+  up. Old instances have. The load balancer sends some requests to
+  the cold ones.
+- **Latency cliffs at low traffic**. A service receiving 5 req/s
+  per instance may never accumulate enough invocation counter
+  ticks to JIT some methods. Steady-state is "warm enough"; new
+  methods invoked rarely stay interpreted forever.
+- **Benchmarks that look weirdly slow**. Run a benchmark for 10
+  seconds; the first 5 are interpreter; the average looks bad.
+  Run for 60 seconds; the result is much better.
+- **The first call after a deoptimization**. Some new class loaded
+  invalidated an assumption; the next call to the hot method goes
+  through the interpreter again until it recompiles.
+
+## Strategies
+
+For services where warmup affects user-visible behavior:
+
+<Steps>
+<Step n="1" title="Synthetic warmup at startup">
+On boot, call the hot methods with representative inputs before
+joining the load balancer. The instance is "ready" only after
+warmup completes.
+</Step>
+<Step n="2" title="Gradual load shifting (slow-start)">
+Load balancers can ramp traffic up to a new instance over 30-120s
+instead of equal share immediately. Lets the JIT catch up while
+the instance handles modest load.
+</Step>
+<Step n="3" title="Compile-on-deploy / AOT">
+GraalVM Native Image, .NET ReadyToRun, V8 snapshots. Trade some
+peak optimization for an instance that's fast from the first
+request. Useful for serverless, where each cold start is a fresh
+process and you can't amortize JIT.
+</Step>
+<Step n="4" title="Tier compilation tuning">
+With tiered compilation (the default in modern JVMs),
+`-XX:CompileThreshold` is effectively ignored — the relevant knobs
+are `-XX:Tier3CompileThreshold` (default 2000, triggers C1) and
+`-XX:Tier4CompileThreshold` (default 15000, triggers C2). Lowering
+them can help during warmup but churns the compiler. Profile before
+tweaking.
+</Step>
+<Step n="5" title="Replay tier-compilation choices">
+JVM Tiered Compilation can save its compilation log; on next
+boot, methods are compiled proactively. Reduces warmup time
+significantly across restarts.
+</Step>
+</Steps>
+
+## Benchmarking around it
+
+For accurate measurements:
+
+- **Run warmup iterations explicitly** — every JIT-aware benchmarking
+  framework does this. JMH's `@Warmup`, Go's `b.ResetTimer()` after
+  warmup loop, Criterion's measurement design.
+- **Discard the first N iterations** of your measurement window.
+- **Separate cold-start from steady-state** in reporting. They're
+  different stories the user might care about for different
+  reasons (serverless cold start: cold matters; long-running
+  service: steady-state matters).
+- **Watch for deoptimization** during the run. Some frameworks
+  log it; check the logs.
+
+## Cold start in serverless
+
+Serverless functions (Lambda, Cloud Functions, Cloud Run) restart
+constantly. Each cold start runs the **uncompiled, unwarmed** code
+path. For a JVM Lambda this can mean 2-5s of cold start. For
+Node.js with V8 it's faster but still 100-500ms.
+
+Options:
+
+- **Provisioned concurrency** (AWS) — keep N instances warm.
+- **AOT compilation** — GraalVM Native Image, Quarkus, Micronaut.
+- **Switch runtime** — for genuinely latency-sensitive serverless,
+  Go and Rust have much smaller cold-start overhead. JS/Python
+  are middle. JVM is the worst.
+
+## Languages without JIT
+
+C, C++, Rust, Go don't have JIT warmup in the JVM sense — they're
+compiled ahead of time. But analogous warmup effects exist:
+
+- **Code page faults**. First call to a function loads its page
+  from the executable, which is a page fault. Subsequent calls
+  hit warm RAM.
+- **Branch predictor warmup**. The CPU's branch predictor learns
+  the program's patterns over time. Wholly cold predictor =
+  worse branch prediction = slower.
+- **Cache warmup**. Data structures that don't fit in L2/L3
+  benefit from being touched recently.
+
+These are smaller effects than JVM warmup but real; AOT-compiled
+languages aren't "instantly fast" either. The first 100ms of any
+process is structurally different from steady-state.

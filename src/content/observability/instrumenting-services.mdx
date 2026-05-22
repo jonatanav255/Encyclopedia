@@ -1,0 +1,231 @@
+export const level = 'senior';
+
+# Instrumenting services
+
+Instrumentation is the code that emits the observability signals
+your operational toolset depends on. Done well, it's invisible —
+the right data is always available. Done poorly, it's a constant
+maintenance burden and the data you need is missing exactly when
+you need it.
+
+This page is about the discipline of **what to instrument** and
+**how to keep it useful over time**.
+
+## The instrumentation layers
+
+For a typical backend service, three layers of instrumentation,
+in order of priority:
+
+<Steps>
+<Step n="1" title="Auto-instrumentation (free)">
+Wrappers around standard libraries: HTTP client and server, DB
+drivers, queue clients, framework middlewares. Adding one
+dependency gives you spans, metrics, and structured logs from
+all of these.
+
+This is the highest-leverage instrumentation work: an hour of
+setup gets you 70% of the value.
+</Step>
+
+<Step n="2" title="Boundary instrumentation">
+The edges of your service: incoming requests, outgoing requests,
+async job dispatches, message publications. Even if auto-instrumentation
+covers them, *enrich* them with business context:
+
+- The user_id behind this request.
+- The customer_tier.
+- The active feature flags.
+- The request_id and trace_id.
+
+These attributes make traces and logs filterable in the
+investigations you'll actually run.
+</Step>
+
+<Step n="3" title="Business-logic instrumentation">
+Internal operations that have business meaning, not just
+technical. Examples:
+
+- `calculate_pricing` — span around the pricing computation.
+- `validate_invoice` — span around invoice validation.
+- `process_payment_method` — span around payment method processing.
+
+These are not standard library calls; auto-instrumentation
+doesn't see them. But they are the operations where business
+slowdowns and errors live.
+
+Be selective. A span every loop iteration is span explosion. A
+span around each significant business step is good.
+</Step>
+</Steps>
+
+## What every request should record
+
+A useful default for HTTP requests:
+
+- **Metric (counter)**: `http_requests_total{service, endpoint,
+  method, status}` — incremented per request.
+- **Metric (histogram)**: `http_request_duration_seconds{service,
+  endpoint, method, status}` — observation per request.
+- **Trace span**: server-side root span with full HTTP attributes.
+- **Log entry** at start: "request received."
+- **Log entry** at end: "request completed" with status and
+  duration.
+
+A typical middleware:
+
+```js
+app.use((req, res, next) => {
+  const start = Date.now();
+  const span = tracer.startSpan(`${req.method} ${req.route?.path || req.path}`);
+  req.trace = span;
+
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    span.setAttributes({
+      'http.method': req.method,
+      'http.route': req.route?.path,
+      'http.status_code': res.statusCode,
+    });
+    span.end();
+    metrics.histogram('http_request_duration_seconds')
+      .observe({ method: req.method, route: req.route?.path, status: res.statusCode }, duration);
+  });
+  next();
+});
+```
+
+Or use auto-instrumentation that does all this; then enrich the
+spans with your own business attributes.
+
+## What every downstream call should record
+
+For every outgoing HTTP, gRPC, DB, cache call:
+
+- A span around the call.
+- The span carries: target service name, operation name, duration,
+  status (success / error).
+- If error: the error message and type.
+- For DBs: `db.system`, `db.statement` (sanitized!), `db.rows`.
+- For HTTP: target URL, method, status code.
+
+Most of this is auto-instrumented. The high-leverage manual add
+is the **target service name as a label** — so dashboards can
+group by "all calls to user-service."
+
+## Don't instrument: every internal function
+
+A tempting mistake: span every function call. Span every loop
+iteration. Track every memory allocation.
+
+This is span explosion. Costs grow:
+
+- More span data per request → more network → higher backend bill.
+- Trace UIs slow down with hundreds of spans per trace.
+- Visual noise — important spans buried in tiny ones.
+- Cardinality on metrics derived from spans.
+
+The rule: **a span should represent a meaningful, named unit of
+work that an engineer would care about when debugging**. If you
+wouldn't ask "how long did this take?" about it, don't span it.
+
+## Naming
+
+Consistent names make queries possible:
+
+- **Span names**: stable strings that describe the operation, not
+  the specific input. `"GET /users/:id"`, not `"GET /users/42"`.
+- **Attribute names**: follow OTel semantic conventions
+  (`http.method`, `db.system`, `peer.service`).
+- **Metric names**: snake_case, with `_total` suffix for counters
+  and `_seconds` for durations. `http_requests_total`,
+  `db_query_duration_seconds`.
+
+When in doubt, look at OTel semantic conventions. They're
+prescriptive on purpose.
+
+## Common instrumentation mistakes
+
+- **Spans that don't end on error paths**. If you `return early`
+  from a try block without ending the span, the span leaks. Use
+  language-idiomatic patterns (`with` in Python, `using` in C#,
+  `defer span.End()` in Go, `try/finally` in JS).
+- **Recording PII or secrets as attributes**. Spans go to the
+  backend; secrets are now leaked. Use redaction at the
+  Collector, but better: don't record them in the first place.
+- **Inconsistent attribute naming**. Half your services use
+  `db.query`, half use `database.query`, the rest invent something
+  new. Queries break across services. Pick one (the OTel
+  convention) and enforce.
+- **Spans without parent**. Forgetting to attach a child span to
+  its parent results in orphan spans floating outside the trace
+  tree. Almost always an API misuse; the SDK has
+  `startActiveSpan` or equivalent to handle this automatically.
+- **Sync work hidden in spans**. A span around "send email" that
+  actually does the SMTP roundtrip blocks the request. Move it
+  to async and span it there.
+
+## Versioning instrumentation
+
+Instrumentation is code. It changes. Two problems:
+
+- **Renaming a metric**: dashboards using the old name break.
+  Plan for it: emit both names for a transition period.
+- **Removing a span**: trace shapes change in the backend; saved
+  queries may miss the span.
+
+A useful discipline: treat instrumentation changes as a
+deprecation cycle. Announce the change, emit both old and new
+for a window, remove the old after dashboards have migrated.
+
+For breaking changes — say, OTel SDK major version — coordinate
+across services. The benefits of consistency are huge; the cost
+of half-migrated state is real.
+
+## Reviewing instrumentation in code review
+
+A practical checklist for PR review when instrumentation is
+touched:
+
+- **New metric**: has a `# HELP` description; uses snake_case;
+  consistent suffix.
+- **New label**: bounded cardinality; documented.
+- **New span**: meaningful name; attributes follow conventions;
+  proper end on all paths including errors.
+- **New log entry**: structured, with consistent field names;
+  appropriate level.
+- **PII / secrets**: not present in any signal.
+
+These checks save you from cardinality explosions, mismatched
+naming, and PII leaks.
+
+## Removing instrumentation
+
+Periodically: review which spans/metrics nobody reads.
+
+- Grafana shows you which queries hit which metrics. Untapped
+  metrics are candidates for removal.
+- Trace backends show which spans are queried. Never-clicked
+  spans are candidates.
+
+Don't be sentimental. Unused instrumentation is dead weight in
+the codebase and in the backend storage.
+
+## Instrumentation as a team practice
+
+A useful pattern: **observability is everyone's job, not a
+specialized team's**. Engineers writing the code know what
+matters; the platform team provides tools and conventions; the
+team in aggregate keeps the instrumentation healthy.
+
+Concretely:
+
+- New service template includes default instrumentation.
+- Linting checks for unattributed spans, untyped metrics.
+- Code review checklist includes observability.
+- Post-incident reviews include "what instrumentation would have
+  helped?"
+- Quarterly review of dashboards and alerts (keep them current).
+
+A team where instrumentation rotted is one where this loop broke.
+A team where instrumentation feels effortless is one where it's
+been built into the development habit.

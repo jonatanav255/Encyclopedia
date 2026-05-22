@@ -1,0 +1,200 @@
+export const level = 'senior';
+
+# Lock contention
+
+A correct lock and a *fast* lock are different things. A program
+can be correct with one giant lock around everything; it just runs
+on one thread's worth of capacity no matter how many cores you
+throw at it.
+
+Lock contention is when threads spend significant time *waiting*
+on a lock rather than doing work. It's the most common reason
+multi-threaded code doesn't scale linearly with cores.
+
+## Symptoms
+
+In a profile, lock contention shows up as:
+
+- **Wide bars in `pthread_mutex_lock`, `sync.Mutex.Lock`,
+  `synchronized`-related stubs.** On JVM, off-CPU samples reveal
+  threads parked in `PARKING`.
+- **CPU utilization plateaus below 100% even under load** —
+  threads are blocked, not running.
+- **Tail latency dominated by lock wait time.** p50 looks fine
+  (no contention); p99 shows long waits during bursts.
+- **Throughput stops scaling when you add cores.** 4-core gives
+  3.5×; 16-core also gives 3.5×.
+
+## The four root causes
+
+<Steps>
+<Step n="1" title="The lock is held too long">
+Code inside the critical section is doing work that doesn't need
+to be there. I/O, allocations, complex logic, calls to other
+locked code.
+
+Fix: shrink the critical section. Compute outside, copy in fast.
+
+```python
+# Bad
+with lock:
+    rows = expensive_db_query()
+    result = process(rows)
+    cache[key] = result
+
+# Good
+rows = expensive_db_query()
+result = process(rows)
+with lock:
+    cache[key] = result
+```
+</Step>
+
+<Step n="2" title="The lock is too coarse">
+One lock protects too much state. Threads working on unrelated
+sub-state still serialize through the same lock.
+
+Fix: lock partitioning. Sharded locks, lock-per-bucket in a
+hashmap, lock-per-segment.
+
+```java
+// Bad: one lock for the whole map
+synchronized(map) { ... }
+
+// Better: ConcurrentHashMap shards by key hash, 16+ locks
+map.compute(key, ...)
+```
+</Step>
+
+<Step n="3" title="False contention (false sharing)">
+Two cores writing different variables that happen to share a
+cache line. The line bounces between cores via the cache
+coherence protocol. No lock is held; performance still tanks.
+See `memory-low-level/false-sharing`.
+
+Fix: pad/align variables to cache-line boundaries.
+</Step>
+
+<Step n="4" title="The wrong primitive">
+Using a mutex for a read-mostly workload, when an RWLock or
+RCU would let readers parallelize.
+
+Fix: pick the primitive matching the access pattern. Reader-writer
+locks for read-heavy; atomic operations for counters; lock-free
+data structures for the hot paths.
+</Step>
+</Steps>
+
+## Mutex vs RWLock
+
+A reader-writer lock allows multiple readers concurrently, but
+only one writer at a time. Sounds like a free win for read-heavy
+workloads. It often isn't.
+
+- **Pure mutex**: fast acquire, single owner. ~10ns uncontended.
+- **RWLock**: more bookkeeping, sometimes slower uncontended.
+  Win comes only if reads dominate *and* are non-trivial in
+  duration.
+
+For tiny critical sections (single-pointer reads, counter
+increments), a mutex or an atomic is faster than an RWLock. RWLocks
+shine when readers hold the lock for tens of microseconds or more.
+
+## Lock-free and wait-free
+
+Lock-free: at least one thread always makes progress.
+Wait-free: every thread always makes progress in bounded steps.
+
+Common lock-free structures:
+
+- **Atomic counters** — `fetch_add` is wait-free.
+- **Compare-and-swap (CAS) loops** — lock-free under low contention,
+  can starve under high contention (lots of retries).
+- **Lock-free queues** (Michael-Scott, MPMC variants).
+- **Lock-free hash maps** (Cliff Click's NonBlockingHashMap, RCU
+  hash tables).
+
+The catch: lock-free doesn't mean fast. Under high contention, CAS
+loops thrash — every thread spins, fails, retries. The cache line
+bounces. Throughput collapses.
+
+A well-designed mutex is often *better* than a hand-rolled lock-free
+structure under contention because the OS schedules threads to
+back off. Lock-free wins when contention is genuinely rare; under
+heavy contention, blocking with proper queueing semantics often
+performs better.
+
+## RCU (read-copy-update)
+
+The Linux kernel's preferred read-heavy primitive. Readers don't
+take a lock at all; they just read the current version of the
+data. Writers prepare a new version and atomically swap the
+pointer.
+
+The trick: the old version isn't freed until all readers that
+saw it are done. The kernel uses scheduler events to detect when
+this is safe.
+
+User-space equivalents (URCU in user space, "lazy" approaches in
+many languages) work but are heavier. The idea — **immutable
+versions + atomic pointer swap** — shows up in many user-space
+designs:
+
+- React-like immutable state with reference equality checks.
+- Copy-on-write data structures.
+- Persistent data structures (Clojure, Immutable.js).
+
+The common theme: readers don't synchronize; writes produce new
+versions.
+
+## Striping / sharded locks
+
+When you need a lock but most threads don't actually conflict —
+shard.
+
+```java
+// Java's old Collections.synchronizedMap: 1 lock for the whole map
+// ConcurrentHashMap (older versions): N locks, hash partitioned
+// ConcurrentHashMap (Java 8+): striping is finer, lock-free reads
+```
+
+The choice of N: empirically, ~4× the number of cores. Too few:
+contention persists. Too many: memory overhead and worse cache
+behavior.
+
+This pattern works for any case where the "shared state" can be
+partitioned cheaply. Connection pools, rate limiters, in-memory
+caches, request counters per route.
+
+## Diagnosing contention
+
+The tools depend on the runtime:
+
+- **JVM**: JFR (Java Flight Recorder) records contention events.
+  async-profiler with `-e lock` captures lock contention flame
+  graphs.
+- **Go**: `pprof` block profile (`go tool pprof -seconds=30
+  http://host/debug/pprof/block`). Shows time spent waiting on
+  synchronization.
+- **Linux generally**: `perf lock` records kernel-level lock
+  events. Shows futex contention.
+- **Off-CPU flame graph**: any time a thread is parked, it's not
+  on CPU. Off-CPU graphs reveal it.
+
+Once you have the data, the question is the same as for CPU
+profiling: which locks are hot? Then apply one of the four fixes.
+
+## A scaling diagnostic
+
+A simple test: run the workload at 1 thread, then 2, then 4, then
+N. Plot throughput vs thread count.
+
+- **Linear up to N cores** → no contention; you're CPU-bound.
+- **Sublinear from early on** → contention from the start.
+- **Linear then flat at K** → contention kicks in at K threads.
+  K - 1 is roughly how much parallelism your lock structure
+  permits.
+- **Linear then *down*** → contention causes destructive
+  interference. Often false sharing or pathological CAS retries.
+
+The shape tells you whether to focus on the lock design at all.

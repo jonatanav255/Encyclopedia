@@ -1,0 +1,155 @@
+export const level = 'mid';
+
+# Connection pooling
+
+Establishing a TCP+TLS connection to a database or external service
+is expensive — handshake, TLS negotiation, sometimes authentication.
+Maybe 5–50ms per new connection. Closing and reopening for every
+query would make a service hilariously slow.
+
+A connection pool keeps a small set of open connections, hands them
+out to threads/requests that need one, and reuses them. **Most
+production performance problems involving DBs are pool problems.**
+
+## What a pool actually is
+
+```
+┌──────────────────────────────────────────────┐
+│                connection pool               │
+│   ┌────┐  ┌────┐  ┌────┐  ┌────┐  ┌────┐     │
+│   │ c1 │  │ c2 │  │ c3 │  │ c4 │  │ c5 │     │
+│   └────┘  └────┘  └────┘  └────┘  └────┘     │
+│       idle    busy   idle   busy    busy      │
+└──────────────────────────────────────────────┘
+          ↑                            ↑
+   acquire()                         release()
+```
+
+When a caller wants a connection: `acquire()` removes one from the
+idle list and hands it over. When done: `release()` puts it back.
+If none are free and the pool isn't at its max, a new one is
+created. If at max, the caller waits on a queue (with a timeout).
+
+## The three sizing knobs
+
+- **min** — keep at least this many connections open, even idle.
+  Trades memory for steady-state warm pool.
+- **max** — never exceed this many. Backpressure into the queue
+  beyond this.
+- **idle timeout** — close idle connections after N seconds.
+  Reduces server-side connection count when traffic is light.
+
+## Sizing the pool
+
+The most common mistake: too big.
+
+People reach for "set max to 100 because we have lots of users."
+But Postgres typically struggles past ~200 active connections per
+node (each is a process). MySQL is friendlier but still capped.
+If your service runs 10 instances and each has max=100, you have
+1000 potential connections to a single DB. That DB collapses.
+
+The empirical rule from the PostgreSQL wiki (and popularised by
+HikariCP's docs): **the sweet spot is often `2 * cores + spindles`**
+on the DB side, divided across all clients. For a modern 16-core
+DB, that's ~40 active connections *total* across the whole fleet.
+
+Practically:
+
+- Start small. `max=10` per service instance is fine for most
+  services.
+- Watch pool wait time and queue length. If you're queueing,
+  *first* check if the DB is the bottleneck (longer queries means
+  fewer connections suffice). If the DB is healthy but you're
+  queueing, raise max cautiously.
+- Add a **shared pooler** (PgBouncer, ProxySQL) between services
+  and the DB. The pooler holds 200 connections to the DB and
+  multiplexes 10,000 client connections onto them.
+
+<Callout type="rule">
+The pool isn't a bigger-is-better dial. The DB has its own
+connection limits and per-connection cost. Adding pool capacity
+beyond the DB's healthy limit doesn't help — it shifts the queue
+from your app to the DB and makes the DB slower.
+</Callout>
+
+## Connection lifecycle gotchas
+
+- **Stale connections**. The OS or a load balancer killed a TCP
+  connection that's still in the pool. The next caller gets it,
+  the query fails. The pool should **validate on borrow** (a cheap
+  `SELECT 1`) or detect failures on use and retry. Validating
+  every borrow is overhead — periodic background validation is
+  usually right.
+- **Half-open connections**. TCP keepalive isn't on by default in
+  many drivers. Without it, network outages can leave connections
+  that look healthy but never respond. Enable TCP keepalive at the
+  pool config level.
+- **Connections leaked**. The caller borrowed and forgot to release
+  — usually due to a return path missing a `finally`. The pool
+  drains and stalls. Always use the language's "borrow with scope"
+  idiom (`using`, `with`, `try-with-resources`).
+- **Pinned to a specific session state**. Some operations set
+  per-connection state (prepared statements, temp tables,
+  `SET`). Returning that connection to the pool means the next
+  user inherits it. Use connection-reset hooks or avoid such
+  ops.
+
+## Pool exhaustion
+
+The classic outage: every connection is in use, the queue fills,
+requests time out.
+
+What causes it:
+
+- **A slow query holds connections.** N requests issue a 30s
+  query; the pool is full for 30s; everything else fails. Fix:
+  set per-query timeouts at the DB layer (statement_timeout,
+  innodb_lock_wait_timeout) so slow queries don't poison the
+  pool indefinitely.
+- **A downstream dependency stalled.** Service B is slow → your
+  handlers wait → connections are held → pool exhausted. Fix:
+  separate pools for separate dependencies. A slow Redis shouldn't
+  hold a DB connection.
+- **N+1 queries combined with high concurrency.** 100 requests ×
+  20 queries each = 2000 acquires. Even a pool of 50 fills up.
+  Fix the N+1.
+- **A deadlock between async tasks waiting for the pool.** Task A
+  holds a connection, awaits Task B, which waits for a connection.
+  Especially nasty with one global pool. Fix: bounded pool with
+  timeout on acquire; the timeout surfaces deadlocks rather than
+  hanging.
+
+## Pool monitoring
+
+The metrics that matter:
+
+- **In-use count** — gauge. How many connections are checked out.
+- **Idle count** — gauge. How many are free.
+- **Wait count / wait time** — histogram. How often callers
+  blocked on `acquire()`, and for how long. **Any non-zero wait
+  time at p95 is the signal you're under-provisioned or
+  bottlenecked.**
+- **Connection errors / validation failures** — counter. Spikes
+  here mean network or DB instability.
+- **Max-out events** — counter. How often you hit max. Should be 0
+  at steady state.
+
+Connection-pool dashboards catch problems earlier than DB
+dashboards because pool exhaustion shows up before the DB itself
+strains.
+
+## Per-DB vs shared pool
+
+Two organizational choices:
+
+- **Per-service-instance pool**: each app process has its own.
+  Simple. Total connections to DB = instances × pool size.
+- **External shared pool (PgBouncer/ProxySQL)**: services share
+  one pool sized to the DB's healthy limit. Critical at scale —
+  no other way to keep 10⁵ clients on a Postgres that handles 200.
+
+The external pooler can also do **transaction-level multiplexing**
+(send each transaction over whichever connection is free), letting
+many more "logical" connections share fewer real ones. Comes with
+trade-offs around prepared statements and session state.

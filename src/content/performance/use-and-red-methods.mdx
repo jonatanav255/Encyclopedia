@@ -1,0 +1,171 @@
+export const level = 'staff';
+
+# USE and RED methods
+
+Two checklists invented by SREs for the question "where do I even
+start looking when this thing is slow?" Both reduce open-ended
+investigations to a small set of signals you can audit in
+order. They're complementary — USE for resources, RED for services
+— and together they cover most production debugging.
+
+## USE: for resources
+
+Brendan Gregg's USE method (2012). For every **resource**, check
+three things:
+
+- **U**tilization — fraction of time the resource was busy.
+- **S**aturation — degree to which the resource has extra work
+  queued.
+- **E**rrors — count of error events.
+
+A "resource" is any component with finite capacity: CPU, memory,
+disk, network, file descriptors, threads, DB connections.
+
+The mechanical process:
+
+<Steps>
+<Step n="1" title="List every resource">
+Hardware: CPUs (per core), memory (DRAM, swap), disks (read,
+write, IOPS, throughput), network interfaces. Software: socket
+queues, thread pools, connection pools, locks.
+</Step>
+<Step n="2" title="For each, ask the three questions">
+- Is it busy?
+- Is there a queue?
+- Are errors happening?
+</Step>
+<Step n="3" title="Stop on the first abnormal signal">
+A saturated disk explains everything else. Don't keep auditing.
+</Step>
+</Steps>
+
+For CPU specifically:
+
+- **Utilization**: `%cpu` from `top`, `mpstat`. Per-core matters more
+  than average — one pegged core hidden by 7 idle ones is invisible
+  in the average.
+- **Saturation**: run queue length (`vmstat` 'r' column,
+  `runnable processes`). Greater than #cores means the CPU is the
+  bottleneck.
+- **Errors**: rare for CPU; thermal throttle events when the chip
+  gets too hot.
+
+For network:
+
+- **Utilization**: `Mbps` out of NIC capacity (`sar -n DEV`).
+- **Saturation**: TCP retransmits, socket buffer drops, full
+  socket queues.
+- **Errors**: `RX errors`, dropped packets, CRC errors.
+
+The USE method's value is **exhaustiveness with low effort**.
+It's a checklist, not a flow chart. You audit each item; if any
+shows a problem, you have a hypothesis.
+
+## RED: for services
+
+Tom Wilkie's RED method (2015). For every **service or request
+endpoint**, track three things:
+
+- **R**ate — requests per second.
+- **E**rrors — errors per second (or rate as a fraction of total).
+- **D**uration — latency distribution (percentiles).
+
+If you have RED for every service, you have the minimum
+observability needed to know what's happening to user requests.
+
+```
+service: api-gateway
+  rate:     5,200 req/s
+  errors:   12 req/s (0.23%)
+  duration: p50=18ms, p95=120ms, p99=380ms
+```
+
+A regression shows in one of the three:
+
+- Rate dropped → upstream is failing or callers gave up.
+- Errors rose → something downstream broke or input is bad.
+- Duration regressed → backend got slower; tail amplification
+  rising.
+
+## Why both, not one
+
+USE covers the **substrate** — physical and logical resources.
+RED covers the **product** — what users get from the service.
+
+A service can be USE-clean (no resource saturated, no errors) but
+RED-broken (high p99 latency because of lock contention in user
+space, which isn't a "resource" in the USE sense). Conversely,
+RED can look fine for a brief window during USE-broken state
+(memory exhausting, no requests yet failing — but they're about
+to).
+
+Use them together:
+
+- USE first when you suspect infrastructure / resource issues.
+- RED first when you suspect application or product issues.
+
+In practice, dashboards should have both. RED at the top (what
+users feel), USE underneath (where the bottleneck is).
+
+## Google's "Four Golden Signals"
+
+Released in the SRE book and broadly adopted: **Latency, Traffic,
+Errors, Saturation**. Effectively RED + the USE saturation
+signal. The advantage is that "saturation" sometimes lives in
+your service code (worker pool full, queue backed up) rather than
+in a hardware resource — and is the leading indicator of trouble
+ahead.
+
+For most services, "Four Golden Signals" is the practical
+dashboard standard. Traffic = rate, Latency = duration, Errors as
+in RED, Saturation as in USE.
+
+## Translating to monitoring
+
+For each USE/RED signal, you need:
+
+- A real-time metric (counter or histogram).
+- An alert threshold (only for actionable signals).
+- A dashboard panel (always).
+
+A typical SLI/SLO pair:
+
+```
+SLI: % of requests with duration < 300ms
+SLO: 99% over 30 days
+```
+
+The "Duration" RED signal feeds directly into this kind of SLO.
+USE signals usually inform capacity alerts: "memory utilization >
+85% for 5 min."
+
+## The diagnostic muscle
+
+Once internalized, USE/RED gives you a default debug stance:
+
+- Slack message "the service is slow" → check the RED dashboard.
+  Latency up? Errors up?
+- Latency up across the board → check USE: is anything saturated?
+- USE clean → look at application-level saturation: connection
+  pool wait time, lock contention, GC pause time.
+- Latency up only on certain endpoints → not infrastructure;
+  application code.
+
+This sequence beats "stare at flame graphs until something
+catches your eye" by a wide margin.
+
+## Limitations
+
+- **Distributed systems** add a layer: request fan-out, dependency
+  chains. RED on the user-facing service is necessary but not
+  sufficient; you need RED on each dependency too.
+- **Async / fire-and-forget patterns** don't show up in latency
+  the user feels. They need separate visibility (queue depth,
+  processing lag).
+- **Multi-tenant services** can have one tenant's bad behavior
+  not reflected in aggregate metrics. Top-N breakdown per
+  tenant catches these.
+
+USE and RED give you the floor. They don't replace deeper tooling
+(distributed tracing, profiling) — they tell you where to point
+the deeper tooling.

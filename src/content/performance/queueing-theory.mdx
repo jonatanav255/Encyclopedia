@@ -1,0 +1,191 @@
+export const level = 'senior';
+
+# Queueing theory basics
+
+You don't need a textbook treatment to get a lot of value out of
+queueing theory. Two laws and one rule of thumb explain most of
+the surprising behavior of saturated systems.
+
+This page covers the ones that show up most in production
+intuition: Little's Law, the utilization-latency curve, and the
+counterintuitive fact that **adding workers helps differently
+than adding capacity**.
+
+## Little's Law
+
+The fundamental conservation law of queueing systems:
+
+```
+L = λ × W
+```
+
+- **L** — average number of items in the system
+- **λ** — arrival rate (items per unit time)
+- **W** — average time an item spends in the system
+
+It holds in steady state for *any* queueing discipline, *any*
+distribution. No assumptions about Poisson, FIFO, or anything
+else. As long as the system is stable (in = out over the long
+term), Little's Law is true.
+
+What it tells you:
+
+- **You can derive any of the three from the other two.** Measured
+  arrival rate (5,000 req/s) and average latency (200ms)? Then on
+  average you have 1,000 requests in flight. Useful for capacity
+  planning.
+- **Reducing latency reduces concurrency.** If you halve latency
+  at the same arrival rate, you halve the number of in-flight
+  requests — fewer connection pool slots, fewer threads, less
+  memory.
+- **Cutting concurrency at fixed throughput cuts latency.** Doing
+  less in parallel makes each individual request finish faster.
+  This is non-obvious until you've used it.
+
+## Utilization and latency
+
+The most consequential intuition: **the closer you push utilization
+to 100%, the more disproportionately latency grows.**
+
+For a single-server queue with Poisson arrivals and exponential
+service (M/M/1), the average wait time in the queue is:
+
+```
+W_q  =  ρ / (μ × (1 - ρ))
+```
+
+where ρ is utilization (0 to 1), μ is the service rate. The
+`(1 - ρ)` denominator is the dragon. Look at how `1 / (1 - ρ)`
+behaves:
+
+<Compare>
+<thead>
+<tr><th>ρ</th><th>1/(1-ρ)</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>0.50</td><td>2</td><td>Linear-ish region. Doubling rate doubles wait.</td></tr>
+<tr><td>0.70</td><td>3.3</td><td>Still tolerable.</td></tr>
+<tr><td>0.80</td><td>5</td><td>Wait is now equal to service time.</td></tr>
+<tr><td>0.90</td><td>10</td><td>Latency is dominated by wait, not work.</td></tr>
+<tr><td>0.95</td><td>20</td><td>Each 1% utilization gain doubles tail wait.</td></tr>
+<tr><td>0.99</td><td>100</td><td>One bad day from outage.</td></tr>
+</tbody>
+</Compare>
+
+This is why production systems aim for 50-70% utilization in
+steady state. You're not "leaving capacity on the table." You're
+buying **headroom for spikes** and keeping the system off the
+hyperbolic part of the curve.
+
+<Callout type="rule">
+At high utilization, the relationship between throughput and
+latency is no longer monotonic in a useful way. Small bursts that
+would be unremarkable at 70% utilization become outages at 95%.
+</Callout>
+
+## Why bursts matter
+
+If your average is 70% utilization, a 30% burst still leaves you
+in the well-behaved region. If your average is 95%, even small
+variability tips you over the edge — and recovery from
+saturation is **non-linear**: the queue built up during the
+spike takes a long time to drain, so latency stays bad for
+minutes after the spike ends.
+
+The technical name: **bufferbloat in queueing**. The same physics
+that causes huge queues in network buffers shows up in app-level
+queues.
+
+## More servers vs faster servers
+
+You have a queueing problem. You can either add more workers (more
+parallelism) or make each worker faster (lower service time).
+Which is better?
+
+For high-utilization queues, **adding workers helps more than
+making the same worker faster** — because more workers reduce
+variance.
+
+This is the M/M/c result. Going from 1 server at 95% utilization
+to 2 servers at 47.5% utilization (same arrival rate) doesn't
+just halve wait time; it dramatically improves the tail. Many
+short-running servers beat few long-running ones, *at fixed
+total capacity*.
+
+In practice:
+
+- **Compute-bound workloads**: faster CPUs help. The work itself
+  is the limit.
+- **Mixed/wait-heavy workloads**: more parallel workers help. The
+  arrivals' variance is the limit.
+
+A common pattern: scale horizontally when capacity needs to grow,
+not vertically. Smaller instances, more of them.
+
+## SRT-1: shortest remaining time
+
+Scheduling discipline matters for tail latency. Two flavors:
+
+- **FIFO**: simple, fair, p99 dominated by long jobs holding up
+  short ones (head-of-line blocking).
+- **SRT (Shortest Remaining Time)**: each job's wait time matches
+  its size. Big jobs wait longer; small ones zip through. p99 of
+  short jobs drops dramatically.
+
+Most systems use FIFO because the cost of estimating job size is
+prohibitive. But there are exceptions: **separate queues per size
+class** is the discrete approximation. Have a fast-lane for small
+requests, a slow-lane for big ones.
+
+Practical example: a worker pool that splits "small fast" requests
+from "large slow" ones, so a big job doesn't head-of-line block
+30 small ones behind it.
+
+## Tail amplification by fan-out
+
+When a user request fans out to N backends and waits for all of
+them, the latency the user sees is the **maximum** of N independent
+backend latencies. With independent backends:
+
+```
+P(user sees ≥ p99 latency)  ≈  1 - (1 - 0.01)^N
+```
+
+- N=1: 1%
+- N=10: ~10%
+- N=100: ~63%
+
+For high fan-out services (a single page might trigger 50-100
+backend calls), the p99 the user sees is much worse than any
+individual backend's p99. The fix is to reduce N (cache, batch) or
+reduce per-backend p99 to push amplification down.
+
+## Putting it together: capacity planning
+
+A useful diagnostic checklist for a service:
+
+<Steps>
+<Step n="1" title="Measure peak λ">
+What's the arrival rate at peak? Real measurements, not estimates.
+</Step>
+<Step n="2" title="Measure W at peak">
+Average latency. Then per-percentile (p50/p95/p99).
+</Step>
+<Step n="3" title="Compute L">
+λ × W. Compare to your provisioned capacity (worker count, pool
+size). Are you running at 30% of capacity? 90%?
+</Step>
+<Step n="4" title="Plot the latency vs throughput curve">
+At what throughput does the knee start? You want to operate at
+60-70% of that knee throughput.
+</Step>
+<Step n="5" title="Plan for 2-3× headroom">
+Real spikes don't ask permission. Plan capacity that handles 2-3×
+steady-state without crossing the knee.
+</Step>
+</Steps>
+
+This is enough math to make decisions that beat "I dunno, scale
+it up." More formal queueing theory exists (M/G/c, network of
+queues, Jackson networks) but adds rigor without changing the
+intuition.

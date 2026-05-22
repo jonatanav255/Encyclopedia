@@ -1,0 +1,196 @@
+export const level = 'senior';
+
+# Backpressure
+
+Backpressure is the discipline of **letting consumers control
+producer rate** so the system doesn't accumulate unbounded
+queues. Without it, a fast producer + slow consumer is an OOM
+waiting to happen, with the bonus that all queued requests are
+already too stale to be useful by the time they're processed.
+
+## The shape of the failure mode
+
+A producer faster than a consumer fills the queue. When the queue
+is unbounded:
+
+```
+queue depth
+  ^
+  |                          ___
+  |                       __/   
+  |                    __/      
+  |                 __/         
+  |              __/            
+  |          ___/               
+  |  _______/                   
+  +------------------ time -->
+```
+
+Memory grows linearly with the imbalance until the process
+crashes. Along the way:
+
+- Each request sits longer in the queue → tail latency tracks
+  total queue depth → user-perceived latency degrades steeply.
+- By the time the consumer gets to an item, the user has given
+  up or retried, so the work is wasted.
+- GC, swap, allocator pressure all worsen as the queue grows.
+- Recovery is impossible — you can never drain a queue that's
+  filling faster than you can serve.
+
+Bounded queues fix the *unbounded* part. Backpressure fixes the
+*imbalance* part.
+
+## The four ways to handle the imbalance
+
+Once the queue is bounded, you have to decide what happens when
+it's full. Four options:
+
+<Compare>
+<thead>
+<tr><th>Strategy</th><th>Behavior</th><th>Use when</th></tr>
+</thead>
+<tbody>
+<tr><td>**Drop new**</td><td>Reject incoming requests with 503 / `EAGAIN`</td><td>Failures are recoverable; client can back off.</td></tr>
+<tr><td>**Drop old**</td><td>Evict oldest items; accept new ones</td><td>Latest data matters most (real-time feeds, metrics).</td></tr>
+<tr><td>**Block producer**</td><td>Producer waits until queue has room</td><td>Producer and consumer share the same process; flow control via pipe / channel.</td></tr>
+<tr><td>**Slow producer**</td><td>Producer reduces rate via signal</td><td>Distributed systems; producer adapts.</td></tr>
+</tbody>
+</Compare>
+
+The wrong default is "expand the queue." The right default is
+one of these four, picked based on workload.
+
+## Where backpressure shows up
+
+<Steps>
+<Step n="1" title="HTTP servers">
+Bounded request queue (semaphore, per-handler). Beyond N concurrent
+requests, return 503 immediately rather than queueing for 10s.
+
+```
+worker pool: 32 workers
+max queue:   64 items
+behavior:    when full, return 503 with Retry-After
+```
+
+This is "load shedding." It looks worse on a dashboard (more
+errors) but is dramatically better for tail latency and recovery
+time.
+</Step>
+
+<Step n="2" title="Message queues">
+Kafka, RabbitMQ, SQS. Each consumer pulls at its own rate; the
+broker stores messages. If consumers fall behind, broker storage
+grows.
+
+Kafka's design pushes back via topic retention policies (drop old
+after N days, regardless). Some brokers throttle producers when
+brokers near capacity.
+</Step>
+
+<Step n="3" title="Reactive streams">
+The Reactive Streams spec (RxJava, Project Reactor, Akka Streams)
+is built around `request(n)` semantics: the consumer requests N
+items; the producer never sends more than that. End-to-end
+backpressure across an entire pipeline.
+</Step>
+
+<Step n="4" title="Node.js streams">
+`readable.pipe(writable)` automatically pauses the readable when
+writable signals it's full (`.write()` returns false). Highlights
+the same idea: consumer controls producer.
+</Step>
+
+<Step n="5" title="TCP itself">
+The protocol has built-in flow control via the receive window.
+The receiver advertises how much buffer space it has; the sender
+can't send more than that. Networking already does what app code
+often forgets to do.
+</Step>
+</Steps>
+
+## Load shedding
+
+Shedding is "drop new" applied to user-facing systems. The key
+realizations:
+
+- **Failing fast is better than failing slow.** A user who waited
+  5 seconds to get a 503 hates you more than one who got the 503
+  immediately and retried.
+- **Shedding under load saves successful requests.** Without
+  shedding, all requests get slow as the queue fills; with
+  shedding, queued requests stay fast and excess requests fail.
+- **Prefer shedding less important traffic first.** Internal
+  health checks shouldn't take the same priority as user requests.
+  Background batch can fail; user-facing must not.
+
+Implementations: **rate limiters** (token bucket) for rate, **bulkheads**
+(separate pools per dependency / route) for isolation, **adaptive
+concurrency limits** (Netflix's library, Vegeta-style) for
+self-tuning shedding.
+
+## Adaptive concurrency
+
+Static limits ("32 workers, queue 64") are hard to set right.
+Too low: capacity wasted under low load. Too high: doesn't
+protect under spikes.
+
+Adaptive concurrency limits adjust dynamically based on observed
+latency:
+
+- Increase limit when latency is well below SLO.
+- Decrease limit when latency rises (system is straining).
+
+The intuition: keep the system at the **knee of the
+throughput-latency curve**, no matter how the workload changes.
+The classic algorithm here is a Vegas-style additive-increase
+multiplicative-decrease loop borrowed from TCP congestion control.
+
+## Backpressure across services
+
+Within a process, backpressure can be enforced by channels or
+explicit `await producer`. Across a network, you need explicit
+signals:
+
+- **HTTP 503 + Retry-After** — server tells client to back off.
+  Client must respect it.
+- **gRPC RESOURCE_EXHAUSTED** — similar.
+- **Reactive RSocket** — explicit `requestN` over the wire.
+- **TCP-level flow control** — only works if your protocol is
+  carrying real backpressure semantics (e.g., HTTP/2 stream
+  flow control).
+- **Circuit breakers** — when downstream is failing, the client
+  stops sending entirely for a while.
+
+Without these signals, a "slow" downstream is indistinguishable
+from a working one until it OOMs.
+
+## What backpressure costs
+
+Backpressure isn't free. The costs:
+
+- **Higher visible error rate** — 503s are now part of normal
+  steady-state during spikes.
+- **Calibration work** — picking limits is empirical, requires
+  load testing.
+- **More complex retry semantics** — clients must back off and
+  retry on shed errors.
+- **Lost work if the dropped requests mattered** — sometimes you
+  *can't* drop. Then you need bigger capacity, not just better
+  shedding.
+
+The trade is **bounded slowdowns instead of unbounded growth**.
+For most systems, that's strictly better.
+
+## A useful framing
+
+Two questions to answer for every component that has a queue or
+buffer:
+
+1. **What's the bound?** Pick one. "Unbounded" is not an answer.
+2. **What happens when it's full?** Pick one of the four
+   strategies above. "Wait forever" is not an answer.
+
+A system that answers both for every queue has backpressure. A
+system that doesn't will eventually accumulate the failure mode
+above, just not at a time you can predict.

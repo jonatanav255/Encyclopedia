@@ -1,0 +1,185 @@
+export const level = 'senior';
+
+# Load testing
+
+Load testing is empirical capacity planning. Instead of theorizing
+"this should handle 5,000 req/s," you generate traffic and measure
+what actually breaks. Done right, it catches the cliff before
+production traffic does.
+
+## What "load testing" actually means
+
+The term covers four distinct activities. Don't conflate them:
+
+<Compare>
+<thead>
+<tr><th>Type</th><th>Question</th><th>Method</th></tr>
+</thead>
+<tbody>
+<tr><td>**Smoke test**</td><td>"Does it work at all under load?"</td><td>Short, low-rate baseline.</td></tr>
+<tr><td>**Load test**</td><td>"How does it behave at expected peak?"</td><td>Sustained traffic at target rate.</td></tr>
+<tr><td>**Stress test**</td><td>"Where does it break?"</td><td>Ramp up until errors / latency degrade.</td></tr>
+<tr><td>**Soak test**</td><td>"Does it survive prolonged load?"</td><td>Run at target rate for hours/days.</td></tr>
+<tr><td>**Spike test**</td><td>"What happens with a sudden surge?"</td><td>Step-change from low to high.</td></tr>
+</tbody>
+</Compare>
+
+Each catches different bugs. A service can pass a 10-minute load
+test and fail a 4-hour soak test because of a memory leak.
+
+## Open-loop vs closed-loop
+
+The single most important distinction.
+
+- **Closed-loop**: the client fires the next request only after the
+  previous one completes. Slow server → client sends fewer requests.
+- **Open-loop**: the client fires requests on a *schedule* (e.g.,
+  every 10ms) regardless of completion. Slow server → backlog
+  grows.
+
+Production traffic is open-loop. Users don't wait for your server
+to be ready before clicking. **A closed-loop load test
+systematically under-reports tail latency** (coordinated omission).
+
+Tools that default to open-loop: **wrk2, k6 (constant-arrival-rate
+executor), Vegeta, locust (with care).**
+Tools that default to closed-loop: **ab (Apache Bench), wrk
+(original), jmeter without configuration.**
+
+Use open-loop for anything performance-critical. The numbers from
+ab/wrk look pretty but lie.
+
+## What to measure
+
+The minimum:
+
+- **Throughput achieved** (req/s the system actually completed,
+  not what the generator attempted).
+- **Latency distribution** (p50, p95, p99, p99.9, max).
+- **Error rate** (4xx, 5xx, timeouts).
+- **Resource utilization** (CPU, memory, disk I/O, network) at
+  the SUT (system under test).
+- **Downstream stats** (DB connections, queue depth, dependency
+  latency).
+
+Plot throughput vs latency. The curve usually looks like:
+
+```
+latency
+   |              ____|
+   |          ___/
+   |       __/
+   |   ___/
+   |__/_______________
+   +------- throughput ---->
+```
+
+Flat at first, then a knee. The knee is the **saturation point**.
+Past it, throughput stops rising and latency explodes (queueing).
+This is the number you care about for capacity planning: not
+"max throughput," but "the throughput before the knee."
+
+<Callout type="rule">
+Operate at 50-70% of the knee, not 95%. Past 70% the latency
+hyperbolic kicks in; small surges turn into outages.
+</Callout>
+
+## Realistic traffic shape
+
+Synthetic load is misleading if it doesn't match reality:
+
+- **Mix of endpoints** — a real workload isn't 100% `GET /healthz`.
+  Sample real traffic ratios.
+- **Cache behavior** — testing with the same 10 keys hits a 100%
+  cache. Test with key distributions that match real (Zipf is
+  often realistic).
+- **Cold + warm starts** — record both. The first 30 seconds of
+  fresh load are different from steady state.
+- **Body sizes** — POST bodies are 10× what they were in dev
+  fixtures. Use realistic sizes.
+- **Auth / session distribution** — many concurrent users vs few
+  power users behave differently (cache effectiveness, connection
+  reuse).
+
+For high-fidelity testing: capture a slice of real traffic, anonymize
+it, replay through the load tester. Tools like **GoReplay** are
+designed for this.
+
+## Generating enough load
+
+A single load generator usually can't saturate a modern service.
+Bottlenecks:
+
+- **Generator's CPU**. wrk runs out at ~100k req/s on one machine.
+- **TCP socket limits**. Ephemeral port exhaustion if you don't
+  reuse connections.
+- **Generator's NIC**. 1Gbps cap on a single machine; you'll hit
+  it with large payloads.
+- **The generator is in the same network as the SUT** — your
+  load test now includes the test's network impact.
+
+Solution: **distributed load testers**. k6 cloud, locust workers,
+JMeter cluster, Vegeta agents. The orchestrator coordinates rate;
+the agents do the work. For multi-million-req/s testing, you need
+many agents in many regions.
+
+## The questions to answer before running
+
+<Steps>
+<Step n="1" title="What's the target throughput?">
+Derived from real traffic projections, not "a number that seems
+big." If steady-state is 2,000 req/s, your load test target might
+be 6,000 req/s (3× headroom for spikes).
+</Step>
+<Step n="2" title="What's the SLO?">
+"p99 < 250ms, 99.9% success." That's the pass/fail criterion. Without
+it, you don't know whether the test passed.
+</Step>
+<Step n="3" title="What does production look like?">
+You'll have to mirror the prod environment closely — same DB,
+caches, dependencies, network paths. Testing a staging env that
+has a fraction of prod's resources will produce useless numbers.
+</Step>
+<Step n="4" title="Who else uses the test environment?">
+Don't run a load test against a shared staging if other teams
+are using it. You'll wreck their workflow.
+</Step>
+</Steps>
+
+## Tools
+
+- **k6** — modern, scriptable in JS, open-loop by default with
+  the right executor, good for both CI and large runs.
+- **wrk2** — Gil Tene's fork of wrk with proper open-loop and CO
+  correction. Old but excellent for raw HTTP benchmarking.
+- **Vegeta** — Go, constant-rate by default (open-loop), command
+  line composable.
+- **JMeter** — GUI-heavy, very mature, can do almost anything.
+  Heavy and slow.
+- **Locust** — Python, scriptable, easy to write but defaults
+  closed-loop unless configured.
+- **gatling** — Scala/Kotlin, expressive DSL, mostly closed-loop
+  but good reporting.
+
+For raw HTTP benchmark: wrk2 or Vegeta.
+For complex scripted scenarios: k6.
+For replaying real traffic: GoReplay.
+For "load tests in CI for regression": k6 (lightweight enough).
+
+## Common pitfalls
+
+- **Testing with `localhost`.** No network, no realistic conditions.
+- **Testing with one client.** Closed-loop, single connection. The
+  result is "this client could go this fast," not "the server can
+  serve this many concurrent users."
+- **No warmup.** First 30 seconds include JIT compilation, cache
+  cold starts, lazy-loaded code paths. Skip them when computing
+  steady-state.
+- **Looking only at throughput.** "We hit 10,000 req/s!" — at what
+  latency? With what error rate? If half the requests are 5xx,
+  the number is meaningless.
+- **Not measuring the SUT's resources.** If CPU is 30% during the
+  test, you didn't load it. Push until something saturates.
+- **Running load tests "every now and then."** Performance regresses
+  silently between runs. Either run nightly in CI or run on every
+  deploy to staging.

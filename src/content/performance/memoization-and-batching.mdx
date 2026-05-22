@@ -1,0 +1,165 @@
+export const level = 'mid';
+
+# Memoization and batching
+
+Two tactical techniques that show up everywhere because they share
+a structural idea: **fewer, bigger operations** instead of many small
+ones. The shapes look different — memoization caches results,
+batching combines requests — but the underlying win is the same:
+amortize fixed costs over more work.
+
+## Memoization
+
+Memoization caches the result of a pure function keyed by its
+inputs. Same inputs → same output → skip the work.
+
+```js
+const cache = new Map();
+function fib(n) {
+  if (n < 2) return n;
+  if (cache.has(n)) return cache.get(n);
+  const v = fib(n - 1) + fib(n - 2);
+  cache.set(n, v);
+  return v;
+}
+```
+
+The textbook example. Without the cache, `fib(40)` makes ~10⁹
+calls; with it, 40. Pure exponential → linear by remembering
+intermediate results.
+
+## When memoization is worth it
+
+A function is a candidate for memoization when **all four** hold:
+
+<Steps>
+<Step n="1" title="The function is pure">
+Same inputs → same outputs. No side effects that the cache would
+hide.
+</Step>
+<Step n="2" title="The inputs are hashable and small">
+You need to use the inputs as cache keys. A function taking a 5MB
+object as input has a 5MB key. Hashing it is the work you were
+trying to avoid.
+</Step>
+<Step n="3" title="Repeated calls actually happen">
+If every call has unique inputs, the cache is overhead. Always
+check call-pattern, not "could be cached in theory."
+</Step>
+<Step n="4" title="The function is expensive enough that hash + lookup is cheaper">
+Memoizing a function that takes 50ns to compute and 80ns to hash
++ look up is a loss. Measure.
+</Step>
+</Steps>
+
+## Memoization variants
+
+- **Unbounded cache** — easiest. Fine for small input domains;
+  unsafe for user-controllable inputs (memory bomb).
+- **LRU cache** — bounded; evict least-recently-used. Good default
+  for hot-path memoization.
+- **TTL cache** — bounded by time. Good for "expensive lookup that
+  is allowed to be a bit stale."
+- **Per-request memoization** — cache lives for the duration of one
+  request, then is dropped. DataLoader is exactly this. Avoids
+  cross-request consistency issues.
+
+## Common bugs
+
+- **Memoizing a function with mutable arguments.** `fn(arr)` where
+  the caller mutates `arr` afterwards: now your cache key is wrong
+  next time. Fix: copy or freeze inputs, or use a stable key
+  derivation.
+- **Memoizing functions that read time or randomness.** Not pure.
+  The cache will return stale values forever.
+- **Cache that lives forever in a long-lived process.** Slow memory
+  leak via the cache. Always pick an eviction policy.
+- **Forgetting that `this` matters in OO languages.** A method
+  bound to a different instance is a different function call;
+  the cache key needs to include the receiver.
+
+## Batching
+
+Batching combines N small operations into 1 larger one. The win:
+the *fixed cost per operation* — round-trip latency, lock
+acquisition, syscall overhead, transaction startup — gets paid
+once instead of N times.
+
+```js
+// Bad: N round trips
+for (const id of ids) {
+  await db.query('SELECT * FROM users WHERE id = ?', id);
+}
+
+// Good: 1 round trip
+await db.query('SELECT * FROM users WHERE id IN (?)', [ids]);
+```
+
+Memory-bound workloads also benefit at the CPU level — process
+a vector of records, not one at a time, and the JIT/SIMD/cache
+prefetcher all work better.
+
+## When batching is the right tool
+
+- The per-op fixed cost is significant relative to the work itself.
+  A 0.5ms RTT to redis + 0.01ms of redis work = 50× overhead per
+  call. Batch.
+- The downstream service supports a batched API. (If it doesn't,
+  batching at your boundary doesn't help; you'd still issue N
+  upstream calls.)
+- You can tolerate some latency increase per operation. Batching
+  always means waiting (briefly) to collect more requests.
+
+## Batching tactics
+
+<Steps>
+<Step n="1" title="Per-request batching (DataLoader)">
+Collect calls within one event-loop tick, fire one batched call,
+distribute results. Zero added latency for the user (one tick is
+sub-millisecond); huge round-trip win. Standard for GraphQL.
+</Step>
+
+<Step n="2" title="Time-window batching">
+Buffer for up to N ms, then flush. Trades a few ms of latency for
+much higher throughput. Classic for log shippers, metric agents,
+analytics SDKs.
+</Step>
+
+<Step n="3" title="Size-window batching">
+Buffer until N items collected, then flush. Used when item count
+dominates fixed costs (e.g., DB bulk inserts with row-bounded
+overhead).
+</Step>
+
+<Step n="4" title="Hybrid (size OR time)">
+"Flush at 100 items OR 50ms, whichever comes first." Bounded by
+either dimension. The default in Kafka producers, StatsD client
+batchers, etc.
+</Step>
+</Steps>
+
+## The batching pitfalls
+
+- **Coordinated omission**: a slow batch holds back N requests'
+  latency. The p99 you report can hide this because each request's
+  end-time waits for the batch. See `coordinated-omission`.
+- **Failure radius growth**: one bad row in a 1000-row batch
+  might fail the whole batch. Choose an API that returns per-row
+  errors, or partition retries on failure.
+- **Backpressure mismatch**: batching at the producer with no
+  backpressure can blow up the queue. The batch fills faster than
+  it drains.
+- **Latency for low-volume traffic**: time-window batching is a
+  *latency tax* when traffic is below threshold. The first
+  request of the day waits 50ms for company that never comes.
+
+## The shared mental model
+
+Both memoization and batching are answers to: *"This operation has
+a fixed cost per call, and I'm paying it N times."*
+
+- Memoization: drop the second through Nth call entirely.
+- Batching: combine calls so the fixed cost is paid once for N.
+
+If you find yourself reaching for one, ask whether the other might
+also apply. Often both do.

@@ -1,0 +1,245 @@
+export const level = 'mid';
+
+# Prometheus and the pull model
+
+Prometheus is the de-facto open-source metrics stack — used
+directly or as the data model underlying many vendor systems
+(Grafana Cloud, Cortex, Mimir, Thanos, VictoriaMetrics).
+
+Its most distinctive design choice is **pull-based collection**:
+Prometheus scrapes metrics from your services rather than the
+services pushing to it. Understanding why matters because the
+trade-offs ripple through how you instrument and operate.
+
+## Pull vs push, very concretely
+
+**Push** (StatsD, OpenTelemetry default, AWS CloudWatch agent):
+
+```
+app  →  agent  →  metrics backend
+```
+
+The app sends metrics on its own schedule. If the backend is down,
+the agent buffers; the app keeps going. The agent has to keep up
+with whatever the app emits.
+
+**Pull** (Prometheus):
+
+```
+app  ←  Prometheus
+   (Prometheus calls GET /metrics every 15s)
+```
+
+The app exposes a `/metrics` endpoint that returns current values.
+Prometheus periodically scrapes it. The app has no opinion on when
+or how often; it just answers when asked.
+
+## Why pull was chosen
+
+The Prometheus team's argument:
+
+- **Service discovery integration**. Prometheus already needs to
+  know which instances to scrape (so it can attach the right
+  labels). It uses that to discover health: an instance that
+  doesn't respond to scrape is down. Push doesn't have this
+  natural up/down signal.
+- **The "infinite buffer" problem disappears**. If Prometheus is
+  down, scrapes fail; the next scrape gets current values. No
+  unbounded queue building up in the agent.
+- **Lower-cardinality control**. Pull means the central system
+  decides what to scrape and how often; push means every client
+  can flood the backend.
+- **Easier debugging**. You can `curl /metrics` on your service
+  to see what it would report. No tooling needed.
+
+The argument against pull:
+
+- **Short-lived jobs** (cron jobs, batch tasks). They might
+  finish before any scrape happens. Prometheus addresses this
+  with a **Pushgateway** — a stateful intermediate that jobs push
+  to, and that Prometheus scrapes. Acknowledged as awkward.
+- **Firewall-restricted networks**. Pull requires Prometheus to
+  reach the service. If services are behind NAT or strict
+  firewalls, push is easier.
+- **Highly dynamic scaling**. Prometheus's service discovery
+  needs to catch new instances; very ephemeral workloads (1-second
+  Lambda invocations) don't fit naturally.
+
+For most server-side workloads, pull works well. For serverless
+and short-lived jobs, push or hybrid is often cleaner.
+
+## What the `/metrics` endpoint returns
+
+A plain-text format (now standardized as OpenMetrics):
+
+```
+# HELP http_requests_total Total HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{endpoint="/users",status="200"} 4234
+http_requests_total{endpoint="/users",status="500"} 12
+
+# HELP http_request_duration_seconds Request latency.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{endpoint="/users",le="0.005"} 100
+http_request_duration_seconds_bucket{endpoint="/users",le="0.01"}  180
+...
+http_request_duration_seconds_bucket{endpoint="/users",le="+Inf"} 1000
+http_request_duration_seconds_count{endpoint="/users"} 1000
+http_request_duration_seconds_sum{endpoint="/users"} 23.4
+```
+
+Each line is metric_name + labels + value. The same endpoint
+exposes every metric the service emits, with current cumulative
+values.
+
+The service's job: keep this endpoint correct and fast (response
+in under 100ms for thousands of series). It's read by Prometheus once
+every scrape interval (upstream default is 1 minute; most setups
+configure it to 15s, and Prometheus Operator's ServiceMonitor defaults
+to 30s).
+
+## Scrape interval and freshness
+
+The scrape interval is the "freshness" of your metrics. Upstream
+default is 1 minute; most production setups tune it down to 15s. At
+15s intervals:
+
+- A latency spike at 14:32:07 might first be visible at 14:32:15.
+- An alert evaluated every 15s plus the rule's `for: 5m` clause
+  fires at earliest ~5m15s after the actual event.
+
+Trade-offs:
+
+- Shorter intervals (5s): faster detection, more storage cost,
+  more scrape-time CPU on the service.
+- Longer intervals (60s): cheaper, slower detection. Fine for
+  most things; bad for outage alerting.
+
+A common pattern: 15s for the critical signals, 60s for
+non-critical ones. Prometheus lets you configure intervals per
+job.
+
+## Service discovery
+
+Prometheus needs to know which targets to scrape. The mechanisms:
+
+- **Static config**: list of hosts. Fine for fixed infrastructure.
+- **DNS SRV records**: query DNS for "give me all instances of
+  service X."
+- **Kubernetes**: native integration; Prometheus discovers pods
+  and services via the K8s API.
+- **Consul, Eureka, Nomad**: integrated.
+- **Cloud-provider**: AWS EC2/ECS, GCP, Azure SDs.
+- **File-based**: a file the operator updates; Prometheus
+  watches.
+
+Without service discovery, scaling is painful. Kubernetes +
+Prometheus + ServiceMonitor (Prometheus Operator) is the dominant
+modern setup.
+
+## Relabeling
+
+A powerful, occasionally confusing, transform on scrape targets.
+Common uses:
+
+- Add labels from K8s metadata (`pod_name`, `node`, `namespace`).
+- Drop targets matching some criterion (don't scrape kube-state
+  in `kube-system` namespace).
+- Rewrite labels (clean up environment names).
+- Filter metrics (drop everything except what you want).
+
+```yaml
+relabel_configs:
+  - source_labels: [__meta_kubernetes_pod_label_app]
+    target_label: service
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: namespace
+  - action: drop
+    source_labels: [__meta_kubernetes_namespace]
+    regex: kube-system
+```
+
+A core Prometheus skill at scale; debugging relabeling rules is
+where many production setups go wrong.
+
+## High availability
+
+Single Prometheus instance is a SPOF. The standard HA pattern:
+
+- Run **two identical Prometheus instances** scraping the same
+  targets.
+- Use a layer in front (Thanos, Cortex, Mimir, or Promxy) to
+  merge their data.
+- The two instances drift slightly in scrape timing, which is
+  fine for HA.
+
+For long-term storage and queries across the fleet, **Thanos** or
+**Cortex/Mimir** sit on top. Local Prometheus retains a few weeks;
+historical data lives in object storage (S3, GCS).
+
+## Push gateway
+
+For jobs that exit before being scraped:
+
+```
+short_job  →  pushes to Pushgateway  ←  scraped by Prometheus
+```
+
+Used for cron jobs, CI builds, batch tasks. **Not for regular
+services** — Prometheus docs are explicit: don't use Pushgateway
+as a general push collector. It has only one global lifecycle and
+isn't designed for thousands of instances.
+
+If your workload doesn't fit pull, consider a different push-based
+TSDB (Datadog, VictoriaMetrics, InfluxDB) or hybrid (OpenTelemetry
+Collector forwarding to a push backend while exposing
+Prometheus-compatible endpoint).
+
+## PromQL — the query language
+
+The query language for Prometheus. Powerful but unconventional.
+Some patterns:
+
+```
+# Request rate over 5 minutes
+rate(http_requests_total[5m])
+
+# Error rate as a percentage
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total[5m]))
+
+# p99 latency
+histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Top 5 endpoints by request rate
+topk(5, sum by (endpoint) (rate(http_requests_total[5m])))
+```
+
+The defining idiom is `rate()` over counters. Almost every
+useful metric query starts with it.
+
+## Pull-model gotchas
+
+- **Counter resets** on restart. PromQL's `rate()` handles them
+  but be aware.
+- **A service that fails to be scraped** appears as `up == 0`.
+  Alert on this — your service might be silently down.
+- **Cardinality at scrape time**. The scrape's `/metrics`
+  response gets bigger as label cardinality grows. Past
+  ~100,000 series per service, scrapes get slow and expensive.
+- **Memory pressure on the scraper**. Prometheus keeps recent
+  data in memory. Tens of millions of active series can need
+  10+GB RAM. Cardinality discipline is the main control.
+
+## When Prometheus is and isn't the right choice
+
+Yes for: server-side services with stable instance lifecycles,
+Kubernetes-native workloads, teams comfortable running their own
+metrics stack, anywhere you want PromQL.
+
+Maybe not for: serverless workloads (use vendor metrics directly),
+mobile/client-side metrics (need push), extremely high-cardinality
+needs (consider VictoriaMetrics, M3, or specialized stores), teams
+without ops bandwidth (use a managed service).

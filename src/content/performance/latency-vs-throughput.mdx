@@ -1,0 +1,132 @@
+export const level = 'junior';
+
+# Latency vs throughput
+
+Two numbers that get mixed up constantly. They aren't the same,
+they aren't trade-offs in the simple sense, and optimizing one
+can move the other in either direction.
+
+- **Latency**: how long *one* request takes, end-to-end. Units of
+  time. "p99 latency is 240ms."
+- **Throughput**: how many requests the system finishes per unit
+  time. Units of count/time. "5,000 req/s."
+
+The Gregg analogy: latency is the time to drive from A to B; throughput
+is how many cars per hour the highway moves.
+
+## The relationship
+
+For an idle system serving one request at a time, throughput is
+just `1 / latency`. A request takes 100ms, you get 10 req/s. Trivial.
+
+The interesting regime is **concurrent** load. Real systems run
+many requests in flight. Then **Little's Law** kicks in:
+
+```
+L = λ × W
+```
+
+- **L**: average requests in the system
+- **λ**: throughput (arrivals per second, in steady state)
+- **W**: average latency
+
+That's the universal law of queueing. It's why you can't reason
+about throughput without knowing latency, and vice versa.
+
+## The four scenarios
+
+<Compare>
+<thead>
+<tr><th>What you did</th><th>Latency</th><th>Throughput</th></tr>
+</thead>
+<tbody>
+<tr><td>Added a faster CPU</td><td>↓</td><td>↑</td></tr>
+<tr><td>Added more workers / cores (parallel)</td><td>flat</td><td>↑</td></tr>
+<tr><td>Batched 100 requests into 1</td><td>↑ (per request)</td><td>↑ (overall)</td></tr>
+<tr><td>Added a network hop</td><td>↑</td><td>↓ at saturation</td></tr>
+</tbody>
+</Compare>
+
+The "batched" row is the one that trips people up. Batching helps
+throughput by amortizing fixed costs (round-trips, lock acquires,
+syscall overhead), but each individual request now waits for its
+batch to fill. You traded per-request latency for system throughput.
+
+## The "they're trade-offs" myth
+
+People sometimes say "latency and throughput are trade-offs." Often
+they aren't. Many fixes help both:
+
+- A faster algorithm (lower Big-O).
+- A smaller payload (less network time, less serialization).
+- A warmer cache (less DB time).
+- Removing a synchronous blocking call.
+
+The genuine trade-offs show up at queueing time:
+
+- **Batching** — better throughput, worse per-request latency.
+- **Queueing depth** — let more requests pile up and your queue is
+  busy more often (better utilization, more throughput), but each
+  request waits longer in the queue (worse latency).
+- **Connection pooling** — fewer connections means more reuse (less
+  TCP/TLS setup) but more wait time when the pool is empty.
+
+## Why throughput collapses near saturation
+
+The mental model that "the server can do 1,000 req/s, so at 950
+req/s I'm fine" is wrong. As you approach saturation, **queue lengths
+explode and latency spikes**, often *before* throughput numbers
+themselves show stress.
+
+Think of an M/M/1 queue with utilization ρ:
+
+```
+average wait time  ∝  1 / (1 - ρ)
+```
+
+At ρ = 0.5, the constant is 2. At 0.9, it's 10. At 0.99, it's 100.
+**Latency goes hyperbolic** as you approach 100% utilization, even
+though throughput barely changes. This is why prod systems aim for
+50–70% utilization at steady state, not 95%.
+
+<Callout type="rule">
+Throughput is a budget you spend on **headroom**, not a target you
+should fully consume. The closer you push utilization to 1.0, the
+more latency you pay per unit of extra throughput.
+</Callout>
+
+## When to optimize which
+
+- User-facing requests → optimize **latency** first. Users feel
+  individual page loads, not your throughput chart.
+- Backend pipelines, batch jobs, queues → optimize **throughput**
+  first. The job is "finish 10M rows by 6am," not "make each row
+  fast."
+- Both matter when the user-facing system *fans out* to backends:
+  one user request triggers many backend ones, so p99 of the slowest
+  backend becomes the user's latency (tail amplification).
+
+## What to actually measure
+
+Don't report a single number. The minimum useful summary:
+
+- **p50** (median): the typical experience.
+- **p95**, **p99**: the bad tail. Most "p50 is fine, p99 is awful"
+  cases come from GC pauses, lock contention, cache misses, retries.
+- **Max**: the worst seen. Often noise, but reveals stalls.
+- **Throughput**: req/s achieved during the measurement window.
+
+Reporting an average alone (`mean latency = 80ms`) hides the
+distribution. A system with mean 80ms and p99 of 2s is very
+different from one with mean 80ms and p99 of 120ms.
+
+## Pitfalls
+
+- **Throughput measured with one client.** You measured your
+  client's loop, not the server. Use a load generator that can
+  saturate it.
+- **Latency measured at the server.** Real user latency includes
+  DNS, TCP, TLS, network, render. Server p99 ≠ user p99.
+- **Average everything.** The interesting signal is the tail.
+- **Mixing read and write latency.** Often dramatically different.
+  Report them separately.

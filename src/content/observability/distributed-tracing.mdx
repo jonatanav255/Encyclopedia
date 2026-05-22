@@ -1,0 +1,239 @@
+export const level = 'senior';
+
+# Distributed tracing
+
+A trace is the record of how a single request moved through a
+system. In a monolith, a stack trace tells you where time went.
+In a distributed system, **the call tree spans services, networks,
+and async boundaries** — and a stack trace from one process tells
+you almost nothing about the whole.
+
+Distributed tracing reconstructs the full request tree across
+processes. It is the only observability signal that gives you
+*causal end-to-end visibility* over a single request.
+
+## The data model
+
+The fundamental unit is a **span**: a named operation with a
+start, end, parent, attributes, and events.
+
+```
+trace_id: 4f3a2c1b... (one per request)
+└─ root span: "GET /products"        service=gateway   0ms - 250ms
+    ├─ span: "validate token"        service=gateway   1ms - 4ms
+    ├─ span: "fetch product"         service=catalog   5ms - 240ms
+    │   ├─ span: "db query"          service=catalog   8ms - 65ms
+    │   ├─ span: "cache get"         service=catalog   66ms - 70ms
+    │   └─ span: "enrich pricing"    service=pricing   71ms - 235ms
+    │       └─ span: "fx convert"    service=fx        72ms - 230ms
+    └─ span: "render response"       service=gateway   241ms - 249ms
+```
+
+Each span has:
+
+- **trace_id** — links it to the larger trace.
+- **span_id** — unique per span.
+- **parent_span_id** — its parent in the tree.
+- **name** — what the span represents.
+- **start_time, end_time** — duration.
+- **attributes** — structured key/value (HTTP status, user_id,
+  query).
+- **events** — timestamped sub-events (a log line within the
+  span).
+- **status** — OK / error.
+
+The data model is now standardized as **OpenTelemetry** (OTel),
+which unified earlier OpenTracing and OpenCensus projects. Use
+OTel SDKs.
+
+## Context propagation
+
+The trace ID has to be passed across every service boundary. The
+W3C Trace Context standard defines headers:
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+              version-traceid                       -spanid           -flags
+```
+
+Plus optional `tracestate` for vendor-specific extensions.
+
+Propagation goes through:
+
+- HTTP outgoing calls (auto-instrumented in most SDKs).
+- gRPC (auto).
+- Message queues (you instrument explicitly — context goes into
+  message headers).
+- Async / promise chains within a process (typically auto with
+  AsyncLocalStorage or contextvars).
+- Background jobs (manual — pass context as part of the job
+  payload).
+
+A trace that breaks at an async boundary becomes two traces —
+the user request becomes one trace, the work it triggered becomes
+another. Linkable via "span links" but not the same tree.
+
+## Instrumentation: auto vs manual
+
+Most SDKs distinguish:
+
+- **Automatic instrumentation**: wraps standard libraries (HTTP
+  client/server, DB drivers, gRPC, common frameworks). One line
+  of bootstrap code; most spans appear automatically.
+- **Manual instrumentation**: your code creates spans for
+  business operations not visible to the SDK.
+
+```python
+with tracer.start_as_current_span("calculate_pricing") as span:
+    span.set_attribute("product.id", product_id)
+    span.set_attribute("user.tier", user.tier)
+    result = calculate(product, user)
+    span.set_attribute("result.total", result.total)
+    return result
+```
+
+Auto gets you 70% of the value for low effort; manual fills in
+the business logic you actually want to debug. A well-instrumented
+service has both.
+
+## Sampling
+
+A 100k req/s service produces 100k traces/s. Storing all of them
+is expensive and rarely worth it. Sampling decides which to keep.
+
+Two families:
+
+<Compare>
+<thead>
+<tr><th></th><th>Head-based</th><th>Tail-based</th></tr>
+</thead>
+<tbody>
+<tr><td>Decision made</td><td>At the start of the trace</td><td>After the trace is complete</td></tr>
+<tr><td>Sampled by</td><td>Random %, attributes at start</td><td>Latency, error status, attributes</td></tr>
+<tr><td>Pros</td><td>Cheap; decision lives in the trace ID</td><td>Can preserve the *interesting* traces</td></tr>
+<tr><td>Cons</td><td>Misses errors and slow requests proportionally</td><td>Requires buffering full trace before deciding</td></tr>
+</tbody>
+</Compare>
+
+For a typical service:
+
+- Head sample at 10% (one of every 10 traces kept) for normal
+  traffic.
+- 100% sampling for error traces (catch every error).
+- 100% sampling for slow traces (above some latency threshold).
+
+Tail-based sampling requires a collector (OTel Collector,
+Tempo, vendor agent) that buffers traces in memory or short-lived
+storage, decides based on the full trace, and then ships.
+
+## What traces are best at
+
+Latency questions in a distributed system. The killer use cases:
+
+- **"Where did the time go?"** — Slow request, you want to see
+  which downstream call was the actual slow part.
+- **"What's blocking the user?"** — Sequential vs parallel calls.
+  Traces show what runs concurrently and what's serial.
+- **"What did this request actually call?"** — In a complex
+  microservices system, no static diagram is accurate. Traces
+  show the runtime dependency graph.
+- **"Why did this request fail?"** — The span where the error
+  originated has the stack trace; ancestors show the call chain.
+
+## What traces are bad at
+
+- **High-volume aggregate analysis**. "Average latency by
+  endpoint last hour" is a metric query, not a trace query. Traces
+  are individual examples, not aggregates.
+- **Anything sampled out**. If you sample at 10%, the request
+  the user just complained about probably isn't in your trace
+  store. Tools that combine RUM + sampling-on-demand help.
+- **Pure intra-process performance**. A profiler is better. Traces
+  see "function call took 50ms"; profilers see "function did N
+  operations spending M cycles each."
+
+## Trace-to-metric and trace-to-log correlation
+
+The most useful integration: jump from a metric anomaly to a
+representative trace, from a trace to logs for that request.
+
+Mechanism:
+
+- **Exemplars**: a metric data point can carry a sample trace ID.
+  Prometheus + OpenMetrics support this. Click the spike in the
+  graph, jump to the trace.
+- **Logs carry trace_id**: every log entry includes the current
+  trace ID. Click a span in the trace UI, see the logs from that
+  exact request.
+
+This is the modern "single pane of glass" — three signals tied
+together by the trace ID.
+
+## Common instrumentation mistakes
+
+- **Forgetting to propagate across an async boundary**. The
+  background job runs in its own trace, disconnected from the
+  user request that triggered it. Use span links if propagation
+  isn't possible.
+- **Span explosion**. Creating a span per loop iteration in a
+  hot loop. Each span has cost; thousands per request break the
+  trace UI and ingest cost. Aggregate ("processed N items")
+  instead.
+- **Sensitive data in attributes**. Span attributes are searchable
+  and stored. Don't put passwords, tokens, or PII there. Use
+  redaction rules at the collector.
+- **Inconsistent naming**. `db.query` in one service, `database`
+  in another, `sql.statement` in a third. Use OTel's semantic
+  conventions for standard attributes (`db.system`, `db.statement`,
+  `http.method`, etc.).
+- **Spans that don't represent meaningful work**. A span around
+  a 0.001ms operation isn't useful; it dilutes the trace.
+
+## The OTel Collector
+
+A separate process that receives, processes, and ships traces. The
+modern best practice for production setups:
+
+- Apps emit OTLP (OpenTelemetry Protocol) to local Collector.
+- Collector batches, samples, redacts, and ships to whichever
+  backend (Tempo, Jaeger, Honeycomb, Datadog, Lightstep, ...).
+- Backend stores and indexes by trace ID.
+
+Why a Collector:
+
+- Vendor-independent. Switch backends without changing apps.
+- Centralized sampling / redaction policy.
+- Aggregation across the cluster (tail-sampling needs all spans
+  of a trace in one place).
+- Buffering and retry against the backend.
+
+## Backends
+
+- **Jaeger** — open source, basic.
+- **Tempo** (Grafana) — cheap, label-indexed (like Loki for
+  traces).
+- **Honeycomb** — high-cardinality wide-event approach; powerful
+  ad-hoc analysis.
+- **Datadog APM** — integrated with their other observability
+  tools.
+- **Lightstep** — pioneer, now part of ServiceNow.
+- **Elastic APM** — if you're already on the ELK stack.
+
+Picking is mostly about cost and what tooling you already have.
+The OTel data model means you can change later relatively easily.
+
+## What good looks like
+
+A mature traced service:
+
+- Auto-instrumentation enabled for HTTP, DB, queues.
+- Manual spans on the 5-10 most important business operations.
+- 10% head sampling + 100% sampling for errors and slow requests.
+- Trace IDs in every log entry.
+- Exemplars in latency histograms.
+- An on-call who routinely jumps from "metric spike → trace →
+  logs" during investigation.
+
+Reaching this isn't a one-quarter project, but the per-service
+incremental investment is small. The payoff during an outage is
+enormous.

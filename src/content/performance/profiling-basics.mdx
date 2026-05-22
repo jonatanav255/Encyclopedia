@@ -1,0 +1,140 @@
+export const level = 'junior';
+
+# Profiling basics
+
+Two things people confuse:
+
+- **Benchmarking** answers: how fast is this operation?
+- **Profiling** answers: where is my program spending time?
+
+If you don't know where the slowness is, optimizing is guessing.
+Profile first.
+
+## The two kinds of profiler
+
+<Compare>
+<thead>
+<tr><th></th><th>Sampling profiler</th><th>Instrumenting profiler</th></tr>
+</thead>
+<tbody>
+<tr><td>How</td><td>Interrupts the program N times/sec, records stack</td><td>Inserts code around every function entry/exit</td></tr>
+<tr><td>Overhead</td><td>Low (1–5%)</td><td>High (often 2–10×)</td></tr>
+<tr><td>Accuracy</td><td>Statistical, more samples → more precise</td><td>Exact call counts</td></tr>
+<tr><td>Use for</td><td>Production, "where is time going"</td><td>Dev, "how often is X called"</td></tr>
+</tbody>
+</Compare>
+
+Default to sampling for performance work. It's the only kind you
+can safely run on a live system, and it doesn't distort hot loops
+the way instrumentation does.
+
+## CPU vs wall-clock time
+
+Two clocks, both important:
+
+- **CPU time**: how much actual processor time your code consumed.
+- **Wall-clock time**: total elapsed time, including waits.
+
+A request that takes 200ms wall but only 5ms CPU is **waiting** for
+something — DB, network, lock, disk. Optimizing the CPU work in
+your service won't move that number. Latency improvements come
+from removing the wait.
+
+A request that takes 200ms wall and 195ms CPU is **CPU-bound** in
+your service. Now your profiler will be useful.
+
+<Callout type="rule">
+Always check the CPU-vs-wall ratio before profiling. CPU profilers
+on wait-heavy code mostly show you the time you spent in the wait
+syscall — true but unactionable.
+</Callout>
+
+## Reading a flame graph
+
+A flame graph stacks each call's children on top of it. Width =
+total time. The y-axis isn't time, it's **stack depth**.
+
+```
+read  process  serialize
+└── deserialize_json (35%)
+    └── allocate_string (22%)
+└── lookup_user (5%)
+└── render_template (40%)
+    └── escape_html (18%)
+```
+
+What to look for:
+
+- **Wide bars near the top.** That's where time is spent and a fix
+  is plausible. A wide bar near the bottom (your `main` function)
+  tells you nothing — *of course* `main` consumes all the time.
+- **Surprise functions.** If `JSON.parse` is 30% of your request
+  time, ask whether you're parsing the same blob twice, or whether
+  the blob should be smaller.
+- **Tall narrow towers.** A deep stack with no big children at each
+  level is often a recursion problem — not always slow, but worth
+  understanding.
+
+## Production-safe profiling
+
+For a long time, profiling in production meant turning on the dev
+profiler and hoping nothing fell over. Today there are dedicated
+**continuous profilers** designed for prod:
+
+- **pprof** (Go, also via libraries in other languages) — sampling.
+- **async-profiler** (JVM) — uses perf events, very low overhead.
+- **perf** (Linux) — kernel-level sampling profiler, the substrate
+  many of the above sit on.
+- **Hosted continuous profilers** — Pyroscope, Datadog Profiler,
+  Grafana Cloud Profiles. Sample a small fraction of requests
+  always-on.
+
+They sample at low rates (often 100Hz per thread), aggregate over
+time, and surface flame graphs you can diff between deploys. The
+diff is the killer feature — "this deploy added 8% CPU to
+`serialize_response`, here's the new code path."
+
+## What to do before profiling
+
+If you skip these and jump to a profiler, you'll usually waste an
+hour:
+
+<Steps>
+<Step n="1" title="Reproduce the slowness reliably">
+A test, a curl, a synthetic load. If you can't reproduce it, you
+can't measure your fix.
+</Step>
+<Step n="2" title="Form a hypothesis">
+"I think it's the DB" or "I think it's serialization." A profiler
+is much more useful when you're confirming or denying a guess than
+when you're staring at a flame graph cold.
+</Step>
+<Step n="3" title="Measure once, with no changes">
+The baseline number. Without it, you can't tell whether your fix
+worked.
+</Step>
+<Step n="4" title="Pick the metric">
+Wall time, CPU time, p99 latency, throughput, allocations/sec. Each
+needs a different tool. Decide which matters.
+</Step>
+</Steps>
+
+## A common rookie mistake: optimizing self-time
+
+Profilers show two numbers per function:
+
+- **Self time** — time spent *in* this function, not in callees.
+- **Total time** — time including callees.
+
+If you sort by self time, you'll see things like `malloc`, `memcpy`,
+`Object.assign`. Those are usually not the bug — they're called
+*from* the bug. Sort by **total time** to find the root, then walk
+the stack to find where you're calling expensive things.
+
+## Profile production-like data
+
+The number one profiling mistake: profile with toy data, then ship
+to prod. The hot path in dev is the auth middleware (100ns); in
+prod it's the 5MB JSON serializer that never appeared in dev because
+your test fixtures had three rows. Use realistic data sizes and
+shapes when measuring.

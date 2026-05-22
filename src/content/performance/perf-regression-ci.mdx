@@ -1,0 +1,224 @@
+export const level = 'staff';
+
+# Performance regression detection in CI
+
+A working performance program prevents regressions from shipping
+in the first place. Dashboards catch regressions after they're
+live; CI catches them before they merge.
+
+Building this well is harder than building functional CI. The
+core difficulty: **performance measurements are noisy**. A naive
+check ("if perf dropped 5%, fail the build") flaps endlessly on
+random variation. A lax check ("only fail on 50% regressions")
+lets death-by-a-thousand-cuts through.
+
+## The shape of a perf regression system
+
+<Steps>
+<Step n="1" title="A reproducible benchmark suite">
+A set of measurable scenarios that match how your system is used.
+Microbenchmarks for hot functions; integration benchmarks for
+endpoints; full-stack tests for user flows. Each must produce
+**numbers**, not pass/fail.
+</Step>
+<Step n="2" title="A deterministic execution environment">
+Same hardware, same OS, same CPU governor, same noise level
+every time. Otherwise variance dominates signal. Cloud VMs are
+usually too noisy; bare metal is gold; dedicated CI runners (no
+neighbors) are workable.
+</Step>
+<Step n="3" title="Statistical comparison">
+Each PR's benchmarks are compared to baseline. The comparison
+uses confidence intervals, not raw deltas. Small changes within
+noise are accepted; changes outside it are flagged.
+</Step>
+<Step n="4" title="A blocking failure mode">
+If a regression is detected, the build fails. PR can't merge
+without either fixing it or explicitly accepting it. This is
+the difference between "we have perf dashboards" (dashboards
+get ignored) and "we have a perf gate" (gates get attention).
+</Step>
+<Step n="5" title="A bypass for legitimate regressions">
+Sometimes you knowingly accept a regression (new feature costs
+more). The system needs a path to update the baseline with
+sign-off, not silently.
+</Step>
+</Steps>
+
+## The variance problem
+
+Two runs of the same benchmark on the same machine routinely
+differ by 5-15% with no code change. Sources:
+
+- CPU frequency scaling, thermal throttling
+- Hyperthreading neighbor activity
+- OS scheduler decisions
+- Cache state, NUMA effects
+- Memory allocator state at start
+- Kernel page cache contents
+
+Solutions, in order of effort:
+
+- **Run more iterations.** Average over 30+ runs. Mean tightens
+  with √N samples.
+- **Pin CPU frequency, disable turbo, pin to specific cores.**
+  Reduces variance from hardware sources.
+- **Use a quiet machine.** No browser, no Slack, dedicated CI
+  runner. Bare metal where possible.
+- **Use statistical tools.** Criterion (Rust) computes confidence
+  intervals automatically. Mann-Whitney U or bootstrap-based
+  comparison is more robust than t-test for non-normal latency
+  distributions.
+
+## Detection methods
+
+**Hard threshold (don't do this):**
+
+```
+if (new_p95 / baseline_p95) > 1.05:
+    fail("Regression > 5%")
+```
+
+False positive rate near 100% if variance is more than a few %.
+Useless without a much wider band, at which point it misses real
+regressions.
+
+**Confidence-interval comparison (do this):**
+
+```
+if new_p95_ci_lower > baseline_p95_ci_upper:
+    fail("Statistically significant regression")
+```
+
+A regression triggers only when the CI of the new measurement
+sits clearly above the CI of the baseline. Eliminates flapping
+on noise.
+
+**Bayesian / sequential testing:**
+
+Run benchmarks for as long as needed to reach a decision
+(significant regression / significant improvement / clearly
+unchanged). Beats a fixed-iteration approach for borderline
+cases.
+
+## What to benchmark
+
+Three layers, in priority order:
+
+- **End-to-end / endpoint benchmarks.** "p95 of GET /products
+  under 200 req/s load." Closest to what users experience. Most
+  robust to internal refactors. Most informative.
+- **Component benchmarks.** "Latency of `parse_invoice`
+  function." Useful for tracking specific hot paths. Easier to
+  blame to a specific PR.
+- **Microbenchmarks.** "Single hashmap lookup latency." Mostly
+  useful for library-style code; misleading for application
+  code (see `benchmarking-pitfalls`).
+
+For most teams: invest in 5-10 endpoint benchmarks; add component
+benchmarks for the genuinely hot internals; skip microbenchmarks
+except where you're optimizing a specific function.
+
+## Where CI fits
+
+The pipeline:
+
+```
+PR opened
+   ↓
+unit tests pass
+   ↓
+build + integration tests pass
+   ↓
+PERF benchmarks run (on dedicated runner)
+   ↓
+compare to baseline; report deltas
+   ↓
+merge if green
+```
+
+Performance benchmarks are usually slower (minutes to hours) than
+unit tests. Two strategies:
+
+- **Run on every PR.** Highest signal; catches regressions
+  immediately. Requires fast benchmarks (under 10 min each).
+- **Run on PRs that touch perf-sensitive code.** Annotation /
+  CODEOWNERS based. Cheaper. Misses cross-cutting regressions.
+- **Run nightly on main.** Catches what got through. Useful as a
+  safety net even if per-PR runs exist.
+
+A reasonable default: PR-blocking benchmarks for the critical
+hot paths (5-10 scenarios, fast each), plus nightly comprehensive
+runs.
+
+## Baseline management
+
+The "baseline" is the number you're comparing to. Two strategies:
+
+- **Latest main**. Compare PR to whatever's on `main` right now.
+  Easy. Risk: small regressions accumulate ("each one is within
+  noise") until baseline has drifted far worse than where it
+  started.
+- **Pinned reference.** Compare to a baseline updated explicitly
+  (e.g., last release). Catches drift but requires more
+  ceremony.
+
+A hybrid: PR-blocking compares to latest main with confidence
+intervals. A weekly/monthly process compares latest main to a
+"golden baseline" — drift alerts go to the team.
+
+## Reporting
+
+The PR comment / build output should include:
+
+- **Per-scenario deltas** with confidence intervals.
+- **Statistical significance** (clear win, clear loss, no
+  meaningful change).
+- **Comparison to recent runs** (not just one number — show the
+  trend).
+- **Direct link to flame graph diff** for regressions, ideally.
+
+Make it cheap to investigate a regression. If the comment is just
+"p95 regressed 8%, see logs," fixing it takes hours. If the
+comment includes a differential flame graph, fixing it takes
+minutes.
+
+## Specific tools / techniques
+
+- **`bencher.dev`, `codspeed`** — managed services for perf CI.
+- **Criterion** (Rust) — statistical, generates HTML reports,
+  built-in regression comparison.
+- **JMH** (JVM) — best-in-class for microbenchmarks; integrate
+  with CI by parsing output.
+- **k6 + custom thresholds** — for HTTP endpoint perf in CI.
+- **Pyroscope continuous profiling** — compare profiles across
+  commits, identify the function that regressed.
+- **Causal profiling (Coz)** — identifies which functions, if
+  sped up, would yield the most program-wide speedup. Useful for
+  picking what to benchmark in the first place.
+
+## Anti-patterns to avoid
+
+- **Treating perf CI as advisory.** If it doesn't block merges,
+  it doesn't prevent regressions; it documents them after the
+  fact.
+- **Running benchmarks on shared infrastructure.** Variance
+  swamps signal; CI flaps; eventually you ignore it.
+- **One number per benchmark.** "We hit 1234 req/s" — at what
+  latency? At what error rate? Always report a tuple.
+- **Letting baselines drift silently.** "It used to be 50ms but
+  it's been 80ms for a month, that's just normal now." That's
+  not normal; that's an unaddressed regression.
+- **Ignoring "improvements" that look too good.** A "20%
+  speedup" sometimes means a dead-code-eliminated test. Audit
+  big wins as carefully as big regressions.
+
+## When perf CI isn't worth it
+
+- Pre-product-market-fit. Optimize for shipping; revisit later.
+- Internal-only tools where performance isn't a feature.
+- Services with no SLO commitments and no user-visible latency.
+
+For everything else, it's worth the investment. Performance
+regressions are the cheapest bugs to prevent and among the most
+expensive to fix in production.

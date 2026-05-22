@@ -1,0 +1,206 @@
+export const level = 'mid';
+
+# Cardinality
+
+Cardinality is the number of unique combinations of label values
+for a metric. It's the single most important cost driver in a
+metrics system. A small cardinality mistake can multiply your
+storage and ingest costs 100×.
+
+Understanding cardinality changes how you instrument code. The
+biggest wins from "good observability" usually come from *not*
+adding labels you shouldn't have added.
+
+## The mechanics
+
+A metric has a name (`http_requests_total`) and a set of labels
+(`endpoint`, `method`, `status`, `region`). Each unique combination
+of label values is a **time series**:
+
+```
+http_requests_total{endpoint="/users", method="GET",  status="200", region="us"} 4234
+http_requests_total{endpoint="/users", method="POST", status="200", region="us"} 18
+http_requests_total{endpoint="/users", method="POST", status="500", region="us"} 1
+http_requests_total{endpoint="/users", method="GET",  status="200", region="eu"} 9821
+...
+```
+
+The number of series = product of cardinalities of each label.
+
+```
+endpoints (50) × methods (5) × statuses (10) × regions (3) = 7,500 series
+```
+
+Add a `user_id` label with 1M users: 7,500 × 1,000,000 = **7.5
+billion series**. Each series has its own time-stamped value
+stored every scrape interval.
+
+This is the catastrophe people walk into accidentally. Most
+metrics backends will either:
+
+- Reject metrics past a cardinality limit (Prometheus).
+- Accept them and bill you for storage that grows linearly
+  with cardinality (Datadog, Cloud).
+
+## What's safe to put in labels
+
+A label value should be:
+
+- **Bounded in advance**. You know roughly how many distinct values
+  exist.
+- **Stable over time**. A new value appearing is unusual.
+- **Low cardinality**. Tens to low thousands is fine; millions is
+  not.
+
+Safe examples:
+
+- `endpoint` — bounded by your route table.
+- `method` — five HTTP methods that matter.
+- `status` — a few dozen at most.
+- `region` — your deployment topology.
+- `version` — releases rotate but slowly; old versions retire.
+- `environment` — prod, staging, dev.
+
+Unsafe examples:
+
+- `user_id` — your user count is your cardinality.
+- `request_id` — unbounded; one per request.
+- `email` — same as user_id.
+- `url` with query strings — unique per call.
+- `error_message` — free text; can be anything.
+
+When you want to "track metrics per user," what you actually want
+is **logs or traces filtered by user_id**, not a metric labeled
+by user_id.
+
+## How to find your cardinality footprint
+
+Prometheus and most TSDBs expose cardinality stats:
+
+```
+# Top 10 metrics by series count
+sum by (__name__) ({__name__=~".+"})
+  | topk(10, count by (__name__) (...))
+```
+
+Or via the admin API:
+
+```
+curl http://prometheus:9090/api/v1/status/tsdb
+```
+
+Returns:
+
+```
+{
+  "headStats": {
+    "numSeries": 1245678,
+    ...
+  },
+  "labelValueCountByLabelName": [
+    {"name": "endpoint", "count": 1242},
+    {"name": "user_id", "count": 482113},    <-- bad
+    {"name": "method", "count": 5},
+    ...
+  ]
+}
+```
+
+Vendor systems (Datadog, Grafana Cloud) have UIs that surface
+"top metrics by series count" or "high-cardinality labels." Run
+this monthly. New high-cardinality labels sneak in via well-meaning
+engineers.
+
+## When you really want per-user data
+
+Three honest options when you find yourself wanting to label by
+user_id:
+
+<Steps>
+<Step n="1" title="Move it to logs or traces">
+Logs and traces have user_id as a field, and you can search /
+filter on it. The right place for "how does this specific user
+experience the system."
+</Step>
+
+<Step n="2" title="Use exemplars">
+Some metric systems (Prometheus with exemplar support,
+OpenMetrics) let you attach an example trace ID or user ID to
+a metric data point — not as a label, but as a side reference.
+You can still see a representative user without exploding
+cardinality.
+</Step>
+
+<Step n="3" title="Track user *tiers* or *cohorts*">
+Instead of per-user, track per-tier (`tier=free`, `tier=enterprise`)
+or per-region cohort. Few values, useful aggregate.
+</Step>
+</Steps>
+
+## Cardinality budgets
+
+For teams operating at scale, set explicit cardinality budgets
+per service. "This service is allowed 100K active series total."
+
+When breaching:
+
+- Audit what's adding series.
+- Drop labels that don't earn their cost.
+- Aggregate (drop labels at recording-rule level for less critical
+  series).
+- Push detailed data to logs / traces instead.
+
+A useful diagnostic: which metric is growing fastest? Usually a
+label was added recently with an unbounded value.
+
+## High-cardinality stores
+
+Some metric stores are designed for higher cardinality:
+
+- **VictoriaMetrics** — handles much higher cardinality than
+  Prometheus at lower cost per series.
+- **M3** (Uber) — designed for billions of series.
+- **InfluxDB** — historically higher cardinality tolerance.
+- **Honeycomb** — built around high-cardinality structured events
+  rather than metrics; you can break down by any field including
+  high-cardinality ones.
+
+If your team genuinely needs to break down by high-cardinality
+attributes routinely, consider one of these. But the right answer
+for *most* teams is to discipline cardinality and use logs/traces
+for the rest.
+
+## Quick checks to add at instrumentation time
+
+When adding a metric label, ask:
+
+- **How many distinct values can this have?** If "unbounded," it's
+  not a label.
+- **Will I want to alert on this?** If yes, label. If not, log.
+- **Will I want to dashboard by this?** If yes, label. If not,
+  log.
+- **Will this value be the same for many consecutive requests?**
+  Good signal it's a real label.
+
+This 30-second check prevents the catastrophic mistakes.
+
+## A recovery story
+
+A typical scenario: you push a metric with `request_id` as a
+label by accident. Within hours, your TSDB has millions of new
+series. Storage costs balloon; queries slow down; alerts get
+noisy.
+
+Recovery:
+
+- **Roll back the change** immediately if possible.
+- **If the labels are in a hot metric**, drop them at the
+  recording-rule level (Prometheus) or scrape-time relabel
+  (Prometheus relabel_configs) to keep the metric without the
+  bad label.
+- **Force TSDB cleanup** of the orphaned series — they remain
+  until retention expires, but stop creating new ones.
+
+The lesson: cardinality bugs are easy to introduce, expensive,
+and slow to recover from. Catch them at code review or via
+automated alerts on "series-per-metric crossed N threshold."

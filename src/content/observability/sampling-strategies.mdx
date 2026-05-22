@@ -1,0 +1,221 @@
+export const level = 'senior';
+
+# Sampling strategies
+
+Observability data scales with traffic. At small scale, you keep
+everything. Past a certain volume, keeping everything costs more
+than you're willing to spend, and querying it gets slow. So you
+sample.
+
+Sampling done well preserves the signals you care about (errors,
+slow requests, representative examples of every kind of traffic).
+Done poorly, it deletes exactly the traces you needed during the
+incident.
+
+## Why sample at all
+
+The cost components that scale with kept volume:
+
+- **Ingest** (network, ingestion CPU).
+- **Storage** (hot, warm, cold tiers).
+- **Query latency** — more data = slower aggregations.
+- **Backend index pressure** — each event is indexed.
+
+For a service at 100k req/s producing 10 spans/request, **1
+million spans per second**. Storing all of them for 30 days =
+tens of TB. Cost of storage + ingest exceeds the cost of the
+compute fleet.
+
+Sampling lets you keep enough to debug without paying for
+exhaustive history.
+
+## Head-based vs tail-based sampling
+
+The first axis. Where in the lifecycle is the keep/drop decision
+made?
+
+<Compare>
+<thead>
+<tr><th></th><th>Head-based</th><th>Tail-based</th></tr>
+</thead>
+<tbody>
+<tr><td>Decision made</td><td>At the start of the trace</td><td>After the trace is complete</td></tr>
+<tr><td>Stored?</td><td>Sampling decision is encoded in the trace ID; downstream services honor it</td><td>Full trace buffered until decision</td></tr>
+<tr><td>Cost</td><td>Cheap; no buffering</td><td>Expensive; needs Collector with memory</td></tr>
+<tr><td>Can sample by outcome?</td><td>No (outcome unknown at start)</td><td>Yes (kept the error/slow ones)</td></tr>
+<tr><td>Need centralized collector?</td><td>No</td><td>Yes</td></tr>
+</tbody>
+</Compare>
+
+For most teams: **head-based default sampling + tail-based
+override for important traces**. The combination wins.
+
+## Head-based strategies
+
+Simple and effective when consistency across the trace matters.
+
+<Steps>
+<Step n="1" title="Probabilistic">
+"Keep N% of traces, drop the rest." Often 10% or 1%.
+
+```
+if (hash(trace_id) % 100) < 10:
+    sample = true
+```
+
+All spans in the same trace agree (because they share the trace
+ID). Predictable cost. Simplest implementation.
+</Step>
+
+<Step n="2" title="Rate-limited">
+"Keep up to N traces per second." Caps cost regardless of traffic
+spikes.
+
+```
+token bucket: 100 traces/sec
+if token available:
+    sample = true
+    consume token
+```
+
+Useful for sudden traffic spikes that would otherwise multiply
+sampled traces.
+</Step>
+
+<Step n="3" title="Adaptive / per-operation">
+"Keep at least K traces per operation per minute, plus N%
+beyond." Guarantees coverage of rare operations.
+
+```
+each operation has a budget of 10 traces/minute
+overhead: probabilistic 1% beyond that
+```
+
+Catches the long tail of operations that wouldn't appear in pure
+probabilistic sampling. Salesforce's argument for "per-key
+sampling" follows this pattern.
+</Step>
+
+<Step n="4" title="Custom / business-logic">
+"Always sample if the user is in the enterprise tier."
+"Always sample if the request came from QA."
+
+Lets you investigate specific scenarios without losing the trace
+to random sampling. Implement at the gateway, set the sampling
+flag in the trace header.
+</Step>
+</Steps>
+
+## Tail-based strategies
+
+The decision is made after the trace finishes. Now you can sample
+by what actually happened.
+
+```yaml
+policies:
+  - errors_always: sample if any span has error status
+  - slow_always: sample if total duration > 1000ms
+  - probabilistic_else: 5% random for everything else
+```
+
+The key win: **you keep every error trace and every slow trace
+even at low overall sample rates**. The traces you actually look
+at during incidents are kept; uninteresting "happy path" traces
+are dropped.
+
+What it costs:
+
+- **Memory at the Collector**: full trace buffered until the
+  decision wait time (typically 30s). For a 100k trace/s service,
+  this is gigabytes of in-memory data.
+- **Collector becomes a critical infrastructure component**:
+  losing a Collector loses every trace that was buffered.
+- **Decision latency**: traces aren't queryable until the
+  decision delay elapses.
+
+For most services, the trade is worth it. The Collector setup is
+the operational cost you pay for vastly more useful sampled
+data.
+
+## Sampling for metrics is different
+
+Metrics are pre-aggregated at the source, so "sampling" looks
+different:
+
+- **Don't actually sample counters**. A counter sampled at 10%
+  reports 10% of the count. Use the full count and scale at
+  query time, or sample only the *exemplars* (which point to
+  traces), not the metric itself.
+- **Sample exemplars**, which are pointers from a histogram
+  bucket to a representative trace. The metric is full
+  precision; only the exemplar is sampled.
+
+A common confusion: "we sample 10% of traces, do we also sample
+10% of metrics?" No — metrics aggregate per request; sampling
+metrics breaks the count. Sample at the trace layer only.
+
+## Sampling for logs
+
+Logs at scale are often sampled too:
+
+- **Drop DEBUG / INFO at high volume**, keep WARN / ERROR.
+- **Sample repeated log events**: "log 1 in 100 of `cache hit`."
+  Track the count as a metric separately.
+- **Always log errors and outliers unsampled**.
+- **Per-request sampling**: if the trace is sampled, log fully;
+  if not, log only errors. Keeps log volume tied to trace volume.
+
+The OTel Collector supports log sampling rules. Loki / Vector
+likewise.
+
+## What goes wrong
+
+- **Sampling decisions inconsistent across services**. Service A
+  decides to sample the trace; service B decides to drop. You get
+  half-traces. Use head-based sampling that propagates the
+  decision via the trace flag (`-01` in `traceparent` means
+  sampled).
+- **Important traces lost in pure probabilistic sampling**. The
+  user's bug-report request is at 0.1% probability of being
+  kept. Mitigate with tail sampling for errors/slow, or with
+  custom rules that boost sampling for specific cookies / users.
+- **Cost still high after sampling**. Often because the wrong
+  layer is sampled. Sampling spans drops trace cost, but if you
+  also keep all the logs and all the metric exemplars, you've
+  saved less than you think.
+- **Buffer overflow at the Collector during tail sampling**.
+  Memory limiter kicks in, drops random traces — your "100% of
+  errors" policy now misses some errors. Size memory generously
+  or use rate-limited tail sampling.
+
+## A reasonable default policy
+
+For a typical mid-scale service (10k - 100k req/s):
+
+- **Head sample at 10%** as the baseline.
+- **100% of errors** (tail sampled or via explicit `errored:
+  true` propagated up).
+- **100% of requests > p95 latency** (tail sampled).
+- **Tier-based override** for important users / customers.
+- **Per-operation budget** to avoid losing rare endpoints.
+
+Cost: ~12-15% of full sampling cost. Coverage: nearly 100% of
+the traces you'd actually want to inspect.
+
+## How much is enough
+
+If the question "can I find the trace for X?" can be answered
+yes 95% of the time, the sampling is fine. If it's a coin flip
+("is the trace I need in the store?"), boost sampling for the
+things you care about.
+
+A useful drill: ask your team to pick 5 recent customer support
+tickets and find the relevant traces. If you can find them all,
+sampling is generous enough. If half are missing, tune up.
+
+## Sampling doesn't replace good logging
+
+A common mistake: lean heavily on traces, sample aggressively,
+realize during an outage that the trace you need isn't in the
+store. **Logs at WARN+ should never be sampled**. They're cheaper
+than traces and form the safety net when sampling fails you.

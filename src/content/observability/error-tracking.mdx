@@ -1,0 +1,213 @@
+export const level = 'mid';
+
+# Error tracking
+
+A separate tool category from logs and metrics, focused on one
+question: **which exceptions are happening in production, where in
+the code, and how often?**
+
+You technically *could* answer this from logs. In practice,
+specialized error trackers (Sentry, Bugsnag, Rollbar, Honeybadger,
+GlitchTip) do it so much better that they're worth their own
+slot in the stack.
+
+## What error trackers do that logs don't
+
+<Steps>
+<Step n="1" title="Group automatically by fingerprint">
+A single bug throwing 10,000 times an hour shows up as **one issue
+with a count of 10,000**, not 10,000 separate log lines you have
+to mentally cluster.
+
+The grouping is by stack trace structure (a hash of frames),
+exception type, and message — so different inputs hitting the
+same code path collapse to one issue.
+</Step>
+
+<Step n="2" title="Show structured context per occurrence">
+Each occurrence captures: the stack trace, local variables at
+each frame, HTTP request details, browser / OS, deployed version,
+user context, breadcrumbs (recent events leading up to the
+error). You see *why* it failed, not just *that* it failed.
+</Step>
+
+<Step n="3" title="Track first-seen / regression">
+The tool notes when an error first appeared, when it stopped, and
+whether it reappeared. A regression after fix is flagged as
+"reopened," and you can attach a fix-version to verify it stayed
+fixed.
+</Step>
+
+<Step n="4" title="Resolve, ignore, assign">
+Errors have lifecycle states. "Resolved" gets reopened
+automatically if the same fingerprint recurs. "Ignored" stops
+notifications for known-low-impact errors. "Assigned" sends the
+error to a specific engineer.
+</Step>
+
+<Step n="5" title="Source map / debug-info handling">
+For frontend JavaScript, the tool unminifies stack traces by
+processing source maps. For native compiled languages, it
+processes debug symbols. You see source-level locations, not
+mangled minified positions.
+</Step>
+</Steps>
+
+## What you can't do this well with logs
+
+Try to answer from logs:
+
+- "What's the trend of unique errors over the last week?"
+- "Which deploy introduced this error?"
+- "Show me the local variables at the time of the exception."
+- "How many users were affected by this specific bug?"
+- "Has this exception been seen before, or is it new?"
+
+Each is possible with enough log infrastructure. None are easy.
+Error trackers do all of these out of the box, optimized for the
+"production exceptions" workflow.
+
+## Integration shape
+
+The minimum:
+
+```js
+// Capture uncaught exceptions
+window.onerror = (msg, src, ln, col, err) => sentry.captureException(err);
+window.onunhandledrejection = e => sentry.captureException(e.reason);
+
+// Manually capture handled errors
+try {
+  riskyOperation();
+} catch (err) {
+  sentry.captureException(err, { tags: { feature: 'checkout' } });
+  // ...handle gracefully
+}
+```
+
+Backend equivalents exist in every language. The SDK:
+
+- Hooks into uncaught-exception paths automatically.
+- Provides middleware for major frameworks (Express, Django,
+  Rails, Spring).
+- Lets you manually capture caught errors with extra context.
+- Sends asynchronously so it never blocks user requests.
+
+## What to capture (and what not to)
+
+Capture:
+
+- **Uncaught exceptions** — always.
+- **Caught exceptions that represent bugs** — e.g., your code
+  swallowed an error after logging it. The catch was intentional;
+  the underlying bug isn't.
+- **Failed external calls** worth investigating (3rd party
+  outages that affect users).
+
+Don't capture:
+
+- **Expected validation errors** ("user submitted invalid form").
+  Not bugs; user behavior.
+- **Auth failures** for normal access denial.
+- **404s** for missing resources that users hit normally.
+- **Errors with PII you can't redact**. Some payloads must never
+  leave your environment.
+
+The rule: capture **bugs**, not **expected outcomes**. Tools have
+features (Sentry's `inboundFilters`, Bugsnag's `discardClasses`)
+to drop noise at the SDK or server level.
+
+## Source maps for frontend
+
+A minified JS error stack trace is unreadable:
+
+```
+TypeError: Cannot read property 'id' of undefined
+  at a.bX (https://example.com/main.4f3a2c.js:1:23456)
+  at Object.fOd (https://example.com/main.4f3a2c.js:1:24102)
+```
+
+With source maps uploaded:
+
+```
+TypeError: Cannot read property 'id' of undefined
+  at UserProfile.render (src/components/UserProfile.tsx:42:18)
+  at Suspense.fallback (src/App.tsx:23:5)
+```
+
+Every frontend deploy should upload source maps to the error
+tracker as part of CI. Without this, your error tracker is half-useful.
+
+## Backend stack trace + context
+
+A typical Sentry event for a backend exception:
+
+- Exception type, message, stack trace.
+- Request context: HTTP method, URL, headers (with PII redacted),
+  body (with secrets redacted), user ID.
+- Server context: hostname, deployment version, environment.
+- Breadcrumbs: recent log entries, recent DB queries, recent
+  HTTP calls leading up to the error.
+- Tags: feature flags active, A/B test arm, customer tier.
+
+This level of structured context per occurrence is what makes
+error trackers worth their own tool.
+
+## Alerting and noise
+
+Error trackers don't replace metric-based alerts but add their
+own:
+
+- **New issues**: alert when an error fingerprint appears that
+  hasn't been seen before. Catches regressions on deploys.
+- **Spike detection**: alert when an existing error's rate spikes.
+  An always-present-but-low error suddenly becoming common is a
+  signal.
+- **Regression detection**: an issue marked resolved that
+  reappears.
+
+Don't alert on raw error counts ("send me an alert per error").
+That's noise. Aggregate and threshold.
+
+## Volume controls
+
+At scale, an error tracker can ingest millions of events per day.
+Cost grows accordingly. Controls:
+
+- **Server-side sampling**: send only X% of repeated errors after
+  they cross a frequency threshold.
+- **Client-side rate limiting**: SDK drops events once a per-process
+  rate is exceeded.
+- **Ignore lists**: known-bad-but-uninteresting errors filtered
+  before upload.
+
+Don't sample down to near-zero blindly — you lose the long tail of
+errors that affect 1 user. Sample smart: keep one event per
+fingerprint per time window even when overall rate is high.
+
+## Integrating with your dev workflow
+
+Error trackers integrate with issue trackers (Jira, Linear, GitHub
+Issues). The pattern:
+
+- Error appears in Sentry.
+- Engineer clicks "Create issue" → file in Linear with full
+  context.
+- Linear issue gets resolved → Sentry auto-closes when no more
+  occurrences seen.
+- Regression in production → Sentry reopens both the Sentry
+  issue and the Linear ticket.
+
+Cuts a lot of manual "copy stack trace into JIRA" work.
+
+## When you don't need a dedicated error tracker
+
+- Tiny services with low error volumes — well-structured logs +
+  search might suffice.
+- Compliance-heavy environments where sending exception data to
+  a 3rd party isn't allowed (use on-prem Sentry or GlitchTip).
+- Greenfield projects pre-launch — set up after you have users.
+
+For everything else, the time savings vs grep-through-logs is
+substantial. Most production-scale teams have an error tracker as
+part of their default stack, separate from logs and metrics.

@@ -1,0 +1,213 @@
+export const level = 'junior';
+
+# Log levels and what to log
+
+The most common logging failure mode in production isn't logging
+nothing — it's logging too much, at the wrong level, with the
+wrong content. The result: noisy logs that cost a fortune, alert
+fatigue, and the actual important entries lost in the noise.
+
+The right approach is intentional: pick what's worth logging,
+pick the level deliberately, and write the content to be useful to
+your future on-call self at 3am.
+
+## The standard levels
+
+<Compare>
+<thead>
+<tr><th>Level</th><th>Meaning</th><th>Prod default</th></tr>
+</thead>
+<tbody>
+<tr><td>**TRACE**</td><td>Extremely detailed; rarely used.</td><td>Off</td></tr>
+<tr><td>**DEBUG**</td><td>Diagnostic detail for developers.</td><td>Off</td></tr>
+<tr><td>**INFO**</td><td>Significant events worth recording.</td><td>On (often sampled)</td></tr>
+<tr><td>**WARN**</td><td>Unusual but not breaking; worth a look.</td><td>On</td></tr>
+<tr><td>**ERROR**</td><td>Something failed. Investigate.</td><td>On</td></tr>
+<tr><td>**FATAL**</td><td>About to crash; not all libraries have.</td><td>On</td></tr>
+</tbody>
+</Compare>
+
+The levels don't fully agree across ecosystems. Java's `log4j` has
+TRACE; Python's `logging` has CRITICAL instead of FATAL; Go's
+`slog` is INFO/WARN/ERROR plus a custom DEBUG. Pick a coherent
+set for your codebase.
+
+## Per-level guidance
+
+<Steps>
+<Step n="1" title="DEBUG: data you need to reproduce or trace internals">
+Used only during development or during specific investigations.
+Should not be enabled in prod by default; if you do, sample
+aggressively or scope to specific request IDs.
+
+Example: "computed cache key as `<value>` for user 42."
+</Step>
+
+<Step n="2" title="INFO: events that matter to operators">
+Service lifecycle (startup, shutdown), significant request
+outcomes (login success, payment captured), background job
+completion. NOT "received request" for every request — that's
+better as a metric.
+
+The test: would you want to see this entry in a 10-minute
+window of normal traffic? If yes, it's INFO. If no, it's DEBUG.
+</Step>
+
+<Step n="3" title="WARN: something unusual that needs human attention eventually">
+A retry succeeded after failures. A deprecated API was called. A
+slow query exceeded a soft threshold. Failed input validation in
+a way that suggests buggy client.
+
+WARN should be rare enough that a human reading the WARN feed
+for an hour can actually digest it. If WARNs are firing 10/sec,
+they're not warnings, they're noise.
+</Step>
+
+<Step n="4" title="ERROR: something failed that should not have">
+An exception you didn't expect. A downstream call failed beyond
+the retry budget. Data validation failed in a way that suggests
+data corruption. A consumer fell behind on its queue.
+
+Crucially: an ERROR is a thing **the on-call should look at**,
+either immediately (if alerting fires) or in a postmortem
+review.
+</Step>
+
+<Step n="5" title="FATAL: the process is about to die">
+OOM-imminent, unrecoverable state, can't acquire required
+resource. Rare. If your service has any FATAL logs in normal
+operation, your service has been compromised in some way.
+</Step>
+</Steps>
+
+## What is *not* an error
+
+Common misuses of ERROR that produce alert fatigue:
+
+- **"User not found"** on a lookup endpoint. That's not an error
+  of the service; it's a 404 outcome. INFO at most.
+- **"Validation failed"** for an input that the user typed wrong.
+  Not a service error. INFO or WARN.
+- **"Rate limit exceeded"** for an over-eager client. Functioning
+  as designed.
+- **"Timeout fetching from downstream"** if you handled the
+  timeout gracefully (returned cached value, fallback response).
+  WARN.
+- **Expected race conditions** that you retry through. WARN at
+  most, often INFO.
+
+The rule: **if the service handled it correctly, it's not an
+ERROR.** ERROR means "this needs human attention." If everything
+worked out, don't summon the human.
+
+## What to include in a useful log entry
+
+Bad:
+
+```
+"failed"
+```
+
+Tolerable:
+
+```
+"DB query failed"
+```
+
+Useful:
+
+```json
+{
+  "msg": "db query failed",
+  "service": "checkout",
+  "operation": "select_order",
+  "order_id": "ord_4f3a",
+  "user_id": 42,
+  "duration_ms": 5043,
+  "error.type": "TimeoutError",
+  "error.message": "connection timed out after 5000ms",
+  "db.host": "primary-db-3",
+  "request_id": "req_abc123"
+}
+```
+
+The useful version tells you:
+
+- **What** — DB query failed.
+- **Where** — checkout service, select_order operation.
+- **Whose** — user 42, order ord_4f3a.
+- **How long** — 5 seconds (which suggests it timed out).
+- **Why** — TimeoutError on primary-db-3.
+- **Correlation** — request_id to find the rest.
+
+You can now act on it.
+
+## The "log the input, not just the failure" rule
+
+When something goes wrong, log enough of the **input** that you
+can reproduce or understand it. Logging just "validation failed"
+without the offending input is useless an hour later.
+
+Caveats:
+
+- Don't log secrets (passwords, tokens).
+- Don't log full bodies if they're large; log relevant fields.
+- For sensitive fields (emails, names), consider hashes or
+  partial values.
+
+The goal is enough context that you can act on the log entry
+without re-running the request.
+
+## What not to log
+
+- **Sensitive data**: see redaction section in `structured-logging`.
+- **Health-check requests**: high volume, no signal. Filter them
+  out.
+- **Routine cache hits / misses**: metric, not log.
+- **Per-element loops**: a loop that iterates 10k times shouldn't
+  log per element. Log start, finish, and any errors.
+- **Stack traces for expected errors**: a 404 doesn't need a stack
+  trace. Reserve stack traces for unexpected ERRORs.
+
+## Logging in libraries vs. applications
+
+Libraries should:
+
+- **Use a configurable logger** (passed in, not hard-coded).
+- **Default to a higher level** — libraries shouldn't be chatty.
+- **Use DEBUG for internal detail**, INFO sparingly, never ERROR
+  for "the caller passed bad input" (return an error; let the
+  caller decide whether it's an ERROR).
+
+Applications should:
+
+- **Configure the logger once** at startup.
+- **Set per-environment levels** (DEBUG in dev, INFO in prod).
+- **Wire request context** so per-request fields auto-attach.
+
+## A useful default config
+
+For a typical service:
+
+- Default level: **INFO** in prod, **DEBUG** in dev.
+- Format: JSON.
+- Per-request fields auto-attached: request_id, user_id (when
+  authenticated), endpoint, method.
+- Sample INFO at 10-50% if traffic is high; never sample ERRORs.
+- Redact known sensitive fields.
+
+This handles 80% of cases without tuning.
+
+## Levels and metrics together
+
+A useful pattern: when you log an ERROR or WARN, also increment
+a metric. Now you can alert on `error_count > threshold` cheaply
+and use the log to investigate the specific instances.
+
+```js
+log.error({ err, user_id }, 'auth failed');
+metrics.counter('auth_failures', { reason: err.code }).inc();
+```
+
+The metric drives the alert; the log explains the alert. Two
+signals from one event.

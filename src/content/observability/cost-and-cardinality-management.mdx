@@ -1,0 +1,263 @@
+export const level = 'staff';
+
+# Cost and cardinality management
+
+At staff scope, observability isn't free engineering hygiene — it's
+a meaningful line item. A mature observability stack at a
+1,000-engineer company costs millions per year. Without active
+management, the cost grows faster than the system grows; with
+active management, it stays proportional and the team gets more
+value per dollar.
+
+This page is about the levers a staff engineer or platform team
+uses to keep observability cost healthy.
+
+## Where the money goes
+
+A typical breakdown of observability spend:
+
+<Compare>
+<thead>
+<tr><th>Component</th><th>Typical % of spend</th><th>Cost driver</th></tr>
+</thead>
+<tbody>
+<tr><td>Log storage and ingest</td><td>50-70%</td><td>Volume × retention</td></tr>
+<tr><td>Trace storage and ingest</td><td>15-25%</td><td>Volume × retention × indexing</td></tr>
+<tr><td>Metrics</td><td>10-15%</td><td>Series cardinality × retention</td></tr>
+<tr><td>APM / tooling licenses</td><td>5-10%</td><td>Hosts, users, features</td></tr>
+</tbody>
+</Compare>
+
+Logs dominate because every request can produce many entries, and
+each entry is full text. Metrics are usually cheapest because they
+aggregate at the source, *unless* cardinality is out of control
+— then they can become a top-1 cost.
+
+## The cost-vs-value question
+
+Before cutting cost, ask: which spending is producing value?
+
+A useful framing:
+
+- **Hot** data (queried frequently): worth the cost.
+- **Warm** data (queried during investigations): worth keeping
+  cheaply.
+- **Cold** data (rarely queried): archive aggressively.
+- **Dark** data (never queried): stop ingesting.
+
+Most observability stores have substantial dark data — metrics no
+one dashboards, logs no one greps, traces never opened. Cutting
+this is free value: lower cost, no loss.
+
+A quarterly audit: which 20% of metrics drive 80% of queries?
+Which 80% of metrics are never queried? Drop them.
+
+## The cardinality dragon
+
+The single biggest hidden cost driver. Once again, because it
+deserves repetition:
+
+- Each unique label combination is a separate time series.
+- Storage and ingest grow linearly with cardinality.
+- A high-cardinality label (user_id, request_id) can cause
+  100-1000× cost increase from one mistake.
+
+Defenses at staff level:
+
+<Steps>
+<Step n="1" title="Cardinality budgets per team / service">
+Each team gets a budget of active series. Auto-alert at 80%.
+Auto-reject at 100% (with override path).
+</Step>
+
+<Step n="2" title="Lint at code-review time">
+Tools that scan PRs for new label patterns and warn on suspect
+ones. Several open-source options; some teams write custom
+linters.
+</Step>
+
+<Step n="3" title="Quotas at the TSDB">
+Mimir / Cortex / Datadog all support per-tenant limits. Set them.
+A team that hits the limit can request more with justification.
+</Step>
+
+<Step n="4" title="Cardinality dashboards">
+A dashboard showing "top 10 metrics by series count" and
+"top 10 labels by cardinality." Review monthly. New high-cardinality
+labels are visible.
+</Step>
+
+<Step n="5" title="Pre-aggregation / recording rules">
+For metrics that genuinely need to be high-cardinality at the
+source, aggregate at recording-rule level into a lower-cardinality
+output series for storage.
+</Step>
+</Steps>
+
+## Log volume tactics
+
+Logs are usually the largest cost. Tactics, ordered by impact:
+
+- **Drop noise at the agent.** Health checks, debug logs in prod,
+  known-uninteresting events. Stops them before storage.
+- **Sample high-volume events.** Log 1% of cache misses; count
+  separately as a metric.
+- **Drop log fields you don't need.** A 200-field event with 20
+  useful fields is 90% waste.
+- **Reduce retention.** 7 days hot, 30 days warm, 90 days cold.
+  Most investigations happen in the first 24 hours.
+- **Tier storage.** Hot in fast-query store, cold in S3. 5-10×
+  cost difference.
+- **Compress.** Most agents do this; verify it's on.
+- **Filter at the source.** Some apps log every cache lookup
+  because someone debugged it once. Now it's permanent
+  background noise.
+
+A good rule of thumb: **for any log line you emit, ask "would I
+search for this?"** If the answer is "no," it doesn't need to be
+in the index. Either it's a metric or it shouldn't exist.
+
+## Trace cost tactics
+
+After cardinality, the biggest trace cost driver is sampling
+strategy:
+
+- **Aggressive head sampling** — drop most traces at the source.
+- **Tail sampling for errors and slow requests** — keep what
+  matters.
+- **Cap spans per trace** — pathological traces with thousands of
+  spans cost disproportionately. Some collectors will drop
+  these.
+
+For a typical service: 5-10% head sampling, plus 100% tail
+sampling on errors and high-latency outliers. Total: maybe 10-15%
+of full data, but 95% of the analytical value.
+
+## Metric cost tactics
+
+For metrics specifically:
+
+- **Reduce label cardinality** (the dragon, again).
+- **Cut unused metrics.** Audit which queries hit which metrics.
+- **Larger scrape intervals** for non-critical metrics. 60s
+  instead of 15s = 4× fewer data points.
+- **Drop unused buckets** from histograms. A histogram with 25
+  buckets that you only ever query for p50/p95/p99 could be
+  10 buckets.
+- **Shorter retention** for high-cardinality metrics. Old per-pod
+  data is rarely queried; old aggregated data is queried
+  routinely.
+
+## The vendor switching tradeoff
+
+A typical pattern: company starts on Datadog at small scale,
+grows, Datadog bill becomes painful, considers self-host.
+
+The decision is rarely as simple as "self-host is cheaper":
+
+- **Compute and storage costs** of self-host are lower at scale,
+  but...
+- **Headcount cost** of operating it is significant. 2-4
+  engineers full-time at scale.
+- **Time-to-value** of vendor features. Switching to self-host
+  means rebuilding some integrations.
+- **Quality of incident response** — vendor tools are often more
+  polished.
+
+A common middle path: stay on vendor for products that are
+hard to replicate (APM, RUM); move high-volume cheap commodities
+(logs, basic metrics) to self-host. Hybrid stacks are common.
+
+OpenTelemetry lowers the switching cost — instrumentation is
+portable. The decision is now about backends, not instrumentation.
+
+## Showback and chargeback
+
+A useful organizational tactic: **show each team their share of
+observability cost**.
+
+- "Your service costs $X/month in logs, $Y in metrics, $Z in
+  traces. Total: $...".
+- Show the cost on a dashboard. Visible to engineers, managers,
+  and leadership.
+- For teams that exceed allocations: conversation about why.
+
+The behavior change from showback alone is often substantial.
+Teams find ways to cut costs when they see what they spend.
+
+Chargeback (actually billing teams) is more politically loaded
+and harder to roll out, but even stronger in effect.
+
+## Optimization is an ongoing process
+
+Not a one-time project. The natural state of an observability
+stack is to grow without bound; active management keeps it
+bounded.
+
+A cadence that works:
+
+- **Weekly**: cost dashboard review by platform team.
+- **Monthly**: top growers, anomaly investigation.
+- **Quarterly**: per-team allocations review. Tactical optimizations
+  with the worst offenders.
+- **Annually**: strategic review. Tool selection, retention
+  policies, contractual commitments.
+
+Most savings come from disciplined ongoing review, not heroic
+one-off projects.
+
+## When to spend more
+
+A staff engineer's job isn't only to cut cost. Sometimes the right
+answer is to **spend more on observability** because the team is
+operating blind in a way that's expensive in other ways.
+
+Concrete indicators:
+
+- Incidents extend longer than they should because nobody can find
+  the issue.
+- The team is debating in postmortems whether problem X happened
+  (no data to confirm).
+- A new architecture is being adopted without observability
+  parity to the old one.
+- Engineers spend hours per week pasting log lines together
+  instead of using tools.
+
+In these cases, the cost of *not* spending exceeds the cost of
+spending. Quantify if you can: "we lost X engineer-hours and Y
+customer-incidents because of observability gaps; investing
+$Z/year would prevent most of it."
+
+## What to escalate
+
+Observability cost is one area where senior leadership often has
+real input:
+
+- **Tool selection** — strategic, affects roadmap.
+- **Major retention changes** — affects compliance, incident
+  response capability.
+- **Multi-year vendor contracts** — financial commitment.
+- **Headcount for platform team** — organizational.
+
+Tactical optimizations (sampling rules, retention adjustments,
+specific dashboards) — handle within the team.
+
+A platform team that knows the difference between strategic
+escalation and tactical autonomy operates more efficiently than
+one that escalates everything or nothing.
+
+## A reasonable end state
+
+A team operating at a healthy observability cost equilibrium:
+
+- Observability spend is 5-15% of compute spend.
+- Cost grows linearly with traffic, not faster.
+- Teams know their cost and have local incentives to manage it.
+- Cardinality is bounded and budgeted.
+- Retention tiers match query patterns.
+- Dark data is regularly purged.
+- Tools are selected for value, not just inertia.
+
+Reaching this isn't a one-quarter project. Maintaining it isn't
+either. But the steady state is much better than the alternative
+of cost-driven panic every 6-12 months.

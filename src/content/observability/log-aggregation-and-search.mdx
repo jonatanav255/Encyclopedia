@@ -1,0 +1,180 @@
+export const level = 'junior';
+
+# Log aggregation and search
+
+A single server's logs land in `/var/log/myservice/`. Tail them
+with `tail -f`. Easy.
+
+A fleet of 100 servers, autoscaling, ephemeral containers, multi-region
+— now you have **logs on machines you can't ssh into, that get
+destroyed when an instance terminates**. SSH-based debugging doesn't
+work. You need centralized aggregation.
+
+## The pipeline shape
+
+Almost every log aggregation system follows the same skeleton:
+
+```
+app → local agent → shipper → backend → index → query/UI
+```
+
+- **App** emits structured logs (stdout, file, syslog).
+- **Local agent** (Fluentd, Fluent Bit, Vector, Filebeat) tails
+  them, adds metadata (host, pod, tags), and ships.
+- **Shipper / queue** (Kafka, NATS, direct HTTP) buffers in transit
+  so backend slowdowns don't lose logs.
+- **Backend** (Elasticsearch, Loki, Splunk, ClickHouse, etc.)
+  stores logs.
+- **Index** makes them searchable by field.
+- **Query/UI** (Kibana, Grafana, Splunk Search, Datadog Logs)
+  lets humans ask questions.
+
+The path matters because **failure at any step loses logs**.
+Designing each link is non-trivial at scale.
+
+## Buffering and durability
+
+Logs are best-effort by convention. Most pipelines lose some during:
+
+- Backend overload (rejected writes).
+- Network partitions.
+- Agent restarts (in-memory buffer dropped).
+- Container kills before flush.
+
+Mitigations:
+
+- **Persistent buffers** on the agent (disk-backed queues).
+  Survives restarts.
+- **Async write with retry** at the shipper.
+- **Sampling under pressure** — drop debug/info first; keep errors.
+- **Backpressure-aware producers** — apps that block when the
+  shipper is full prefer log loss to OOM.
+
+For most services, "lose 0.1% under extreme conditions" is
+acceptable. For audit logs / compliance logs, **you need a
+synchronous, durable path** — often a separate system from
+operational logs.
+
+## What the backend does
+
+Indexers serve a specific query pattern: "given a query expression
+over fields, return matching events from a time range."
+
+Two architectural families:
+
+<Compare>
+<thead>
+<tr><th></th><th>Inverted-index (Elastic, Splunk)</th><th>Label-indexed (Loki)</th></tr>
+</thead>
+<tbody>
+<tr><td>Indexed</td><td>Every field</td><td>Only labels (tags)</td></tr>
+<tr><td>Full-text search</td><td>Fast on any field</td><td>Linear scan of label-matched streams</td></tr>
+<tr><td>Storage cost</td><td>Higher (index overhead)</td><td>Lower (label-only)</td></tr>
+<tr><td>Cardinality limits</td><td>Wider tolerance</td><td>Tight on labels (don't put user IDs in labels)</td></tr>
+<tr><td>Use for</td><td>Heavy ad-hoc queries</td><td>Volume-driven workloads</td></tr>
+</tbody>
+</Compare>
+
+The choice often comes down to cost. Elastic is more flexible
+but expensive at scale. Loki + Grafana is much cheaper but expects
+you to know what fields you'll search by.
+
+For most teams: Loki for high-volume operational logs; a smaller
+Elastic / Splunk for audit and incident-investigation logs that
+benefit from full-text search. Or a vendor (Datadog, Honeycomb,
+Splunk Cloud) that hides the choice.
+
+## What "structured" enables
+
+Structured logs (see the structured-logging page) are the unlock
+for useful querying:
+
+```
+# Find all error logs for a specific user
+service:api AND level:error AND user_id:42
+
+# Group error rates by endpoint
+service:api AND level:error | stats count() by endpoint
+
+# Find slow requests
+service:api AND duration_ms:>1000 | stats avg(duration_ms) by endpoint
+
+# Trace a specific request across services
+request_id:abc123 | sort ts
+```
+
+Each query is fast because the backend indexes the fields. Without
+structure, every query is a `grep`-equivalent over text — slow
+and brittle.
+
+## Cost shapes at scale
+
+The single biggest line item: **log volume**. A few patterns to
+control it:
+
+- **Sample high-volume events.** Log 1% of cache hits; count them
+  as a metric. The 1% is enough to understand individual cases.
+- **Drop noise at the agent.** Don't ship health checks, debug
+  logs in prod, or known-uninteresting events.
+- **Reduce retention.** 7 days of detailed logs + 30 days of
+  summaries is usually adequate for ops; 30+ days only for audit
+  / compliance.
+- **Cheaper storage for older logs.** Hot for 7 days (queryable
+  in seconds), warm for 30 days (queryable in minutes), cold for
+  the rest (rare access). S3-backed log archives are cheap.
+- **Compress at the agent.** Most ship compressed by default.
+
+A typical breakdown of cost in a log pipeline:
+
+- ~60% storage.
+- ~25% ingestion/processing.
+- ~15% queries/UI.
+
+You can predict most of the bill from volume × retention.
+
+## Correlation across signals
+
+The killer feature of a log aggregation system isn't search — it's
+**correlation**. From a log, you should be able to jump to:
+
+- The metric values at the same time (load, error rate, latency).
+- The distributed trace for the same request.
+- Other log entries from the same request (request_id pivot).
+- Other log entries for the same user, instance, or version.
+
+Most modern observability vendors do this automatically when
+fields are present (`trace_id`, `request_id`, `service`,
+`instance`). The investment is in instrumenting the app to emit
+these fields consistently.
+
+## A reasonable initial setup
+
+For a small-to-medium service:
+
+- **Format**: JSON structured logs to stdout.
+- **Agent**: Vector or Fluent Bit (lightweight, low memory).
+- **Backend**: Loki + Grafana (open source, low cost), or a SaaS
+  like Datadog if budget exists.
+- **Retention**: 7 days hot, 30 days warm, 90 days archive.
+- **Sampling**: errors unsampled; info sampled at 10% if traffic
+  is high; debug off in prod.
+- **Mandatory fields**: ts, level, service, version, message,
+  trace_id, request_id.
+
+Most teams over-engineer this initially. The right move is the
+simplest setup that works, then iterate.
+
+## Don't store everything
+
+Logs aren't a system of record. Two ways teams misuse them:
+
+- **As a database.** "We'll log every entity change and query
+  the logs later." No — use a database. Logs aren't optimized for
+  this; they have variable schema and are sometimes lossy.
+- **As an audit trail.** Operational logs are best-effort. If
+  audit is a compliance requirement, you need a separate
+  durable pipeline (write to a queue, ack from a durable store,
+  alert on failure).
+
+Logs are for **operations and debugging**, not data warehouse or
+ledger. Confusing the roles leads to outages.

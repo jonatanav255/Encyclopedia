@@ -1,0 +1,267 @@
+export const level = 'senior';
+
+# Exemplars and signal correlation
+
+The three pillars (logs, metrics, traces) on their own are
+useful. The **correlation between them** is where mature
+observability lives. An alert fires on a metric → click into a
+representative trace → from the trace, jump to the logs for that
+specific request → see the full story in 10 seconds.
+
+This page covers the mechanisms that wire the signals together.
+
+## The problem to solve
+
+Without correlation, an investigation looks like:
+
+```
+1. Alert: "p99 latency on endpoint X spiked at 14:32"
+2. Open the latency dashboard — confirmed.
+3. Open the trace UI, filter by endpoint X, time range
+   14:30-14:34, latency > 1s, hope for a representative
+   trace.
+4. Find a slow trace. Note its trace ID.
+5. Open the log UI. Search for that trace ID.
+6. Read the logs.
+7. Note user_id and downstream service from logs.
+8. Investigate downstream.
+```
+
+Each step is a context switch with mental friction. Five minutes
+per investigation, sometimes more.
+
+With correlation, the same investigation:
+
+```
+1. Alert. Click the metric spike.
+2. UI shows representative trace IDs (exemplars).
+3. Click one; trace UI opens.
+4. From the trace, click any span; logs open filtered to that
+   trace.
+5. Read the story end-to-end.
+```
+
+Maybe 30 seconds. The tooling is doing what the engineer used to
+do by hand.
+
+## Exemplars: metrics → traces
+
+An **exemplar** is a pointer from a metric data point to a
+representative trace. Standardized in OpenMetrics:
+
+```
+http_request_duration_seconds_bucket{le="0.5"} 998 # {trace_id="4f3a..."} 0.46 1716387123
+```
+
+That trailing `# {...}` is the exemplar — for this bucket
+observation, here's a trace ID that landed in this bucket, along
+with the actual value and timestamp.
+
+In dashboards (Grafana with Prometheus exemplars enabled), the
+histogram chart shows dots at observation points. Click one →
+jump to the trace.
+
+Use cases:
+
+- **Latency histograms**: each bucket can carry exemplars; the
+  user can click into the p99 bucket and see why that bucket has
+  long latencies.
+- **Error counts**: each error sample's exemplar is the trace of
+  one of the failing requests.
+- **Throughput**: less useful for exemplars.
+
+Adoption: Prometheus supports exemplars since 2.26 (2021).
+OpenTelemetry SDKs emit them when configured. Modern dashboards
+(Grafana, Datadog) surface them.
+
+## Logs → traces
+
+The mechanism: **every log entry carries the current trace_id**.
+
+```json
+{"ts": "...", "level": "info", "msg": "user fetched", "trace_id": "4f3a..."}
+```
+
+How this happens:
+
+- OpenTelemetry's logging bridges inject the active trace context
+  into log records automatically.
+- Or you configure your logger with a context resolver that
+  pulls trace_id from the current context.
+
+Once the trace_id is in the log, the log UI can be wired to "this
+log entry has a trace_id, click here to open the trace."
+
+```js
+import { trace } from '@opentelemetry/api';
+
+logger.info({
+  trace_id: trace.getSpanContext()?.traceId,
+  user_id: user.id,
+}, 'user fetched');
+```
+
+Or with OTel's log SDK, automatic.
+
+## Traces → logs
+
+The reverse direction: from a span, jump to the logs for that
+request.
+
+The log UI needs to be searchable by trace_id (it is, if you've
+been putting trace_id in logs). The trace UI needs to know the
+URL to navigate to.
+
+In Grafana: configure **trace-to-logs** in the data source
+settings. Clicking a span opens the log query for that trace_id.
+Datadog, Honeycomb, and others have equivalents.
+
+## Traces ↔ profiles
+
+A newer correlation: from a trace span to a continuous profiler
+flame graph for that period.
+
+- Grafana Pyroscope ↔ Tempo: click a slow span, see the CPU
+  profile during that span.
+- Datadog Continuous Profiler ↔ APM: same.
+- Pyroscope is open source; the integration with Grafana Tempo is
+  free.
+
+For CPU-bound requests, the flame graph is the next layer of
+detail beyond "the span took 200ms." You can see *which functions
+inside the span* consumed the time.
+
+## Resource attributes for cross-signal join
+
+OpenTelemetry's notion of **resource attributes** describes the
+entity producing signals: service name, version, instance,
+environment, region.
+
+```yaml
+resource:
+  service.name: api-gateway
+  service.version: 2.31.4
+  deployment.environment: prod
+  k8s.pod.name: api-gateway-7d9
+  k8s.namespace.name: default
+  host.name: ip-10-0-1-23
+```
+
+These attributes are attached to every metric, trace, and log
+from the same process. They enable queries across signals: "show
+me everything from `service.version: 2.31.4` since deploy."
+
+Resource attributes are the unsung correlation mechanism.
+Without consistency across signals, joins fall apart. OTel
+auto-detection populates many of them; explicit configuration
+fills the rest.
+
+## Deploy markers
+
+A specific kind of correlation worth calling out: **vertical
+lines on dashboards marking deploys**.
+
+A latency spike at 14:32 means little. A latency spike at 14:32,
+3 minutes after a deploy at 14:29, means a lot. The "deploy
+caused this" hypothesis goes from 4 minutes of investigation to
+the first thing you see.
+
+Implementations:
+
+- **Grafana annotations**: post a deploy event to Grafana via API.
+  Shows as a vertical line.
+- **Datadog Events**: same idea.
+- **Slack-integrated deploy bots** that also fire annotation
+  events.
+
+A 30-second integration that pays back forever.
+
+## Wide events (the Honeycomb approach)
+
+A different philosophy: instead of three separate signals tied
+together, emit one **structured wide event** per request that
+contains every dimension of interest — duration, user, version,
+error if any, dependency latencies, etc.
+
+```json
+{
+  "trace.trace_id": "4f3a...",
+  "trace.span_id": "00f0...",
+  "service.name": "api-gateway",
+  "duration_ms": 220,
+  "http.status_code": 200,
+  "user.id": 42,
+  "user.tier": "enterprise",
+  "feature_flag.experimental_cache": true,
+  "downstream.user_service.duration_ms": 120,
+  "downstream.cache.hit": true,
+  "deploy.version": "2.31.4",
+  "error.type": null,
+  ...
+}
+```
+
+Honeycomb argues this is more flexible than separate
+metrics/logs/traces because **you can pivot on any field**. You
+don't have to pre-aggregate into a histogram bucketed by service
++ endpoint; you can do the aggregation at query time.
+
+The trade: cost. Wide events are more storage than aggregated
+metrics. The upside: aggregations are computed at query time, so
+new questions don't need new metrics.
+
+A useful pattern even outside Honeycomb: emit a wide event per
+request as a high-cardinality log line, in addition to your
+metrics and traces. Gives you the pivot capability when you need
+it.
+
+## The mental model
+
+Three signals + the resource attributes that join them:
+
+```
+       resource attributes (service, version, instance, region)
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+     metrics        traces          logs
+        │              │              │
+        └── exemplar ──┴── trace_id ──┘
+              points to
+              specific
+              traces
+```
+
+The arrows are the correlation paths. A mature observability
+stack has all of them populated.
+
+## Practical setup
+
+To get from "we have three pillars" to "they're correlated":
+
+<Steps>
+<Step n="1" title="Pick OTel">
+The cross-signal join works much better when all signals share
+context. OTel propagates trace context to logs, metrics, and
+profiles automatically.
+</Step>
+<Step n="2" title="Enable exemplars on histograms">
+Modify your histogram emission to include exemplars. Most
+backends now support them.
+</Step>
+<Step n="3" title="Configure dashboard data sources">
+In Grafana: link Loki/Tempo/Prometheus together. Click flow
+becomes natural.
+</Step>
+<Step n="4" title="Add deploy annotations">
+Every deploy posts to Grafana. Every dashboard with a relevant
+metric shows the line.
+</Step>
+<Step n="5" title="Standardize resource attributes">
+service.name, version, environment, region — required on every
+signal.
+</Step>
+</Steps>
+
+After this, the cross-signal navigation becomes natural. A
+on-call investigation that took 5 minutes takes 30 seconds.

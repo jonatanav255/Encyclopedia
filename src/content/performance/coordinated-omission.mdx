@@ -1,0 +1,185 @@
+export const level = 'staff';
+
+# Coordinated omission
+
+Coordinated omission is the most insidious latency-measurement bug
+in modern systems. It was named and analyzed by Gil Tene around
+2012-2013 (the "How NOT to Measure Latency" talk hit QCon NY in
+June 2013), and it changed how anyone serious about latency
+measurement designs load tests and percentile estimation.
+
+It's "insidious" because the data looks fine. The numbers come back
+showing good percentiles. The customers complain. You eventually
+discover that you were systematically not measuring the slow
+requests at all.
+
+## The setup
+
+A closed-loop load test:
+
+```python
+while running:
+    t0 = time.time()
+    response = send_request()
+    record_latency(time.time() - t0)
+    sleep(0.001)  # 1000 req/s target
+```
+
+This is **how most basic load testers work**. wrk, ab, naive
+Python loops, naive Java loops.
+
+## The bug
+
+Now imagine the server stalls for 10 seconds. What happens?
+
+- The current `send_request()` blocks for 10 seconds.
+- The loop is *not* sending requests during the stall.
+- After the stall, one (1) request is recorded with a 10-second
+  latency. **That's it.**
+
+The test recorded **1 slow request**. In reality, during a 10s
+stall at a 1000 req/s target, **10,000 requests were prevented
+from happening**. They should have arrived during the stall and
+each waited some amount of time. By the closed-loop client's
+construction, they never existed.
+
+## Why the percentiles lie
+
+Suppose the test ran for 10 minutes (60,000 requests in steady
+state) and had one 10-second stall:
+
+- p50 = 5ms (correct-looking)
+- p95 = 20ms (correct-looking)
+- p99 = 50ms (correct-looking)
+- p99.99 = 10s (single outlier)
+- **Mean ≈ correct steady-state + tiny perturbation**
+
+A user with a real workload (open-loop, arrivals on a schedule
+regardless of past behavior) would see:
+
+- 10,000 requests stuck waiting during the stall.
+- Each one experiences some fraction of the 10-second delay.
+- p99 = ~10 seconds.
+
+The closed-loop p99 says 50ms. The real-user p99 is 10 seconds.
+**Two orders of magnitude wrong on the metric that matters most
+for SLOs.**
+
+## Why "coordinated" — the name
+
+The client and server are "coordinated" by the blocking call: the
+client is **prevented from issuing further requests** during the
+slowdown. Real users don't wait their turn; they refresh, retry,
+and arrive on their own schedule.
+
+## The two fixes
+
+<Steps>
+<Step n="1" title="Open-loop load generation">
+Decouple the request schedule from the response schedule. Each
+request fires at its scheduled time even if previous requests
+are still in flight. wrk2 and k6's `constant-arrival-rate`
+executor are designed for this.
+
+```
+wrk2 -t 4 -c 100 -R 1000 -d 60s http://host/
+       4 threads, 100 connections, 1000 req/s target, 60s
+```
+
+If the server stalls, the load generator's request queue grows
+on the client side. Each request records the full latency it
+experienced (including queueing).
+</Step>
+
+<Step n="2" title="HdrHistogram with expected interval">
+Even with closed-loop testing, if you record latency *plus
+expected interval*, the recorder can interpolate the missing
+samples.
+
+HdrHistogram's `recordValueWithExpectedInterval(value,
+expectedInterval)` does exactly this. For a 10s observed latency
+when expected interval is 1ms, it records 10,000 samples ranging
+from 1ms to 10s (linearly interpolated). The histogram now
+reflects the implied lost requests.
+
+This is a *correction* — not as good as real open-loop data, but
+much better than the raw closed-loop number.
+</Step>
+</Steps>
+
+## Where it shows up in practice
+
+Coordinated omission affects more than load testing:
+
+- **Service-internal latency metrics.** A worker that processes
+  one item at a time naturally exhibits CO: when one item is
+  slow, downstream items aren't being processed yet, so their
+  latencies appear later (when picked up, with the queue wait
+  starting only then).
+- **Caller-side timing in synchronous RPC**. If your client thread
+  blocks on each RPC, you've reproduced the load-test bug. Async
+  with explicit deadlines avoids it.
+- **Producer-consumer pipelines.** A slow consumer doesn't reduce
+  arrivals; it reduces *observed* arrivals at the consumer.
+- **Sampled metrics.** Sampling that's triggered "every N
+  responses" coordinates the sampling with the latency.
+
+## The right way to record application latency
+
+For latency that reflects user experience:
+
+- **Start the timer when the work *arrives***, not when the
+  worker picks it up.
+- **End it when the response is sent to the user**, not when the
+  work finishes.
+- **Use a recorder that knows about expected intervals** if you
+  have systematic stalls.
+
+Concretely, for an HTTP server, the latency should include the
+time the request sat in any internal queue waiting for a worker
+— not just the time the worker spent on it.
+
+## Gil Tene's stronger framing
+
+Tene's argument goes further: most percentile reporting in
+production is wrong by an order of magnitude because of CO. Some
+specific claims worth thinking about:
+
+- **Average GC pause times reported by application servers**
+  often have CO. The "stop the world" pause is recorded for one
+  request; the requests that would have arrived during the
+  pause aren't counted.
+- **"P95 of response time" measured at the load balancer** has
+  this issue if measurement happens after the response leaves —
+  by then, queued requests aren't yet visible.
+- **Lambda / serverless** cold start metrics may underestimate
+  user-facing impact because retries during cold start aren't
+  recorded as part of the cold start's latency.
+
+The defense is the same in each case: think about *what events
+should have happened* during a stall, and whether your
+measurement captures them.
+
+## The diagnostic test
+
+Ask "what would my latency dashboard show if the service stalled
+for 30 seconds?" If the answer is "one request with 30-second
+latency," CO is present. If the answer is "10,000 requests with
+latencies between 1ms and 30s," CO is not present.
+
+For most off-the-shelf benchmark tools, the answer is "one
+request." Almost every published "we benchmarked at 100k req/s
+with 5ms p99" number on the internet is suspect.
+
+## Tools that get this right (today)
+
+- **wrk2** — Gil Tene's fork of wrk. Open-loop, HdrHistogram-based.
+- **k6** — has `constant-arrival-rate` executor for open-loop.
+- **JMeter** — with `Constant Throughput Timer` configured.
+- **Vegeta** — constant-rate by default.
+- **HdrHistogram in app code** — for production latency
+  recording.
+
+If you're choosing a load tester and the docs don't mention
+coordinated omission or open-loop arrival, the tool likely has
+the bug.

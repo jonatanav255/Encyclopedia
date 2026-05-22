@@ -1,0 +1,205 @@
+export const level = 'staff';
+
+# Little's Law, Amdahl, and Universal Scalability
+
+Three formulas, each a one-liner, each more useful than ten
+intuitions. They tell you the bounds on what your system can do,
+no matter how much you optimize.
+
+## Little's Law (review)
+
+```
+L = λ × W
+```
+
+- **L** — concurrent items in the system at steady state
+- **λ** — throughput (items per unit time)
+- **W** — latency per item
+
+Any two determine the third. It holds under almost any conditions.
+This is the only one of the three that's a hard *equality* (the
+other two are *upper bounds*).
+
+Typical uses:
+
+- "We do 5,000 req/s at 200ms latency. So we have 1,000 concurrent
+  in-flight requests. Our connection pool, our worker pool,
+  whatever's serving those — they all need to handle 1,000
+  concurrent or we have a bottleneck."
+- "If we double throughput at the same latency, in-flight
+  doubles. Plan accordingly."
+
+## Amdahl's Law
+
+```
+Speedup(N) = 1 / ((1 - p) + p / N)
+```
+
+- **N** — number of parallel workers / cores / shards
+- **p** — fraction of the workload that's parallelizable (0 to 1)
+
+The maximum theoretical speedup from adding parallelism. The bound
+is:
+
+```
+max speedup = 1 / (1 - p)
+```
+
+If your workload is 90% parallel, the maximum speedup is **10×**,
+no matter how many cores you throw at it. If 99% parallel, max is
+100×. The remaining serial fraction is the floor that limits
+everything.
+
+What this tells you:
+
+- **Adding cores doesn't help most workloads as much as you'd hope.**
+  At p=0.9, going from 4 to 8 cores improves speed by ~17%, not
+  2×.
+- **The serial fraction is what you have to attack.** A 1%
+  improvement in the serial part is often more valuable than
+  doubling the parallel cores.
+- **Diminishing returns are sharp.** The first few cores help
+  hugely; the next few help less; eventually nothing helps.
+
+The classic chart:
+
+```
+Speedup
+   10 |.................   ← p=0.9, asymptote
+    8 |        ___________
+    6 |     __/
+    4 |  __/
+    2 |_/_____________________ p=0.5, asymptote at 2
+       1    4    16    64   N
+```
+
+Note Amdahl's Law **never models negative effects**. It says
+"speedup at N cores ≤ X." It doesn't say "speedup might *decrease*
+beyond N cores." Real systems often do.
+
+## Universal Scalability Law (USL)
+
+Gunther's USL extends Amdahl by modeling **contention** (alpha) and
+**coherence** (beta):
+
+```
+Speedup(N) = N / (1 + α(N - 1) + βN(N - 1))
+```
+
+- **α** — contention coefficient (serial-ish fraction)
+- **β** — coherence coefficient (cost of cross-worker
+  coordination)
+
+The first two terms reproduce Amdahl. The β term — coherence —
+matters because in real systems, adding workers means more
+coordination between them: cache invalidations, lock cache-line
+bouncing, mutex hot-spots, distributed consensus rounds. This
+cost grows *quadratically* in N.
+
+The result: **the USL has a maximum**. Past a certain N, adding
+more workers makes things *worse*.
+
+```
+Speedup
+   10 |       ___
+    8 |      /   \___                  ← peak around N=8, then declines
+    6 |     /
+    4 |    /
+    2 |   /
+       1    4    16    64   N
+```
+
+This is what you actually see in benchmarks. Throughput rises with
+N, peaks somewhere, then falls. The USL is the equation that
+matches the curve.
+
+Practical implications:
+
+- **There's an optimal worker count** for any given workload. Past
+  it, you lose. Find it empirically.
+- **Reducing β has compounding returns.** Cutting coherence cost
+  in half doesn't just speed up by 2× — it raises the peak N
+  significantly.
+- **Lock-free / share-nothing designs reduce β**, often dramatically.
+  This is why "scale-out" architectures (independent instances)
+  outperform "scale-up" (more cores per instance) at large N.
+
+## Fitting USL to your system
+
+A reasonable scaling experiment:
+
+<Steps>
+<Step n="1" title="Measure throughput at N=1, 2, 4, 8, 16, 32 workers">
+Same workload, varying parallelism.
+</Step>
+<Step n="2" title="Plot throughput vs N">
+Eyeball the curve.
+</Step>
+<Step n="3" title="Fit USL coefficients">
+Tools like the `usl` R package, or just by hand: find the α that
+matches the early sublinearity, find the β that matches the
+peak/decline.
+</Step>
+<Step n="4" title="Predict N_max">
+The N at which throughput peaks. Operate near it but not past it.
+</Step>
+</Steps>
+
+A typical software service has α in the range 0.01-0.1 (some
+genuinely serial parts) and β in the range 0.001-0.01 (some
+coordination overhead). N_max often lands at 8-32 workers per
+machine, after which more workers hurt.
+
+## How the three connect
+
+- **Amdahl** bounds *peak* parallel speedup.
+- **USL** explains *where* peak occurs and what happens past it.
+- **Little** tells you the *concurrency level* you need to support
+  to achieve a given (throughput, latency) point.
+
+A flow that uses all three:
+
+- "We need 10,000 req/s at 200ms latency."
+- Little: 2,000 concurrent in-flight requests.
+- USL: at our measured α=0.05, β=0.001, peak speedup is at N≈30.
+- Therefore: we need ceil(2000/30) ≈ 67 instances, each running
+  30 workers, to hit the throughput at the latency target.
+
+This is the kind of math that turns "we need to scale" into a
+concrete plan.
+
+## The serial fraction is the limit
+
+The biggest practical takeaway from Amdahl and USL: **focus on
+reducing the serial fraction**. Locks, single-leader writes,
+cache invalidations, sequence-number generators — these are the
+parts that bound scaling.
+
+Patterns that reduce serial fraction:
+
+- **Sharding by key**: each key's work is serial within its
+  shard but parallel across shards.
+- **Eventually consistent reads**: no leader-coordination on
+  reads.
+- **Conflict-free replicated data types (CRDTs)**: writes from
+  multiple replicas merge without coordination.
+- **Read replicas + write leader**: at least scales reads.
+
+Patterns that *increase* serial fraction (avoid):
+
+- A global lock around hot state.
+- A single sequence number that all writes must claim.
+- A leader election protocol triggered on every write.
+
+The pattern is clear: **anything that requires coordination
+across all workers is a serial fraction**, and Amdahl says it
+caps your total speedup.
+
+## A useful three-word summary
+
+- Little: *conservation* (concurrency = throughput × latency).
+- Amdahl: *speedup is bounded by the serial fraction*.
+- USL: *coordination cost eventually wins*.
+
+Memorize these and you can reason about most scaling questions
+faster than running another benchmark.

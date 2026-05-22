@@ -1,0 +1,194 @@
+export const level = 'senior';
+
+# Benchmarking pitfalls
+
+Micro-benchmarks measure how long an operation takes in isolation.
+They're useful — sometimes essential — but they're also the area
+of performance work where it's easiest to fool yourself.
+
+A "benchmark" that runs in 0.3ns isn't fast; it's a benchmark that
+got optimized away.
+
+## The classes of mistakes
+
+<Steps>
+<Step n="1" title="Dead-code elimination">
+The compiler / JIT observes that the result of your benchmark
+isn't used, and removes the code entirely.
+
+```java
+public void measureHash() {
+  for (int i = 0; i < 1_000_000; i++) {
+    "hello".hashCode();   // unused — JIT removes the call
+  }
+}
+```
+
+You measure the loop overhead, not the hash. Fix: **consume the
+result.** JMH has `Blackhole`; in Go, assign to a `runtime.KeepAlive`
+target or a package-level sink variable.
+</Step>
+
+<Step n="2" title="Constant folding / loop hoisting">
+The compiler notices that an expression doesn't depend on the
+loop variable and computes it once outside the loop.
+
+```java
+for (int i = 0; i < N; i++) {
+  result = expensive(42);   // hoisted out — runs once
+}
+```
+
+Fix: make the input depend on `i`. Use a vector of inputs, or
+`i % 1024` as a parameter.
+</Step>
+
+<Step n="3" title="JIT not warmed up">
+The first few thousand iterations of a JIT'd loop run in interpreted
+mode, then in lightly-optimized mode, then in fully-optimized mode.
+Measuring the first 1,000 calls measures the interpreter.
+
+Fix: **warm up** for several seconds before measurement. JMH,
+Criterion (Rust), and Go's `testing.B` do this automatically. If
+you're rolling your own, do 10⁴–10⁶ untimed iterations first.
+</Step>
+
+<Step n="4" title="Inlining changes between iterations">
+After enough samples, the JIT inlines the hot function and the
+benchmark gets ~5x faster. The benchmark looks like it's "warming
+up" forever. Use frameworks that account for this (JMH's iteration
+modes).
+</Step>
+
+<Step n="5" title="Wrong unit of work">
+You measure "1000 hashes in 1 microsecond" → "1ns per hash." Maybe.
+Or maybe the JIT batched the work, vectorized it, or the loop got
+unrolled and 8 hashes happen per logical iteration. The per-op
+number from a loop divided by N is only reliable when the loop
+doesn't optimize differently from a single call.
+</Step>
+</Steps>
+
+## Use a real framework
+
+Roll-your-own micro-benchmarks fail in the above ways
+*systematically*. Use the established frameworks:
+
+- **JMH** (Java) — Oracle's official, considers every gotcha above.
+  `@Benchmark`, `@State`, `Blackhole`. Run with default settings;
+  results are believable.
+- **Criterion** (Rust) — statistical analysis built in, generates
+  HTML reports with regression detection.
+- **Go's `testing.B`** — built into the standard library, handles
+  warmup automatically. Use `b.ResetTimer()` and avoid measuring
+  setup.
+- **Benchmark.js** (JavaScript) — fewer guarantees in modern V8
+  (lots of optimization happens lazily and unpredictably), but
+  better than `Date.now()` loops.
+- **Google Benchmark** (C++) — handles dead-code elimination via
+  `DoNotOptimize`, runs adaptive iteration counts.
+
+These frameworks produce:
+
+- An iteration count picked so the test runs long enough for noise
+  to average out.
+- Variance/confidence intervals along with the mean.
+- Detection of "the result didn't stabilize" (suspicious).
+- Awareness of warmup phases.
+
+## Variance is real
+
+Two runs of the same benchmark on the same machine routinely vary
+by 5–20%. Causes:
+
+- **CPU frequency scaling**. The CPU clocked down between runs.
+  Fix: pin frequency or disable scaling (`cpupower frequency-set
+  -g performance`).
+- **Thermal throttling**. Sustained load → CPU runs hotter → it
+  throttles down. Run shorter, or with cooling.
+- **CPU affinity**. The OS moves the thread to a different core
+  with cold caches. Pin (`taskset -c 1`).
+- **Background work**. Cron jobs, browser, indexer, whatever else
+  is on the machine. Run on a quiet machine.
+- **Hyper-threading neighbor**. The other logical core on the
+  same physical core competes for L1/L2. Pin to a non-HT core or
+  disable HT for benchmarking.
+- **NUMA effects**. Memory allocated on one socket, threads
+  running on another. Pin both.
+
+For numbers you'll publish or commit to: run 30+ trials, report
+median and IQR, mention the machine config. A single 1.43µs number
+is rarely defensible.
+
+## The "faster" trap
+
+A 2× speedup in a micro-benchmark might not move the real-world
+metric at all:
+
+- The function was 1% of the actual workload. Amdahl's Law: total
+  speedup is bounded by the fraction you can optimize. 2× on 1% =
+  0.5% overall.
+- The micro-benchmark ran on warm caches. In context, the function
+  runs on cold caches and is dominated by memory latency. The
+  speedup disappears.
+- The benchmark didn't include allocation. In context, you allocate
+  and pay GC cost; the optimization shifts the bottleneck without
+  reducing it.
+
+Always validate micro-benchmark wins with **system-level
+measurement**. If you can't show the improvement at the request
+level, you may not have one.
+
+## Micro vs macro
+
+Both are useful, for different jobs:
+
+- **Micro-benchmark**: I want to know if function `f` got faster
+  after my change. Best for hot inner loops and algorithm
+  comparisons.
+- **Macro-benchmark / system test**: I want to know if the user
+  experience got faster. Best for "did my change actually help?"
+  questions.
+
+A change that wins the micro and loses the macro is a real and
+common case. The macro is the ground truth.
+
+## A defensible procedure
+
+For "is rewrite X faster than baseline":
+
+<Steps>
+<Step n="1" title="Define the benchmark in the framework's idioms">
+JMH `@Benchmark`, Criterion `bench_function`, `func BenchmarkX(b
+*testing.B)`. Don't roll your own timer.
+</Step>
+<Step n="2" title="Use realistic inputs">
+Not "loop over 10 items 1M times" — use a representative input
+distribution.
+</Step>
+<Step n="3" title="Run on a quiet, pinned machine">
+No background work, frequency scaling off, thread pinned, JIT
+warmed.
+</Step>
+<Step n="4" title="Report distribution, not just mean">
+Median + IQR + max. State the machine config and toolchain version.
+</Step>
+<Step n="5" title="Validate at the system level">
+Did the request p95 actually move? If not, the micro-benchmark
+win didn't translate.
+</Step>
+</Steps>
+
+## When you don't need micro-benchmarks
+
+For most application work, profiling + end-to-end testing
+suffices. Micro-benchmarks are needed when:
+
+- Writing library code where consumers can't easily measure.
+- Comparing two algorithms before integrating.
+- Quantifying the win for a specific JIT/compiler change.
+- Tracking regressions in known hot paths.
+
+If you find yourself reaching for a micro-benchmark to decide
+between two equally readable implementations, you might just want
+to ship the more readable one.

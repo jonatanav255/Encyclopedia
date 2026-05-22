@@ -1,0 +1,183 @@
+export const level = 'senior';
+
+# GC tuning
+
+Garbage collection is a fixed feature of most server-side runtimes
+— JVM, .NET, Go, Node.js, Python. You can't escape it; you can
+only shape how it interacts with your latency profile.
+
+The instinct to "tune the GC" is usually misplaced. The actual win
+is almost always **producing less garbage**, with tuning as a
+second-order concern.
+
+## The GC tradeoff triangle
+
+Every collector trades among three goals:
+
+- **Low pause times** — single GC events don't stop the world for
+  long.
+- **High throughput** — total time spent collecting is a small
+  fraction of total runtime.
+- **Low memory footprint** — runs within tight heaps.
+
+You can win two and lose the third; no collector wins all three at
+once. Modern concurrent collectors (G1, ZGC, Shenandoah, Go's
+collector) push hard on the first by giving up some of the others.
+
+## Generational hypothesis
+
+Most allocators bet on the **weak generational hypothesis**: most
+objects die young.
+
+- A request handler allocates 50 objects: parsed JSON, query
+  params, intermediate values, response object. Almost all become
+  garbage when the request ends.
+- A handful of objects live longer: caches, connection pools,
+  application state.
+
+Generational collectors split the heap:
+
+- **Young generation** ("nursery", "Eden") — small, fast, collected
+  frequently. Most objects die here.
+- **Old generation** ("tenured") — bigger, collected less often,
+  more expensively.
+
+Young-gen collections (minor GCs) are cheap. Old-gen collections
+(major / full GCs) are expensive — the latency spikes you fear
+come from old-gen work.
+
+## What pauses look like
+
+Pause behavior by collector:
+
+<Compare>
+<thead>
+<tr><th>Collector</th><th>Typical pause</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>JVM Parallel GC</td><td>50ms - several seconds</td><td>STW for the whole collection. Default in older JVMs.</td></tr>
+<tr><td>JVM G1</td><td>10-50ms typical</td><td>Region-based, mostly concurrent. Default since JDK 9.</td></tr>
+<tr><td>JVM ZGC</td><td>sub-ms on JDK 16+</td><td>Concurrent everything. Experimental in JDK 11, production in JDK 15, sub-ms pause guarantee since JDK 16. Enable with `-XX:+UseZGC`.</td></tr>
+<tr><td>JVM Shenandoah</td><td>&lt;10ms</td><td>Similar to ZGC, different approach.</td></tr>
+<tr><td>Go runtime</td><td>sub-ms</td><td>Concurrent mark-sweep, designed for low pause.</td></tr>
+<tr><td>.NET Server GC</td><td>5-50ms</td><td>Background and concurrent modes.</td></tr>
+<tr><td>V8 (Node.js)</td><td>~5ms typical, 50ms+ on major GC</td><td>Generational; incremental marking.</td></tr>
+</tbody>
+</Compare>
+
+The big-picture trade: low-pause collectors do more concurrent
+work (uses CPU during the program's normal execution) at the cost
+of higher steady-state CPU overhead. ZGC might cost 5-15% throughput
+to win you sub-ms pauses.
+
+## Three actionable interventions, in order
+
+<Steps>
+<Step n="1" title="Reduce allocation">
+The largest, most reliable lever. Less garbage = fewer GCs = less
+total pause time. Tactics:
+
+- Reuse buffers (`ByteBuffer`, `sync.Pool`, object pools where
+  appropriate).
+- Avoid unnecessary boxing (`int` → `Integer` in JVM, large
+  closures in JS).
+- Stream rather than load fully into memory.
+- Pre-allocate arrays/maps with known capacity.
+- Avoid creating intermediate collections (filter + map chains
+  that allocate transient lists).
+
+Allocation profilers exist for every major runtime: JFR for JVM,
+`go tool pprof -alloc_objects`, Chrome DevTools heap snapshot for
+V8.
+</Step>
+
+<Step n="2" title="Right-size the heap">
+A heap that's too small triggers GCs constantly. A heap that's
+too big takes longer per GC and uses more RAM.
+
+The shape of the curve: lots of GC at small heaps, gradually less
+until the heap is comfortable, then diminishing returns. Modern
+collectors are designed for **heap occupancy ~30-50%** at steady
+state — if you're running at 80% live data, GC is fighting you.
+
+The JVM heuristic: heap big enough to keep old-gen utilization
+below ~50% even under load.
+</Step>
+
+<Step n="3" title="Pick the right collector">
+Only after the above. Default collectors are good for default
+workloads; specialized collectors win for specific shapes.
+
+- Latency-sensitive (user-facing, SLO-bound): ZGC, Shenandoah on
+  JVM; Go's default; .NET Server GC with sustained-low-latency
+  mode.
+- Throughput-bound (batch jobs, ETL): JVM ParallelGC; longer
+  pauses acceptable, total work minimized.
+- Tight-memory environments: G1 with small heap; sometimes the
+  serial GC for tiny heaps.
+</Step>
+</Steps>
+
+## The metrics that matter
+
+For diagnosis, watch:
+
+- **GC pause time** (max and p99). Should be a single-digit
+  percentage of total time at most.
+- **GC frequency**. Young-gen GC every few seconds is normal.
+  Every 100ms = under-provisioned heap or allocation storm.
+- **Heap occupancy after GC**. Should drop substantially. If it
+  stays high, you have a leak or genuine working-set growth.
+- **Allocation rate** (bytes/sec). Compare across deploys — a
+  sudden jump means a new allocation hot path was introduced.
+
+In the JVM, GC logs (`-Xlog:gc*`) give you all of this. Use a
+visualizer like GCViewer or upload to gceasy.io.
+
+## Anti-patterns
+
+- **Calling `System.gc()` / `runtime.GC()` manually**. Almost
+  always wrong. The collector knows when to run; forcing it just
+  causes a big GC at a bad moment.
+- **Allocating in a hot loop "because it's fine."** A
+  million-element loop that allocates 100 bytes per iteration =
+  100MB of garbage per execution. Even a fast GC notices.
+- **Caching forever without bounds**. Now every entry is
+  long-lived; the cache promotes to old-gen; major GCs become
+  more expensive. Use bounded caches.
+- **Tuning GC flags without measurement**. Each generation of
+  JVM has different "magic incantation" advice on the internet,
+  half of it outdated. Profile, then tune one knob at a time,
+  always with a baseline.
+
+## Special case: latency-sensitive low-allocation services
+
+For services where p99 latency is critical, the right move is often
+**zero-allocation hot paths**:
+
+- Allocate everything you need up front, at startup.
+- Reuse buffers / pools for transient objects.
+- Avoid common patterns that hide allocations (string concatenation,
+  iterator chains).
+- Use value types or stack allocation where the language permits
+  (Rust, Go's escape analysis, Java records with escape analysis).
+
+A request handler that allocates *nothing* under normal load won't
+trigger young-gen GC at all in steady state. Your tail comes down
+dramatically. Worth it only for paths where you've already measured
+GC as a contributor.
+
+## When GC isn't the problem
+
+People reach for GC tuning because pauses are visible in profiles.
+Often the underlying problem is:
+
+- A memory leak (live data grows; old-gen fills; major GCs
+  intensify).
+- An allocation hot path (lots of churn; young-gen GCs frequent
+  even though pauses are short).
+- An undersized heap (collector is fine; you're starving it).
+
+Diagnose first. The "fix" of switching collectors without
+understanding the workload often shifts the problem to a different
+shape rather than solving it.
