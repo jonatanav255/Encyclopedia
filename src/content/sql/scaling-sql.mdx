@@ -1,0 +1,291 @@
+export const level = 'senior';
+
+# Scaling SQL
+
+"SQL doesn't scale" is the most-repeated misconception in
+databases. The honest version: **SQL scales further than people
+think**, and the techniques to scale it are well-understood. The
+real question is when to reach for each lever, and what each one
+costs.
+
+## Vertical scaling — the boring answer
+
+A modern Postgres on a beefy machine (64+ cores, 512GB+ RAM, fast
+NVMe) serves 50,000–100,000 simple QPS for many workloads. Even
+heavier analytical queries run comfortably with 5x that hardware.
+
+The cliché "we need to scale beyond a single primary" is usually
+wrong. Most teams hit performance issues from:
+
+- Missing indexes.
+- N+1 query patterns.
+- Stale statistics.
+- Cache layer missing or misused.
+- ORM-generated queries fetching too much.
+
+Fix those first. Vertical scaling buys you years for a fraction of
+the operational complexity of horizontal scaling.
+
+**Rule of thumb:** don't go horizontal until you've proven a single
+big box, properly tuned, can't keep up. That's a measurement, not
+a vibe.
+
+## The four-stage scaling path
+
+Most successful systems go through these stages, roughly in order:
+
+1. **One database, one app process** — your starting point.
+2. **One DB primary + read replicas** — read scaling.
+3. **Caching layer (Redis)** — offload hot reads entirely.
+4. **Sharding or distributed SQL** — write scaling.
+
+Most apps never need stage 4. Many never need stage 3 beyond
+basic caching.
+
+## Read replicas
+
+The primary handles all writes; one or more **replicas** receive a
+stream of the write-ahead log and apply it. You point read queries
+at the replicas.
+
+```text
+       writes
+client ----> [primary] ---WAL stream---> [replica 1]
+                                 \-----> [replica 2]
+       reads
+client ----> [replica N]
+```
+
+**Wins:**
+- Read capacity scales horizontally — add replicas, gain throughput.
+- Survives the primary going down (with failover).
+- Geographic locality — replicas in different regions cut read
+  latency.
+
+**Costs:**
+- **Replication lag.** A replica may be milliseconds-to-seconds
+  behind the primary. A read against a replica may not see a write
+  that just succeeded.
+- **Read-your-writes problem.** User posts a comment, immediately
+  refreshes, the comment isn't there. Common fix: route reads from
+  a user back to the primary for a short window after they wrote.
+- **Eventual consistency** across replicas — you've left strict
+  serial consistency.
+- Failover orchestration adds operational surface.
+
+See **Replication & CDC** in the Data topic.
+
+## Caching
+
+A cache layer (typically Redis) absorbs the read load that doesn't
+need to hit the database at all.
+
+```js
+async function getUser(id) {
+  const cached = await redis.get(`user:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  const user = await db.users.findById(id);
+  await redis.set(`user:${id}`, JSON.stringify(user), { EX: 300 });
+  return user;
+}
+```
+
+**Wins:**
+- Single-digit-ms reads regardless of DB load.
+- DB load drops by 90%+ for hot read paths.
+
+**Costs:**
+- **Invalidation** is the hard problem. When the underlying data
+  changes, the cache may serve stale data until the TTL expires
+  or you explicitly invalidate.
+- **Stampedes** — when a hot cache key expires, many requests
+  race to repopulate it, hammering the DB.
+- Extra system to operate, monitor, and pay for.
+
+See **Redis Patterns** in the Data topic, and the staff caching
+question for stampede mitigation strategies.
+
+## Connection pooling
+
+Each Postgres connection costs ~10MB of RAM (it forks a process)
+and ~10–50ms to establish. Without pooling, every request pays
+that cost.
+
+```js
+import pg from 'pg';
+const pool = new pg.Pool({ max: 10, connectionString: ... });
+const { rows } = await pool.query('SELECT NOW()');
+```
+
+For larger deployments, add **PgBouncer** between your app and
+Postgres. PgBouncer pools at the connection level (transaction
+mode is the standard) and lets thousands of app processes share a
+small number of real DB connections.
+
+Sizing: `pool.max × num_processes < postgres.max_connections`,
+with headroom. Most cloud Postgres has `max_connections` set
+absurdly high (100+) because pooling is assumed. Don't trust the
+default — measure. See **Connection Pooling** in the Data topic.
+
+## Partitioning
+
+A single table split into multiple physical tables, addressed as
+one logical table:
+
+```sql
+CREATE TABLE events (
+  id SERIAL,
+  occurred_at TIMESTAMPTZ NOT NULL,
+  payload JSONB NOT NULL
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE events_2026_01 PARTITION OF events
+  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+```
+
+**Wins:**
+- Queries with the partition key in the predicate scan only the
+  relevant partition — huge for time-series data.
+- You can drop old partitions instantly (no `DELETE` walking
+  billions of rows).
+- Indexes per partition stay small.
+
+**Costs:**
+- Schema is more complex.
+- Queries without the partition key in `WHERE` scan all partitions.
+- Operational management (creating new partitions, dropping old).
+
+Partitioning is **vertical scaling enhancement**, not sharding.
+The data is still on one machine.
+
+## Sharding
+
+Splitting data across multiple **independent** databases by a
+shard key (user_id, region, hash). Each shard is its own Postgres,
+no shared state.
+
+```text
+shard_key = hash(user_id) % 16
+
+user_id 12345 → shard 7 → postgres-7
+user_id 99999 → shard 3 → postgres-3
+```
+
+**Wins:**
+- Writes scale horizontally — each shard absorbs its own write
+  rate.
+- Each shard is just Postgres — familiar ops, no new tech.
+
+**Costs (real):**
+- **Cross-shard queries are hard.** A query that needs data from
+  multiple shards has to fan out at the application layer.
+- **No cross-shard transactions** in vanilla Postgres. You're
+  back to outbox patterns for consistency across shards.
+- **Joins across shards** require either denormalization or
+  application-level joining.
+- **Resharding** is painful. Changing from 16 shards to 32 means
+  moving half the data.
+- **Operational complexity multiplies by N.** You're running 16
+  Postgres clusters, not 1.
+
+Tools like **Citus** (Postgres extension), **Vitess** (MySQL),
+and **PolyScale** automate some of this — they sit in front of
+your DB and route queries to shards. They help, but the
+fundamental constraints remain.
+
+**When to shard:** when you've measured that vertical scaling +
+read replicas + caching genuinely can't handle your write rate.
+Almost never for "we might need to scale someday."
+
+## Distributed SQL
+
+The newer answer: a single logical database that's transparently
+distributed across many nodes, preserving ACID via consensus
+protocols (Raft, Paxos).
+
+Examples: **CockroachDB**, **YugabyteDB**, **Google Spanner**,
+**Aurora DSQL**.
+
+**Wins:**
+- Looks like one Postgres to your app (wire-compatible mostly).
+- Survives node failures without manual failover.
+- Multi-region active-active possible.
+- Strong ACID across the whole cluster (serializable isolation).
+- No shard management — the database handles distribution.
+
+**Costs:**
+- **Higher per-query latency** — every write involves consensus
+  among replicas, which adds milliseconds.
+- **More expensive** per workload than single-node Postgres.
+- **Operational surface** of a distributed system.
+- **Some Postgres features** (extensions, specific SQL) don't work.
+- Most distributed-SQL vendors are commercial; license terms vary.
+
+When to reach for distributed SQL: genuinely global apps,
+multi-region active-active, write workloads that exceed what a
+single big box gives you. See **Distributed SQL** for the deep
+dive.
+
+## CQRS — separating read and write models
+
+A more architectural lever: stop using one schema for both writes
+and reads.
+
+- **Write model** — normalized, transactional. Source of truth.
+  Lives in Postgres.
+- **Read model** — denormalized, optimized for specific queries.
+  Materialized views, or a separate store (Elasticsearch for
+  search, Redis for hot reads, a data warehouse for analytics).
+
+Writes update the source of truth and produce events (CDC,
+outbox, change streams). Asynchronous workers update the read
+models.
+
+**Wins:**
+- Each model is shaped for its job.
+- Read models can be regenerated from the source of truth.
+- Different scaling profiles for reads and writes.
+
+**Costs:**
+- Eventual consistency between write and read models.
+- More moving parts.
+- "I wrote it, why don't I see it" UX bugs if not designed for.
+
+Useful at moderate scale; mandatory at large scale.
+
+## What scales: writes vs reads
+
+Cleanly:
+
+- **Reads scale via replicas + caching.** Easy.
+- **Writes scale via sharding or distributed SQL.** Hard.
+
+If your scale problem is read-bound, you have a lot of options
+before you need to leave single-primary Postgres. If it's
+write-bound, the conversation changes — you're either heading to
+shards, distributed SQL, or a different data model entirely.
+
+## The honest decision framework
+
+1. **Are you sure you have a scaling problem?** Measure. Most
+   "scaling problems" are actually missing indexes.
+2. **Is it read-bound?** → Add caching first, replicas second.
+3. **Is it write-bound on a single hot table?** → Partition.
+   Optimize hot-row patterns. Consider a queue + batch writes.
+4. **Is it write-bound across the whole DB?** → Now the
+   conversation is sharding or distributed SQL. Both are real
+   investments.
+5. **Is it cross-region latency?** → Distributed SQL or
+   region-local read replicas.
+
+The mistake is jumping to step 4 or 5 because someone read a blog
+post. Each lever solves a specific problem; pulling the wrong one
+adds complexity without value.
+
+## What to learn next
+
+- **Distributed SQL** — Cockroach, Spanner, Yugabyte in depth.
+- **Replication & CDC** (Data topic) — how replicas work.
+- **Redis Patterns** (Data topic) — caching done right.
+- **Connection Pooling** (Data topic) — pool sizing.

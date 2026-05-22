@@ -1,0 +1,310 @@
+export const level = 'mid';
+
+# Joins & Queries
+
+The reason to use a relational database is that data has
+relationships and you can query across them. **Joins** are how you
+do that. Knowing the join types and the query execution order
+turns "I write SQL by trial and error" into "I write SQL on
+purpose."
+
+## The logical query order
+
+SQL reads top-to-bottom, but it doesn't execute top-to-bottom.
+Here's the order the database actually thinks about it:
+
+1. **FROM** + **JOIN** — figure out which rows to consider.
+2. **WHERE** — filter rows before grouping.
+3. **GROUP BY** — collapse rows into groups.
+4. **HAVING** — filter the groups.
+5. **SELECT** — choose columns / compute aggregates.
+6. **ORDER BY** — sort.
+7. **LIMIT** / **OFFSET** — paginate.
+
+This is why you can use a `SELECT` alias in `ORDER BY` (sort
+happens after select) but not in `WHERE` (filter happens before
+select).
+
+```sql
+SELECT u.id, u.name, COUNT(p.id) AS post_count
+FROM users u
+LEFT JOIN posts p ON p.author_id = u.id
+WHERE u.created_at > NOW() - INTERVAL '30 days'
+GROUP BY u.id, u.name
+HAVING COUNT(p.id) > 0
+ORDER BY post_count DESC
+LIMIT 10;
+```
+
+That single query touches every step. Read it in execution order
+and it makes sense.
+
+## INNER JOIN
+
+The default. Returns rows where the join condition matches in
+both tables.
+
+```sql
+SELECT u.name, p.title
+FROM users u
+INNER JOIN posts p ON p.author_id = u.id;
+```
+
+Users without posts disappear. Posts whose author was deleted (if
+the FK doesn't cascade) disappear too.
+
+Use INNER JOIN when you need both sides to exist.
+
+## LEFT JOIN
+
+Returns all rows from the left table; nulls in the right-side
+columns where no match.
+
+```sql
+SELECT u.name, COUNT(p.id) AS post_count
+FROM users u
+LEFT JOIN posts p ON p.author_id = u.id
+GROUP BY u.name;
+```
+
+Users with zero posts appear with `post_count = 0`. (Well, with
+`COUNT(p.id)` — `COUNT(*)` would give 1 because there's still a
+row, just with null right-side columns. Subtle.)
+
+Use LEFT JOIN when you want "everything on the left, plus whatever
+matches on the right."
+
+## RIGHT JOIN
+
+Symmetric to LEFT JOIN. Used rarely — most people just flip the
+table order and write a LEFT JOIN, which is more readable.
+
+## FULL JOIN
+
+All rows from both sides; nulls where no match.
+
+```sql
+SELECT u.name, p.title
+FROM users u
+FULL JOIN posts p ON p.author_id = u.id;
+```
+
+You get users without posts AND posts without users. Useful for
+data reconciliation ("which rows are orphaned on either side?").
+Rare in app code.
+
+## CROSS JOIN
+
+Cartesian product — every row from the left paired with every row
+from the right. With 1000 users and 1000 posts, you get 1,000,000
+rows.
+
+Almost always a mistake when you write one accidentally (forgot
+the join condition). Rare when intentional (generating combinations,
+date sequences).
+
+## Self-joins
+
+A table joined to itself. Common for hierarchies (employees and
+their managers in the same `employees` table):
+
+```sql
+SELECT e.name AS employee, m.name AS manager
+FROM employees e
+LEFT JOIN employees m ON m.id = e.manager_id;
+```
+
+Aliases (`e`, `m`) disambiguate the two references.
+
+## Subqueries
+
+A query inside a query. Two main flavors:
+
+```sql
+-- Subquery in WHERE (a value)
+SELECT name FROM users
+WHERE id IN (SELECT author_id FROM posts WHERE created_at > NOW() - INTERVAL '1 day');
+
+-- Subquery in FROM (a derived table)
+SELECT category, COUNT(*)
+FROM (
+  SELECT id, classify(body) AS category FROM posts
+) classified
+GROUP BY category;
+```
+
+Modern query planners handle subqueries well. You don't need to
+rewrite every subquery as a join — write what's clearest.
+
+## CTEs (`WITH`)
+
+A named subquery, defined once at the top:
+
+```sql
+WITH recent_posts AS (
+  SELECT * FROM posts WHERE created_at > NOW() - INTERVAL '7 days'
+),
+top_authors AS (
+  SELECT author_id, COUNT(*) AS post_count
+  FROM recent_posts
+  GROUP BY author_id
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT u.name, ta.post_count
+FROM top_authors ta
+JOIN users u ON u.id = ta.author_id;
+```
+
+CTEs make multi-step queries readable. Each step is named; later
+steps refer to earlier ones. Postgres 12+ inlines them by default
+(used to be a fence — explicitly materialized — which could hurt
+performance).
+
+Recursive CTEs (`WITH RECURSIVE`) compute hierarchies or graph
+traversals — though if you do a lot of those, a graph database
+might fit better.
+
+## Aggregates
+
+Collapse many rows into one (or one per group):
+
+```sql
+SELECT
+  COUNT(*)           AS total_posts,
+  COUNT(DISTINCT author_id) AS unique_authors,
+  AVG(score)         AS avg_score,
+  MAX(created_at)    AS latest_post,
+  SUM(view_count)    AS total_views
+FROM posts;
+```
+
+`COUNT(*)` counts rows. `COUNT(col)` counts non-null values. `AVG`,
+`SUM`, `MIN`, `MAX` ignore nulls.
+
+With `GROUP BY`, you get one row per group:
+
+```sql
+SELECT author_id, COUNT(*) AS post_count
+FROM posts
+GROUP BY author_id;
+```
+
+Every column in `SELECT` must either be in `GROUP BY` or wrapped
+in an aggregate. Postgres enforces this strictly; MySQL has been
+lax historically (turn on `ONLY_FULL_GROUP_BY`).
+
+## HAVING vs WHERE
+
+`WHERE` filters rows **before** aggregation. `HAVING` filters
+groups **after** aggregation. The classic example:
+
+```sql
+SELECT country, COUNT(*) AS user_count
+FROM users
+WHERE active = true        -- filter rows: only active users
+GROUP BY country
+HAVING COUNT(*) > 100;     -- filter groups: only countries with >100
+```
+
+Aggregate functions can only appear in `HAVING`, never `WHERE`.
+
+## Window functions
+
+The advanced query feature most people skip too long. Window
+functions compute aggregates **without collapsing rows**.
+
+```sql
+SELECT
+  id,
+  author_id,
+  score,
+  AVG(score) OVER (PARTITION BY author_id) AS author_avg_score,
+  ROW_NUMBER() OVER (PARTITION BY author_id ORDER BY created_at DESC) AS rank_in_author
+FROM posts;
+```
+
+Each row gets the author's average score, and a rank-within-author.
+The rows themselves stay; you just gain computed columns.
+
+Useful window functions:
+
+| Function | What it gives you |
+| --- | --- |
+| `ROW_NUMBER()` | Sequential rank, no ties |
+| `RANK()` | Rank with gaps for ties |
+| `DENSE_RANK()` | Rank with no gaps |
+| `LAG(col, n)` | Value from N rows earlier |
+| `LEAD(col, n)` | Value from N rows later |
+| `SUM/AVG/COUNT(...) OVER (...)` | Running aggregates |
+
+Window functions replace a lot of self-joins and gnarly
+subqueries. Learn them.
+
+## EXPLAIN
+
+The most useful command for understanding query performance:
+
+```sql
+EXPLAIN ANALYZE
+SELECT u.name, COUNT(p.id)
+FROM users u LEFT JOIN posts p ON p.author_id = u.id
+GROUP BY u.name;
+```
+
+Output (Postgres) shows the plan: scan types, join algorithms,
+estimated rows, actual rows, time per step.
+
+What to look for:
+
+- **Seq Scan on big_table** — sequential scan. Need an index?
+- **Index Scan** — using an index. Good.
+- **Nested Loop** — fine for small joins; bad for large ones.
+  Want **Hash Join** or **Merge Join** for big joins.
+- **Rows estimated vs actual** way off — stats are stale, run
+  `ANALYZE`.
+
+Read every `EXPLAIN` you can until the plan stops surprising you.
+
+## Common query mistakes
+
+### `SELECT *` in production
+Three reasons it's bad:
+1. Schema change adds a column → consumer code that destructures
+   rows breaks silently.
+2. Network + memory cost for columns you don't use.
+3. Index-only scans defeated — the database can't skip touching
+   the table.
+
+Be explicit: `SELECT id, name, email FROM users`.
+
+### Forgetting `WHERE` on `UPDATE` / `DELETE`
+Always have a `WHERE` unless you really want to touch every row.
+Postgres won't save you. There are a lot of "I updated 4 million
+users to be named NULL" stories.
+
+### `OFFSET` for deep pagination
+`OFFSET 10000` walks past 10000 rows before returning anything.
+Use cursor pagination for anything past page 10 or so. See
+**Pagination** in the Data topic.
+
+### Function on a column in `WHERE`
+```sql
+WHERE lower(email) = 'jon@example.com'    -- index on `email` unused
+```
+
+If you need this, create an expression index: `CREATE INDEX ON
+users (lower(email))`.
+
+### `IN` with thousands of values
+Generated `WHERE id IN ($1, $2, ... $5000)` queries get slow. Use
+`= ANY($1::int[])` (Postgres) with an array parameter, or a
+temp-table join.
+
+## What to learn next
+
+- **What is SQL** — the language overview.
+- **Relational Model** — the foundation.
+- **SQL Basics** (Data topic) — practical CRUD patterns.
+- **Indexing** (Data topic) — making queries fast.
+- **N+1 queries** (Data topic) — the most common ORM performance trap.

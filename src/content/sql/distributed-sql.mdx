@@ -1,0 +1,280 @@
+export const level = 'senior';
+
+# Distributed SQL
+
+For decades the pitch was: "SQL is what you want, but if you need
+horizontal scale you have to give it up." Distributed SQL systems
+— CockroachDB, YugabyteDB, Spanner, Aurora DSQL, TiDB — are the
+modern answer to that trade-off. You get SQL ergonomics, ACID
+guarantees, and horizontal scale. You pay in per-query latency and
+operational surface.
+
+## What "distributed SQL" actually means
+
+A distributed SQL database is a single logical database whose
+storage and query execution are spread across many nodes,
+preserving:
+
+- **SQL** as the query language (usually Postgres-compatible).
+- **ACID** transactions across the whole cluster.
+- **Horizontal scale** for storage and throughput.
+- **High availability** — survives node failures without manual
+  failover.
+
+This is different from sharded SQL (separate databases stitched
+together at the app layer). Distributed SQL hides the
+distribution from the app.
+
+## The core mechanism: consensus
+
+When you have N replicas of data, the question is: how do they
+agree on the order of writes?
+
+Distributed SQL systems use a consensus protocol — usually **Raft**
+(Cockroach, Yugabyte, TiDB) or **Paxos** (Spanner) — to coordinate.
+A write isn't acknowledged until a **quorum** (majority) of
+replicas has durably accepted it.
+
+The basic Raft flow:
+
+1. Client sends a write to the **leader** of the relevant data
+   range.
+2. Leader appends to its log and sends the entry to **follower**
+   replicas.
+3. Once a majority (including the leader) has the entry, leader
+   commits and acknowledges the client.
+4. Followers commit in the background.
+
+**Consequence:** every write pays one round-trip-time of network
+latency between the leader and followers. In a single data center,
+that's sub-millisecond. Across regions, it's 50–200ms.
+
+This is the fundamental tax of distributed SQL — you cannot have
+"distributed + consistent + low-latency writes" simultaneously
+across regions. Pick two.
+
+## Data distribution: ranges and tablets
+
+The database splits each table into **ranges** (Cockroach) or
+**tablets** (Spanner, Yugabyte) — contiguous key spaces. Each
+range is replicated to N nodes (typically 3 or 5) and assigned a
+Raft group.
+
+```text
+users table (sorted by id)
+├── range 1: id ∈ [aaa, fff)  → replicas on nodes 1, 4, 7
+├── range 2: id ∈ [fff, mmm)  → replicas on nodes 2, 5, 8
+├── range 3: id ∈ [mmm, ttt)  → replicas on nodes 3, 6, 9
+└── range 4: id ∈ [ttt, zzz)  → replicas on nodes 1, 5, 9
+```
+
+As ranges grow, they **split**. As nodes are added or removed,
+ranges **rebalance**. All automatic. You don't pick a shard key
+(though you influence distribution via primary key choice).
+
+**Hot range trap:** if your primary key is monotonically increasing
+(serial integer, timestamp), all writes go to the last range,
+which means one leader handles all writes. You've lost the scale
+benefit. Use **UUID v4** or **hash-prefixed keys** to distribute
+writes across ranges. UUID v7 is a compromise — sortable but
+random enough at the high bits to spread load.
+
+## Strong consistency model
+
+Most distributed SQL systems default to **serializable** isolation
+— the strongest level, equivalent to "as if all transactions ran
+one at a time."
+
+This is stronger than vanilla Postgres's default (Read Committed)
+or MySQL's (Repeatable Read). The trade-off: more transaction
+retries when there's contention. Apps must be prepared to retry
+on serialization-failure errors.
+
+```js
+async function transferWithRetry(from, to, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await db.transaction(async (tx) => {
+        // ... transfer logic
+      });
+      return;
+    } catch (err) {
+      if (err.code === '40001') continue;  // serialization_failure
+      throw err;
+    }
+  }
+  throw new Error('too many retries');
+}
+```
+
+The retry loop is a fact of life with serializable isolation. ORMs
+and drivers usually have utilities for it.
+
+## Multi-region — the actual hard problem
+
+Single-region distributed SQL is the easy case. Multi-region is
+where the trade-offs get real.
+
+The fundamental constraint: **strong consistency across regions
+requires cross-region consensus on every write**, which means
+50–200ms of latency per write.
+
+Approaches:
+
+### Geo-partitioned tables
+You pin specific rows to specific regions. EU users live in EU
+replicas; US users in US replicas. Reads and writes for a given
+user happen in their home region — fast. Cross-region access is
+slow but explicit.
+
+```sql
+-- Cockroach
+ALTER TABLE users PARTITION BY LIST (region) (
+  PARTITION us VALUES IN ('us-east', 'us-west'),
+  PARTITION eu VALUES IN ('eu-west', 'eu-central')
+);
+```
+
+The default for multi-region apps where data has a "home."
+
+### Global tables
+Some tables (reference data: currencies, countries, feature flags)
+need to be readable everywhere with low latency. Distributed SQL
+systems support **global tables** — replicated to every region,
+with reads served locally. Writes are slow (cross-region consensus)
+but reads are fast.
+
+### Follower reads
+Read a slightly stale version of the data from a local follower
+without consensus. Tunable: "give me data that's at most 4s old."
+Useful for analytics, dashboards, anything where strict freshness
+isn't required.
+
+## Spanner's TrueTime — the unique case
+
+Google Spanner uses **TrueTime** — hardware clocks (GPS +
+atomic) plus a known uncertainty bound. Spanner waits out the
+uncertainty (typically under 10ms) before committing, which lets it
+provide **external consistency** — the strongest possible
+consistency model — globally.
+
+You can't replicate TrueTime without Google's hardware
+infrastructure. CockroachDB simulates it in software (HLC — hybrid
+logical clocks) but with weaker guarantees in edge cases.
+
+If you need external consistency at global scale and you're on
+GCP, Spanner is the only option. Otherwise, Cockroach / Yugabyte /
+Aurora DSQL are functionally similar with slightly weaker
+guarantees.
+
+## The major systems
+
+### CockroachDB
+- Raft-based.
+- Postgres wire-compatible.
+- Self-hostable; cloud version on AWS/GCP/Azure.
+- License changed in 2024 to source-available (not OSI open-source).
+- Mature, widely used in production.
+
+### YugabyteDB
+- Two API layers: YSQL (Postgres-compatible) and YCQL
+  (Cassandra-compatible).
+- Storage layer is DocDB, RocksDB-based.
+- Apache 2 licensed (proper OSS).
+- Smaller community than Cockroach but growing.
+
+### Google Spanner
+- Proprietary, GCP-only.
+- TrueTime-backed external consistency.
+- Expensive but unparalleled at global scale.
+- Postgres-compatible interface available; native dialect underneath.
+
+### Aurora DSQL
+- AWS's distributed-SQL service (released 2024–2025).
+- Postgres-compatible.
+- Serverless, multi-region active-active.
+- AWS-only.
+
+### TiDB
+- MySQL-compatible.
+- Used at huge scale in China (PingCAP, the company behind it,
+  originates there).
+- HTAP — hybrid transactional/analytical (paired with TiFlash for
+  columnar reads).
+
+### FoundationDB
+- Not strictly SQL (it's a transactional ordered key-value store)
+  but worth mentioning — Apple uses it as the substrate for many
+  services, including iCloud.
+- Layered model: build SQL or document semantics on top of FDB's
+  KV + transactions.
+
+## Trade-offs vs single-node Postgres
+
+| Concern | Postgres | Distributed SQL |
+| --- | --- | --- |
+| **Write latency** | sub-ms | ~5–50ms (single-region), 50–200ms (cross-region) |
+| **Read latency** | sub-ms | sub-ms to few-ms |
+| **Max throughput** | tens of thousands QPS on one box | scales horizontally |
+| **High availability** | failover required | automatic |
+| **Multi-region** | manual sharding/replication | built-in |
+| **Cost** | low | significantly higher |
+| **Operational complexity** | well-understood | distributed-systems mode |
+| **Extension ecosystem** | huge | limited |
+| **Schema migrations** | well-trodden | mostly fine, some quirks |
+
+The headline: distributed SQL is **slower per operation** than
+single-node Postgres but **scales arbitrarily** and tolerates
+failures gracefully.
+
+## When to actually pick distributed SQL
+
+The honest list:
+
+1. **Multi-region active-active** — users in multiple regions
+   writing simultaneously, needing low local latency.
+2. **Workloads beyond a single big box** — you've measured that
+   vertical Postgres can't keep up with your write rate.
+3. **HA requirements that exceed failover SLAs** — you need zero
+   manual intervention when a node dies, with no data loss.
+4. **Operational preference** — your team is willing to invest in
+   running a distributed system in exchange for not managing
+   shards manually.
+
+When **not** to pick distributed SQL:
+
+- "We might need to scale someday" — you don't yet. Vertical
+  Postgres + replicas + Redis covers it for years.
+- "It's the modern choice" — single-node Postgres is still the
+  modern choice for 95% of new services.
+- "We want HA" — managed Postgres (RDS, Cloud SQL) does HA via
+  failover; you don't need full distributed SQL for that.
+- Single-region apps with moderate scale. The cost-vs-benefit
+  rarely works out.
+
+## Practical advice
+
+If you do go distributed SQL:
+
+- **Choose Postgres-compatible** unless you have a strong reason
+  not to. CockroachDB, Yugabyte YSQL, Aurora DSQL — your
+  application code (mostly) doesn't change.
+- **Plan for retries.** Serializable isolation means more
+  serialization-failure errors. Wrap transactions in retry logic.
+- **Watch primary key design.** Avoid monotonically-increasing
+  keys that create hotspots. Use UUID v4 (random) or v7
+  (semi-sortable, less hot than v4 but spread enough).
+- **Profile cross-region latency** explicitly before going
+  multi-region. The math: 100ms of cross-region RTT means every
+  write transaction takes >100ms minimum.
+- **Test failure.** Kill nodes in staging. Distributed SQL is
+  designed to survive node loss; verify your app does too.
+
+## What to learn next
+
+- **Scaling SQL** — the levers short of distributed SQL.
+- **Types of SQL Databases** — where the distributed systems fit.
+- **CAP & Consistency** (in NoSQL) — the theoretical framing for
+  the trade-offs.
+- **Replication & CDC** (Data topic) — how replicas work at the
+  Postgres level.

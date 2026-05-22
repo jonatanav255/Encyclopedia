@@ -1,0 +1,316 @@
+export const level = 'senior';
+
+# CAP & Consistency
+
+The reason NoSQL exists at all is that distributed systems force
+trade-offs that single-machine SQL ducks. The most famous framing
+of these trade-offs is **CAP** (Brewer, 2000) and its successor
+**PACELC** (Abadi, 2010). Both are essential vocabulary for
+talking about distributed databases — but the way they're commonly
+quoted is misleading. Here's the honest version.
+
+## The CAP theorem
+
+Eric Brewer's original statement (2000): a distributed system can
+provide **at most two** of:
+
+- **C**onsistency — every read sees the most recent write (or an
+  error).
+- **A**vailability — every request gets a non-error response.
+- **P**artition tolerance — the system keeps working when network
+  links between nodes fail.
+
+Partitions in real networks are not optional — they happen.
+Network cables get cut, switches die, regions disconnect. So the
+real trade-off in any distributed system is:
+
+**When a partition occurs, do you choose Consistency or
+Availability?**
+
+### CP systems
+
+When the network partitions, **refuse to serve reads/writes that
+can't be guaranteed consistent**. Some clients get errors; the
+data stays correct.
+
+Examples:
+- **HBase** — refuses writes if the region server is isolated.
+- **MongoDB** (default) — only the primary serves writes; if a
+  replica is isolated, it can't serve reads requiring primary
+  freshness.
+- **etcd / Zookeeper / Consul** — refuse writes without quorum.
+- **CockroachDB / Spanner** — refuse writes that can't reach
+  quorum.
+
+### AP systems
+
+When the network partitions, **keep accepting reads/writes on
+both sides**, reconcile later. Clients always get a response; some
+of those responses might be stale.
+
+Examples:
+- **Cassandra** (default settings) — every node accepts writes,
+  conflicts resolved via last-write-wins.
+- **DynamoDB** (eventually consistent reads) — same model.
+- **Riak**, **Couchbase**, **CouchDB** — same family.
+
+### The misleading "pick two" framing
+
+You'll see CAP described as "pick two of three." This is wrong in
+practice — partitions aren't optional, so you're always picking
+between **C and A under partition**. The third leg (P) isn't a
+choice; it's a fact of distributed life.
+
+The accurate framing: **CAP describes what a system does during a
+partition, not in steady state.**
+
+## PACELC — the better framing
+
+Daniel Abadi's PACELC (2010) extends CAP to cover the steady state:
+
+> If there is a **P**artition, choose between **A**vailability and
+> **C**onsistency. **E**lse (when the network is fine), choose
+> between **L**atency and **C**onsistency.
+
+The second half is what people miss. Even with a healthy network,
+strong consistency across replicas requires coordination — extra
+network round-trips between nodes. That coordination is **latency**.
+
+So distributed databases sit on a 2D plane:
+
+| System | Partition behavior | Steady-state behavior |
+| --- | --- | --- |
+| **DynamoDB** | AP | EL (eventual reads for low latency) |
+| **Cassandra (ONE)** | AP | EL |
+| **Cassandra (QUORUM)** | AP | EC (slower, more consistent) |
+| **Spanner** | CP | EC (TrueTime adds wait, but consistent) |
+| **CockroachDB** | CP | EC |
+| **MongoDB (default)** | CP | EC |
+| **Postgres (single node)** | n/a (no partitions) | CA-ish (single source of truth) |
+
+PACELC captures that "even when nothing is wrong, distributed
+strong consistency costs latency." This is why a globally
+distributed database with serializable isolation has higher p99
+than a single-node Postgres on the same workload.
+
+## Consistency models — the actual vocabulary
+
+CAP is too coarse for picking a database. The richer vocabulary
+distinguishes specific consistency levels:
+
+### Strong consistency / linearizability
+Reads see the latest committed write, period. The system behaves
+as if there's a single global timeline of operations.
+
+- Hardest to provide in a distributed system.
+- Spanner, CockroachDB, etcd, Zookeeper provide it.
+- Pay for it in latency.
+
+### Sequential consistency
+Operations appear in *some* global order that's consistent with
+each process's order, but not necessarily real-time order.
+Theoretical; rarely a user-facing guarantee.
+
+### Causal consistency
+Operations that are causally related (B happened because of A) are
+seen by all readers in the same order. Concurrent operations
+(neither caused the other) may be ordered differently across
+replicas.
+
+Useful model: "if Alice replies to Bob's post, no one sees the
+reply without the post." MongoDB's causal consistency option,
+some session-aware modes in DynamoDB.
+
+### Read-your-writes
+A client that writes X always sees X (or newer) on subsequent
+reads, even if other clients see stale data. Usually implemented
+per-session.
+
+Important for UX: "I posted a comment, refreshing should show it."
+Otherwise users panic-click "post" again.
+
+### Monotonic reads
+Once a client has seen value X, it never sees an older value on
+subsequent reads. Prevents "time travel" UX where data appears to
+go backward.
+
+### Bounded staleness
+"Reads may be stale, but never more than N seconds / M
+operations behind." Useful when you can quantify the staleness
+budget.
+
+### Eventual consistency
+The weakest meaningful guarantee. "If writes stop, replicas
+eventually converge on the same value." No bound on how long
+"eventually" takes.
+
+Despite the name, eventually consistent systems usually converge
+quickly in practice (milliseconds to seconds). But there's no
+formal guarantee, and during partition you can read genuinely
+stale data.
+
+## What you actually pick
+
+Real systems offer **tunable consistency** so you can pick per
+operation:
+
+### DynamoDB
+- **Eventually consistent reads** (default): low latency, may be
+  stale.
+- **Strongly consistent reads**: higher latency, guaranteed
+  freshness.
+
+### Cassandra
+Per-query consistency level:
+- `ONE`, `LOCAL_QUORUM`, `QUORUM`, `ALL`.
+- `LOCAL_QUORUM` writes + `LOCAL_QUORUM` reads = strong in a single
+  DC.
+
+### MongoDB
+**Read concern** (`local`, `available`, `majority`, `linearizable`)
+and **write concern** (`{w: 1}`, `{w: "majority"}`,
+`{w: "majority", j: true}`). Combinations give different
+guarantees.
+
+### CockroachDB / Spanner
+Serializable isolation by default. Follower reads opt-in for stale
+reads at lower latency.
+
+The right level depends on the data:
+
+- **User profile updates** → strong consistency (avoid showing the
+  old profile to the same user).
+- **View counts / like counts** → eventual is fine.
+- **Account balances** → strong, transactional.
+- **Recommendation cache** → eventual / stale OK.
+
+Per-query choice lets you mix.
+
+## ACID vs BASE
+
+Two acronym camps:
+
+### ACID (SQL world)
+- **A**tomicity
+- **C**onsistency
+- **I**solation
+- **D**urability
+
+See **ACID** in the SQL topic. The contract for transactional
+systems.
+
+### BASE (NoSQL world)
+- **B**asically **A**vailable — usually serves a response.
+- **S**oft state — the state may change over time without input
+  (replicas converging).
+- **E**ventually consistent — reads may be stale; converge over
+  time.
+
+BASE trades guarantees for availability and scale. The pitch:
+"strict ACID is overkill for most operations; let me trade some
+correctness for performance."
+
+The honest framing: **ACID and BASE are endpoints on a spectrum,
+not opposites.** Most real systems are some mix.
+
+## Common consistency failure modes
+
+The pain points to know:
+
+### Read-your-writes failure
+User updates their email. Their settings page (served from a read
+replica with replication lag) shows the old email. They re-submit
+the update. Now you have two writes to investigate.
+
+**Mitigation:** route reads from a user back to the primary (or
+the same replica they wrote to) for a short window after they
+write. Many systems support "session consistency" for this.
+
+### Lost updates
+Two clients read the same record, modify it, write it back. The
+second write overwrites the first.
+
+**Mitigation:** atomic operations (`UPDATE balance = balance - $1`),
+optimistic locking with a version column, or pessimistic locking
+(`SELECT ... FOR UPDATE`).
+
+### Phantom writes (asymmetric partitions)
+Client A writes to one side of a partition; client B reads from
+the other side. After partition heals, both versions exist.
+
+**Mitigation:** vector clocks (Cassandra, Riak), CRDTs, or
+last-write-wins with conflict logging.
+
+### Stale reads after failover
+Primary fails, replica promotes. Recent writes that hadn't
+replicated yet are lost. Reads from the new primary don't see
+them.
+
+**Mitigation:** synchronous replication (writes ack'd only after
+N replicas confirm), or accept the data loss and configure
+monitoring.
+
+### Time-of-check / time-of-use
+Read a value, decide based on it, write a new value. The value
+changed between the check and the write.
+
+**Mitigation:** transactions with `SERIALIZABLE` isolation, or
+atomic predicate updates (`UPDATE ... WHERE expected_value = ?`).
+
+## CAP doesn't actually describe modern systems well
+
+The honest 2026 take: CAP is **vocabulary**, not a useful
+classifier. Real systems are more nuanced:
+
+- **Spanner** is technically CP but uses TrueTime to make
+  consistency very fast in practice.
+- **DynamoDB** is technically AP but the bounded staleness is
+  usually under 100ms.
+- **CockroachDB** is CP but tunable — follower reads relax it.
+- **MongoDB** is CP for primary writes but eventually consistent
+  on secondary reads if you opt in.
+
+What matters in practice:
+
+1. **Steady-state latency** — what does p50 / p99 read and write
+   latency look like?
+2. **Partition behavior** — what happens when a node or region
+   disconnects?
+3. **Failure-mode UX** — what does a user see when something is
+   wrong?
+4. **Recovery model** — how does the system get back to consistent
+   when the partition heals?
+
+Talking about specific scenarios beats arguing about which letter
+of CAP a system "is."
+
+## How to pick a consistency level
+
+A pragmatic decision framework:
+
+1. **Identify the data.** Per-table, per-operation. Don't pick one
+   level for everything.
+2. **Identify the worst-case if you're wrong.**
+   - "User sees stale view count" → eventual is fine.
+   - "Two users get assigned the same username" → strong needed.
+   - "Money goes missing" → transactional, never anything weaker.
+3. **Identify the cost.**
+   - Stronger consistency = higher latency + lower availability
+     under partition.
+4. **Pick the weakest level that handles your worst case.**
+   Default to stronger; relax with intent.
+
+The mistake is **defaulting to eventual consistency for everything
+because it's faster**. Most apps need strong consistency for
+99% of operations and eventual is wrong.
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **Key-Value Stores** through **Time-Series & Vector** — the
+  specific systems and their consistency models.
+- **ACID** (SQL topic) — the alternative model.
+- **Distributed SQL** (SQL topic) — how systems achieve strong
+  consistency at scale.
+- **Replication & CDC** (Data topic) — practical replication
+  patterns.

@@ -1,0 +1,278 @@
+export const level = 'mid';
+
+# Search Engines
+
+Search engines are databases optimized for one thing: **finding
+text by content**. They use **inverted indexes** — a map from words
+to the documents containing them — to answer queries like "all
+products matching 'wireless headphones' sorted by relevance" in
+milliseconds, against billions of documents.
+
+They're technically databases (they store data, you can query it),
+and they're usually classed under NoSQL — but they have a specific
+role: a derived index over your primary data, not a system of
+record.
+
+## The model
+
+Documents are JSON-ish records with text fields:
+
+```json
+{
+  "id": "product:42",
+  "name": "Sony WH-1000XM5 Wireless Headphones",
+  "description": "Industry-leading noise cancellation...",
+  "price": 399,
+  "category": "audio",
+  "in_stock": true,
+  "rating": 4.8
+}
+```
+
+You index the document. The engine breaks the text into **tokens**
+(words), normalizes them (lowercase, stem, remove stop words),
+and builds an inverted index:
+
+```
+"wireless" → [product:42, product:51, product:88, ...]
+"headphones" → [product:42, product:67, product:88, ...]
+"noise" → [product:42, product:73, ...]
+```
+
+A query for `"wireless headphones"` intersects the lists and
+scores each match for relevance.
+
+## The major search engines
+
+### Elasticsearch
+The dominant open-source-ish search engine. License changed to
+SSPL/Elastic License in 2021 (which excludes it from some OSS
+definitions). Mature, feature-rich, JSON-based REST API.
+
+Used for:
+- Product search, site search.
+- Log aggregation (the "ELK stack" — Elasticsearch + Logstash +
+  Kibana).
+- Application observability (alongside Grafana / Loki).
+- Security analytics.
+
+### OpenSearch
+Amazon's fork of Elasticsearch from 2021 (after the license
+change). Apache 2 licensed, mostly compatible with older
+Elasticsearch versions. The two are diverging.
+
+If you're on AWS or want a clearly-OSS option, OpenSearch. If
+you're using Elastic's commercial features (machine learning,
+SIEM), Elasticsearch.
+
+### Solr
+The other long-standing open-source search engine (Apache).
+Built on Lucene (same underlying library as Elasticsearch). More
+config-file-driven; smaller community than Elasticsearch now.
+
+### Meilisearch
+Open-source, written in Rust, focused on fast typo-tolerant
+search out of the box. Lighter operationally than Elasticsearch —
+great for app-search use cases that don't need the full Elastic
+feature set.
+
+### Typesense
+Similar pitch to Meilisearch: open-source, fast, easy to operate.
+The two compete for the "I just want product / app search and
+don't want to run Elasticsearch" niche.
+
+### Algolia
+Hosted (not open source). Excellent developer experience, fastest
+search-as-you-type performance, easy to integrate. Expensive at
+scale but a great "stop building search infrastructure" choice for
+many products.
+
+### Vespa
+Yahoo's search engine, open-sourced. Used at huge scale (Yahoo,
+Spotify recommendations). Combines search + ML ranking +
+real-time updates. Steep learning curve; powerful when justified.
+
+### Postgres full-text search (`tsvector`)
+Worth mentioning here even though it's not a "search engine":
+Postgres has solid full-text search built in via `tsvector` and
+GIN indexes. For many apps it's enough and saves you from running
+a second system. Cross-language analyzers, stemming, ranking —
+all there.
+
+When to upgrade from `tsvector` to a real search engine: you need
+faceted search at scale, relevance tuning beyond what `ts_rank`
+gives you, machine-learned ranking, or you're indexing 100M+
+documents.
+
+## What search engines are good at
+
+### Full-text search
+"Find products matching this query, ranked by relevance." With
+typo tolerance, stemming ("run" matches "running"), and language-
+aware analysis.
+
+### Faceted search
+Multiple filters applied simultaneously, with counts:
+
+```
+[√] Brand: Sony (124)
+[ ] Brand: Bose (89)
+[√] Price: $100-$200 (45)
+[√] In stock (203)
+```
+
+Search engines compute facets on every query. SQL can do this but
+each facet is a separate query and the totals expensive to
+recompute on every page load.
+
+### Autocomplete and search-as-you-type
+Inverted indexes naturally support prefix queries. Show 10
+suggestions as the user types each character.
+
+### Geo queries
+Search "restaurants within 2km of this point" combined with text
+search and filters.
+
+### Aggregations on text data
+"How many log entries per service per hour" — log aggregation
+shape. Elasticsearch's aggregation framework is powerful for this.
+
+### Vector similarity (newer)
+Modern search engines (Elasticsearch 8+, OpenSearch, Vespa,
+Meilisearch) support vector search alongside text search — the
+"hybrid search" pattern for RAG and semantic search. The line
+between search engines and vector databases is blurring.
+
+## What search engines are NOT good at
+
+- **Being a system of record.** Search engines lose data
+  occasionally (corrupt shards, restore from snapshot needed).
+  You always populate them from your primary database, never the
+  other way around.
+- **Strong consistency.** Indexed writes are visible after a
+  flush interval (often ~1s). Don't search-for-then-decide on
+  freshly-written data.
+- **Transactions.** No multi-document atomicity.
+- **OLTP traffic.** They're optimized for read-heavy search, not
+  for high-rate single-key reads and writes.
+- **Complex joins.** Some join-like operations exist
+  (nested documents, parent-child) but they're awkward. Denormalize
+  at index time instead.
+
+## The "derived index" pattern
+
+The right way to use a search engine: it's a **derived index** over
+your source-of-truth database.
+
+```
+[Postgres] ----CDC / outbox / dual-write----> [Elasticsearch]
+   |                                              |
+   v                                              v
+authoritative data                       search-only index
+```
+
+The flow:
+
+1. Write to Postgres (authoritative).
+2. Propagate the change to Elasticsearch via CDC (Debezium),
+   outbox + worker, or dual-write.
+3. Search queries go to Elasticsearch.
+4. Detail / mutation queries go back to Postgres (Elasticsearch
+   returns IDs; Postgres returns full records, or Elasticsearch
+   returns enough fields for the search UI directly).
+
+**Don't** write to Elasticsearch as your only store. **Don't**
+mutate data in Elasticsearch — re-derive it from Postgres.
+
+The "derived" framing matters: if Elasticsearch gets corrupted or
+needs reindexing, you can always rebuild it from Postgres.
+Reverse isn't true.
+
+## Sharding and operations
+
+Elasticsearch / OpenSearch are distributed by default — indexes
+are split into **shards**, each shard replicated for HA.
+
+**Pain points:**
+- Choosing shard counts. Too few → can't scale; too many → memory
+  overhead. The default of 1 shard/index in modern versions is
+  usually right.
+- Memory pressure. Search engines love RAM (caching the index
+  for fast queries). Undersized clusters get slow.
+- Mapping changes. Changing the type of a field requires
+  reindexing — you create a new index with the new mapping and
+  switch an alias.
+- Mature observability — Elasticsearch monitoring is itself a
+  whole topic.
+
+For app-scale search (< 100M docs, < 1000 QPS), Meilisearch or
+Typesense are dramatically simpler to operate than Elasticsearch.
+Pick complexity only when you need the features.
+
+## Relevance ranking
+
+The thing search engines do that SQL can't:
+
+```
+score = TF-IDF(query, document)
+       × BM25 normalization
+       × field-specific weights (title > description)
+       × business-specific boosts (in-stock, recent)
+       × user-specific signals (personalization)
+```
+
+The default BM25 ranking is good enough for most apps. The pain
+starts when product wants:
+
+- "Boost in-stock items."
+- "Penalize old items."
+- "Personalize by user history."
+- "Always show the exact-match product first, then fuzzy
+  matches."
+- "Promoted products at the top."
+
+Relevance tuning is a full discipline. At scale, **learning to
+rank** (machine-learned ranking models) replaces hand-tuned
+weights. Vespa and Elasticsearch's LTR plugin support this; most
+teams don't get there.
+
+## Log aggregation — Elasticsearch's other big role
+
+The ELK stack (Elasticsearch + Logstash + Kibana) is the
+default open-ish-source log aggregation system.
+
+- **Logstash / Beats / Fluent Bit** ship logs to Elasticsearch.
+- **Elasticsearch** indexes them.
+- **Kibana** is the UI for searching and dashboarding.
+
+For application logs, this is heavyweight but powerful. Loki +
+Grafana is the lighter alternative gaining ground. ClickHouse is
+the high-end alternative for huge volumes.
+
+## When to skip a search engine
+
+Many apps don't need a separate search engine:
+
+- **Small datasets (< 1M rows).** Postgres `tsvector` + GIN
+  handles it.
+- **Search isn't a core feature.** A `WHERE name ILIKE '%term%'`
+  with a trigram index gets you basic substring matching.
+- **You can use a hosted SaaS.** Algolia / Meilisearch Cloud /
+  Typesense Cloud — pay them, don't run it yourself.
+
+When to commit to running a search engine:
+
+- Real text search across many fields with relevance.
+- Faceted browsing UI.
+- Log aggregation at scale.
+- Vector / hybrid search for RAG.
+- > 10M documents you need to search interactively.
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **Document Stores** — same JSON-shape, different optimization.
+- **Time-Series & Vector** — overlapping with search for log /
+  vector use cases.
+- **Replication & CDC** (Data topic) — how to populate search
+  engines from Postgres.

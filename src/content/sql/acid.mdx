@@ -1,0 +1,212 @@
+export const level = 'mid';
+
+# ACID
+
+ACID is the four-letter contract every SQL database honors for
+transactions. It's the killer feature SQL has that most NoSQL
+systems traded away. If your domain has money, inventory,
+bookings, or any "two things must both happen or neither" rule —
+ACID is non-negotiable, and it's the reason you should default to
+SQL.
+
+## What the letters mean
+
+- **A**tomicity — all-or-nothing.
+- **C**onsistency — constraints hold before and after.
+- **I**solation — concurrent transactions don't interfere.
+- **D**urability — once committed, it survives crashes.
+
+Each does real work. Let's go through them.
+
+## Atomicity — all or nothing
+
+A transaction groups statements into one unit. Either every
+statement commits, or none of them do.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+If the second `UPDATE` fails — or the network dies, or the process
+crashes — the first one is **rolled back**. The database goes back
+to the state before `BEGIN`.
+
+Without atomicity, the failure mode is "$100 left account 1 but
+never arrived at account 2." Money vanished. Atomicity makes that
+impossible.
+
+In code:
+
+```js
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 1]);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 2]);
+  await client.query('COMMIT');
+} catch (err) {
+  await client.query('ROLLBACK');
+  throw err;
+} finally {
+  client.release();
+}
+```
+
+The three rules: same client for all statements, always release in
+`finally`, always rollback on error. See **Transactions** in the
+Data topic.
+
+## Consistency — constraints hold
+
+Constraints (`NOT NULL`, `UNIQUE`, `FOREIGN KEY`, `CHECK`) are
+true before the transaction starts, and true after it commits. The
+database refuses to commit a transaction that would leave invalid
+data.
+
+```sql
+CREATE TABLE accounts (
+  id      UUID PRIMARY KEY,
+  balance NUMERIC NOT NULL CHECK (balance >= 0)
+);
+```
+
+Try to commit a transaction that leaves `balance = -10`? The
+`CHECK` constraint rejects it. The transaction is rolled back.
+
+(The "C" in ACID is the least precise of the four. Some people
+read it as "your application invariants hold" — but really, only
+the constraints you've declared to the database are enforced. The
+app's job is to declare them.)
+
+## Isolation — concurrent transactions don't interfere
+
+This is the subtle one. Multiple transactions run at the same time.
+Without isolation, they'd see each other's half-finished work and
+get confused.
+
+Standard isolation levels, from weakest to strongest:
+
+| Level | Allows |
+| --- | --- |
+| **Read Uncommitted** | Dirty reads (seeing uncommitted data) |
+| **Read Committed** | Non-repeatable reads (same row, different values) |
+| **Repeatable Read** | Phantoms (new rows appearing) — sometimes |
+| **Serializable** | Nothing — as if transactions ran one at a time |
+
+Postgres defaults to **Read Committed**. MySQL/InnoDB defaults to
+**Repeatable Read**. Most apps run on the default and it's fine.
+
+The classic isolation failure:
+
+```sql
+-- Transaction A
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- reads 100
+-- ... (decides to withdraw 80)
+UPDATE accounts SET balance = balance - 80 WHERE id = 1;
+COMMIT;
+
+-- Transaction B (concurrent)
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- also reads 100
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+COMMIT;
+```
+
+Both read 100. Both decide their withdrawal is fine. Both commit.
+The balance ends at -30 (depending on order). This is a **lost
+update** — the failure mode you prevent with stronger isolation, or
+with atomic updates (`balance = balance - 80`), or with explicit
+locking (`SELECT ... FOR UPDATE`).
+
+See **Transactions** in the Data topic for the full isolation
+discussion.
+
+## Durability — committed writes survive
+
+Once `COMMIT` returns success, the write has been persisted to
+disk and will survive a crash, power failure, or restart.
+
+How databases achieve this:
+
+1. Before modifying the actual data files, write the change to a
+   **write-ahead log** (WAL) and `fsync` it to disk.
+2. Acknowledge the commit only after the log entry is durable.
+3. On crash recovery, replay the log to bring the data files up to
+   date.
+
+That `fsync` step is the expensive part — it's why naive databases
+that skip it are fast but lose data on crash. Real databases pay
+the cost.
+
+In cloud setups, durability extends to replication: a write isn't
+acknowledged until it's replicated to N replicas. If the primary
+disk dies, the data survives on the replicas.
+
+## Why ACID matters more than people say
+
+You'll read takes like "ACID is overrated, eventual consistency is
+fine for most apps." That's true if your app is fully tolerant of
+data loss and inconsistency. Most aren't, but they fake it because
+the bugs are subtle.
+
+Examples of "I didn't think I needed ACID, but I did":
+
+- **Double-charging a credit card** — atomicity failure.
+- **Negative inventory** — consistency failure (no CHECK).
+- **Reading stale follower count** — isolation failure (under
+  some replication setups).
+- **Lost order after server restart** — durability failure (write
+  to cache that wasn't persisted).
+
+ACID is the difference between "we have a bug" and "we have an
+incident with a postmortem and an apology email."
+
+## ACID vs BASE
+
+The NoSQL world sometimes contrasts ACID with **BASE**:
+
+- **B**asically **A**vailable
+- **S**oft state
+- **E**ventually consistent
+
+BASE trades guarantees for availability and scale. A globally-
+replicated key-value store can survive any single-region failure
+and serve every read, but you might read stale data for a few
+seconds after a write.
+
+Both are valid models for different problems. The mistake is
+picking BASE because it sounds modern and discovering, two years
+in, that your app actually needed atomicity.
+
+Default to ACID. Reach for BASE when you can name the specific
+constraint that forced the trade.
+
+## ACID across multiple systems
+
+The honest limitation: ACID is a single-database guarantee. If your
+transaction needs to update Postgres **and** publish a Kafka
+message, you can't put both in one atomic transaction — they're
+different systems.
+
+The **outbox pattern** is the standard fix: write the message into
+an `outbox` table in the same DB transaction as the business write;
+a separate worker reads new outbox rows and publishes them. You
+get at-least-once delivery (consumers must be idempotent), but no
+lost messages. See the outbox question in the Data topic.
+
+For truly distributed transactions across multiple databases,
+two-phase commit (2PC) and Saga patterns exist, but most teams
+avoid them in favor of outbox + idempotent consumers. Simpler,
+more reliable.
+
+## What to learn next
+
+- **What is SQL** — the language overview.
+- **Relational Model** — the foundation ACID protects.
+- **Types of SQL Databases** — which databases honor ACID how.
+- **Transactions** (Data topic) — the practical patterns.
+- **Replication & CDC** (Data topic) — durability across nodes.

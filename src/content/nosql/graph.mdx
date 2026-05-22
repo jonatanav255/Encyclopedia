@@ -1,0 +1,269 @@
+export const level = 'mid';
+
+# Graph Databases
+
+Graph databases treat **relationships as first-class data**. Where
+SQL forces you to model relationships as foreign keys you traverse
+via joins, graph databases store edges directly and traverse them
+in constant time per hop. For queries that are fundamentally about
+"who is connected to whom and how" — recommendation engines,
+fraud detection, social graphs, knowledge graphs — they're
+dramatically better than SQL.
+
+## The model
+
+Two primitives:
+
+- **Nodes** (vertices) — entities. A user, a product, an account.
+- **Edges** (relationships) — connections between nodes. Typed and
+  often directional.
+
+Both can have properties (key-value attributes).
+
+```
+(:User {id: 1, name: "Jon"}) -[:FRIEND]-> (:User {id: 2, name: "Ana"})
+(:User {id: 1}) -[:LIKES {since: 2024}]-> (:Band {name: "Beach House"})
+(:User {id: 2}) -[:LIKES]-> (:Band {name: "Beach House"})
+```
+
+The colon-prefixed labels (`:User`, `:Band`) are types. The
+arrows are typed edges. Properties go in `{...}`.
+
+## The query model
+
+Graph queries are pattern-matching:
+
+```cypher
+MATCH (u:User {id: $userId})-[:FRIEND]->(f)-[:LIKES]->(b:Band)
+WHERE NOT (u)-[:LIKES]->(b)
+RETURN b, COUNT(*) AS score
+ORDER BY score DESC
+LIMIT 10;
+```
+
+That's two hops — friend → liked band — filtered to bands the
+user doesn't already like. "Bands my friends like that I haven't
+discovered yet."
+
+In SQL this is two self-joins of a `friendships` table plus a
+join to `user_band_likes`. At 2 hops it's still tractable. At 5
+hops ("friends of friends of friends ..."), SQL queries become
+brutal — each hop is another join multiplying the row count.
+
+Graph databases keep the cost roughly proportional to the **result
+size**, not the dataset size, because traversal follows the stored
+edges directly.
+
+## The major graph databases
+
+### Neo4j
+The most-used open-source-ish graph database (GPL with commercial
+enterprise version). Mature, excellent tooling, the Cypher query
+language is the most readable graph query language.
+
+Neo4j is **native graph storage** — internally, nodes hold direct
+pointers to their edges, so traversal is constant-time per hop
+regardless of database size. This is the architectural property
+that makes deep traversals fast.
+
+### Dgraph
+Open-source, distributed, scales horizontally. Uses GraphQL as the
+query language (with extensions). Less mature than Neo4j, but
+better at large datasets that don't fit on one node.
+
+### Amazon Neptune
+AWS's managed graph service. Speaks both Gremlin (property graph)
+and SPARQL (RDF / semantic web). Managed, integrated with AWS,
+costlier than self-hosted Neo4j.
+
+### ArangoDB
+Multi-model — document + graph + key-value in one engine. Reasonable
+for "I want a graph DB but also other things." Smaller community
+than Neo4j; the multi-model pitch is appealing but tradeoffs
+exist.
+
+### TigerGraph
+Commercial, focused on very large graphs and analytics. Used in
+fraud detection, recommendation at scale.
+
+### JanusGraph
+Open-source distributed graph database, pluggable storage
+(Cassandra, HBase, ScyllaDB). For when you need a graph view over
+data already in a wide-column store.
+
+### Memgraph
+In-memory graph database, Cypher-compatible with Neo4j, focused on
+real-time / streaming graph workloads.
+
+## Query languages
+
+The graph world hasn't settled on one query language the way SQL
+unified the relational world. Three main options:
+
+### Cypher (Neo4j, openCypher)
+ASCII-art pattern syntax. Most readable.
+
+```cypher
+MATCH (a:User)-[:FRIEND*2..3]->(b:User)
+WHERE a.id = 1
+RETURN b LIMIT 50;
+```
+
+`[:FRIEND*2..3]` matches paths of length 2 to 3 through `FRIEND`
+edges.
+
+### Gremlin (Apache TinkerPop)
+Functional/imperative traversal language. Supported by JanusGraph,
+Neptune, others.
+
+```groovy
+g.V().has('User', 'id', 1)
+ .out('FRIEND').out('LIKES')
+ .dedup().limit(10)
+```
+
+Less readable than Cypher but more flexible for procedural logic.
+
+### SPARQL (RDF)
+For semantic-web / triple-store databases. Used by Neptune (in
+SPARQL mode), various academic and enterprise knowledge-graph
+systems.
+
+```sparql
+SELECT ?friend WHERE {
+  :Jon foaf:knows ?friend .
+}
+```
+
+Not chosen for application work as often as Cypher or Gremlin.
+
+### GQL (ISO standard)
+The 2024 ISO standard graph query language, designed to unify
+Cypher and other property-graph dialects. Adoption is slow but
+real — Neo4j, others are converging. Expect this to matter more
+over the next 5 years.
+
+## When graph databases fit
+
+### Social graphs
+Friends, followers, group memberships. Queries like "people who
+follow X also follow Y," "shortest path between users," "communities
+within the graph."
+
+### Recommendation engines
+Collaborative filtering as graph traversal: "users who liked what
+you liked also liked..." Multi-hop neighborhood queries.
+
+### Fraud detection
+"Find accounts that share an IP, a card number, an email pattern,
+or a device fingerprint within 2 hops of a known bad actor."
+Pattern-matching across many relationship types simultaneously.
+
+### Knowledge graphs
+Wikidata, enterprise knowledge management, RAG systems for LLMs.
+Entities with typed relationships, queried by pattern.
+
+### Identity and access management
+Permissions modeled as `(:User)-[:MEMBER_OF]->(:Group)-[:CAN]->(:Resource)`.
+Authorization queries become graph traversals.
+
+### Network topology
+Routing, dependency analysis, supply chains. "What depends on
+service X?" is a graph traversal.
+
+## When NOT to use graph databases
+
+- **Your queries are tabular.** "Show me the top 10 users by
+  signups this month" is a SQL aggregation, not a graph query.
+  Graph DBs are bad at this.
+- **The graph isn't really a graph.** If your "edges" are just
+  foreign keys you join across occasionally, SQL is fine. Graph
+  databases shine when the graph structure is the *point*.
+- **You only have 1-2 hops.** SQL with proper indexes handles 1-2
+  joins fine. Graph databases pay off at 3+ hops or where the
+  number of hops is variable.
+- **You need rich aggregations.** Graph databases have aggregation
+  primitives, but they're less mature than SQL's.
+
+A common pattern: **SQL or document as the system of record, graph
+database as a derived index for specific queries**. You ETL the
+relationship data into Neo4j; queries that need traversal go
+there; everything else stays in Postgres.
+
+## SQL recursive CTEs — the alternative
+
+Modern SQL has recursive CTEs that handle some graph queries:
+
+```sql
+WITH RECURSIVE descendants AS (
+  SELECT id, parent_id FROM employees WHERE id = ?
+  UNION ALL
+  SELECT e.id, e.parent_id
+  FROM employees e JOIN descendants d ON e.parent_id = d.id
+)
+SELECT * FROM descendants;
+```
+
+For tree traversals and shallow graph queries, SQL recursive CTEs
+work. They start to hurt at scale, especially with cycles or
+many-to-many traversals. If recursive CTEs are working for you,
+you don't need a graph database.
+
+## Property graphs vs RDF triple stores
+
+Two architectural lineages:
+
+### Property graphs
+Nodes and edges have arbitrary key-value properties. The model
+most graph databases use (Neo4j, Dgraph, Neptune, TigerGraph).
+Pragmatic, ergonomic.
+
+### RDF (Resource Description Framework)
+Everything is a **triple**: `subject — predicate — object`. No
+inline properties; properties become more triples. Queried with
+SPARQL. Origins in semantic web / linked data.
+
+```
+:Jon foaf:knows :Ana .
+:Jon foaf:age "32" .
+```
+
+RDF is better for cross-organization knowledge graphs where
+shared vocabularies (FOAF, schema.org) matter. Property graphs
+are better for application-internal use.
+
+For most app developers: property graphs (Neo4j et al.).
+
+## Operational notes
+
+- **Indexing.** Index node properties you query on, just like SQL.
+  Neo4j: `CREATE INDEX FOR (u:User) ON (u.email)`.
+- **Sharding** is hard. Graph traversals don't shard well — an
+  edge can lead to any node, including one on another shard. Some
+  systems (Dgraph, TigerGraph) handle it; many work best on a
+  single node with replicas.
+- **Backup / restore** is database-specific. Neo4j has online
+  backup in enterprise; OSS version requires more care.
+- **Schema** is optional but recommended. Cypher / GQL increasingly
+  support constraints (`CREATE CONSTRAINT FOR (u:User) REQUIRE
+  u.id IS UNIQUE`).
+
+## The honest assessment
+
+Graph databases are excellent at what they're for and bad at
+everything else. Most apps don't need one — their relationships
+fit fine in SQL. The apps that do need one usually realize it
+because they've written 50-line SQL queries with 6 self-joins and
+the performance is unacceptable.
+
+The 2026 reality: graph databases are a complement to your main
+database, not a replacement. Postgres + Neo4j (or pgRouting / Apache
+AGE — a Postgres extension that adds Cypher support) is a common
+shape.
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **Document Stores** — adjacent NoSQL family.
+- **Search Engines** — another query-specialized store.
+- **Relational Model** (SQL topic) — what graph DBs are *not*.

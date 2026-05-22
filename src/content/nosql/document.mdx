@@ -1,0 +1,338 @@
+export const level = 'mid';
+
+# Document Stores
+
+Document stores hold records as JSON-shaped **documents** indexed
+by an `_id`. Each document is self-contained — it can hold nested
+objects, arrays, mixed types — and can have a different shape from
+its siblings. The model fits well when your data is genuinely
+document-shaped, and badly when you try to use it as a general-
+purpose database.
+
+## The data model
+
+```json
+{
+  "_id": "user:42",
+  "name": "Jon",
+  "emails": [
+    { "address": "jon@example.com", "verified": true },
+    { "address": "j@personal.io", "verified": false }
+  ],
+  "preferences": {
+    "theme": "dark",
+    "notifications": { "email": true, "push": false }
+  },
+  "created_at": "2026-01-15T10:00:00Z"
+}
+```
+
+A document can have nested objects, arrays, dates, references to
+other documents. No fixed schema is required (though one is
+usually a good idea — more on that below).
+
+The collection (analogous to a table) holds many such documents.
+You query by document fields, including nested ones:
+
+```js
+db.users.find({ "preferences.theme": "dark" });
+```
+
+## The major document stores
+
+### MongoDB
+The dominant document database. Open source (SSPL since 2018,
+which excludes it from some "true OSS" definitions but is fine for
+most users). Rich query language, aggregation pipeline, indexing
+on nested fields, geospatial, full-text search.
+
+MongoDB has matured significantly since the early "lost-your-data"
+stories from 2012-ish. It now has:
+
+- **Multi-document ACID transactions** (since 4.0, 2018).
+- **Journaled writes** (durable by default).
+- **Replica sets** for HA.
+- **Sharding** for horizontal scale.
+- **Schema validation** via JSON Schema (opt-in).
+
+It's a serious database now. The trade-offs vs Postgres still
+apply, but the "MongoDB loses your data" jokes are outdated.
+
+### Firestore (Google Cloud)
+Managed serverless document database. Real-time sync (clients can
+subscribe to query results), strong client SDKs, integrates with
+Firebase Auth and Cloud Functions.
+
+Best for: mobile/web apps with real-time UI needs (chat, collab,
+live data), where managing infra is a non-goal.
+
+Trade-offs: per-document billing, query limitations (you must
+create composite indexes for every multi-field query, ahead of
+time), lock-in to GCP/Firebase.
+
+### Couchbase
+Document store with a SQL-ish query language (N1QL). More
+performance-focused, used in latency-sensitive deployments.
+Smaller community than MongoDB.
+
+### DynamoDB (document mode)
+DynamoDB can store document attributes (maps and lists) inside
+items. It's not a "pure" document store — the primary access is
+still key-based — but it covers many document use cases at
+serverless scale.
+
+### Amazon DocumentDB
+AWS's MongoDB-API-compatible service. Not actually MongoDB under
+the hood — different storage engine — but the wire protocol
+matches. Compatibility lags a few MongoDB versions.
+
+### CouchDB
+The original document database (2005), HTTP/REST API, multi-master
+replication built in. Excellent for sync-heavy use cases (offline-
+first apps with eventual sync). Smaller community than MongoDB.
+
+## When document stores fit
+
+- **Data is genuinely document-shaped.** Orders with nested line
+  items, CMS articles with mixed media blocks, user profiles with
+  varying optional fields.
+- **You read whole "things" at once.** Pulling one document gets
+  everything you need; no joins.
+- **Schema is fluid early.** Prototyping, MVPs, products still
+  finding shape. (Caveat: this freedom often becomes a liability
+  later — see below.)
+- **Sharding by document is easy.** If documents are independent,
+  you can shard by `_id` trivially.
+
+## When document stores hurt
+
+- **Cross-document transactions.** MongoDB has them, but they're
+  slower than the SQL equivalent and have limitations.
+- **Relationships.** "Embed vs reference" is a permanent question
+  with no perfect answer. Joins (`$lookup` in MongoDB) exist but
+  are slower than SQL joins.
+- **Ad-hoc analytics.** "Count orders by category by month"
+  requires an aggregation pipeline that's powerful but verbose.
+  SQL is better at this.
+- **Strong consistency under contention.** Postgres handles this
+  with isolation levels and locks; MongoDB has narrower tools.
+
+## Embed vs reference — the central design question
+
+You have a `Post` and `Comment` relationship. Two options:
+
+### Embed
+```json
+{
+  "_id": "post:42",
+  "title": "Hello",
+  "comments": [
+    { "user": "alice", "body": "first!" },
+    { "user": "bob", "body": "great post" }
+  ]
+}
+```
+
+- **Pro:** one read gets the post and all comments.
+- **Pro:** atomic single-document writes.
+- **Con:** unbounded growth — what if there are 10,000 comments?
+  Documents have a 16MB size limit in MongoDB. Reads pull the
+  whole thing.
+- **Con:** if `user` is mutable data (display name changes), every
+  embedded copy gets stale.
+
+### Reference
+```json
+{ "_id": "post:42", "title": "Hello" }
+
+{ "_id": "comment:1", "post_id": "post:42", "user": "alice", ... }
+{ "_id": "comment:2", "post_id": "post:42", "user": "bob", ... }
+```
+
+- **Pro:** no unbounded growth — comments are their own collection.
+- **Pro:** user data lives in one place.
+- **Con:** two queries (or `$lookup` aggregation) to render a
+  post with its comments.
+
+### The rule of thumb
+Embed when the relationship is **bounded, owned, and read
+together**. Reference when it's **unbounded, shared, or
+independently queryable**.
+
+Examples:
+- Order line items inside an order → embed.
+- Address inside a user → embed.
+- Comments under a post (potentially many) → reference.
+- Author of a post (shared across many posts) → reference.
+
+This decision is one-way under load. Migrating from embedded to
+referenced means rewriting every document. Get it right early.
+
+## Schema-on-write vs schema-on-read
+
+The pitch: "schemaless means we move fast." The reality: the
+schema doesn't go away. It moves from the database to your
+application code.
+
+In a SQL world:
+- Schema is declared in one place (the database).
+- Migrations are explicit.
+- Every reader gets the same shape.
+
+In a document store:
+- Schema lives in N application places (every reader).
+- "Migration" is conceptual — old documents still have the old
+  shape until you touch them.
+- Year three, you have 14 variants of `user` and your code does
+  `user.email_address ?? user.email ?? user.emails?.[0]?.address`.
+
+The fix: apply schema **at the application boundary**, even though
+the database doesn't enforce it.
+
+- **MongoDB:** use Mongoose (TypeScript schemas), or add JSON
+  Schema validation to the collection.
+- **Anywhere:** use Zod, io-ts, or Valibot to validate
+  documents on read and write.
+
+This gives you most of the type-safety benefits of SQL without
+losing the schema flexibility you picked the document store for.
+
+## Indexing
+
+Document stores let you index any field, including nested ones:
+
+```js
+db.users.createIndex({ email: 1 });
+db.users.createIndex({ "preferences.theme": 1 });
+db.users.createIndex({ name: "text" });   // full-text
+db.users.createIndex({ location: "2dsphere" });   // geospatial
+```
+
+Like SQL, indexes speed up reads and slow down writes. The
+challenge is similar: index columns you query frequently, don't
+index everything.
+
+**Compound indexes** matter just like in SQL. An index on `{a: 1,
+b: 1}` helps `WHERE a = X AND b = Y` and `WHERE a = X`, but not
+`WHERE b = Y` alone.
+
+## Aggregation pipelines
+
+MongoDB's answer to SQL GROUP BY / window functions: a multi-stage
+pipeline.
+
+```js
+db.posts.aggregate([
+  { $match: { created_at: { $gt: lastWeek } } },
+  { $group: { _id: "$author_id", count: { $sum: 1 } } },
+  { $sort: { count: -1 } },
+  { $limit: 10 },
+  { $lookup: {
+      from: "users", localField: "_id",
+      foreignField: "_id", as: "author"
+  }},
+  { $unwind: "$author" }
+]);
+```
+
+That's the equivalent of:
+
+```sql
+SELECT u.*, COUNT(*) AS count
+FROM posts p JOIN users u ON u.id = p.author_id
+WHERE p.created_at > $lastWeek
+GROUP BY u.id ORDER BY count DESC LIMIT 10;
+```
+
+The aggregation pipeline is genuinely powerful — `$lookup` does
+joins, `$facet` does multiple aggregations in parallel, `$graphLookup`
+does recursive lookups. It's also verbose, and the SQL equivalent
+is usually shorter.
+
+## Transactions in MongoDB
+
+```js
+const session = client.startSession();
+try {
+  await session.withTransaction(async () => {
+    await db.collection("accounts").updateOne(
+      { _id: from }, { $inc: { balance: -100 } }, { session }
+    );
+    await db.collection("accounts").updateOne(
+      { _id: to }, { $inc: { balance: 100 } }, { session }
+    );
+  });
+} finally {
+  await session.endSession();
+}
+```
+
+Works. Has higher overhead than SQL transactions (especially on
+sharded clusters), and there's a hard time limit (default 60s).
+
+For most operations involving only one document, MongoDB's
+single-document atomic writes are enough — and they don't pay the
+transaction overhead.
+
+## Sharding
+
+MongoDB sharding works on a **shard key** — a field used to
+distribute documents across shards.
+
+```js
+sh.shardCollection("mydb.events", { user_id: 1, occurred_at: 1 });
+```
+
+Picking the shard key is one of the most consequential decisions
+you'll make:
+
+- **Cardinality matters.** A boolean shard key gives you 2 shards
+  max. Pick high-cardinality fields.
+- **Write distribution matters.** Time-based shard keys (occurred_at)
+  send all current writes to one shard. Hash the shard key, or
+  use a compound `{user_id, time}`.
+- **Query patterns matter.** Queries that include the shard key
+  are routed to one shard (fast). Queries without it broadcast to
+  all shards (slow).
+
+You can't easily change the shard key once data is sharded. Plan it.
+
+## When you'd reach for Postgres JSONB instead
+
+Postgres has had `JSONB` (binary, indexed JSON) since 2014. For
+the case "I want flexible schemas on some columns," it covers most
+of what people pick MongoDB for:
+
+```sql
+CREATE TABLE events (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  data JSONB NOT NULL
+);
+
+SELECT data->>'username' FROM events
+WHERE data->'meta'->>'env' = 'prod';
+
+CREATE INDEX events_username ON events ((data->>'username'));
+```
+
+You get:
+- Flexible-schema column.
+- Indexable JSON paths.
+- Joins, transactions, foreign keys for everything else.
+- All the Postgres tooling and ecosystem.
+
+The case for MongoDB has to be more specific than "we want
+flexibility": you need horizontally-partitioned writes beyond a
+single primary, *or* documents large enough that you genuinely
+want per-document independence. Most apps that picked MongoDB for
+flexibility later wish they had Postgres + JSONB.
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **Key-Value Stores** — the simpler model.
+- **Wide-Column Stores** — when document doesn't scale.
+- **CAP & Consistency** — the trade-offs MongoDB makes.
+- **Types of SQL Databases** (SQL topic) — including the JSONB
+  alternative.

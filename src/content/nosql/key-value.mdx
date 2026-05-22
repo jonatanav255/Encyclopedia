@@ -1,0 +1,232 @@
+export const level = 'junior';
+
+# Key-Value Stores
+
+The simplest possible database: a giant distributed `Map<key,
+value>`. You look up by key, you write by key. That's almost the
+whole API. Despite the simplicity (because of it), key-value stores
+are everywhere — they power caches, sessions, rate limits, feature
+flags, and most of the "fast lookup by ID" use cases in modern
+backends.
+
+## The model
+
+```
+SET "user:42" → "{...JSON blob...}"
+GET "user:42"
+DEL "user:42"
+```
+
+Keys are strings. Values are bytes — the database doesn't look
+inside them. (Redis is a partial exception: it has typed values
+like lists, hashes, sorted sets.)
+
+There's no query language. No `WHERE`, no `JOIN`, no `GROUP BY`.
+If you need to find values by anything other than the key, you're
+in the wrong tool.
+
+The trade-off pays off in **speed**: single-digit milliseconds (or
+microseconds for in-memory stores) regardless of how many keys
+exist. O(1) lookup on a hash.
+
+## The major key-value stores
+
+### Redis
+The dominant in-memory key-value store. Open source (RSAL/SSPL
+license since 2024), single-threaded core (multiple shards in
+Redis Cluster), wildly fast.
+
+Beyond raw key-value, Redis has typed values:
+
+- **Strings** — bytes / serialized JSON.
+- **Lists** — push/pop, cheap queues.
+- **Hashes** — field-value maps.
+- **Sets** — unordered unique members + set operations.
+- **Sorted sets** — set + score per member; leaderboards.
+- **Bitmaps**, **HyperLogLogs**, **Streams**, **Geo**.
+
+Plus expiration (TTLs), pub/sub, scripting (Lua), and atomic ops.
+
+The result is "key-value plus a Swiss Army knife of data
+structures." Almost every backend uses Redis for something. See
+**Redis Patterns** in the Data topic.
+
+### Memcached
+Older than Redis, simpler, still excellent. Pure in-memory cache —
+no persistence, no data structures beyond strings, no replication
+in the OSS version. What it lacks in features it makes up for in
+speed and simplicity.
+
+When to pick Memcached over Redis: when you want a pure cache and
+nothing else, and the operational simplicity matters. Otherwise
+Redis.
+
+### DynamoDB (AWS)
+Managed, serverless, NoSQL key-value store. Single-digit-ms reads
+at any scale. The pricing model (pay per request + per GB) lets
+you scale from zero to massive without operational work.
+
+DynamoDB also supports document-style attributes — it's
+key-value-ish with document features bolted on. The pure access
+pattern is: `GetItem(partition_key, sort_key)`.
+
+**Single-table design** is the DynamoDB philosophy: rather than
+multiple tables with relationships (SQL-style), you cram all
+entity types into one table with composite keys representing the
+hierarchy. Powerful, but a learning curve, and rigid against
+access-pattern changes.
+
+### Cloud-native managed KV
+- **Cloudflare Workers KV** — eventually consistent KV at the edge.
+- **AWS DynamoDB** — covered above.
+- **Azure Cosmos DB (Table API)** — Microsoft's offering.
+- **GCP Memorystore** — managed Redis on GCP.
+
+### etcd / Consul / Zookeeper
+A specialized class — **strongly consistent** key-value stores
+used for service discovery, distributed coordination, leader
+election, and configuration. Backed by Raft consensus.
+
+These aren't for application data — they're for "the cluster
+needs to agree on something." Kubernetes uses etcd as its
+authoritative store.
+
+## When key-value stores shine
+
+### Caching
+The classic use case. Check the cache; on miss, load from the
+source of truth and populate the cache.
+
+```js
+async function getUser(id) {
+  const cached = await redis.get(`user:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  const user = await db.users.findById(id);
+  await redis.set(`user:${id}`, JSON.stringify(user), { EX: 300 });
+  return user;
+}
+```
+
+Cuts read load on your primary database dramatically, and serves
+the cached path in under 1ms.
+
+### Sessions
+A web session is a perfect KV workload: lookup by session ID,
+short TTL, no relational queries needed.
+
+```js
+import session from 'express-session';
+import { RedisStore } from 'connect-redis';
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: process.env.SESSION_SECRET,
+}));
+```
+
+### Rate limiting
+Atomic increment + expiration:
+
+```js
+const fullKey = `ratelimit:${userId}:${Math.floor(Date.now()/1000/60)}`;
+const count = await redis.incr(fullKey);
+if (count === 1) await redis.expire(fullKey, 60);
+if (count > 100) throw new Error('rate limited');
+```
+
+`INCR` is atomic; works correctly under concurrent access.
+
+### Feature flags
+Cache the flag state in Redis; reload periodically from the source
+of truth. Decisions take microseconds; you don't hit your config
+service per request.
+
+### Distributed locks
+"Set if not exists" with expiration is the basic primitive:
+
+```js
+const ok = await redis.set(`lock:${resource}`, token, {
+  NX: true,
+  PX: 30000,
+});
+```
+
+If `ok` is truthy, you hold the lock. The TTL prevents deadlocks
+if the holder crashes. Release via Lua script that only deletes if
+the token matches (so you don't release someone else's lock).
+
+### Coordination (etcd / Zookeeper / Consul)
+Service registries, leader election, configuration distribution.
+Different consistency model from Redis — these guarantee linearizable
+reads and writes via Raft.
+
+## When NOT to use key-value stores
+
+- **You need to query by anything other than the key.** No `WHERE
+  age > 30`. You'd have to scan every key, which defeats the
+  point.
+- **You have relationships.** No joins. You'd implement them in
+  app code, badly.
+- **It's the only copy of your data.** Pure in-memory KV stores
+  (Memcached, Redis without persistence) lose data on restart.
+  Even with persistence, KV stores are best used alongside a
+  durable source of truth.
+
+## Consistency models
+
+Different KV stores make different consistency choices:
+
+| Store | Model | Notes |
+| --- | --- | --- |
+| **Redis** (single node) | Strong | One server, atomic ops |
+| **Redis Cluster** | Weak | Async replication; failover can lose recent writes |
+| **DynamoDB** | Eventual (default) / strong (opt-in) | Per-request choice |
+| **etcd / Zookeeper** | Linearizable | Raft consensus; slower writes |
+| **Cloudflare KV** | Eventually consistent | Edge-distributed |
+
+If you're using Redis as a cache, eventual consistency is fine —
+worst case you read stale data and refresh next time. If you're
+using it as a distributed lock, you need to understand that
+Redis Cluster failover can lose lock state under partition. (This
+is what the Redlock debate is about.)
+
+## Memory pressure
+
+In-memory KV stores have finite memory. Configure eviction
+policies:
+
+- `noeviction` — return errors on writes when full. Right for
+  session stores (you don't want to silently drop sessions).
+- `allkeys-lru` — evict least recently used. Right for caches.
+- `volatile-ttl` — evict the shortest-TTL keys first.
+
+For Redis used as a cache, set `maxmemory` and `allkeys-lru`.
+Memory grows until the limit; eviction keeps it there. Don't run
+without a limit — out-of-memory crashes the process.
+
+## Key naming conventions
+
+There's no enforced naming, but the convention is `entity:id` or
+`entity:id:field`:
+
+```
+user:42
+user:42:sessions
+team:7:members
+ratelimit:ip:1.2.3.4
+lock:resource:42
+```
+
+This makes `SCAN` / `KEYS` (for debugging) work meaningfully. It
+also helps when you migrate from one keying scheme to another —
+clear prefixes are easy to find.
+
+## What to learn next
+
+- **Redis Patterns** (Data topic) — practical Redis patterns in
+  depth.
+- **Document Stores** — the next family up in expressiveness.
+- **CAP & Consistency** — the theoretical framing for KV
+  consistency trade-offs.
+- **What is NoSQL** — the overview.

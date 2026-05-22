@@ -1,0 +1,262 @@
+export const level = 'mid';
+
+# Wide-Column Stores
+
+Wide-column stores look like tables, but the resemblance to SQL is
+superficial. They're designed for one thing: **massive write
+throughput with predictable lookups by partition key**. If your
+workload is time-series, event logs, audit trails, IoT telemetry,
+or any "fire hose of writes indexed by some ID" — wide-column is
+the family.
+
+## The data model
+
+A wide-column table has:
+
+- A **partition key** — determines which node stores the row.
+- A **clustering key** (optional) — determines the sort order
+  within a partition.
+- **Columns** — value fields.
+
+```cql
+CREATE TABLE events (
+  user_id  UUID,        -- partition key
+  event_id TIMEUUID,    -- clustering key
+  type     TEXT,
+  payload  TEXT,
+  PRIMARY KEY (user_id, event_id)
+) WITH CLUSTERING ORDER BY (event_id DESC);
+```
+
+All events for a given `user_id` land on the same partition (=
+same node) and are stored sorted by `event_id`.
+
+The two queries that are blazing fast:
+
+```cql
+SELECT * FROM events WHERE user_id = ?;
+SELECT * FROM events WHERE user_id = ? AND event_id > ?;
+```
+
+Queries without the partition key are either slow (full cluster
+scan) or rejected outright.
+
+This is fundamentally different from SQL: **you design the table
+shape for the query**, not the other way around. New query pattern
+→ new table (or new secondary index, with caveats).
+
+## Why "wide-column"?
+
+The name is historical and a little misleading. Internally, the
+storage is closer to a sparse two-level map: `partition_key →
+(clustering_key → columns)`. A single partition can have
+thousands or millions of clustering keys, each with its own
+columns. From far enough away it looks like a giant table with
+millions of columns per row — hence "wide-column."
+
+The model dates back to Google's **Bigtable** paper (2006), which
+inspired HBase, Cassandra, and the rest of the family.
+
+## The major wide-column stores
+
+### Apache Cassandra
+The most-used open-source wide-column database. Originated at
+Facebook (2008), now Apache. Peer-to-peer architecture: no
+"primary" node; every node accepts reads and writes. Tunable
+consistency per query.
+
+The pitch: linear horizontal scalability and high availability.
+Add nodes → gain throughput proportionally. Survive arbitrary
+node failures.
+
+**CQL** (Cassandra Query Language) looks like SQL but is
+deliberately restricted — only queries the data model supports
+are allowed.
+
+### ScyllaDB
+A C++ rewrite of Cassandra, compatible at the protocol level, 5–10x
+faster per node. Same data model and CQL; better operational
+efficiency. Picks up where Cassandra leaves off when per-node
+cost matters.
+
+### HBase
+Hadoop ecosystem's wide-column store, modeled directly on Bigtable.
+Strongly consistent (uses HDFS for storage, Zookeeper for
+coordination). Less commonly chosen for new projects; entrenched in
+big-data shops running Hadoop/Spark.
+
+### Google Bigtable
+The original. Managed service on GCP. Used internally for Google
+Search, Maps, Analytics. Externally: ad-tech, time-series at
+massive scale.
+
+### Amazon Keyspaces
+AWS's Cassandra-compatible managed service. Same CQL, serverless
+pricing model.
+
+### Azure Cosmos DB (Cassandra API)
+Microsoft's offering. Multi-model — also speaks document, KV,
+graph — but the Cassandra API gives you wide-column semantics.
+
+## When wide-column shines
+
+### Time-series at scale
+IoT sensors, financial ticks, application metrics. The pattern is
+"identify a stream by some ID, append events to it, query recent
+events."
+
+```cql
+CREATE TABLE sensor_readings (
+  sensor_id UUID,
+  ts TIMESTAMP,
+  value DOUBLE,
+  PRIMARY KEY (sensor_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC);
+
+-- Fast: recent readings for a sensor
+SELECT * FROM sensor_readings
+WHERE sensor_id = ? AND ts > ? LIMIT 1000;
+```
+
+Append-only writes, predictable reads by `sensor_id`. Each sensor's
+data is colocated.
+
+### Event logs / audit trails
+Per-user activity, per-account events. Same shape: partition by
+the entity, cluster by time.
+
+### Write-heavy workloads beyond SQL's reach
+You've measured that a single Postgres primary can't keep up with
+your write rate, and your access pattern is partition-key-shaped.
+Cassandra absorbs writes by spreading them across nodes — each
+write only involves the replicas for that partition, not the
+whole cluster.
+
+### Multi-region active-active
+Cassandra's peer-to-peer model means every region has full read/
+write capability. Cross-region replication is asynchronous. You
+trade strict consistency for availability.
+
+## The data modeling discipline
+
+In SQL you design tables around the entities and let the planner
+figure out queries. In wide-column you design tables around the
+queries.
+
+A common pattern: **denormalize, store one table per query**.
+
+If you need:
+- "Recent events for a user" → `events_by_user` (PK: user_id,
+  clustering: event_time).
+- "Recent events of a type" → `events_by_type` (PK: type,
+  clustering: event_time).
+
+Same data, two tables, kept in sync at write time. Storage is
+cheap; query speed is what you're buying.
+
+This makes ad-hoc queries painful. If someone asks for "events
+in this geographic region in this time range," and you didn't
+build that table, you have to either:
+
+- Add a new table and backfill (slow, operational).
+- Run a Spark/Hadoop job over the data (slow, expensive).
+- Stream the data into a separate analytics store (Elasticsearch,
+  ClickHouse, BigQuery).
+
+The cost of wide-column is **inflexibility for ad-hoc queries**.
+
+## Consistency — tunable per query
+
+Cassandra's default is **eventual consistency**, but every query
+can specify a consistency level:
+
+| Level | Meaning |
+| --- | --- |
+| `ONE` | Wait for 1 replica to acknowledge |
+| `QUORUM` | Wait for majority of replicas |
+| `ALL` | Wait for all replicas |
+| `LOCAL_QUORUM` | Quorum within the local data center |
+| `EACH_QUORUM` | Quorum in every data center |
+
+A write at `QUORUM` plus a read at `QUORUM` gives you strong
+consistency (overlap guarantees you see the latest write). Both
+at `ONE` is fastest but can return stale data.
+
+This is the **AP** side of CAP for Cassandra: under partition,
+nodes keep accepting writes; you reconcile later (last-write-wins
+or app-level merge). See **CAP & Consistency**.
+
+## No joins, no transactions (mostly)
+
+Cassandra has no joins. If you need data from two tables, you
+either:
+- Denormalize them into one.
+- Do two queries and join in app code.
+
+Multi-partition transactions don't exist. **Lightweight
+transactions** (`IF NOT EXISTS`) provide CAS-style single-partition
+atomicity using Paxos, but they're expensive and not for general
+use.
+
+This is a big mental shift from SQL. You can't model "transfer
+between accounts" naturally. You have to redesign the schema
+(maybe event-sourced ledger entries instead of mutable balances)
+or pick a different database for that specific data.
+
+## The tombstone trap
+
+Cassandra deletes don't immediately remove data — they write a
+**tombstone**, a marker saying "this is deleted." The actual
+removal happens during compaction.
+
+If you delete a lot in a partition (especially with TTLs causing
+implicit deletes), you accumulate tombstones. Reads have to scan
+them to find live data. Performance collapses.
+
+**Mitigations:**
+- Avoid heavy delete patterns. Use TTLs sparingly; design tables
+  to be append-mostly.
+- Tune compaction.
+- Monitor tombstone counts (Cassandra has metrics for this).
+
+This is a class of operational pain SQL doesn't have. Worth
+knowing before you commit.
+
+## When wide-column is NOT the answer
+
+- **You have a normal CRUD app.** Wide-column is overkill and
+  inflexible.
+- **You need ad-hoc queries.** The model doesn't support them
+  without a separate analytics layer.
+- **You need real transactions.** Multi-row atomicity isn't there.
+- **Your write rate isn't actually huge.** Single Postgres on a
+  big box handles enormous write rates with proper batching.
+  Wide-column is for the case where you've measured that's not
+  enough.
+
+The honest assessment: **most teams that picked Cassandra didn't
+need it**. They wanted "scale" abstractly and ended up with
+operational pain plus query inflexibility. Wide-column is the
+right tool for a specific shape of problem, not a default.
+
+## Comparison table
+
+| Concern | Cassandra | Postgres |
+| --- | --- | --- |
+| **Write throughput** | massive, scales linearly | tens of thousands TPS on one box |
+| **Read by partition key** | fast | fast (with index) |
+| **Ad-hoc queries** | slow / forbidden | fast |
+| **Transactions** | single-partition only (LWT) | full ACID |
+| **Joins** | no | yes |
+| **Schema flexibility** | rigid (design-for-query) | very flexible |
+| **HA model** | peer-to-peer, multi-region | failover, read replicas |
+| **Operational complexity** | high (tombstones, compaction, node tuning) | moderate |
+| **When to pick** | huge writes, time-series, multi-region active-active | almost everything else |
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **CAP & Consistency** — why Cassandra picks AP.
+- **Time-Series & Vector** — adjacent territory.
+- **Scaling SQL** (SQL topic) — what to try before reaching for
+  Cassandra.

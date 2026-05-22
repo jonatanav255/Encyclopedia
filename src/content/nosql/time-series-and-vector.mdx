@@ -1,0 +1,290 @@
+export const level = 'senior';
+
+# Time-Series & Vector
+
+Two specialized database families that don't fit cleanly into the
+five main NoSQL types but increasingly matter. **Time-series**
+databases optimize for high-volume timestamped writes;
+**vector** databases optimize for similarity search over
+high-dimensional embeddings. Both have grown enormously since
+2020 — time-series with the metrics/observability boom, vector
+with the LLM/RAG explosion.
+
+## Time-series databases
+
+Time-series data has a specific shape:
+
+- **Timestamped writes** at high volume — IoT sensors, metrics
+  agents, financial ticks, application logs.
+- **Append-mostly** — old data isn't updated; new data arrives
+  constantly.
+- **Read patterns** are usually "give me data for entity X in
+  time range T" or "aggregate over time buckets."
+- **Retention policies** matter — you don't keep raw data forever;
+  you downsample old data and discard older still.
+
+General-purpose databases struggle with this:
+
+- Write throughput exhausts SQL's single-primary model.
+- Time-bucketed aggregation queries are slow without specialized
+  indexes.
+- Storage costs balloon without downsampling.
+- Retention deletions (`DELETE FROM ... WHERE ts < ...`) are
+  expensive.
+
+Time-series databases solve all of these specifically.
+
+### TimescaleDB
+A **Postgres extension** for time-series workloads. It's
+still Postgres — you write SQL, you keep ACID, you use existing
+tooling. Timescale adds:
+
+- **Hypertables** — automatic partitioning by time (and optionally
+  by other dimensions). Inserts route to the right chunk; queries
+  exclude chunks outside the time range.
+- **Continuous aggregates** — materialized views that incrementally
+  maintain time-bucketed aggregations.
+- **Compression** — old chunks get compressed (often 10–20x) while
+  remaining queryable.
+- **Retention policies** — drop chunks older than N days
+  automatically.
+
+```sql
+CREATE TABLE metrics (
+  ts TIMESTAMPTZ NOT NULL,
+  device_id UUID NOT NULL,
+  value DOUBLE PRECISION
+);
+SELECT create_hypertable('metrics', 'ts');
+
+SELECT time_bucket('5 minutes', ts) AS bucket,
+       device_id,
+       AVG(value)
+FROM metrics
+WHERE ts > NOW() - INTERVAL '1 hour'
+GROUP BY bucket, device_id;
+```
+
+If you're already on Postgres and time-series is part of your
+workload, TimescaleDB is usually the right answer — you don't
+add a second database stack.
+
+### InfluxDB
+Purpose-built time-series database. Custom query language
+(InfluxQL, then Flux, now SQL via InfluxDB 3.0 / IOx). Excellent
+for the "metrics agent → metrics DB → dashboard" pipeline.
+
+Best for: standalone time-series workloads where you want a
+specialized system. Standard choice for monitoring stacks before
+Prometheus took over the simpler cases.
+
+### Prometheus
+Pull-based metrics monitoring system. Stores time-series in a
+local TSDB (its own format). Not a general-purpose time-series
+database — it's tightly coupled to the metrics-scraping model —
+but it's the de-facto standard for cloud-native monitoring.
+
+Often paired with **Thanos** or **Cortex / Mimir** for long-term
+storage and multi-cluster aggregation.
+
+### ClickHouse
+Columnar OLAP database that excels at time-series too. Open
+source, blazingly fast for aggregation queries over billions of
+rows. Used by Cloudflare, Uber, ByteDance for log/metrics
+analytics at huge scale.
+
+Not strictly a "time-series database" — it's a general analytical
+columnar store — but the access patterns match well. The trade-off:
+no transactions, mutations are expensive (it's optimized for
+append + read).
+
+### Druid
+Apache Druid — distributed real-time analytics database, popular
+for log/event analytics. Similar niche to ClickHouse but with
+more operational complexity. Used at Netflix, Airbnb.
+
+### QuestDB
+Open-source time-series database with SQL support. Lighter than
+ClickHouse, faster than InfluxDB for many benchmarks. Growing.
+
+### VictoriaMetrics
+Prometheus-compatible long-term storage, performance-focused.
+Standard pick alongside Prometheus for "I need to keep metrics
+longer than Prom does."
+
+### TimescaleDB vs InfluxDB vs ClickHouse — picking
+- **TimescaleDB**: you're already on Postgres, want SQL, want
+  ACID, time-series is one of multiple workloads.
+- **InfluxDB**: standalone TS database, agent-based metrics
+  collection, comfortable with their query language.
+- **ClickHouse**: huge scale, analytics over time-series and other
+  data, willing to invest in operational complexity.
+- **Prometheus + VictoriaMetrics**: cloud-native infrastructure
+  metrics, pull-based, ecosystem maturity.
+
+## Vector databases
+
+Vector databases store **high-dimensional embeddings** — typically
+768, 1024, 1536, or 3072 floats per record — and answer queries
+of the form "find the K nearest neighbors to this query vector."
+
+The use case exploded with LLMs:
+
+- **RAG** (retrieval-augmented generation) — embed documents, embed
+  the user's question, retrieve top-K relevant chunks, feed them
+  to the LLM.
+- **Semantic search** — search by meaning rather than keywords.
+- **Recommendation** — items with similar embeddings to those a
+  user liked.
+- **Deduplication / clustering** — group near-duplicates by vector
+  similarity.
+
+### The core problem: ANN
+Exact nearest-neighbor search over millions of high-dimensional
+vectors is O(N) per query — too slow. Vector databases use
+**approximate nearest neighbor (ANN)** algorithms:
+
+- **HNSW** (Hierarchical Navigable Small World) — graph-based.
+  Most popular today. Excellent recall/speed trade-off.
+- **IVF** (Inverted File Index) — cluster vectors, search clusters.
+  Faster builds, lower recall.
+- **PQ** (Product Quantization) — compress vectors for memory
+  efficiency.
+
+ANN trades exact accuracy (recall < 100%) for speed. For RAG and
+search, recall of 95–99% is usually fine — the LLM doesn't care
+about the K+1th result.
+
+### pgvector
+A **Postgres extension** for vector storage and search. The right
+default for most apps — you keep one database.
+
+```sql
+CREATE EXTENSION vector;
+
+CREATE TABLE documents (
+  id UUID PRIMARY KEY,
+  content TEXT,
+  embedding VECTOR(1536)
+);
+
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, content
+FROM documents
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+`<=>` is the cosine distance operator. The HNSW index makes the
+ORDER BY fast.
+
+**Why pgvector first:** you keep transactions, joins, filters,
+SQL. Vector search becomes one feature, not a whole new stack.
+You can mix vector queries with structured filters (`WHERE
+category = 'docs' ORDER BY embedding <=> $1 LIMIT 10`) trivially.
+
+For most apps with up to ~50M vectors, pgvector is enough.
+
+### Pinecone
+Hosted vector database service. The pioneer in this space (founded
+2019, before vector DBs were trendy). Excellent SDK, easy to set up,
+expensive at scale.
+
+Best for: prototyping, teams that don't want to run vector infra,
+or workloads where the managed-service convenience justifies the
+cost.
+
+### Weaviate
+Open-source vector database with built-in transformers (you can
+have it embed the text for you). Supports multi-tenancy, hybrid
+search, generative search (LLM integration). Larger feature
+surface than alternatives.
+
+### Qdrant
+Open-source, Rust-based vector database. Fast, well-engineered,
+supports filtered vector search efficiently. Growing rapidly in
+adoption.
+
+### Milvus
+Open-source, scalable vector database (Apache 2). Built for
+billion-scale vector workloads. More operational surface than
+Qdrant; pays off at scale.
+
+### Chroma
+Lighter-weight vector database aimed at LLM application developers.
+Easy to embed in a Python prototype; not the choice for huge scale.
+
+### Vespa
+Yahoo's search engine (mentioned in Search Engines) is also a
+serious vector store. Combines text search + vector search + ML
+ranking in one engine. Powerful, steep learning curve.
+
+### Elasticsearch / OpenSearch
+Both added vector indexes in recent versions. If you already run
+Elasticsearch for search, you can add vector capability without
+introducing a new system. Performance is decent but not best-in-
+class.
+
+### The picking heuristic
+- **Up to ~50M vectors, mixed with structured data:** pgvector.
+- **You already use Elasticsearch:** add vectors there.
+- **You want managed and don't mind cost:** Pinecone, Weaviate
+  Cloud.
+- **High-scale (billions of vectors) self-hosted:** Milvus,
+  Qdrant.
+- **You need full hybrid search + ranking + LLM integration:**
+  Vespa or Weaviate.
+
+## Hybrid search
+
+The current frontier: **combining vector similarity with keyword
+search** for better RAG and search results.
+
+The pattern:
+
+1. Tokenize the query for keyword (BM25) scoring.
+2. Embed the query for vector similarity scoring.
+3. Combine the scores (reciprocal rank fusion, weighted sum, or
+   reranker model).
+
+Pure vector search misses cases like proper nouns and exact-match
+queries; pure keyword search misses semantic relationships.
+Hybrid handles both.
+
+Vespa, Elasticsearch, OpenSearch, Weaviate, Qdrant all support
+hybrid search natively. pgvector + Postgres `tsvector` lets you
+build it manually.
+
+## Other specialized databases worth knowing
+
+These don't fit the five main families either:
+
+### Object stores (S3 / GCS / Azure Blob)
+Not really "databases" but they own the "store huge unstructured
+blobs" job. Files, images, videos, backups, ML training data.
+Always use these for blobs — never store large files in Postgres.
+
+### Embedded analytics (DuckDB)
+"SQLite for analytics." Columnar, vectorized, excellent for local
+analytics over parquet/CSV. Increasingly used in data engineering
+pipelines as a replacement for Pandas-style processing.
+
+### Streaming-first (Apache Kafka + ksqlDB, Apache Pulsar)
+Not databases exactly — they're message buses with database-like
+query capabilities. Used as the substrate for event-sourced
+architectures.
+
+### Multi-model (ArangoDB, OrientDB, FaunaDB, SurrealDB)
+Databases that combine document + graph + key-value + sometimes
+SQL in one engine. Compelling pitch; the trade-off is that each
+model is usually less mature than dedicated systems.
+
+## What to learn next
+
+- **What is NoSQL** — the overview.
+- **Wide-Column Stores** — neighboring territory for time-series
+  at huge scale (ClickHouse, Cassandra).
+- **Search Engines** — overlapping with vector for hybrid search.
+- **CAP & Consistency** — the consistency models these systems
+  make.
