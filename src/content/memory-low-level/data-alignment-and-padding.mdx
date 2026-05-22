@@ -1,0 +1,195 @@
+export const level = 'mid';
+
+# Data alignment and padding
+
+Computers don't actually load "one byte at a time" — they load
+**cache lines** at the granularity of memory units (typically 4
+or 8 bytes for register loads). Aligning data to natural boundaries
+costs nothing in source code and avoids slow-path penalties or
+outright crashes. Misaligning it is one of the most common causes
+of "works on x86, dies on ARM" bugs.
+
+## What "aligned" means
+
+A value of size `S` is **naturally aligned** when its address is a
+multiple of `S` (or the platform's required alignment for that
+type, which is sometimes weaker, like 4 for `double` on 32-bit x86).
+
+| Type | Size | Natural alignment (x86-64 / ARM64) |
+| --- | --- | --- |
+| `char` / `int8_t` | 1 | 1 |
+| `short` / `int16_t` | 2 | 2 |
+| `int` / `int32_t` / `float` | 4 | 4 |
+| `long` / `int64_t` / `double` / pointers | 8 | 8 |
+| `long double` (x86-64 SysV) | 16 (80-bit precision, padded) | 16 |
+| SSE `__m128` / NEON `int32x4_t` | 16 | 16 |
+| AVX `__m256` | 32 | 32 |
+| Cache line | 64 (most current CPUs) | 64 (for performance, not correctness) |
+
+Compilers align stack variables and `malloc` returns memory aligned
+to at least the platform's `max_align_t` (16 bytes on x86-64
+Linux). So scalar locals and heap allocations are naturally aligned
+for free. The problems start when you build composite types,
+mmap-aliased buffers, or pack structs.
+
+## Struct layout: the padding tax
+
+A struct's fields are laid out **in declaration order**, with the
+compiler inserting **padding** to keep each field aligned. The
+struct's overall alignment is the max of its fields' alignments;
+its size is rounded up to a multiple of that alignment so arrays
+of structs stay aligned.
+
+```c
+struct Bad {
+  char a;     // offset 0
+  // 7 bytes of padding
+  double b;   // offset 8
+  char c;     // offset 16
+  // 7 bytes of padding (so sizeof(Bad) is a multiple of 8)
+};            // total: 24 bytes
+
+struct Good {
+  double b;   // offset 0
+  char a;    // offset 8
+  char c;    // offset 9
+  // 6 bytes of padding
+};            // total: 16 bytes
+```
+
+Same fields, 33% less memory. **Order fields from largest to
+smallest** and you'll usually find the minimum-padding layout. For
+large arrays of structs (think: a million particles, a million
+rows), this matters. For one-off configs, it doesn't.
+
+`pahole` (Linux) is the canonical tool — point it at a binary with
+debug info and it prints every struct's layout with explicit padding
+gaps. Worth running on any performance-sensitive struct.
+
+## SoA vs AoS revisited
+
+The padding problem is one input to choosing **Struct-of-Arrays**
+over **Array-of-Structs** for large hot-loop data (see the
+`Struct of Arrays vs Array of Structs` question in the practice
+bank). With SoA you store each field in its own contiguous array.
+No per-element padding. Cache lines fill only with relevant data.
+For wide structs where the hot loop touches one or two fields, the
+speedup is substantial.
+
+## Cache-line alignment for hot data
+
+For variables touched in tight loops or shared across threads,
+aligning to the **cache line** (typically 64 bytes; 128 on some
+Apple Silicon parts) avoids accidental cache-line sharing with
+unrelated data:
+
+```cpp
+struct alignas(64) PerCoreCounter {
+  std::atomic<uint64_t> hits;
+  char pad[64 - sizeof(std::atomic<uint64_t>)];
+};
+```
+
+C++17 has `std::hardware_destructive_interference_size` for
+"how far apart to space things so they don't share a cache line."
+Java has `@Contended`. Rust has `repr(align(64))`. The pattern is
+the same: pad to cache-line granularity for any data you don't
+want sharing a line with anything else. This is the cure for false
+sharing (see `memory-low-level/false-sharing.mdx`).
+
+## Misalignment on x86 vs ARM
+
+<Compare
+  left={{
+    title: 'x86 / x86-64',
+    points: [
+      'Misaligned scalar loads work — the hardware fixes it up internally.',
+      'Cost: one or two extra cycles in the worst case, often zero.',
+      'Crossing a 64-byte cache-line boundary is the only meaningful penalty.',
+      'SIMD loads (`movaps` aligned vs `movups` unaligned) historically differed but converged in recent uarches.',
+    ],
+  }}
+  right={{
+    title: 'ARM / RISC-V',
+    points: [
+      'Older ARM cores would SIGBUS on misaligned loads — outright crash.',
+      'Current ARMv8 cores allow most misaligned scalar loads, with a perf cost.',
+      'Atomic ops and some SIMD instructions still require strict alignment.',
+      '`#pragma pack` followed by an atomic op is a classic platform-portability bug.',
+    ],
+  }}
+/>
+
+The portable rule: **don't intentionally misalign data**. If you
+must (e.g., parsing wire formats), use `memcpy` to a properly
+aligned local variable rather than dereferencing a `*(uint64_t*)`
+on a wire pointer. The compiler optimizes `memcpy` of a known-size
+struct to the right load instruction on each platform — including
+the unaligned variant where supported.
+
+## Packed structs: when you really need them
+
+`__attribute__((packed))` in GCC/Clang and `#pragma pack(1)` in MSVC
+turn off all padding. Useful for:
+
+- Network protocol headers (`sizeof(struct iphdr)` must equal the
+  on-wire size).
+- File-format structures (ELF, BMP, ZIP, etc.).
+- Memory-mapped hardware registers.
+
+Cost: every field that isn't naturally aligned will be loaded via
+unaligned access. Taking a pointer to such a field and passing it to
+an atomic op or SIMD load is undefined behavior. Read packed structs;
+don't share pointers into them.
+
+```c
+struct __attribute__((packed)) WireHeader {
+  uint8_t  version;
+  uint32_t length;   // offset 1 — misaligned
+  uint16_t flags;    // offset 5
+};
+```
+
+For reading, use `memcpy` to a local; for writing, build the value
+in a local and `memcpy` out.
+
+## Cache-line boundary crossing
+
+A 4-byte load is fast and atomic if it doesn't cross a cache-line
+boundary. If it straddles two lines (one byte at offset 63, three at
+offset 64-66), it requires fetching two lines and stitching the
+bytes together. The CPU does this transparently for scalars, but at
+2-5x the latency of an aligned access.
+
+For SIMD loads (16 / 32 / 64 bytes), crossing a cache line is also
+worse than not crossing. Aligning your data to its size (or to 64
+bytes) ensures you never cross. This is the substantive
+"align your buffers" advice — not "align to vector width specifically"
+(which was true on older microarchs and is mostly fine now), but
+"don't cross a cache line."
+
+## `aligned_alloc` and friends
+
+When you need explicitly aligned allocations:
+
+- C11 / POSIX: `aligned_alloc(alignment, size)` or
+  `posix_memalign(&p, alignment, size)`.
+- C++17: `new (std::align_val_t{64}) T[n]` or `std::aligned_alloc`.
+- Windows: `_aligned_malloc(size, alignment)` — paired with
+  `_aligned_free`.
+
+Required for: SIMD-heavy buffers (32-byte or 64-byte alignment),
+DMA buffers, mmap-style structures, custom allocators that hand
+out aligned chunks.
+
+## The takeaway
+
+Alignment is a layout discipline that costs nothing in source code
+and prevents both correctness bugs (SIGBUS on ARM, torn atomics)
+and performance bugs (cache-line crossing, false sharing). Order
+struct fields large-to-small to minimize padding. Cache-line-align
+per-core counters and hot shared atomics. Don't dereference
+misaligned pointers — `memcpy` to a local instead. Packed structs
+are for wire / file formats only; take a pointer into one at your
+peril. `pahole` is the tool that turns "my struct feels big" into
+a concrete diagnosis.

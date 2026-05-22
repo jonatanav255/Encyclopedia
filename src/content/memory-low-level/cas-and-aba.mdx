@@ -1,0 +1,163 @@
+export const level = 'senior';
+
+# Compare-and-swap and the ABA problem
+
+Compare-and-swap (CAS) is the single instruction every lock-free
+algorithm is built on. It's also where most people meet the **ABA
+problem** — the classic bug that makes naive lock-free code "work" 99%
+of the time and corrupt state the other 1%.
+
+## What CAS actually does
+
+CAS is one atomic instruction. In pseudo-C:
+
+```c
+bool CAS(addr, expected, new) {
+  // atomically:
+  if (*addr == expected) {
+    *addr = new;
+    return true;
+  }
+  return false;
+}
+```
+
+On x86 it's `cmpxchg` with the `lock` prefix. On ARM and RISC-V it's
+synthesized from a **load-linked / store-conditional** (LL/SC) pair:
+the load tags the cache line, and the store only succeeds if the line
+hasn't been touched by anyone else since the load.
+
+Either way, CAS lets you say "if the world still looks how I expect,
+update it. If it changed under me, tell me and I'll retry." That's
+the whole basis of lock-free programming — you read, you compute, you
+CAS your new value back; if it failed because someone else got there
+first, you loop and try again.
+
+## The classic CAS loop
+
+```cpp
+do {
+  old = head.load(acquire);
+  new_node->next = old;
+} while (!head.compare_exchange_weak(old, new_node, release, acquire));
+```
+
+This is a lock-free push onto a singly-linked stack. `compare_exchange_weak`
+takes `old` by reference — on failure it updates `old` to the current
+value, so the next iteration sees fresh state. **Weak** means it's
+allowed to fail spuriously (cheaper on LL/SC); use it inside loops.
+**Strong** never fails spuriously; use it when you're not looping.
+
+The pattern is universal: load → compute → CAS → loop. The win is
+that there's no lock to acquire — many threads can be doing CAS in
+parallel, only one wins per round, and the losers retry. No
+deadlock, no priority inversion, no thread blocked because someone
+else is holding a mutex.
+
+## The ABA problem
+
+Here's the subtle disaster. Thread T1 reads `head = A`. T1 gets
+descheduled for a long time. While T1 is asleep:
+
+1. T2 pops `A` from the stack — now `head = B`.
+2. T2 pops `B` — now `head = C`.
+3. T2 (or whoever owned them) **frees A and B**.
+4. T2 allocates a fresh node, the allocator reuses A's address, and
+   pushes it. Now `head = A` again (same address, different node).
+
+T1 wakes up. Its CAS checks `head == A`. **It is.** The CAS
+succeeds — and T1 splices in `new_node->next = B`, even though `B`
+was freed and `A` now points to an entirely different chain. Memory
+corruption. The bug is invisible in code review: the CAS contract
+("update if unchanged") was satisfied. The address didn't change.
+The *meaning* of the address did.
+
+ABA bites every data structure where you CAS a pointer that might
+be freed and reused — stacks, queues, hazard pointers, generally
+anything that recycles memory.
+
+## Three real fixes
+
+<Steps>
+<Step n="1" title="Tagged pointers (versioned CAS)">
+
+Use a **double-word CAS** (`cmpxchg16b` on x86-64; ARMv8.1-LSE has
+`CASP` for paired register CAS) that compares a `<pointer, counter>`
+pair atomically.
+Every time you update, increment the counter. ABA can't happen
+because the counter changed even if the pointer reused an address.
+
+```cpp
+struct alignas(16) TaggedPtr { Node* ptr; uint64_t tag; };
+std::atomic<TaggedPtr> head;
+```
+
+This is what `boost::lockfree::stack` and most production lock-free
+libraries do. Cost: a 16-byte atomic instead of 8. Trivially worth it.
+
+</Step>
+<Step n="2" title="Hazard pointers">
+
+Each thread publishes "I'm currently using node X" into a per-thread
+slot before dereferencing X. A retiring thread (the one that wants
+to free X) checks all hazard slots; if anyone's pointing at X, it
+defers freeing. ABA can't happen because A *cannot be freed* while
+T1 is mid-operation.
+
+This is the basis of `folly::HazPtr` and the foundation of
+Michael-Scott queues. Cost: a small fixed number of slots per
+thread, plus the publish/check protocol.
+
+</Step>
+<Step n="3" title="Epoch-based reclamation (RCU-style)">
+
+Group operations into **epochs**. Memory freed in epoch N is only
+actually reclaimed once all threads have left epoch N. T1 entering
+the read-side blocks reclamation; ABA can't happen because A's old
+allocation isn't returned to the allocator until T1 leaves.
+
+This is `crossbeam::epoch` in Rust, `Folly::AtomicHashMap`, and
+conceptually how the Linux kernel's RCU works (though kernel RCU is
+its own beast). Cost: a bit of bookkeeping; very cache-friendly.
+
+</Step>
+</Steps>
+
+Garbage-collected languages get this mostly for free — the GC won't
+collect A while T1 still has a reference, so A's address can't be
+reused under T1. That's why lock-free data structures in Java (e.g.,
+`ConcurrentLinkedQueue`) need much less ceremony than the equivalent
+in C++. The GC *is* the safe-memory-reclamation scheme.
+
+## When CAS loops are not the answer
+
+CAS is great when contention is low. Under heavy contention, CAS
+loops degrade badly — many threads each spinning, each failing,
+each invalidating each other's cache line. The "lock-free" stack can
+become slower than a mutexed stack with 32 threads piling on.
+
+The signal is **MESI ping-pong**: `perf c2c` shows the head pointer
+cache line bouncing between cores. Mitigations:
+
+- **Back-off** between retries — exponential or randomized, like
+  Ethernet collision avoidance. Cuts the contention rate dramatically.
+- **Per-thread / per-core data structures** with a periodic merge —
+  if you can shard, you skip the contention entirely.
+- **Just use a mutex.** A well-implemented mutex with a futex backend
+  is extremely fast for low-to-moderate contention; under high
+  contention it puts waiters to sleep instead of burning CPU on CAS
+  retries.
+
+The lock-free literature is full of "8x faster than a mutex"
+benchmarks that quietly assume the read-mostly case. Measure your
+real workload before reaching for lock-free.
+
+## The takeaway
+
+CAS is the atomic instruction that makes lock-free possible: "update
+this if it still looks how I expect." ABA is the classic trap — the
+address can match even though the underlying object was freed and
+reused. Real systems solve it with tagged pointers, hazard pointers,
+or epoch-based reclamation. Under high contention, "lock-free" can
+be slower than locked — the absence of locks is not the same as the
+absence of contention.

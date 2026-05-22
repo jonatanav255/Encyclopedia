@@ -27,6 +27,16 @@ function titleCase(slug: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+// Display-name overrides for topic folders whose pretty title isn't just
+// titleCase(slug). Sidebar pills uppercase this anyway; pages render it as-is.
+const TOPIC_TITLES: Record<string, string> = {
+  'memory-low-level': 'Memory & low-level',
+};
+
+function topicTitle(topic: string): string {
+  return TOPIC_TITLES[topic] ?? titleCase(topic);
+}
+
 function asLevel(v: unknown): Level | null {
   return v === 'junior' || v === 'mid' || v === 'senior' || v === 'staff' ? v : null;
 }
@@ -64,7 +74,7 @@ export const groups: TopicGroup[] = (() => {
     map.set(e.topic, list);
   }
   return Array.from(map.entries())
-    .map(([topic, list]) => ({ topic, title: titleCase(topic), entries: list }))
+    .map(([topic, list]) => ({ topic, title: topicTitle(topic), entries: list }))
     .sort((a, b) => a.title.localeCompare(b.title));
 })();
 

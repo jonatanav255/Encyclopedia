@@ -1,0 +1,167 @@
+export const level = 'senior';
+
+# Memory ordering models
+
+`memory-low-level/memory-barriers.mdx` talks about hardware fences and
+why CPUs reorder loads and stores. This page is the layer above that:
+the **language-level memory model** — the set of guarantees the
+*language standard* gives you about what one thread will observe of
+another thread's writes. Most modern languages (C++11, Java 5+, Go,
+Rust, JS Atomics) share roughly the same vocabulary.
+
+## The four orderings you'll meet
+
+| Name | What it guarantees | Cost |
+| --- | --- | --- |
+| **Relaxed** | The atomic itself is indivisible. No ordering relative to other accesses. | Free on x86; one atomic instruction on ARM. |
+| **Acquire** (load) | After this load sees a value, all writes that *happened before* the matching release become visible. | Free on x86; `ldar` / `dmb ishld` on ARM. |
+| **Release** (store) | All writes before this store are visible to any thread that does an acquire-load of this same variable. | Free on x86; `stlr` / `dmb ish` on ARM. |
+| **Sequentially consistent (seq-cst)** | Acts as if there is one global total order of all seq-cst operations across all threads. | Full fence on x86 (`mfence` / locked op); strongest fence on ARM. |
+
+The C++ names map almost directly to Java's `VarHandle`,
+`java.util.concurrent.atomic`, Rust's `std::sync::atomic::Ordering`,
+and the Go memory model (which exposes mostly seq-cst through
+`sync/atomic`).
+
+## The "release / acquire" pattern is the workhorse
+
+This is the most common pattern in real concurrent code. One thread
+publishes data; another reads it.
+
+```cpp
+// Producer
+data = compute_big_thing();      // ordinary writes
+ready.store(true, release);      // publication
+
+// Consumer
+while (!ready.load(acquire)) {}  // wait for publication
+use(data);                       // ordinary reads see compute_big_thing()
+```
+
+The **release** on `ready.store(true)` says: "all my writes up to this
+point — including the writes inside `compute_big_thing` — are now
+visible to anyone who acquire-loads `ready` and sees `true`."
+
+The **acquire** on `ready.load()` says: "if I see `true`, I also see
+everything the producer wrote before its release-store."
+
+Without acquire / release, the consumer can see `ready=true` and still
+read garbage from `data`. Not because the CPU is buggy — because both
+the compiler and the CPU are *allowed* to move ordinary reads and
+writes across an atomic that's not marked acquire/release.
+
+## Relaxed is for counters
+
+The only time **relaxed** is safe is when the atomic value carries no
+ordering meaning relative to other memory — it's purely an isolated
+counter.
+
+```cpp
+hits.fetch_add(1, relaxed);   // page-hit counter — fine
+```
+
+Read it back at the end of the request? Still fine — you don't care
+what happened in other threads, just an approximate count. The
+moment another thread *uses the counter value to decide what to read*,
+relaxed is wrong and you need acquire/release.
+
+## Seq-cst is the safe default
+
+If you're not sure, **use seq-cst**. It costs a full fence per
+operation on weak machines, but it's also the only ordering that
+preserves the intuition "there's one global order of events." Algorithms
+like Dekker's, Peterson's, and the classic Dijkstra-style mutex
+implementations *require* seq-cst — release/acquire is not enough for
+them, because release/acquire only orders the producer-consumer pair,
+not unrelated accesses across all threads.
+
+Java's `volatile` provides acquire/release on each access plus a
+**total order over all volatile accesses** (often summarized as
+"seq-cst-on-volatiles") — non-volatile accesses around them can
+still be reordered, so the JMM as a whole is not seq-cst. JavaScript's
+`Atomics.load` and `Atomics.store` on a `SharedArrayBuffer` are
+seq-cst. C++'s default `std::atomic<T>` operations (no explicit
+ordering argument) are seq-cst. The language designers picked the
+strong default for a reason — relaxing should be a measured
+decision, not the default.
+
+<Callout type="warning">
+**The IRIW gotcha.** Independent Reads of Independent Writes is the
+canonical example of where release/acquire ≠ seq-cst. Two writers,
+two readers, each writing to a different variable; one reader sees
+A-then-B while the other sees B-then-A. Release/acquire allows this
+("each pair sees itself consistent, but no global order exists").
+Seq-cst forbids it. If your algorithm depends on **all threads
+agreeing on a total order**, you need seq-cst.
+</Callout>
+
+## Compiler reordering is real, even on x86
+
+The compiler is allowed to reorder ordinary loads and stores in your
+function as long as the single-threaded behavior is preserved. So even
+on x86 (which has strong hardware ordering), code without atomics or
+barriers can race because the compiler moved a read above the loop
+condition or hoisted a write out of the loop entirely.
+
+This is why `volatile` (in C and C++) is **not enough** for
+concurrency. It prevents some compiler reorderings (and forces
+re-reads from memory) but doesn't prevent the CPU from reordering at
+runtime, and doesn't establish happens-before. Use atomics, not
+`volatile`, for inter-thread communication in C/C++. Java's
+`volatile` happens to mean seq-cst — different keyword, different
+language, completely different semantics. The naming overlap has
+confused engineers for two decades.
+
+## How this maps in real languages
+
+<Compare
+  left={{
+    title: 'C++ / Rust',
+    points: [
+      '`std::atomic<T>` with explicit `memory_order_*` arguments.',
+      'Default is seq-cst.',
+      'Rust calls them `Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst`.',
+    ],
+  }}
+  right={{
+    title: 'Java / JavaScript',
+    points: [
+      'Java `volatile` gives acquire/release plus a total order over volatile accesses; `j.u.c.atomic` and `VarHandle` expose the full ordering vocabulary.',
+      'JS `Atomics.load` / `Atomics.store` on `SharedArrayBuffer` are seq-cst — no acquire/release variants.',
+      'Plain reads/writes to shared buffers are races; you must go through `Atomics`.',
+    ],
+  }}
+/>
+
+Go is the odd one out: it exposes essentially seq-cst through
+`sync/atomic` (with a `Compare-And-Swap` and a few primitives) and
+expects you to use channels for everything else. The Go memory model
+defines happens-before in terms of channel sends and lock
+acquisitions, not explicit barriers.
+
+## The practical rule
+
+For 95% of code, you should be using **either**:
+
+- A **mutex** (`Mutex`, `synchronized`, `sync.Mutex`) — the lock
+  acquire/release inherently gives you the right barriers, and
+  reasoning about critical sections is easier than reasoning about
+  individual atomics.
+- A **seq-cst atomic** for a single flag or counter where a mutex
+  feels heavy.
+
+The other 5% — when you're writing a lock-free queue, an RCU-style
+read-mostly data structure, or you've measured that seq-cst atomics
+are your bottleneck — is when learning the acquire/release model pays
+off. Reaching for relaxed/acquire/release "to be fast" before measuring
+is one of the most reliable ways to ship a hard-to-reproduce bug.
+
+## The takeaway
+
+Acquire/release is the formal name for "publication." Seq-cst is the
+formal name for "global agreement on order." Relaxed is "I just need
+indivisibility." The hardware doesn't directly give you these — the
+language model maps each ordering to whatever fences the target CPU
+needs. Picking the right ordering is mostly a question of: *do
+I need other threads to also see my prior writes when they observe
+this atomic? Do all threads need to agree on the order?*

@@ -62,7 +62,10 @@ function mdxMetaPlugin(): Plugin {
 }
 
 const SHIKI_LANGS = [
+  'asm',
   'bash',
+  'c',
+  'cpp',
   'dockerfile',
   'graphql',
   'html',

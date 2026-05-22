@@ -1,0 +1,175 @@
+export const level = 'senior';
+
+# Swapping and the OOM killer
+
+Linux is designed to keep working when memory is tight. The two
+mechanisms for this — **swapping** (move cold pages to disk) and
+the **OOM killer** (pick a victim and kill it when allocation
+genuinely can't succeed) — show up at the most painful moments in
+production. Knowing what they actually do, and tuning them
+deliberately, separates "the box went unresponsive at 3 AM" from
+"the loud bad process got killed at 3 AM."
+
+## How Linux runs out of memory
+
+The kernel never reports allocation failures upfront. `malloc` is
+**optimistic** — it returns success as soon as virtual address space
+is reserved, even if physical RAM to back the pages doesn't exist
+yet. This is **memory overcommit**, and it's the default behavior
+on Linux.
+
+```
+vm.overcommit_memory = 0   # heuristic (default) — usually allow
+vm.overcommit_memory = 1   # always allow (used by Redis-style apps)
+vm.overcommit_memory = 2   # strict — never overcommit, fail malloc instead
+```
+
+So under normal Linux, allocation success doesn't mean "I have the
+memory." It means "you can have it if you actually use it." The day
+of reckoning is when a page is first written to, the kernel has no
+free frame to give, and reclaim can't free one fast enough.
+
+## Swapping: the first response
+
+When `MemAvailable` (free + reclaimable cache) drops below a
+threshold, the **page reclaim** subsystem starts working:
+
+1. Free clean pages from the page cache. Cheap — they're already on
+   disk.
+2. Write dirty page-cache pages back to disk, then free them.
+3. **Swap out** anonymous pages (heap, stack) to the swap device.
+4. **Drop** rarely-used files from the page cache.
+
+Swapping pages out is slow but not catastrophic — it's the kernel
+trading "this process's slow heap pages on disk" for "free RAM for
+something hotter." The classic dashboard mistake is to alert on
+**any** swap usage. That's wrong; what matters is **swap rate**.
+A few hundred MB of swap with near-zero `pswpin/pswpout/s` (in
+`vmstat`) is fine — those are pages the kernel correctly identified
+as cold. **Pages flowing in and out continuously** is the bad
+state ("thrashing"), where the working set doesn't fit and the box
+is one cache miss away from a stall on every access.
+
+## `swappiness`: the wrong knob to obsess over
+
+`vm.swappiness` (0-100, default 60) tunes the **tradeoff between
+reclaiming page cache vs. swapping anonymous pages**. It does not
+"turn swap off" — even `swappiness=0` will swap if it's the only
+option to free memory.
+
+Common tuning advice:
+
+- **Database hosts (Postgres, MySQL)**: `swappiness=1` or `10`. The
+  buffer pool is more valuable than the OS page cache; prefer
+  dropping cache before touching anonymous pages.
+- **General-purpose servers**: leave at default `60`.
+- **Latency-sensitive services**: `swappiness=1` plus a small swap
+  device (or none) so swap-related stalls don't appear.
+
+What matters more is whether you have **any swap at all**. The
+correct default for most server workloads is **a small swap device
+(1-4 GB)**, not "no swap." A small swap lets the kernel push truly
+cold anonymous pages out and use that RAM for cache, which is a net
+win. Zero swap means the OOM killer gets invoked earlier and more
+suddenly. **Kubernetes traditionally required `swap=off` on
+nodes**, which is a different design choice (it makes resource
+accounting cleaner at the cost of harsher OOM behavior).
+
+## When swapping isn't enough: the OOM killer
+
+If the kernel can't reclaim enough memory to satisfy an allocation,
+it triggers **OOM-killer**: a kernel routine that picks a victim
+process and sends it `SIGKILL`. The victim is chosen by
+`oom_score`, a per-process score the kernel computes from its
+**total memory usage**, **priority** (`oom_score_adj`), and a few
+heuristics (kernel threads and PID 1 are protected; recently-forked
+processes get extra protection).
+
+You can see scores at `/proc/<pid>/oom_score` and `oom_score_adj`.
+Lower `oom_score_adj` makes the process less likely to be killed
+(values from -1000 "never kill" to 1000 "always preferred victim").
+
+```
+$ for p in $(pgrep -f myapp); do
+    echo "$p: $(cat /proc/$p/oom_score) (adj $(cat /proc/$p/oom_score_adj))"
+  done
+```
+
+System services that "must not be killed" (e.g., systemd, sshd, the
+container manager) set `oom_score_adj=-1000`. Conversely, batch jobs
+running in the background can set a positive `oom_score_adj` so they
+get killed first when something has to go.
+
+## Container OOMs are different (and more common)
+
+Inside a cgroup with a memory limit, you don't have to exhaust the
+host's RAM to get OOM-killed — you only have to exhaust the
+**cgroup's limit**. The OOM killer runs **inside the cgroup**: it
+picks a victim from processes in that cgroup, not the whole host.
+
+This is why Kubernetes pods get the dreaded `OOMKilled` status:
+the container exceeded its memory limit, cgroup OOM fired, killed
+the largest process in the cgroup. The exit code is 137 (`SIGKILL`)
+and `dmesg` shows the cgroup OOM banner.
+
+Common causes:
+
+- **JVM heap not container-aware.** Pre-8u191 / pre-Java 10 JVMs
+  ignored cgroup limits and sized the heap from the host's RAM.
+  Modern JVMs with `-XX:+UseContainerSupport` (default since 8u191
+  and Java 10) read cgroup limits correctly.
+- **Node.js V8 heap defaults.** Older Node versions had a fixed
+  ~1.7 GiB old-space default that was independent of the cgroup
+  limit. Node 20+ is container-aware: V8 sizes the heap from the
+  cgroup memory limit (~50% up to a few GiB). The fix on older
+  Node is still `--max-old-space-size=<MB>`; on Node 20+ it
+  mostly does the right thing on its own but can be overridden
+  when you want a non-default split.
+- **Page cache counted toward cgroup memory.** A workload that does
+  heavy file I/O can fill its cgroup's page cache and trigger OOM
+  even though the "real" heap is small. Mitigations: limit cache
+  via `MADV_DONTNEED` after large reads, or in newer kernels
+  cgroup v2 distinguishes file vs anon cleaner.
+
+## `dmesg` reads the post-mortem
+
+When OOM fires, the kernel logs a detailed message:
+
+```
+Out of memory: Killed process 12345 (java) total-vm:8000000kB,
+  anon-rss:6500000kB, file-rss:1000kB, shmem-rss:0kB, UID:1000
+  pgtables:18000kB oom_score_adj:0
+```
+
+`anon-rss` is the killer's view of the victim's heap. `pgtables` is
+the size of its page tables (huge for processes with very large
+heaps — that's its own thing). Reading these in `dmesg` after an
+incident tells you which process got killed and roughly why. In K8s,
+`kubectl describe pod` shows the `OOMKilled` reason and the same
+data via the kubelet.
+
+## Useful tunings, in order of leverage
+
+<Cheatsheet
+  rows={[
+    ['Right-size the container limit', 'The most leverage. p99 RSS plus a buffer; not p50 RSS.'],
+    ['Tell the runtime about limits', '`-XX:+UseContainerSupport` (JVM), `--max-old-space-size` (Node), `GOMEMLIMIT` (Go 1.19+), `automaxprocs` for CPU.'],
+    ['Set `oom_score_adj` on critical services', 'Make sshd, the agent, the database supervisor harder to kill than the workload.'],
+    ['Configure swap deliberately', 'A small swap (1-4 GB) and `swappiness=1` for DBs. No swap for K8s nodes is the K8s convention but trade-offs apply.'],
+    ['Monitor `pswpin/pswpout` rate, not swap size', 'Sustained nonzero rates are the signal of thrashing.'],
+    ['Alert on `MemAvailable`, not `MemFree`', '`MemFree` is meaningless on a healthy Linux box.'],
+  ]}
+/>
+
+## The takeaway
+
+Linux overcommits memory by default, so allocation failures appear
+later — as swapping (slow but recoverable), thrashing (a death
+spiral), or OOM kill (sudden, blunt). Swapping is fine in
+moderation; the metric to alert on is the swap **rate**, not its
+size. The OOM killer picks victims by `oom_score`, tunable per
+process. In containers, the cgroup limit is what triggers OOM long
+before the host runs out, and runtime-specific memory flags
+(`-XX:+UseContainerSupport`, `--max-old-space-size`, `GOMEMLIMIT`)
+let the runtime stay inside that limit instead of being killed
+arbitrarily.

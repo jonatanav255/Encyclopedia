@@ -1,0 +1,143 @@
+export const level = 'senior';
+
+# SIMD and vectorization
+
+SIMD — **Single Instruction, Multiple Data** — is how a modern CPU
+does the work of 4, 8, 16, or 32 scalar operations in one cycle. A
+512-bit AVX-512 register holds eight 64-bit doubles; one
+`vaddpd` adds eight pairs in a single instruction. When your data
+fits the SIMD model, you get a 4-16x speedup over scalar code on the
+same core.
+
+## The instruction set zoo
+
+x86-64 SIMD has accumulated layers:
+
+| ISA | Width | Year | Use today |
+| --- | --- | --- | --- |
+| SSE / SSE2 | 128-bit | 1999/2000 | Baseline on every x86-64 CPU. Always available. |
+| SSE4.x | 128-bit | 2007 | String ops, dot product. Common assumed baseline. |
+| AVX | 256-bit | 2011 | Sandy Bridge and newer. Assume on any current server. |
+| AVX2 | 256-bit | 2013 | Integer ops at 256-bit, FMA. Haswell+. |
+| AVX-512 | 512-bit | 2016 | Skylake-X, Ice Lake, current EPYC. Watch for downclocking on older Intel. |
+
+ARM has **NEON** (128-bit, in every ARMv8 chip — Apple Silicon, AWS
+Graviton, modern phones) and the newer **SVE / SVE2** (length-agnostic
+vectors). SVE shows up on AWS Graviton 3 (256-bit), Graviton 4
+(128-bit SVE2), Fujitsu A64FX, and other HPC parts. Apple Silicon
+does **not** implement SVE/SVE2 in its general-purpose cores — the
+M4 adds SME (Scalable Matrix Extension), which has a streaming
+SVE2 subset only inside streaming mode.
+
+The first lesson: portable code targets the lowest common SIMD level
+(SSE2 on x86-64, NEON on ARM64). Going wider needs runtime dispatch
+or a build with explicit `-march=native`.
+
+## How you write SIMD
+
+<Compare
+  left={{
+    title: 'Auto-vectorization (compiler-driven)',
+    points: [
+      'Write straight scalar loops; let the compiler pattern-match them into SIMD.',
+      'Works best on simple counted loops over contiguous data with no aliasing.',
+      'Bails out on branches, function calls, pointer aliasing, or anything it can\'t prove safe.',
+      '`gcc/clang -O3 -march=native -fopt-info-vec` tells you what got vectorized.',
+    ],
+  }}
+  right={{
+    title: 'Intrinsics (manual SIMD)',
+    points: [
+      'C/C++ functions like `_mm256_add_pd`, `vaddq_f32` that map 1:1 to instructions.',
+      'You write the algorithm in SIMD shape: load 8 elements, op, store 8.',
+      'Tedious but predictable — no surprise scalar fallback.',
+      'Libraries (`xsimd`, `highway`, `std::experimental::simd`, Rust `portable_simd`) wrap this portably.',
+    ],
+  }}
+/>
+
+JIT-compiled languages get auto-vectorization too — V8, the JVM
+HotSpot/Graal, and .NET RyuJIT all do simple SIMD lowering. For
+heavy numeric work, you'd reach for explicit vector APIs (Java's
+`jdk.incubator.vector`, .NET `Vector<T>`, JS's `WebAssembly SIMD`).
+
+## What vectorizes and what doesn't
+
+**Vectorizes well:**
+
+- Counted loops over typed arrays — `for (i = 0; i < n; i++) c[i] = a[i] + b[i]`.
+- Reductions like sum, dot product, min/max — the compiler emits a
+  vector reduction tree.
+- Stencil computations, image filters, audio DSP.
+- Hash/string scans (find, memchr, memcmp — all SIMD-accelerated in libc).
+
+**Doesn't vectorize (or vectorizes poorly):**
+
+- Loops with early exit or data-dependent branches in the body.
+- Function calls inside the loop (unless inlined and themselves SIMD-friendly).
+- Pointer chasing (linked lists, irregular graph walks).
+- Read-modify-write to overlapping pointers (the compiler can't
+  prove `a` and `b` don't alias unless you tell it with
+  `__restrict__` / `noalias`).
+- Anything with strides bigger than the vector width — gather/scatter
+  helps but is slow.
+
+## Alignment matters less than you think
+
+On AVX2 and AVX-512, **unaligned loads are essentially free** on
+modern microarchitectures — the cost gap to aligned loads is one or
+two extra cycles in the worst case, often zero. The "always align to
+the vector width" advice you'll see in old books is mostly obsolete.
+
+What still matters: not **crossing a cache-line boundary** with a
+SIMD load. A 32-byte load that straddles two 64-byte cache lines may
+need both lines and is slower. Aligning to **64 bytes** (one cache
+line) is the meaningful alignment, not vector-width alignment.
+
+## The AVX-512 frequency-throttling story
+
+On older Intel CPUs (Skylake-SP, Cascade Lake), executing AVX-512
+instructions could **lower the core's clock frequency** for hundreds
+of microseconds — sometimes net-negative for short bursts of
+AVX-512 in an otherwise scalar workload.
+
+This is largely fixed on **Ice Lake / Sapphire Rapids and newer**
+Intel server parts, and on **AMD Zen 4+**. But on older fleets, the
+classic gotcha is: a glibc function called `memcpy` with AVX-512,
+your whole process briefly slowed down, and the team blamed the
+wrong thing for weeks. Stick to AVX2 unless you've measured a real
+win on your target hardware.
+
+## When to reach for SIMD
+
+The honest answer: **rarely, in app code**. The places SIMD pays off
+are typically already done for you:
+
+- **`memcpy`, `memcmp`, `memchr`, `strlen`** in glibc / musl —
+  SIMD-vectorized.
+- **JSON parsers** (simdjson and its ports) — runtime detect,
+  use the widest SIMD available.
+- **Compression** (zstd, lz4) — SIMD in the encode/decode hot path.
+- **Cryptography** — AES-NI, SHA-NI, PCLMULQDQ.
+- **Regex engines** — Hyperscan, Rust's `regex`, V8's irregexp use
+  SIMD for prefilters.
+- **Database execution engines** — DuckDB, ClickHouse, Apache Arrow
+  Compute are SIMD-heavy.
+- **ML inference** — every BLAS / oneDNN / Apple Accelerate path is
+  SIMD or matrix-extension (AMX / SME).
+
+For application code: if you find yourself writing a tight numeric
+loop that runs millions of times, *first* check if a library already
+does it. Then try auto-vectorization with `-O3 -march=native`. Only
+then drop to intrinsics or `std::simd` / `highway`.
+
+## The takeaway
+
+SIMD turns one instruction into 4-16 parallel operations on packed
+data. It's free performance for the right workload — and unreachable
+for the wrong one. Most of the win in real systems comes from
+SIMD-accelerated *libraries* you already use (libc string ops,
+simdjson, zstd, BLAS), not from hand-written intrinsics in your app.
+When you do roll your own, target the lowest SIMD level your
+deployments support and avoid AVX-512 on older Intel parts unless
+you've measured.

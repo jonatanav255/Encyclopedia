@@ -1,0 +1,174 @@
+export const level = 'senior';
+
+# ELF and dynamic linking
+
+When you run a binary on Linux, the kernel doesn't just "execute the
+file." It reads an **ELF** (Executable and Linkable Format) header,
+maps a few segments into memory, hands control to a **dynamic
+linker**, and that linker does most of the real work — resolving
+shared library imports, fixing up addresses, calling initializers.
+Most of the time you don't think about any of it. When something
+goes wrong (a wrong libc version, a missing `.so`, a symbol clash,
+an `LD_PRELOAD` mystery), this layer is exactly where the answer
+lives.
+
+## The structure of an ELF file
+
+An ELF binary has two views of itself, for two consumers:
+
+| View | Used by | Contains |
+| --- | --- | --- |
+| **Sections** | Linker / debugger | `.text` (code), `.data` (initialized data), `.bss` (zero-initialized), `.rodata` (constants), `.symtab` (symbols), `.debug_info`. Fine-grained. |
+| **Segments / Program headers** | Kernel loader | A small handful of `LOAD`, `DYNAMIC`, `INTERP`, `GNU_STACK` etc. — what to actually `mmap` at runtime. |
+
+The kernel only cares about segments. It reads the program header
+table, calls `mmap` for each `LOAD` segment (typically two: one
+read+execute for code, one read+write for data), and that's it — at
+that point the binary's *static* image is in memory.
+
+Look at it with `readelf -l ./prog` or `objdump -p ./prog`. Or just
+`file ./prog`:
+
+```
+./prog: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
+  dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, ...
+```
+
+That **interpreter** path is critical.
+
+## The dynamic linker (ld.so)
+
+If the binary is dynamically linked, the kernel — after mapping the
+binary — also `mmap`s `/lib64/ld-linux-x86-64.so.2` (the path is
+baked into the binary's `PT_INTERP` program header) and jumps to its
+entry point instead of the program's.
+
+The dynamic linker then:
+
+1. Reads the `DT_NEEDED` entries from the `.dynamic` section —
+   "this binary needs `libc.so.6`, `libssl.so.3`, etc."
+2. Finds and `mmap`s each library, recursively pulling in their
+   dependencies.
+3. Resolves every symbol the binary references against the symbols
+   each library exports.
+4. Patches up function pointers and data references (relocations).
+5. Calls each library's initialization code (`.init_array`).
+6. Finally jumps to the program's `_start`, which calls `main`.
+
+When something is wrong with this chain you see errors like
+`error while loading shared libraries: libfoo.so.2: cannot open
+shared object file` or `undefined symbol: SSL_new`. They come from
+the dynamic linker, not the kernel or your code.
+
+## How `ldd` and `LD_LIBRARY_PATH` actually work
+
+`ldd ./prog` invokes the dynamic linker with
+`LD_TRACE_LOADED_OBJECTS=1`, which makes the loader resolve and
+print dependencies and then exit *before* running constructors or
+`main`. So on modern glibc it doesn't actually execute the
+program's code. Historically, `ldd` *could* be tricked into
+executing untrusted code (by a binary specifying a custom
+`PT_INTERP`), which is why "don't run `ldd` on untrusted
+binaries" is still a common piece of advice — current glibc
+mitigates this, but the cultural rule outlives the bug.
+
+The search order for shared libraries is:
+
+1. Paths baked into the binary as `DT_RPATH` (legacy) or `DT_RUNPATH`
+   (modern). Set at link time with `-Wl,-rpath,$ORIGIN/lib`.
+2. `LD_LIBRARY_PATH` environment variable (overrides system paths —
+   useful and dangerous).
+3. `/etc/ld.so.cache` (precomputed index, rebuilt by `ldconfig`).
+4. Default system paths: `/lib`, `/usr/lib`, `/lib64`, `/usr/lib64`.
+
+This is why the same binary "works on my machine" and fails in
+production: a `LD_LIBRARY_PATH` set in your shell, an `rpath` pointing
+at a path that exists only on your dev box, or a missing
+`ldconfig` after a system update.
+
+## The PLT and GOT: lazy symbol resolution
+
+Resolving every symbol at startup would make process launch slow.
+The trick: each call to a shared-library function goes through a
+**Procedure Linkage Table** (PLT) stub.
+
+```
+   your code        PLT (per-call stub)        GOT (table of addrs)
+   ----------       -------------------        --------------------
+   call foo@plt --> foo@plt:                   GOT[foo]:
+                      jmp *GOT[foo]              <addr>  (after first call)
+                      push reloc_idx             ^
+                      jmp PLT0  -----------------+ first call only:
+                                                 resolves & patches GOT
+```
+
+The first call to `foo()` jumps through the PLT stub, into the
+dynamic linker, which resolves `foo` to its real address, writes
+that address into the **Global Offset Table** (GOT), and jumps there.
+Every subsequent call short-circuits: PLT stub reads GOT, jumps
+straight to the resolved address. One indirection, very fast.
+
+This is what **`LD_BIND_NOW=1`** disables — force resolution of
+everything at startup. Used for security (so the GOT isn't writable
+at runtime if also combined with **RELRO**) and for predictable
+latency (no first-call resolution stall).
+
+## Why `LD_PRELOAD` is so powerful (and scary)
+
+`LD_PRELOAD=/path/to/foo.so ./prog` tells the dynamic linker to
+load `foo.so` **before** any other library. Symbols defined in `foo.so`
+**override** the same names later in the resolution order. So
+defining a function called `malloc` in your preloaded library
+silently replaces every call to malloc in the program — including
+calls inside libc itself.
+
+This is how:
+
+- **jemalloc / tcmalloc** are deployed without rebuilding apps.
+- **Sanitizers** intercept allocation and string functions.
+- **Profiling tools** (`heaptrack`, `valgrind`) hook into the heap.
+- **Spyware and rootkits** intercept I/O. (Hence: never set
+  `LD_PRELOAD` from untrusted sources.)
+
+Setuid binaries ignore `LD_PRELOAD` (and most other `LD_*` env vars)
+for exactly this reason.
+
+## Static vs dynamic: the practical trade-off
+
+<Compare
+  left={{
+    title: 'Dynamic linking',
+    points: [
+      'One copy of libc shared across every running process — saves RAM.',
+      'Security patches to libssl/libcrypto land for every binary that uses them, no rebuild needed.',
+      'Smaller binaries on disk.',
+      'But: dependency-resolution failures at runtime, "DLL hell"-style version conflicts, slower process start.',
+    ],
+  }}
+  right={{
+    title: 'Static linking',
+    points: [
+      'All deps bundled into the binary. Bigger binaries, but no surprises at runtime.',
+      'Container images: a 5 MiB static Go binary in `FROM scratch` vs a 200 MiB Ubuntu image with libc.',
+      'No way to hot-patch libssl across the fleet — you must redeploy.',
+      'Some libs (glibc, NSS) are unfriendly to static linking; `musl` is the easy alternative.',
+    ],
+  }}
+/>
+
+The pendulum has swung back toward static linking for **single-purpose
+binaries** in container images (Go, Rust with musl). For long-running
+multi-tenant systems where security updates need to apply broadly,
+dynamic linking still wins.
+
+## The takeaway
+
+ELF is the file format; the dynamic linker (`ld.so`) is the
+small runtime that actually wires shared libraries into your
+process. The PLT/GOT enables lazy symbol resolution at first call.
+`LD_LIBRARY_PATH` and `LD_PRELOAD` are the two environment levers
+that change everything about how a binary loads — useful tools and
+common sources of mysterious bugs. Static vs dynamic linking is a
+real trade-off: dynamic saves RAM and lets security patches flow
+across the fleet; static gives you a binary you can drop anywhere
+and trust to start.
