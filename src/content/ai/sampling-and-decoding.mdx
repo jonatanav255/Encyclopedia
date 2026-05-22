@@ -1,0 +1,332 @@
+export const level = 'mid';
+
+# Sampling and decoding
+
+After the model has done its forward pass, it gives you a
+probability distribution over the next token — a vector of logits
+the same length as the vocabulary, softmaxed into probabilities.
+Sampling is how you choose one token from that distribution.
+
+This is the part of the LLM stack where you have the most knobs
+and the least theory. Every provider exposes some subset of
+`temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
+`frequency_penalty`, `presence_penalty`, `seed`, `logit_bias`, and
+`logprobs`. Most teams set `temperature=0.7` and never touch the
+rest. That's leaving real quality on the table.
+
+## What the model actually returns
+
+After the final transformer block and the LM head, you have a
+vector of **logits** — one real-valued score per token in the
+vocabulary. Softmax turns these into a probability distribution:
+
+```ts
+// logits: Float32Array of length vocab_size (e.g. 128000)
+function softmax(logits: Float32Array, T = 1.0): Float32Array {
+  const max = Math.max(...logits);  // for numerical stability
+  const exps = logits.map(x => Math.exp((x - max) / T));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return exps.map(e => e / sum) as Float32Array;
+}
+```
+
+The sampler picks one token from this distribution. Then the whole
+loop runs again with that token appended. That's decoding.
+
+## Temperature is not a creativity slider
+
+The lie everyone tells: "temperature controls creativity. Higher =
+more creative, lower = more conservative."
+
+What it actually does: divides the logits by `T` before softmax.
+
+- `T = 1.0` — distribution unchanged.
+- `T &lt; 1.0` — sharpens the distribution. The top token gets
+  *more* probability, everything else gets *less*. The model
+  becomes more deterministic.
+- `T &gt; 1.0` — flattens the distribution. The top token loses
+  probability, low-probability tokens gain. The model becomes
+  more random.
+- `T → 0` — argmax. The model always picks the single most
+  likely token. This is "greedy decoding."
+- `T → ∞` — uniform random over the vocabulary. Total garbage.
+
+So temperature is a sharpness knob on the probability
+distribution. "Creative" is downstream of that — at higher
+temperature, low-probability tokens can win, which is *sometimes*
+creative and *often* nonsense. There's no concept of "good
+creativity" in the math; just probability mass redistribution.
+
+A practical curve: `T &gt; 1.3` on most models produces noticeable
+incoherence. `T = 2.0` produces tokens that look like the model is
+having a stroke. The useful range for almost everything is
+**0 to 1.0**.
+
+## Why temp=0 is not deterministic on hosted APIs
+
+You set `temperature=0`. You make the same call twice. You get
+two different responses. Welcome to the most-asked-and-least-
+answered question in LLM engineering.
+
+Greedy decoding on a single GPU with a single forward pass *is*
+deterministic — argmax of logits is a deterministic operation.
+What breaks the guarantee:
+
+<Cheatsheet
+  columns={['Source', 'What happens', 'Can you fix it?']}
+  rows={[
+    ['Continuous batching nondeterminism', 'Your request joins a batch with different other requests each call; batched matmul produces slightly different floats due to non-associativity of fp arithmetic', 'No, not from the client side'],
+    ['Multi-GPU reduction order', 'Tensor-parallel forward passes reduce across GPUs; the reduction order can change across calls', 'No on hosted APIs'],
+    ['Mixed precision rounding', 'fp16/bf16 ops round differently depending on intermediate state', 'No'],
+    ['Routing in MoE', 'Top-k expert selection on borderline tokens can flip with tiny logit perturbations', 'No on hosted MoE models'],
+    ['Sampler tie-breaking', 'Two tokens have identical logits; tie-break is implementation-defined', 'Rare in practice'],
+  ]}
+  caption="None of these are bugs. They're consequences of running on shared infrastructure designed for throughput."
+/>
+
+Float arithmetic is not associative: `(a + b) + c ≠ a + (b + c)`
+in the last few bits. When a matmul is split across GPUs and the
+partial sums come back in different orders, the result differs in
+the last few bits. Those few bits are usually irrelevant — but on
+a borderline token where two candidates have nearly equal logits,
+the tiebreaker can flip. One flipped token sometimes cascades into
+an entirely different output.
+
+OpenAI's `seed` parameter is "best effort" — same seed gets you
+closer to reproducible output but doesn't guarantee it. Anthropic
+doesn't expose a seed for this reason; they're honest that the
+guarantee they could give would be too weak to be useful.
+
+Self-hosted vLLM with batch size 1, single GPU, greedy decoding,
+fixed seed — that's actually deterministic. Once you turn on
+batching or tensor parallelism, the guarantee is gone.
+
+**Engineering consequence:** never write a test that asserts an
+exact LLM string. Test for structural properties (valid JSON, key
+present, length in range), or use an LLM-as-judge eval, or both.
+
+## Top-p (nucleus), top-k, min-p
+
+After temperature scales the distribution, you can further
+restrict which tokens are eligible to be sampled.
+
+<Compare
+  left={{
+    title: 'top-k',
+    points: [
+      'Keep the K most likely tokens, zero out the rest, renormalize, sample',
+      'Simple, predictable',
+      'Bad on flat distributions (e.g. "the cat sat on the ___") — K=40 might include lots of plausible options',
+      'Bad on peaky distributions (e.g. "2 + 2 = ___") — K=40 includes nonsense tokens that should be impossible',
+    ],
+  }}
+  right={{
+    title: 'top-p (nucleus)',
+    points: [
+      'Keep tokens whose cumulative probability ≥ p, sample from those',
+      'Adapts to the shape of the distribution',
+      'Peaky distribution → only 1-2 tokens considered',
+      'Flat distribution → many tokens considered',
+      'The 2026 default. Holtzman et al. (2019) introduced it',
+    ],
+  }}
+/>
+
+`top_p=0.9` means "sample from whatever set of top tokens together
+accounts for 90% of the probability mass." On a math problem where
+the top token has 0.95 probability, that's just the top token. On
+a creative-writing prompt where 100 tokens are roughly equally
+plausible, that's a wide set.
+
+**min-p** is the newer one. It says "keep tokens whose probability
+is at least `min_p` times the most probable token's probability."
+So `min_p=0.05` keeps anything within 1/20 of the top token. It's
+more robust than top-p on the edges — when the top token has 0.99
+probability, top-p=0.9 keeps just it; min-p=0.05 also keeps it; on
+a flat distribution they behave similarly.
+
+The combiner rule: **temperature first, then top-p (or top-k or
+min-p), then sample.** Providers handle the order for you; this
+matters when you're rolling your own sampler.
+
+## Repetition, frequency, presence penalties
+
+The model loves to repeat itself. "I think... I think... I think..."
+is a real failure mode. Three knobs address this:
+
+- **Repetition penalty** (most open models, llama.cpp): multiplies
+  the logits of recently-seen tokens by a factor (often 1.1–1.3).
+  Higher = stronger penalty. `1.0` = off.
+- **Frequency penalty** (OpenAI): subtracts `α × count` from each
+  token's logit, where `count` is how many times that token has
+  already appeared. Penalty grows with repetition.
+- **Presence penalty** (OpenAI): subtracts `α` from any token
+  that has appeared at all (binary, not cumulative). Encourages
+  topic diversity without punishing repeat usage of common words.
+
+Used judiciously they help. Cranked too high they break the
+model's ability to use common words ("the", "and", "is") or to
+finish thoughts that legitimately repeat key terms. The defaults
+should be the defaults; touch these last.
+
+## Logit bias
+
+`logit_bias` lets you add a constant to specific tokens' logits
+before sampling. Range typically -100 (effectively ban) to +100
+(effectively force).
+
+Real uses:
+
+- **Constrain output to a small vocabulary** — e.g. force the
+  model to answer one of `[YES, NO, MAYBE]`. Set positive bias
+  on those tokens; negative bias on common alternatives.
+- **Ban a phrase** that keeps showing up. Bias the first token
+  of the phrase to -100.
+- **Steer toward a topic.** Mild positive bias on relevant
+  keywords.
+
+Caveats:
+
+- You apply bias to **token IDs**, not words. " cat" and "cat"
+  and " Cat" are different tokens; you have to bias all of them.
+- Logit bias of +100 doesn't *guarantee* the token — only makes
+  it extremely likely. If a stop sequence triggers first, you
+  don't get it.
+- Heavy-handed bias destroys grammar. The model still has to
+  produce coherent text.
+
+For structured output, modern function calling and constrained
+decoding (JSON schema mode, Outlines, llguidance) are strictly
+better than logit bias. See
+`ai/structured-output-and-function-calling.mdx`.
+
+## logprobs — the cheap classifier trick
+
+Most providers will return, alongside the generated text, the log
+probability of each emitted token (and optionally the top-N
+alternatives at each position). This is the most under-used
+feature in the API.
+
+What it gives you:
+
+- **Cheap classification confidence.** Ask the model "Is this
+  email spam? Respond with YES or NO." Request `logprobs` and
+  `top_logprobs=5`. You get `log P(YES)` and `log P(NO)` for the
+  first token. That's a *calibrated* (well, calibratable)
+  confidence score, not just a hard label.
+- **Detect "I don't know" in disguise.** When the model is
+  uncertain, multiple completion paths have similar logprobs.
+  When it's confident, one path dominates.
+- **Eval signal without a separate model.** Compare logprob of
+  a known-good answer vs the model's actual output.
+
+```ts
+// Cheap classifier with calibrated confidence
+const res = await openai.chat.completions.create({
+  model: 'gpt-4o-mini',
+  messages: [
+    { role: 'system', content: 'Reply with one word: YES or NO.' },
+    { role: 'user', content: `Is this spam?\n\n${email}` },
+  ],
+  max_tokens: 1,
+  temperature: 0,
+  logprobs: true,
+  top_logprobs: 5,
+});
+
+const top = res.choices[0].logprobs?.content?.[0]?.top_logprobs ?? [];
+const yes = top.find(t => t.token.trim() === 'YES')?.logprob;
+const no = top.find(t => t.token.trim() === 'NO')?.logprob;
+// confidence = exp(yes) / (exp(yes) + exp(no))
+```
+
+Output: a probability rather than a label. Use it for routing,
+filtering, or active learning. Costs the same as a normal
+completion (typically; check your provider).
+
+## The knob matrix: pick your settings
+
+What we set for each task shape:
+
+<Cheatsheet
+  columns={['Task', 'Temperature', 'top_p', 'Other', 'Why']}
+  rows={[
+    ['Structured output (JSON, SQL, function args)', '0', '1.0', 'Use schema/function-call mode', 'Determinism matters; structure must be exact'],
+    ['Classification / extraction', '0', '1.0', 'logprobs for confidence', 'One correct answer; want calibration'],
+    ['Code generation', '0.0–0.3', '0.95', '—', 'Mostly deterministic; small temp for stuck cases'],
+    ['Q&A from retrieved docs', '0.1–0.3', '0.9', '—', 'Mostly deterministic; tiny temp for paraphrasing'],
+    ['Agentic reasoning loop', '0.0–0.2', '0.9', 'small top_k (5–20) to avoid drift', 'Steps must be sound; randomness compounds across turns'],
+    ['Creative writing / brainstorm', '0.7–1.0', '0.9', 'mild frequency_penalty (0.3)', 'Variation desired; penalty avoids loops'],
+    ['Summarization', '0.2–0.4', '0.95', '—', 'Some paraphrase, mostly faithful'],
+  ]}
+  caption="Start here, then tune on your eval. The classic temp=0.7 default is wrong for most non-creative tasks."
+/>
+
+The single most common mistake we see: `temperature=0.7` (because
+the docs example used it) on a structured-extraction task. The
+model invents fields, hallucinates IDs, and occasionally writes a
+sonnet. Drop to `0` and most "the LLM is unreliable" complaints
+disappear.
+
+The second most common: `temperature=0` on an agent that runs a
+multi-step loop and gets stuck retrying the same wrong action.
+Bump to 0.2 with a small `top_k` and it escapes the loop.
+
+## Greedy vs sampling vs beam search
+
+Three decoding strategies you'll hear about:
+
+- **Greedy** — argmax every step. Deterministic (modulo
+  infrastructure nondeterminism above). Tends to be repetitive
+  and "safe." This is what `temperature=0` gives you.
+- **Sampling** — draw from the (modified) distribution. Adds
+  variation. What every chat model does in production by default.
+- **Beam search** — keep the top-N partial sequences at each
+  step, expand all of them, keep the best N. Used historically
+  in machine translation. Mostly **not used** for chat LLMs
+  because (a) the optimization objective produces dull output
+  ("the the the" can be locally probable), (b) it costs N× per
+  step, and (c) sampling does better in practice.
+
+If a provider exposes "beam search" for a generative chat task,
+ignore it. It's a holdover from encoder-decoder days.
+
+## Hidden costs of higher temperature
+
+Two things that get worse as temperature goes up that nobody
+warns you about:
+
+- **JSON validity.** At `T=0`, modern models produce valid JSON
+  ~99.5% of the time on simple schemas. At `T=0.7`, the rate
+  drops to ~95–98%. At `T=1.0`, it can be &lt; 90%. If you parse
+  output, this is real money in retries.
+- **Tool-call argument correctness.** Function calling with
+  `T=0` reliably produces the right argument types. At `T=0.7`
+  the model occasionally passes a string where an integer is
+  expected, or omits a required field.
+
+Use temperature when you genuinely want variation. Don't use it
+because the default is 0.7.
+
+## What we tell people
+
+- Temperature is a sharpness knob on the logit distribution, not
+  a creativity dial. The useful range is 0 to 1.0.
+- `temperature=0` is not actually deterministic on hosted APIs —
+  batching, multi-GPU reduction, and float non-associativity
+  break the guarantee. Don't write tests that depend on exact
+  strings.
+- For structured output, classification, extraction, and code:
+  `temperature=0` is the default. The "0.7 default" is wrong for
+  most non-creative tasks.
+- top-p (nucleus) is the better cousin of top-k. Use it. min-p
+  is the better cousin of top-p; use it if your provider
+  supports it.
+- `logprobs` + `top_logprobs` is the cheapest calibrated
+  classifier you can get out of an LLM. Use it for routing and
+  confidence-aware UX.
+- Repetition/frequency/presence penalties solve a real problem
+  but break a model's ability to use common words when overused.
+  Touch them last.
+- For constrained output (one of N labels, a fixed schema), use
+  function calling or JSON mode, not logit bias.

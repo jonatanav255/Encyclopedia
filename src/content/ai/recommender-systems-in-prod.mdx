@@ -1,0 +1,295 @@
+export const level = 'staff';
+
+# Recommender systems in prod
+
+A production recommender is two systems pretending to be one. The
+**model side** ranks items by relevance to a user. The **system
+side** retrieves candidates, fans out to rankers, reranks for
+business rules, and serves in tens of milliseconds. Most teams
+that try to "just use embeddings" learn the hard way that the
+model is the easy 30% and the pipeline is the other 70%.
+
+For the **system layout** — services, indexes, caching, fanout
+shape — see `system-design/recommendation-system-architecture.mdx`.
+This page is the **model side**: candidate generation, ranking,
+the metrics that lie, and the feedback-loop pathologies that
+ruin recommenders given time.
+
+## The four-stage pipeline
+
+The industry standard shape, regardless of domain:
+
+<Diagram caption="The funnel narrows; latency budgets per stage shrink as item count drops.">
+<DBox x={10} y={10} w={120} h={50} label="Candidates" sub="~10^7 → 10^3" />
+<DBox x={150} y={10} w={120} h={50} label="Light rank" sub="~10^3 → 10^2" />
+<DBox x={290} y={10} w={120} h={50} label="Heavy rank" sub="~10^2 → 10^2" />
+<DBox x={430} y={10} w={120} h={50} label="Rerank + policy" sub="~10^2 → ~10" />
+<DArrow from={{x: 130, y: 35}} to={{x: 150, y: 35}} />
+<DArrow from={{x: 270, y: 35}} to={{x: 290, y: 35}} />
+<DArrow from={{x: 410, y: 35}} to={{x: 430, y: 35}} />
+</Diagram>
+
+Why a funnel at all: the heavy ranker is a deep model running on
+GPU-or-equivalent, and **you cannot afford to run it on 10
+million items per request**. So you cheaply narrow first, then
+spend latency budget on the items most likely to matter.
+
+Stage budgets in a typical 100ms p99 system:
+
+- **Candidate generation**: 20–30ms, returns 500–5000 items.
+- **Light rank**: 10–20ms, scores cheaply, keeps top 100–200.
+- **Heavy rank**: 30–50ms, deep model, fine-grained scores.
+- **Rerank**: 5–10ms, diversification, freshness, policy filters.
+
+Latency-wise, candidate generation is the surprise — it has to
+be sub-30ms over a corpus of millions of items, which is why ANN
+indexes (HNSW, IVF, ScaNN) exist.
+
+## Candidate generation: where two-tower lives
+
+The two main families and where they earn their place.
+
+### Collaborative filtering (matrix factorization, ALS)
+
+Build a user × item interaction matrix; factor it into low-rank
+user and item vectors. Classic, still useful for cold-ish users
+with some history. Falk's *Practical Recommender Systems*
+treats this exhaustively. Problems:
+
+- **Cold-start.** New users and new items have no row/column.
+- **Sparse interactions.** Most users have engaged with &lt;1% of
+  items.
+- **Retrain cost.** Re-factoring a billion-row matrix nightly is
+  not cheap.
+
+### Two-tower retrieval (the modern default)
+
+Train one tower that maps `(user features, history)` to a vector;
+another tower that maps `(item features)` to a vector. Optimize
+so that dot-product `(user, positive_item)` > dot-product `(user,
+negative_item)`. At serving time:
+
+1. Encode the user → query vector.
+2. ANN-search the item vector index → top K candidates.
+3. Hand off to ranking.
+
+The wins:
+
+- **Decoupled** — item vectors are precomputed and indexed;
+  user encoding is online but cheap.
+- **Handles content features**, so new items get reasonable
+  vectors before they have any interactions.
+- **Scales** to billion-item corpora via HNSW or IVF-PQ indexes.
+
+The traps:
+
+- The **two towers are trained jointly**, so a change to one
+  side means re-encoding the other. Item vectors drift; the
+  index has to be rebuilt.
+- The **dot-product objective** is convex in vector space but
+  doesn't encode business rules — "show diverse items," "don't
+  show items the user already saw" — those live in rerank.
+- **Negative sampling matters.** In-batch negatives produce
+  retrieval that overfits to popular items. Hard negatives
+  (items the user *almost* engaged with) are the standard fix.
+
+### Hybrid
+
+In practice you generate candidates from multiple sources and
+union them:
+
+- Two-tower retrieval (personalized).
+- Item-to-item ANN (similar to what they just engaged with).
+- Trending / fresh items (cold-start fallback, novelty).
+- Editorial (curated lists for high-stakes slots).
+
+A typical Netflix-shaped homepage is the union of 8–20 candidate
+generators, each contributing rows. The ranker decides ordering
+across them.
+
+## Ranking: it's a classifier you happen to sort by
+
+The heavy ranker is usually a **pointwise binary classifier**
+trained to predict "will this user engage with this item?" —
+P(click), P(watch >30s), P(purchase). At serving time you sort
+by predicted probability.
+
+Common architectures:
+
+- **Wide-and-deep** (Cheng et al., 2016) — wide linear part for
+  memorization, deep MLP for generalization. Old but a strong
+  baseline.
+- **DLRM / DCN** — Facebook / Google deep-learning rankers
+  designed for high-cardinality categoricals via embedding
+  tables.
+- **Gradient-boosted trees** (XGBoost, LightGBM) — still beat
+  deep models on small-to-medium-feature problems with strong
+  tabular features. Easy to train, easy to debug, often the
+  pragmatic choice.
+
+Multi-objective is where it gets real:
+
+- You don't actually want to maximize CTR. You want CTR *and*
+  watch time *and* not-fatigue *and* diversity. The standard
+  trick is to predict multiple targets jointly (multi-head
+  network), then combine scores at rerank with weights tuned
+  to business outcomes.
+- Pareto frontier between objectives is real — pushing CTR
+  cannibalizes long-term retention. This is where ML meets
+  product judgment.
+
+## Cold start: the unavoidable problem
+
+The categories and what actually works:
+
+<Cheatsheet caption="Cold-start strategies that earn their keep">
+| Variant | What it means | Practical defense |
+|---|---|---|
+| New user, no history | Just signed up | Onboarding signals (region, language, declared interests); popular-in-segment fallback; bandit exploration |
+| Returning user, sparse history | A few interactions | Content-based retrieval on items they touched; popularity backoff |
+| New item, no engagement | Just uploaded | Content features in the item tower; trending lift on first few views; editorial slots |
+| New domain entirely | Launching in a new country | Pretrain on global data; fine-tune on local; expect 2-3 months of quality lag |
+</Cheatsheet>
+
+For new items, the **bootstrapping problem** is structural — you
+can't learn what users like about an item until users see it,
+but users won't see it until you rank it. The two real fixes:
+
+1. **Use content features** so the item tower produces a
+   reasonable vector before any interactions.
+2. **Reserve exploration slots** — a fixed % of impressions
+   that go to under-explored items, even if their predicted
+   score is lower. Thompson sampling or epsilon-greedy. Cost:
+   short-term CTR. Benefit: a recommender that doesn't ossify.
+
+## Feedback loops and filter bubbles
+
+The most underrated production failure mode. Your recommender
+sees what the user clicked. The user only clicks what you
+showed. **You are training on data that you generated.**
+
+The pathologies:
+
+- **Popularity bias.** Popular items get shown more, get
+  clicked more, get predicted to be more popular. The
+  long-tail starves.
+- **Filter bubble.** Users who clicked political-content-X get
+  shown more X-aligned content, never see other views, your
+  metrics report engagement is up while the system narrows the
+  user's diet.
+- **Confirmation loop.** A user accidentally clicks an item;
+  the recommender doubles down; the user now sees more of the
+  category they didn't actually want.
+- **Position bias.** Items at position 1 get clicked far more
+  than position 10 regardless of relevance. If you train on
+  raw clicks, you're training a "predict position" model, not
+  a relevance model.
+
+Mitigations (none are free):
+
+- **Inverse propensity scoring (IPS)** for training labels —
+  weight clicks by 1 / P(was shown). Reduces popularity bias in
+  training.
+- **Position bias models** — explicitly model P(click | shown
+  at position k); decouple from relevance.
+- **Diversity terms** in rerank — penalize too-similar items
+  in the result set. MMR, DPP, or simpler greedy diversity.
+- **Exploration slots** — see cold-start; same defense.
+- **User-facing controls** — "show me less of this" gives the
+  user a way to escape the bubble; it also provides clean
+  negative training data.
+
+The point isn't to "fix" the feedback loop — you can't, you're
+always training on data influenced by past recommendations. The
+point is to **build defenses that keep the loop loose enough**
+that the system doesn't collapse into showing every user the
+same 50 most-popular items.
+
+## Online vs offline metrics
+
+The single biggest trap in recommender work.
+
+<Compare>
+<thead>
+<tr><th></th><th>Offline metrics</th><th>Online metrics</th></tr>
+</thead>
+<tbody>
+<tr><td>What they measure</td><td>Model quality on held-out historical data</td><td>User behavior in production</td></tr>
+<tr><td>Examples</td><td>AUC, NDCG@k, MAP, MRR</td><td>CTR, conversion, watch time, retention</td></tr>
+<tr><td>Time to compute</td><td>Minutes (after training)</td><td>Days to weeks (A/B tests need stat-sig)</td></tr>
+<tr><td>Tells the truth?</td><td>Usually no</td><td>Usually yes</td></tr>
+</tbody>
+</Compare>
+
+Offline metrics improve. Online metrics don't move, or move
+*opposite* to offline. Why:
+
+- Offline data is what *the old model showed*. A new model that
+  would have shown different items has no labels for those items
+  — it gets penalized for showing things the old model didn't.
+- Offline AUC weighs all items equally; online users only see
+  the top few.
+- Online has selection effects, novelty, fatigue, and
+  ecosystem-level dynamics offline can't simulate.
+
+The discipline:
+
+- **Use offline metrics to gate experiments** — if offline
+  drops, don't ship.
+- **But ship is decided by online A/B** — offline win is
+  necessary, not sufficient.
+- **Counterfactual evaluation** (Bottou et al., off-policy
+  estimators) can help when A/B is expensive, but it's a
+  research-grade tool with strong assumptions.
+
+The healthiest team I've seen had a wall display of "offline
+delta vs online delta for the last 30 experiments" — a scatter
+plot of how often the two agreed. The slope was lower than
+anyone wanted; the correlation was real but messy.
+
+## Serving constraints that shape the model
+
+The model doesn't get to ignore the system:
+
+- **Latency budget.** Heavy ranker has 30–50ms for ~100 items.
+  This caps model size (parameter count, feature count). A
+  brilliant transformer ranker that takes 200ms is useless.
+- **Throughput.** A homepage is ~10 ranked slots × hundreds of
+  candidates × millions of users. GPU rankers need batching
+  and careful memory management.
+- **Freshness.** Item features (popularity in last hour, recent
+  engagement) need to be in the online store within minutes,
+  not days. See `ai/mlops-pipelines-and-feature-stores.mdx`.
+- **Consistency.** Two requests from the same user within the
+  same session should not show wildly different rankings unless
+  state changed. Session-level caching is normal.
+
+## What good looks like
+
+- Two-tower retrieval + hybrid candidate sources with explicit
+  budgets.
+- Heavy ranker with multi-objective heads; weights tuned via
+  online experiments, not gut.
+- Cold-start handled by content features + exploration slots,
+  not "popular items for new users" alone.
+- Feedback-loop defenses (IPS, position-bias modeling, diversity
+  terms) wired into training and rerank.
+- Offline metrics treated as a gate, online A/B as the truth.
+- Per-segment online metrics — overall lift hides regressions on
+  cohorts.
+- An on-call rotation that owns recommender quality the same way
+  an SRE team owns latency.
+
+## The discipline
+
+- **The funnel is not optional.** You cannot rank a million
+  items per request; design for the budget.
+- **Two-tower retrieval is the modern default**, but cold-start
+  and feedback loops are not fixed by it.
+- **Online metrics are the ones that matter.** Offline AUC is
+  a gate, not a verdict.
+- **You are always training on data your past model generated.**
+  Build defenses against the loop; don't pretend it isn't there.
+- **The system around the model is most of the engineering.**
+  See `system-design/recommendation-system-architecture.mdx`
+  for the system half of the picture.

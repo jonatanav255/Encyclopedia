@@ -1,0 +1,289 @@
+export const level = 'mid';
+
+# LLM eval design
+
+You shipped a RAG system. A week later someone edited the system
+prompt to add "be concise." Quality dropped 12%. Nobody noticed
+for a month. By the time the bug report arrived, three more prompt
+edits had landed on top.
+
+**Without an eval suite, every prompt edit is a silent migration
+of behavior.** This page is the eval design that catches that.
+The mechanics are simple; the failure modes of LLM-as-judge are
+the part people get wrong.
+
+## Offline vs online eval
+
+Two separate jobs, often confused:
+
+- **Offline eval** — run the system over a golden set of inputs
+  with known expected outputs. Run before deploy. Catches
+  regressions on representative inputs. Deterministic-ish.
+- **Online eval** — sample real production traffic, score it
+  (thumbs-up rate, follow-up rates, automatic judges), monitor
+  the trend. Catches things the offline set didn't anticipate.
+
+You need both. Offline catches the regressions you can predict.
+Online catches the ones you can't.
+
+## Building the golden set
+
+The single highest-leverage activity in LLM eval.
+
+A golden set is 50–500 (input, expected-output) pairs that
+represent your real query distribution. Properties of a good one:
+
+- **Mined from real traffic**, not invented. The query
+  distribution you imagine is not the one you have.
+- **Stratified.** Cover easy cases (model gets these in its
+  sleep), medium cases (most of the work), edge cases (the
+  ones that drive your support tickets).
+- **Annotated by humans, with rubrics.** Not just "good"/"bad"
+  — concrete criteria per question.
+- **Versioned.** A golden set is a dataset; treat it like one.
+  Git-tracked, schema-checked, dated.
+
+The trap nobody catches in time: **the golden set leaks into the
+prompt.** Someone reviewing failures hand-codes "if the question
+is about X, do Y" into the system prompt. The golden set now
+measures whether the prompt has memorized it, not whether the
+system generalizes. Solution: hold out 20–30% of golden examples,
+never look at them, only run them at release time. Rotate them in
+quarterly.
+
+## Metrics that work for RAG
+
+Split the eval by pipeline stage. End-to-end eval tells you
+"things got worse" but not why.
+
+### Retrieval metrics
+
+Cheap, deterministic, no LLM judge required. Compute against
+the gold answer's `expected_source_chunks`.
+
+- **Recall@K** — fraction of gold chunks present in top-K.
+  The number that controls everything downstream.
+- **MRR (Mean Reciprocal Rank)** — `1/rank` of the first
+  correct hit. Rewards getting the right answer to the top.
+- **nDCG@K** — discounted gain weighted by relevance. The
+  standard ranking quality metric.
+- **Hit rate** — at least one gold chunk in top-K. Coarse but
+  useful for "did retrieval at least give the LLM a chance."
+
+These run in milliseconds, deterministically. Use them as the
+inner loop when tuning chunking, indexing, hybrid weights,
+rerankers. Save the expensive LLM-judge eval for actual generation
+quality.
+
+### Generation metrics
+
+- **Faithfulness** — does the answer match the retrieved
+  context, or did the model invent? An LLM-judge task: "Is every
+  claim in `answer` supported by `context`?" Scored 0/1 or by
+  count of unsupported claims.
+- **Answer relevance** — does the answer address the question?
+  Judge task.
+- **Answer correctness** — does the answer match the gold
+  answer? Judge task or, if the gold answer is structured (a
+  number, a code snippet), deterministic check.
+- **Context relevance** — were the retrieved chunks actually
+  needed for this answer? Helps spot retrieval bloat.
+
+These need a judge. See the next section for the pitfalls.
+
+### Latency and cost metrics
+
+Often the deciding factor in production:
+
+- **P50, P95, P99 end-to-end latency.**
+- **Latency by stage.** Diagnoses where the slowdown is.
+- **Cost per query** — tokens in × input rate + tokens out ×
+  output rate, summed across retrieval-stage embeddings, rerank,
+  and LLM calls.
+
+A 30% quality lift that doubles cost is a tradeoff conversation,
+not a clean win.
+
+## LLM-as-judge — and how it lies
+
+Using an LLM (often a stronger one than the one being judged) to
+score outputs is the only practical way to grade large eval sets
+on open-ended quality dimensions. It's also full of measurable
+biases that wreck your eval if you don't design around them.
+
+### Position bias
+
+In pairwise comparison ("which answer is better, A or B?"), the
+judge consistently prefers the first answer presented. Measured
+preference rate for position-1 is often 55–65% when the answers
+are actually equivalent.
+
+**Mitigation:** randomize order, and run each comparison twice
+(A then B, then B then A). Count it a tie if the judge flips.
+
+### Length bias
+
+Judges prefer longer answers. They equate length with thoroughness.
+
+**Mitigation:** measure the correlation between length and judge
+score on your data. If high, add explicit instructions to the
+judge: "Answer length is not a factor. Prefer concise answers
+that fully address the question." Don't expect this to fully
+remove the bias — just attenuate it.
+
+### Self-preference / model affinity
+
+A judge model prefers its own family's answers. GPT-4 judging
+GPT-4 vs Claude often picks GPT-4 at >55% even on equivalent
+outputs. Same for Claude judging itself, etc.
+
+**Mitigation:** if you can, use a judge from a different family
+than the model being judged. If you can't, use multiple judges
+and majority-vote. At minimum, disclose this bias when reporting
+results.
+
+### Style and formatting bias
+
+Markdown-formatted answers beat plain text. Bulleted answers beat
+prose. This is judge bias, not user preference.
+
+**Mitigation:** rubric the judge to evaluate content, not
+presentation. Pre-strip formatting from both candidates if you
+want to fully control for it.
+
+### Refusal/safety bias
+
+Judges trained to avoid harmful content are biased toward
+preferring answers that refuse uncertain queries. This can be the
+right behavior; it can also be the model giving up on questions
+it should attempt.
+
+**Mitigation:** segment eval by query type. Track refusal rate
+explicitly as its own metric, not folded into "correctness."
+
+## Pairwise vs pointwise
+
+<Compare
+  left={{
+    title: "Pointwise (single-answer scoring)",
+    points: [
+      "Judge sees one answer at a time, scores 0–5 or 1–10",
+      "Score has absolute meaning across runs",
+      "More noise per individual rating",
+      "No position bias (one answer at a time)",
+      "Calibration drifts as the judge model changes",
+    ],
+  }}
+  right={{
+    title: "Pairwise (head-to-head)",
+    points: [
+      "Judge picks between two candidates",
+      "Better noise properties (relative judgments are stable)",
+      "Position bias is real and must be controlled",
+      "Standard for A/B-style comparisons of system variants",
+      "Win rates don't directly tell you absolute quality",
+    ],
+  }}
+/>
+
+The pragmatic choice: pairwise for "is this change an
+improvement?" decisions, pointwise for absolute quality tracking
+over time. Many production setups run both.
+
+## Reference-free metrics
+
+When you don't have a gold answer — open-ended queries, brand-new
+content, exploratory analysis — you can still score outputs
+against the context they should have been derived from:
+
+- **Faithfulness** — claims supported by context. Reference-free.
+- **Answer relevance** — does it address the question. The
+  question itself is the reference.
+- **Context relevance** — was the retrieved context actually
+  needed.
+
+Frameworks that ship these out of the box: **RAGAS** (the
+canonical reference-free RAG eval framework), **TruLens**, **Arize
+Phoenix**, **DeepEval**. They wire up the judges and handle the
+prompts. They don't remove the biases — you still need to think
+about which judge you're using and what's drifting.
+
+## A regression suite that catches prompt edits
+
+The eval that catches the scenario this page opened with looks
+like:
+
+```
+On every PR that changes prompts, retrievers, models, or
+configs, run:
+
+1. The full retrieval suite (recall@K, MRR, nDCG, latency).
+2. The faithfulness + relevance suite on a 100-question
+   held-out golden set.
+3. A pairwise comparison of new-system vs current-prod on
+   50 representative queries, judged by a different-family
+   model.
+
+Fail the build if any metric drops >X% (X defined per-metric).
+```
+
+Concretely: this lives as a CI job. The 100-question suite costs
+maybe $1–5 per run in LLM-judge calls. That's cheap insurance
+against a $100K quality regression that nobody noticed for a
+month.
+
+## The online eval loop
+
+Three layers, in order of cost:
+
+- **Implicit signals.** Was there a follow-up question? Did the
+  user copy the answer? Did the session end? Free, noisy, useful.
+- **Explicit feedback.** Thumbs up/down on each response.
+  Conversion: ~1–5% of users will rate, even with prominent
+  UI. Useful for trends, not for individual queries.
+- **Sampled judge.** Sample 1–5% of production conversations,
+  run them through the offline-style faithfulness/relevance
+  judges. The most expensive but the most actionable signal.
+
+The implicit signals tell you something is off. The sampled judge
+tells you what.
+
+## A short list of failure modes
+
+<Cheatsheet caption="Recurring LLM-eval failure modes — every team rediscovers these.">
+| Failure mode | What it looks like | Fix |
+|---|---|---|
+| Golden set leaks into prompt | Eval scores rise, real users stay unhappy | Hold out 20–30% of golden set; rotate quarterly |
+| Position bias in pairwise | New system "wins" 55% of A-B trials at parity | Randomize order; run both directions |
+| Length bias | Judge prefers longer answers regardless of quality | Rubric; control for length |
+| Self-preference | Judge prefers its own family | Use cross-family judge or majority vote |
+| Single-metric obsession | nDCG up, real users complain | Multi-metric dashboard, including online signals |
+| Eval set frozen in time | Reflects 2024 user behavior in 2026 | Refresh from production traffic quarterly |
+| Faithfulness "always 5/5" | Calibration drift in judge prompt | Recalibrate judge against human ratings |
+| End-to-end only | Knows something broke, not where | Stage-by-stage metrics |
+</Cheatsheet>
+
+## The discipline
+
+- Build a golden set on day one. Mine it from real traffic.
+  Hold 20–30% out.
+- Split retrieval eval (cheap, deterministic) from generation
+  eval (expensive, judge-based). Localize regressions.
+- LLM-as-judge has measurable biases. Design around them —
+  randomize order, control length, use cross-family judges.
+- Pairwise for "is this better?", pointwise for absolute tracking.
+- Run eval in CI on every change to prompts, retrievers, models.
+  Fail the build on regressions.
+- Sample online traffic and judge it. The offline set doesn't
+  know what users are actually asking.
+
+## What to learn next
+
+- `rag-retrieval-pipeline.mdx` — the system this eval evaluates.
+- `chunking-strategies.mdx` — silent regressions live here.
+- `rerankers-and-cross-encoders.mdx` — the easiest win that
+  proper eval reveals.
+- `hybrid-search-bm25-plus-vectors.mdx` — the eval set bias
+  that hides this win.
+- `observability/logs-metrics-traces.mdx` — production
+  signals you already have that double as eval inputs.

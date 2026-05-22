@@ -1,0 +1,326 @@
+export const level = 'mid';
+
+# Structured output and function calling
+
+"Just ask the model for JSON" is the demo. The production
+question is: **how often does it actually emit valid,
+schema-conformant JSON, and what do you do the rest of the
+time?**
+
+Three answers exist, with increasing strictness and cost:
+
+1. **Ask nicely.** Prompt the schema, hope for the best.
+2. **JSON mode.** Provider guarantees syntactic JSON, not
+   schema conformance.
+3. **Strict mode / function calling with schema.** Provider
+   constrains decoding so output matches the JSON Schema you
+   passed, token-by-token.
+
+Bouchard & Peters's *Building LLMs for Production* and Alto's
+*Building LLM-Powered Applications* both treat this as the
+load-bearing pattern for serious LLM apps. Below is the
+operational shortlist.
+
+## JSON mode
+
+`response_format: { type: 'json_object' }` (OpenAI) and
+similar parameters elsewhere. Effect: the decoder is
+constrained to produce valid JSON syntax. Braces match, quotes
+match, no trailing prose, no markdown fences.
+
+```ts
+const response = await openai.chat.completions.create({
+  model: 'gpt-4o-2024-08-06',
+  response_format: { type: 'json_object' },
+  messages: [
+    { role: 'system', content: 'Reply only with a JSON object containing name and age.' },
+    { role: 'user', content: 'John is thirty' },
+  ],
+});
+// response.choices[0].message.content is guaranteed parseable JSON
+```
+
+What it gives you:
+
+- `JSON.parse(content)` will not throw.
+- No "Sure, here's the JSON:" prefix.
+- No markdown ` ```json ` fence.
+
+What it does **not** give you:
+
+- Field names. The model may emit `{"person_name": "John"}`
+  instead of `{"name": "John"}`.
+- Field types. `{"age": "thirty"}` is valid JSON.
+- Required fields. You may get `{}`.
+
+JSON mode is "syntactically clean garbage is still garbage"
+insurance. Worth turning on; not sufficient on its own.
+
+## Function calling / tool use
+
+This is where the model can also *invoke* something. You
+declare a schema; the model emits a structured call to it; you
+execute the function and feed the result back.
+
+```ts
+const tools = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get current weather for a city.',
+      parameters: {
+        type: 'object',
+        properties: {
+          city: { type: 'string', description: 'City name' },
+          unit: { type: 'string', enum: ['celsius', 'fahrenheit'] },
+        },
+        required: ['city'],
+        additionalProperties: false,
+      },
+      strict: true,
+    },
+  },
+];
+```
+
+OpenAI's `strict: true` (and Anthropic's tool-use, which is
+strict by default) means **constrained decoding** —
+under the hood, the decoder is restricted to tokens that keep
+the output valid against the JSON Schema. The model literally
+cannot emit `{"city": 30}` because at the value position for
+`city`, only tokens that continue a string are allowed.
+
+This is dramatically more reliable than JSON mode + hope.
+Field names are guaranteed; field types are guaranteed; enums
+are guaranteed; required fields are guaranteed.
+
+## Constrained decoding: the actual mechanism
+
+The trick: at each token-generation step, the decoder looks at
+the JSON Schema and the current parser state, computes the set
+of tokens that *could* legally continue (e.g., "we're inside a
+string for the `city` field, so any string token is valid,
+plus the closing quote"), and masks the model's logits so only
+those tokens get probability mass.
+
+Implementations:
+
+- **OpenAI** — `strict: true`. Server-side, opaque.
+- **Anthropic** — tool use is constrained by default; the
+  client SDK exposes `input_schema`.
+- **Outlines** (Python lib) — open-source, works with `vLLM`,
+  `transformers`. Builds a finite-state machine from the
+  schema or regex.
+- **`llama.cpp` grammars** — GBNF grammars (BNF-derived). You
+  write a grammar; the decoder enforces it.
+- **JSONFormer**, **LMQL**, **Guidance** — various flavors of
+  the same idea.
+
+The output is **always valid**. Trade-offs:
+
+- **Latency.** Computing the legal-token set adds work at
+  every step. Modern implementations are fast (single-digit
+  percent overhead), but it's not free.
+- **Quality.** When the model wants to say something the
+  grammar forbids, it's forced into the next-best token.
+  Sometimes the "best" valid completion is worse than the
+  unconstrained one. Rare but real.
+- **Token waste.** Strict JSON output uses tokens on `{`, `"`,
+  `}` that you don't strictly need. A custom DSL might be
+  shorter.
+
+## Pseudocode: the retry loop
+
+When you don't have strict mode (older models, smaller
+self-hosted ones, providers without it), the canonical
+pattern is **validate and retry**:
+
+```ts
+import Ajv from 'ajv';
+const ajv = new Ajv();
+const validate = ajv.compile(schema);
+
+async function callWithJsonRetry(messages, schema, maxAttempts = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const msgs = lastError
+      ? [...messages, {
+          role: 'user',
+          content: `Your previous response failed validation: ${lastError}. Please fix and reply with valid JSON matching the schema.`,
+        }]
+      : messages;
+
+    const response = await client.messages.create({ model, messages: msgs });
+    const text = response.content[0].text;
+
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch (e) { lastError = `Not valid JSON: ${e.message}`; continue; }
+
+    if (validate(parsed)) return parsed;
+    lastError = JSON.stringify(validate.errors);
+  }
+  throw new Error(`Failed after ${maxAttempts} attempts: ${lastError}`);
+}
+```
+
+The crucial detail: **feed the validation error back into the
+prompt on retry**. Models are surprisingly good at fixing
+"property `age` should be integer, got string" if you tell
+them that's what failed.
+
+Cost reality: a 3-attempt retry on a 1k-token prompt costs
+up to 3x the input cost plus 3x output. For high-volume
+endpoints this gets expensive fast. Strict mode pays for
+itself almost immediately.
+
+## "Schema with optional fields" trap
+
+The seductive idea: "I'll make most fields optional so the
+model can omit ones it doesn't know."
+
+The actual behavior: the model omits fields it *could* infer,
+because "optional" is interpreted as "you don't have to bother."
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "age":  { "type": "integer" },
+    "email": { "type": "string" }
+  },
+  "required": ["name"]
+}
+```
+
+You'll get `{"name": "John"}` half the time, even when "John
+is 30, email john@x.com" was in the input.
+
+Better patterns:
+
+- **Require everything.** Use `"required": ["name", "age", "email"]`
+  and use sentinel values for "unknown":
+  ```json
+  {
+    "properties": {
+      "age": { "type": ["integer", "null"] }
+    },
+    "required": ["name", "age", "email"]
+  }
+  ```
+  With strict mode, you're guaranteed to get all three; the
+  model emits `null` when it can't infer.
+- **`additionalProperties: false`** to prevent the model
+  inventing fields. OpenAI's strict mode requires this; it's
+  good practice everywhere.
+- **Enums over free strings** for categorical fields. Don't let
+  the model emit "high", "High", "HIGH", "very high" for what
+  should be one of three values.
+
+OpenAI's strict mode in 2024 made `additionalProperties:
+false` and *all properties required* a hard requirement of the
+schema. They didn't do this for fun — they did it because
+optional fields were the #1 source of bugs.
+
+## Latency cost of strict mode
+
+Numbers vary by provider and load, but typical:
+
+| Mode | Relative latency | Reliability |
+|---|---|---|
+| Plain prompt | 1x | 60–90% valid JSON, depending on model |
+| JSON mode | 1.05x | ~99% valid JSON syntax, wrong shape often |
+| Strict mode / function calling | 1.05–1.2x | 100% valid against schema |
+
+Strict mode is not free, but the latency hit is small. The
+reliability gain is enormous. **Default to strict mode** for
+anything machine-consumed; the only reason not to is if your
+provider doesn't support it.
+
+## When function calling is the wrong tool
+
+Not every "give me structured output" problem is best solved
+with function calling. The cases where it's overkill:
+
+- **One-shot extraction** where you control the prompt and a
+  few-shot example pins the format. JSON mode + Ajv is fine.
+- **Streaming-first UX** where you need to render output as
+  tokens arrive. Strict JSON streaming is awkward — you can't
+  parse incrementally without a streaming JSON parser like
+  `clarinet` or `stream-json`.
+- **Free-form text with structured *parts***. Don't force the
+  whole answer into JSON; emit prose with structured tags
+  (e.g., XML) for the parts you need to parse.
+
+## A worked tool-call architecture
+
+The classic "model calls a tool, gets a result, continues":
+
+```ts
+async function runToolLoop(initialMessages, tools, executors) {
+  let messages = [...initialMessages];
+  for (let step = 0; step < 10; step++) {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-5',
+      messages,
+      tools,
+    });
+
+    // Did the model want to call a tool?
+    const toolUse = response.content.find(c => c.type === 'tool_use');
+    if (!toolUse) {
+      return response.content.find(c => c.type === 'text').text;
+    }
+
+    const result = await executors[toolUse.name](toolUse.input);
+
+    messages.push({ role: 'assistant', content: response.content });
+    messages.push({
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(result),
+      }],
+    });
+  }
+  throw new Error('Tool loop exceeded 10 steps');
+}
+```
+
+The traps in this loop:
+
+- **No step limit.** A model can loop forever calling tools.
+  Hard cap.
+- **No tool failure handling.** If `executors[toolUse.name]`
+  throws, you need to feed that error back as a `tool_result`
+  with `is_error: true`, not crash. The model can sometimes
+  recover.
+- **No timeout per tool.** A slow tool blocks the whole chain.
+  Wrap each `executors[...]()` in a timeout.
+- **Parallel tool calls.** Recent models (Claude 3.5+, GPT-4o)
+  can request *multiple* tools in one turn. The loop above
+  handles one; production code should execute them in parallel.
+
+## The discipline
+
+- Default to **strict mode / function calling with schema**
+  for anything machine-consumed. Latency cost is small;
+  reliability gain is enormous.
+- Require all fields. Use `null` for "unknown." Use enums for
+  categoricals. Set `additionalProperties: false`.
+- JSON mode is the minimum baseline if strict mode isn't
+  available. Still validate with Ajv (or equivalent).
+- Retry with the validation error in the prompt. Most retries
+  succeed on attempt 2.
+- For tool loops: step limit, per-tool timeout, error
+  feedback, parallel calls when supported.
+- For the prompt-side mechanics (delimiters, few-shot,
+  schema-in-prompt) see `ai/prompt-patterns.mdx`.
+- For where tool-using LLM systems sit in a wider
+  architecture, the request/response logging and tracing
+  patterns from `observability/logs-metrics-traces.mdx`
+  and `observability/distributed-tracing.mdx` are directly
+  applicable.

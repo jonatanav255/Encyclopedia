@@ -1,0 +1,187 @@
+export const level = 'junior';
+
+# What is AI engineering
+
+"AI engineering" got its current meaning around 2023 when teams
+realized that calling a hosted LLM is a *different job* than
+training a model. You're not collecting data, picking an
+architecture, and watching a loss curve. You're treating a model
+you didn't train as a remote dependency, building an application
+around it, and figuring out why the answers got worse on
+Wednesday.
+
+If you've shipped backend services, most of the skills transfer.
+The parts that don't are what this topic is about.
+
+## ML engineering vs AI engineering vs data science
+
+Rough division of labor in 2025:
+
+- **Data science** — frames the problem, picks metrics, runs
+  offline experiments. Often hands off to ML eng for production.
+- **ML engineering** — owns the model lifecycle: data pipelines,
+  training infra, feature stores, model registry, deployment,
+  monitoring. The model is *built by you*; you can change it.
+- **AI engineering** — owns the application layer around a model
+  *built by someone else* (OpenAI, Anthropic, Google, an open-
+  weights checkpoint someone fine-tuned). The model is a remote
+  API or a `vLLM` process you're babysitting; you can't change it
+  directly, you can only change how you use it.
+
+Chip Huyen's *AI Engineering* (2025) makes the split explicit:
+ML eng builds models, AI eng builds *systems that use* models.
+The two roles overlap — an AI engineer fine-tuning a 7B model is
+doing ML eng work for a week — but the day job is different.
+
+For most product teams in 2025–2026, the AI eng path is the one
+that exists. You won't train GPT-5. You will spend a quarter
+fighting evals.
+
+## "The model is a dependency"
+
+The single mental shift that matters: **the model is a versioned
+external dependency**, like a database engine or a third-party
+API. Treat it like one.
+
+What that means concretely:
+
+- It has a **version** (`gpt-4o-2024-08-06`,
+  `claude-sonnet-4-5-20250929`). Pin it. "Latest" is a footgun.
+- It has a **rate limit**, a **price**, and a **latency
+  distribution** that you don't control.
+- It has **breaking changes** disguised as improvements. The
+  same prompt against `gpt-4o` and `gpt-4o-mini` produces
+  different output; the same prompt against `gpt-4o-2024-05-13`
+  and `gpt-4o-2024-08-06` also produces different output.
+- It has **deprecation timelines**. Models get retired. Your
+  app needs a migration path before the deprecation email lands.
+
+If you've integrated Stripe, you already know this rhythm. The
+difference is that Stripe's API is deterministic and the model
+isn't — same input, slightly different output, and the bug only
+shows up in 3% of requests.
+
+See `express/integrating-third-party-apis.mdx` for the general
+shape of dependency-as-API discipline; the LLM-specific twist is
+that outputs are *probabilistic*.
+
+## Where LLM apps actually break in prod
+
+The four real failure modes, in rough order of how often they
+bite teams:
+
+### 1. Prompt regressions on model upgrade
+
+You ship against `gpt-4o-2024-05-13`. Six months later it's
+deprecated. You move to `gpt-4o-2024-08-06`. Your eval set still
+passes — but the production output on edge cases shifts. Users
+complain about a tone change, or your downstream JSON parser
+starts seeing extra prose.
+
+The fix is not "don't upgrade." The fix is **versioned evals**
+that you re-run on every model bump, and a release process that
+treats a model change like a library upgrade in a hot path.
+
+### 2. Cost blowups
+
+LLM cost scales with **token count**, not requests. A user
+uploads a 200-page PDF; your RAG pipeline naively stuffs it into
+context; one request costs $0.40 instead of $0.004. Multiply by
+a few thousand users.
+
+The traps:
+
+- **Context bloat** — you keep appending to chat history without
+  truncation, and a 50-turn conversation costs 10x a 5-turn one.
+- **Retry storms** — a bad prompt fails JSON parsing, you retry
+  3x with the same input, you paid 4x for one logical request.
+- **Prompt caching not enabled** — Anthropic and OpenAI both
+  support prompt caching for stable prefixes (system prompt,
+  retrieved docs). Forgetting to use it is the most common cost
+  bug; the saving is often 50–90% on repeated calls.
+
+Budget alarms in dollars per hour, not requests per second.
+
+### 3. Latency p99
+
+LLM latency has a long tail. Median is 1–3s for a moderate
+completion; p99 is 10s+. Streaming responses help perceived
+latency but not total compute time.
+
+The traps:
+
+- **Sequential tool calls** that could be parallel — a 4-tool
+  chain at 2s each is 8s; the same fanned out is 2s.
+- **Cold-start fine-tuned models** on serverless inference
+  platforms — first call after idle is 5–30s.
+- **Token-rate ceilings** on the provider side throttling you
+  silently during traffic spikes.
+
+Always track p50, p95, p99 separately. The mean lies.
+
+### 4. Eval drift
+
+Your eval suite passed last week. This week the same suite
+passes but production complaints are up. Why? Because the eval
+set was built against last quarter's user behavior, and users
+have started asking new kinds of questions your set doesn't
+cover.
+
+Evals are not a once-and-done artifact. They need to be
+*updated from production traffic*. Sample real user queries,
+label outcomes, add the failures to the eval set.
+
+## What an AI eng codebase actually has
+
+The directory listing for a serious LLM app, in 2026:
+
+```
+app/
+  prompts/              # versioned prompt templates, not strings in code
+  evals/                # offline eval datasets + judge prompts
+  llm/                  # provider clients, retry/timeout policy, caching
+  retrieval/            # embedding, vector store, hybrid search, rerank
+  tools/                # function-calling tool implementations
+  observability/        # request/response logging, token accounting, traces
+  guardrails/           # input/output filters, PII redaction, jailbreak detection
+```
+
+Nothing exotic — it's a normal backend service with a few
+LLM-shaped wings. The mistake teams make early is treating the
+LLM call as a single line in a controller; six months later
+there's no eval suite, no prompt versioning, no token logging,
+and shipping a model change is terrifying.
+
+## How this topic is laid out
+
+The pages in this section, in roughly the order they bite you:
+
+- **`ai/tokens-and-tokenizers.mdx`** — how the model sees text.
+  Where token counts actually come from.
+- **`ai/embeddings-fundamentals.mdx`** — vector representations,
+  the building block of retrieval and similarity.
+- **`ai/prompt-patterns.mdx`** — the patterns that survive a
+  model swap and the ones that don't.
+- **`ai/structured-output-and-function-calling.mdx`** — getting
+  the model to emit JSON you can actually parse.
+
+Adjacent topics worth knowing:
+
+- `system-design/recommendation-system-architecture.mdx` for the
+  shape of ranking/retrieval systems that long predate LLMs.
+- `observability/logs-metrics-traces.mdx` and
+  `observability/distributed-tracing.mdx` for the
+  request/trace discipline you'll lean on hard.
+
+## The discipline
+
+- Treat the model as a pinned, versioned dependency. Not
+  "latest."
+- Build evals before you ship; update them from production
+  traffic.
+- Track cost per request, per user, per route — in dollars,
+  not tokens.
+- Track latency p50/p95/p99 separately. The tail is where
+  users hurt.
+- Prompts are code. Version them. Diff them. Review them.
+- The model is the easy part. The system around it is the job.

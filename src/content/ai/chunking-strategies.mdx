@@ -1,0 +1,331 @@
+export const level = 'mid';
+
+# Chunking strategies
+
+Chunking is the most under-respected stage of a RAG pipeline. It's
+also where the largest quality wins hide. Every tutorial picks
+"fixed 512-token chunks with 50-token overlap" because LangChain's
+default is that. On real corpora — markdown docs, code, tables,
+PDFs — that default leaves 10–30% of retrieval recall on the floor.
+
+This page is the menu of chunking strategies, when each one earns
+its complexity, and the failure modes you need to know about
+before you commit.
+
+## The core insight
+
+> The chunk is the unit of retrieval. The context you pass to the
+> LLM is not.
+
+These don't have to be the same thing. You can retrieve at one
+granularity and present at another — that's the parent-document
+pattern below. Once that clicks, the chunking landscape stops
+looking like a single tuning knob and starts looking like a design
+choice.
+
+## Strategy 1 — Fixed-size
+
+Slice the document every N tokens with optional overlap.
+
+```ts
+function fixedChunks(text: string, size = 512, overlap = 50) {
+  const tokens = tokenize(text);
+  const chunks: string[] = [];
+  for (let i = 0; i < tokens.length; i += size - overlap) {
+    chunks.push(detokenize(tokens.slice(i, i + size)));
+  }
+  return chunks;
+}
+```
+
+**When this is fine:** flat prose with no internal structure —
+chat logs, news articles, transcripts.
+
+**When this breaks:** anywhere the source has structure the
+fixed-size cutter is blind to. A 512-token slice through a markdown
+file routinely:
+
+- Cuts a heading off from its body, so retrieving the "Auth"
+  chunk gives you content that's actually about logging.
+- Splits a code block — the closing fence ends up in the next
+  chunk, the opening fence in this one. Shiki and rerankers both
+  get confused.
+- Slices the middle row out of a table, so neither chunk contains
+  enough of the schema to be useful.
+
+The chunker doesn't know any of this. There are no errors. Recall
+just quietly drops.
+
+## Strategy 2 — Recursive character splitting
+
+The standard "smarter default" in 2024–2026. Try to split on
+paragraph breaks; if a chunk is still too big, fall back to
+sentences; then to words; then to characters. LangChain's
+`RecursiveCharacterTextSplitter` is the reference implementation.
+
+```ts
+const splitters = ['\n\n', '\n', '. ', ' ', ''];
+// Try each in order until chunks fit within `size`.
+```
+
+This avoids cutting mid-sentence and respects paragraph boundaries
+on prose. It's still structure-blind — it doesn't understand
+markdown headers, code fences, or HTML elements — but it's a
+strict improvement over fixed-size for almost zero extra cost.
+
+**Default this for unstructured prose.** It's the baseline you
+should beat, not start from scratch from.
+
+## Strategy 3 — Document-structure-aware
+
+The chunker reads the document's structure and splits on natural
+boundaries. The exact rules depend on format:
+
+- **Markdown:** split on H1 → H2 → H3, keep code fences atomic,
+  keep tables atomic.
+- **HTML:** split on `<section>`, `<article>`, `<h*>`. Strip
+  navigation and footer chrome.
+- **PDFs:** use a layout-aware parser (Unstructured, PyMuPDF,
+  AWS Textract). Pages are not chunks — sections are.
+- **Code:** split on function and class boundaries via Tree-sitter
+  or language-specific AST. A function with its docstring is one
+  chunk; never split mid-function.
+
+```ts
+// Sketch: markdown structure-aware splitter
+function markdownChunks(md: string) {
+  const sections = splitOnHeadings(md, { maxDepth: 3 });
+  return sections.flatMap(s =>
+    s.tokenCount > MAX
+      ? recursiveSplit(s.text, MAX)
+      : [s.text]
+  );
+}
+```
+
+**When this earns its keep:** docs sites, technical manuals, API
+references, source code, anything with semantic structure. The
+quality lift on a markdown corpus over recursive splitting is
+typically large — proper-noun and "what does the H2 say" queries
+go from "sometimes works" to "consistently works."
+
+**The trap:** PDFs lie. A two-column academic paper looks fine
+visually but the underlying text stream reads "left-column-line-1
+right-column-line-1 left-column-line-2 right-column-line-2…" if
+you parse it naively. Use a layout-aware tool or your "chunks"
+will be unreadable interleaved gibberish.
+
+## Strategy 4 — Semantic chunking
+
+Split on *meaning shifts*, not on structure. The chunker embeds
+sentences sequentially and starts a new chunk wherever the
+embedding distance between consecutive sentences exceeds a
+threshold.
+
+```
+sentences: s1, s2, s3, s4, s5, ...
+distances: d(s1,s2)=0.05, d(s2,s3)=0.07, d(s3,s4)=0.42, d(s4,s5)=0.08
+                                                ^ break here
+```
+
+**When this helps:** loosely-structured prose that covers multiple
+topics inside a single document — long blog posts, interview
+transcripts, meeting notes.
+
+**When it doesn't:** technical docs (structure-aware wins) and
+short uniform content (overkill — recursive is fine). Also: every
+sentence costs an embedding call at ingest time. On a 1M-document
+corpus that's a noticeable bill.
+
+The default threshold is corpus-specific. Plan to tune it on a
+validation set.
+
+## Strategy 5 — Parent-document retrieval
+
+The most important pattern on this page. The trick:
+
+> Index small chunks for retrieval precision. Return their parent
+> sections to the LLM for context completeness.
+
+```ts
+// Ingest: split twice
+const sections = markdownSections(doc);          // ~1500 tokens each
+const chunks = sections.flatMap(s =>
+  recursiveSplit(s.text, 300).map(c => ({
+    text: c,
+    embedding: embed(c),
+    parentId: s.id,
+  })),
+);
+// Index `chunks` for ANN search.
+// Store `sections` keyed by id.
+
+// Query:
+const hits = await index.search(queryVec, { topK: 20 });
+const parentIds = new Set(hits.map(h => h.parentId));
+const contextSections = parentIds.map(id => sections.get(id));
+// Pass the parent sections to the LLM, not the tiny chunks.
+```
+
+Why this works: small chunks (200–400 tokens) embed precisely —
+the embedding is "about one thing." Big chunks dilute meaning.
+But small chunks are too narrow to actually answer questions, so
+you expand to the parent section after retrieval.
+
+This pattern routinely beats every single-granularity chunking
+strategy on real corpora. The cost is one extra index and a small
+join at query time. If you only adopt one technique from this
+page, adopt this one.
+
+## Strategy 6 — Sentence-window
+
+A simpler cousin of parent-document retrieval. Index individual
+sentences with embeddings, but at query time expand each hit with
+N neighboring sentences as a window.
+
+```ts
+// Hit: sentence #142 in doc X
+// Return: sentences 140–144 from doc X as the context.
+```
+
+Cheaper to implement than parent-document (no second granularity
+to maintain), and good for prose where "sections" aren't really a
+thing. The downside: a sentence window that crosses a topic
+boundary mixes context.
+
+## Overlap: how much, and why
+
+Overlap is the cheapest robustness lever. With 0% overlap, any
+sentence straddling a chunk boundary is "half in each chunk" and
+might not match either. With 10–20% overlap, the boundary sentence
+appears in full in one of the chunks.
+
+- **0%:** only if you have a strong reason. Wastes recall.
+- **10–15%:** common default.
+- **20%:** safer for unstructured prose.
+- **>30%:** you're paying to embed and store nearly-duplicate
+  content. Recheck.
+
+Overlap is irrelevant if you're doing structure-aware splitting
+on natural boundaries — there's no "sentence cut in half" to
+recover from. It matters most for fixed-size and recursive
+strategies.
+
+## Chunk size: the actual tradeoff
+
+<Compare
+  left={{
+    title: "Small chunks (~200–400 tokens)",
+    points: [
+      "Embedding is precise — one chunk = one idea",
+      "Higher retrieval precision",
+      "Can fit more chunks in context (K=10+)",
+      "Often miss context the chunk depends on",
+      "Need parent-doc retrieval to compensate",
+    ],
+  }}
+  right={{
+    title: "Large chunks (~1000–2000 tokens)",
+    points: [
+      "More self-contained, less context expansion needed",
+      "Embedding averages multiple topics — diluted",
+      "Lower retrieval precision",
+      "Fewer chunks fit in context (K=3–5)",
+      "Often necessary for tables and code",
+    ],
+  }}
+/>
+
+Real production answer: small chunks for the embedding+index,
+parent sections for the LLM context. Stop trying to find one
+chunk size that's good at both jobs.
+
+## Special cases that bite
+
+**Tables.** Never split a table. Either keep it as one atomic
+chunk (even if it's 2000 tokens) or render each row as a separate
+chunk with the header repeated. Half a table embedded is
+worthless.
+
+**Code.** Split on function/class boundaries. A function with its
+docstring is one chunk. If a single function is too big, that's a
+code-quality signal — chunk it anyway and accept the size.
+
+**Markdown headings.** Always prepend the heading hierarchy to
+the chunk text:
+
+```
+# API Reference
+## Authentication
+### OAuth 2.1
+
+To exchange an authorization code for a token, POST to /token
+with grant_type=authorization_code...
+```
+
+Without the hierarchy, "POST to /token" is ambiguous across the
+entire docs site. With it, the chunk is unambiguous and the
+embedding is meaningfully different from "POST to /token" in
+another API section.
+
+**FAQs and Q&A content.** One chunk per Q+A pair. Splitting these
+on token boundaries is a special kind of disaster — half the
+answer ends up in a chunk with the next question.
+
+## A worked example: the "fixed-512 ate my table" failure
+
+A team indexed their HR policies with fixed-512-token chunks. A
+table with 15 rows of leave policy entitlements landed across two
+chunks: the header + 9 rows in chunk A, 6 rows in chunk B. A
+question about the entitlement on row 12 retrieved chunk B (it
+contained the relevant row) — but chunk B has no header, so the
+LLM saw a context like:
+
+```
+Senior  20  10  5  Yes
+Staff   25  10  5  Yes
+```
+
+…and the answer was "I cannot determine the entitlement from the
+provided context." Switching to a markdown-aware chunker that
+treated each table as atomic made the same question answerable
+in one retrieval. No model change, no prompt change. Pure
+chunking.
+
+## Picking a strategy
+
+<Cheatsheet caption="Strategy by corpus type.">
+| Corpus type | Default strategy | Notes |
+|---|---|---|
+| Long-form prose, blogs, transcripts | Recursive + parent-doc | Semantic chunking is overkill |
+| Technical docs, manuals, API refs | Markdown-aware + parent-doc | Prepend heading hierarchy |
+| Source code | Tree-sitter on functions/classes | Never split mid-function |
+| PDFs (papers, reports) | Layout-aware parser + structure | Test with two-column PDFs |
+| Tables / spreadsheets | One row + headers per chunk | Or one table per chunk if small |
+| FAQs / Q&A | One Q+A pair per chunk | Trivial and high-value |
+| Mixed corpus | Per-type chunkers + unified index | Don't force one strategy on all |
+</Cheatsheet>
+
+## The discipline
+
+- Default to recursive splitting + parent-document retrieval.
+  That's the best general-purpose baseline.
+- Use structure-aware splitting whenever the source has structure
+  worth respecting.
+- Tables are atomic. Code is atomic at function granularity.
+  Markdown chunks need their heading hierarchy.
+- Chunk size is a budget, not a target. ~300 tokens for the
+  index, ~1500 tokens for the LLM context — different jobs,
+  different sizes.
+- Evaluate retrieval recall against a golden set. Chunking
+  changes are silent regressions otherwise — see
+  `llm-eval-design.mdx`.
+
+## What to learn next
+
+- `rag-retrieval-pipeline.mdx` — where chunking sits in the
+  bigger picture.
+- `vector-search-and-anns.mdx` — what the index does with
+  these chunks.
+- `rerankers-and-cross-encoders.mdx` — recovers some recall
+  that imperfect chunking gives up.

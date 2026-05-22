@@ -1,0 +1,268 @@
+export const level = 'mid';
+
+# Attention and context windows
+
+The context window is the bag of tokens the model can see in one
+forward pass — system prompt, conversation history, retrieved
+documents, the current user message, and any output it's generated
+so far. Providers advertise it in big numbers ("1M tokens!") and
+charge for it linearly, but the model's *effective* recall over that
+window is not linear. Long context is real, useful, and full of
+sharp edges.
+
+This page is the engineer's view: what the context window is, what
+it actually costs, and where it breaks. For the systems-level cost
+of holding tokens in GPU memory, see
+`ai/model-serving-and-inference-latency.mdx`.
+
+## What the context window actually is
+
+A decoder-only transformer takes a sequence of `N` tokens and
+produces a probability distribution over the next token. `N` is
+bounded by:
+
+- A trained positional encoding (RoPE, ALiBi) with a maximum
+  effective range.
+- The KV cache memory available on the serving GPU.
+- A hard `max_model_len` configured by the server.
+
+When a provider says "200K context," they mean the model was
+fine-tuned with positional encodings extending that far and the
+inference server will accept that many input tokens. They do *not*
+mean the model uses all of them equally.
+
+The other side of the same coin: every token in the context window
+sits in the KV cache for the duration of the request. KV cache
+memory scales linearly with sequence length (see
+`ai/model-serving-and-inference-latency.mdx` for the formula).
+Roughly **0.15–1.5 MB per token** depending on model — a Llama 3
+70B with GQA is on the lower end (~0.3 MB/token), a dense MHA model
+on the upper end (~1.5 MB/token). A 200K-token request can demand
+30–60 GB of KV cache by itself. That is the whole reason long
+context is expensive.
+
+## Quadratic attention, linear KV
+
+The thing every junior engineer says: "attention is O(N²) so 1M
+context must be 1M² operations." This is true for the math of one
+attention layer in one forward pass, and misleading for what you
+actually pay.
+
+<Compare
+  left={{
+    title: 'Prefill (process the prompt)',
+    points: [
+      'Compute is O(N² × d) per layer — all pairs of tokens attend',
+      'Compute-bound on the GPU',
+      'A 100K-token prompt has a long prefill — multiple seconds',
+      'This is what determines TTFT',
+    ],
+  }}
+  right={{
+    title: 'Decode (generate one token at a time)',
+    points: [
+      'Compute is O(N × d) per new token — only the new token attends to all prior',
+      'Memory-bandwidth-bound (read the KV cache)',
+      'KV cache memory is O(N) — linear in sequence length',
+      'This is what determines TPOT and concurrency limit',
+    ],
+  }}
+/>
+
+So the quadratic cost shows up in prefill latency, not in steady
+streaming. The linear KV-cache cost shows up in how many concurrent
+long-context sessions you can hold. Different bottlenecks; track
+them separately.
+
+Practical sizing: for a 70B GQA model at fp16, expect roughly
+**~0.3 MB per token** of KV cache per request (so ~300 MB for a 1K
+prompt, ~30 GB at 100K). Bump to **~1.5 MB per token** for older
+70B-class MHA models. Multiply by your concurrency target, then
+subtract from GPU memory after weights. That number is your real
+context budget.
+
+## Lost in the middle
+
+Liu et al. (2023), "Lost in the Middle: How Language Models Use
+Long Contexts," ran a controlled experiment: place a relevant
+document at positions 1, 5, 10, 15, 20 of a 20-doc prompt, ask a
+question that requires it, measure accuracy.
+
+The result was a U-curve. Models recovered information near the
+**start** and near the **end** of the context with high accuracy
+(80%+); accuracy at the **middle** dropped to as low as 50% — worse
+than feeding the model *no* context at all on some tasks.
+
+This wasn't a bug in one model. GPT-3.5, Claude, and open-weight
+models all showed the same shape. It hasn't gone away with bigger
+context windows; if anything, the U gets wider.
+
+What it means in practice:
+
+- **Put the most important context at the start or end of the
+  prompt.** System prompt at top, user query and retrieved
+  documents at the bottom is a sensible default.
+- **Don't dump 50 RAG hits in arbitrary order.** Reranking is not
+  optional past ~10 hits — the model will under-attend to whatever
+  lands in the middle.
+- **Few-shot examples in the middle of a long prompt are
+  effectively wasted.** Move them adjacent to the user query.
+
+## Needle in a haystack — what it measures and what it doesn't
+
+The "Needle in a Haystack" (NIAH) eval, popularized by Greg
+Kamradt, drops a single specific fact ("the best food in San
+Francisco is a Dungeness crab sandwich at Swan Oyster Depot") into
+a long, irrelevant document (essays, Paul Graham, etc.) at varying
+depths and lengths, then asks the model to retrieve it.
+
+Modern frontier models claim near-100% NIAH accuracy across their
+full context. Anthropic and OpenAI run versions of this on every
+release.
+
+Why it's not the whole story:
+
+- NIAH is **single-fact extraction**. Real long-context tasks
+  usually need *multi-hop synthesis* — combine fact A at position
+  20K with fact B at position 180K and infer C. Models are
+  dramatically worse at this.
+- NIAH facts are **out-of-distribution noise** in their haystack.
+  The "needle" is semantically distinct from the surrounding
+  text. Real-world relevant chunks look similar to irrelevant
+  ones — that's the hard case.
+- NIAH doesn't measure **distraction** — what happens when there
+  are 10 plausible-looking but wrong answers in the context. This
+  is where production RAG actually breaks.
+
+The honest read: NIAH at 100% means the model *can* attend to
+position N. It does not mean the model *will* prefer position N
+over plausible distractors. Build your own task-shaped eval before
+shipping a long-context system.
+
+<Callout type="warning">
+The numbers we've seen in our own evals: a model that scores 100%
+on single-needle NIAH at 500K tokens may score 30–50% on
+"summarize the three contracts mentioned in the document" at the
+same length. Long context recall on synthesis tasks degrades
+sharply past ~64K tokens for most current models, even when the
+provider advertises 1M.
+</Callout>
+
+## Sliding-window and sparse attention
+
+Full attention every token to every other token is the brute-force
+approach. Several models trade some of that for cheaper long
+context:
+
+<Cheatsheet
+  columns={['Variant', 'What it does', 'Tradeoff']}
+  rows={[
+    ['Full attention', 'Every token attends to every prior token', 'O(N²); the default; best quality at moderate N'],
+    ['Sliding-window (Mistral)', 'Each token attends only to last W tokens (W≈4096)', 'O(N×W); cheap; loses early context unless stacked with cache rotation'],
+    ['Sparse / local + global', 'Most tokens local, a few "global" attend everywhere', 'Longformer-style; engineered for documents'],
+    ['Ring attention', 'Distribute KV cache across GPUs in a ring; rotate K/V blocks', 'Scales to multi-million context across a cluster; serving complexity'],
+    ['Linear attention / SSMs', 'Mamba, RWKV — recurrent state instead of attention', 'O(N) compute and memory; quality still trails strong transformers on most tasks'],
+  ]}
+  caption="Most production frontier models are still mostly full-attention with engineering tricks (chunked prefill, GQA, KV quantization)."
+/>
+
+Mistral's sliding-window in particular is worth understanding: it
+sounds like "the model can only see the last 4K tokens," but
+because attention stacks across layers, each layer's window is
+4K but the effective receptive field after 32 layers is much
+larger. In practice, sliding-window models recall far-back tokens
+worse than dense-attention models, but at a fraction of the cost.
+
+For our use case, the heuristic: **if you advertise long context
+and use sliding-window attention, your recall past the window is
+going to disappoint someone.** Read the model card carefully.
+
+## KV cache and long context in production
+
+The serving-side reality, expanded from
+`ai/model-serving-and-inference-latency.mdx`:
+
+- **One long-context request can starve everyone else.** A user
+  with a 200K-token prompt holds 30 GB of KV cache. On an 80 GB
+  H100 with 40 GB of weights, that's most of the remaining memory.
+  Your concurrent capacity drops from 30 sessions to 2.
+- **Chunked prefill is mandatory.** Without it, a 200K prefill
+  freezes decode for every other session for 5–15 seconds.
+- **KV cache quantization** (FP8 or INT8 KV) is the lever that
+  buys you more concurrent long-context sessions. Quality cost
+  is usually negligible; benchmark on your task.
+- **Prompt caching** (Anthropic, OpenAI, Gemini all ship versions
+  of this) lets you reuse the KV cache for a stable prompt prefix
+  across requests. If you have a 50K-token system prompt that
+  never changes, this is a ~90% TTFT and cost reduction on
+  warm hits.
+
+## The "we shipped 1M context" reality
+
+Story from one team's deployment of a 1M-token long-context model
+for legal document Q&A:
+
+- NIAH at position 950K — 100%. Marketing page accurate.
+- Multi-hop synthesis ("compare clauses across these three
+  contracts") at 800K input tokens — **30% accuracy**, vs 85% at
+  32K input tokens with retrieval over the same docs.
+- TTFT at 800K input — **8.4 seconds**, vs 600ms with retrieval.
+- Cost per query — **40× higher** than the retrieval baseline.
+
+The lesson isn't "long context is fake." It's that "stuff
+everything in the context window and trust the model" is the
+wrong default. Retrieval + reranking + a 32K context window beats
+1M context for almost every information task in 2026, on quality,
+latency, and cost.
+
+Long context shines for tasks where you *can't* retrieve:
+processing a single coherent document end-to-end (a meeting
+transcript, a single legal contract under 200K tokens, a codebase
+that fits), or where the relevant context isn't keyword- or
+embedding-discoverable.
+
+## When to actually use long context
+
+A practical decision tree:
+
+<Steps>
+<Step n="1" title="Does the task need synthesis across the document, or is it lookup?">
+Lookup → RAG. The whole point of retrieval is to put the relevant
+2K tokens in front of the model instead of 200K of noise.
+</Step>
+
+<Step n="2" title="Does the corpus fit in context after dedup and compression?">
+If your "corpus" is one 50-page meeting transcript, just paste it.
+If it's a 10GB document store, RAG is the only option.
+</Step>
+
+<Step n="3" title="Have you benchmarked recall at the depth you need?">
+Run a task-specific eval at the context length you intend to use.
+Don't trust NIAH; build a multi-hop eval over your own data.
+</Step>
+
+<Step n="4" title="Is the prefix stable enough to cache?">
+If yes, prompt caching makes long-context economically viable.
+If no — every request changes the long context — you'll pay full
+prefill every time.
+</Step>
+</Steps>
+
+## What we tell people
+
+- The context window is a hard ceiling, not a usable area. Plan
+  for effective recall to drop past ~64K tokens on synthesis
+  tasks, even on models that advertise 1M.
+- Put critical context at the start or end. The middle is where
+  attention goes to die.
+- NIAH is necessary but not sufficient. It tests extraction, not
+  synthesis or distraction handling. Build your own eval.
+- One long-context request can monopolize a GPU. Cap input length
+  at the gateway and quote a separate price tier for long
+  contexts if you offer them.
+- Retrieval almost always beats stuffing the context window — on
+  quality, cost, and latency. Long context is the fallback when
+  retrieval can't find the right chunks, not the default.
+- Prompt caching is the only thing that makes a 100K-token system
+  prompt economically defensible. Without it, you pay full
+  prefill on every request.

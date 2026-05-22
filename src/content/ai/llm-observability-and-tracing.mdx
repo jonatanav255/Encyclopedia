@@ -1,0 +1,250 @@
+export const level = 'senior';
+
+# LLM observability and tracing
+
+The first time an LLM agent fails in production, you will reach
+for the same tools you use to debug a microservices outage:
+traces, logs, metrics. The first time you reach, you will find
+that **none of them were instrumented for this**. The provider's
+API call shows up as a single HTTP span; the retrieval, the
+prompt assembly, the tool calls, the chain-of-thought are all
+invisible. You spend the rest of the day adding instrumentation
+during the incident.
+
+Don't do that. **The only way to debug an LLM application is the
+trace. The only way to get useful traces is to plan for them on
+day one.**
+
+For the general distributed-tracing model this builds on, see
+`observability/distributed-tracing.mdx`. This page is the
+LLM-specific span shape, attributes, and costs.
+
+## The span shape
+
+A single user message to an agent expands into a tree of
+operations. The minimum useful span hierarchy:
+
+<Diagram caption="Span tree for one agent turn. Each box is a span; nesting is parent-child.">
+<DBox x={10} y={10} w={220} h={40} label="agent.turn" sub="root span, one per user message" />
+<DBox x={20} y={70} w={140} h={36} label="prompt.assemble" sub="template + RAG + history" />
+<DBox x={20} y={120} w={140} h={36} label="retrieval.search" sub="vector + keyword" />
+<DBox x={40} y={170} w={140} h={32} label="embed.query" />
+<DBox x={40} y={210} w={140} h={32} label="vector.search" />
+<DBox x={40} y={250} w={140} h={32} label="rerank" />
+<DBox x={20} y={300} w={160} h={36} label="llm.completion" sub="provider, model, tokens" />
+<DBox x={20} y={350} w={140} h={36} label="tool.call: search_db" />
+<DBox x={20} y={400} w={160} h={36} label="llm.completion" sub="continuation after tool" />
+<DBox x={20} y={450} w={140} h={36} label="output.filter" sub="PII redaction, guardrails" />
+</Diagram>
+
+Each span carries attributes that vary by type:
+
+- **`agent.turn`**: `user_id`, `session_id`, `agent.version`,
+  `total.tokens`, `total.cost_usd`, `total.latency_ms`.
+- **`prompt.assemble`**: `prompt.template_id`, `prompt.version`,
+  `messages.count`, `context.tokens`.
+- **`retrieval.search`**: `query`, `top_k`, `index.name`,
+  `hits.count`, `hits.scores` (top-5).
+- **`llm.completion`**: `provider` (openai/anthropic/etc),
+  `model` (`gpt-4o-2024-08-06`), `prompt.tokens`,
+  `completion.tokens`, `cached.tokens`, `latency_ms`,
+  `cost_usd`, `temperature`, `stop_reason`.
+- **`tool.call`**: `tool.name`, `tool.args` (sanitized),
+  `tool.result_size`, `tool.error`.
+- **`output.filter`**: `redactions.count`, `blocks` (yes/no).
+
+OTel's `gen_ai.*` semantic conventions standardize many of
+these attribute names (`gen_ai.system`,
+`gen_ai.request.model`, `gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens`). Use them so you don't have to
+invent a vocabulary your future self has to remember.
+
+## Token / cost / latency per span
+
+The three metrics that matter for an LLM app, and where they
+have to live:
+
+- **Tokens** belong on the `llm.completion` span. Always both
+  `prompt.tokens` and `completion.tokens`; also `cached.tokens`
+  if you're using prompt caching (Anthropic and OpenAI both
+  return this in the response).
+- **Cost** is derived from token counts × provider pricing.
+  Compute it in the SDK wrapper, not the dashboard — the
+  provider can change pricing and your old traces have to
+  remain accurate. Pin the price in effect at request time.
+- **Latency** is the span duration. The interesting numbers are
+  **time-to-first-token (TTFT)** for streamed responses and
+  **total** for full responses. Track both; users feel TTFT.
+
+Then **roll up to the root span** so a single trace tells you
+the total cost and latency of this user's turn without you
+summing children by hand. Most tracing backends can compute
+this; some can't, in which case the SDK wrapper has to.
+
+## Prompt versioning, attached to traces
+
+Prompts are code. They have versions. The version has to be on
+the trace.
+
+```ts
+const prompt = renderPrompt('agent.v17', {
+  user: userMsg,
+  retrieved: docs,
+});
+
+span.setAttributes({
+  'prompt.template_id': 'agent',
+  'prompt.version': 17,
+  'prompt.hash': sha256(prompt).slice(0, 8),
+});
+```
+
+Why bother:
+
+1. **You'll change the prompt.** When the change breaks
+   something, you need to know which prompt version was active
+   at the time of a trace.
+2. **A/B testing prompts** is normal; the version attribute is
+   what lets you slice metrics by variant.
+3. **Replay.** When you want to test prompt v18 against the
+   bug-reproducing trace, you need the inputs and the *exact*
+   v17 prompt that ran originally.
+
+## Replaying traces against a new model
+
+The killer use case for LLM tracing that classical APM doesn't
+need:
+
+You change the model from `gpt-4o-2024-08-06` to
+`gpt-4o-2024-11-20`. Your offline eval passes. You want to know
+how the new model would have handled the 100 traces that caused
+user complaints last month. You replay.
+
+The replay needs:
+
+- The **exact prompt** sent to the model (not the template; the
+  rendered final string).
+- The **tool definitions** that were exposed at the time.
+- The **system prompt** version.
+- Ideally, the **state of any retrieved documents** at the time
+  (otherwise the new model retrieves new docs, you're not
+  comparing apples to apples).
+
+If your tracing only captured "OpenAI call took 1200ms," you
+cannot replay. If it captured the full input messages,
+serialized, you can. **Store the full input.** Yes, it's bigger.
+Yes, it's worth it. Storage is cheap; rebuilding the prompt
+state from logs is not.
+
+<Callout variant="info">
+Be careful with PII in stored prompts. The full input includes
+the user's message and your retrieved documents. Apply the same
+redaction rules to stored spans as to production output filters.
+The trace store is now a data-classification surface.
+</Callout>
+
+## Sampling for LLM traces
+
+Standard tracing wisdom (`observability/sampling-strategies.mdx`)
+applies, with twists:
+
+- **Sample at the agent-turn level, not the span level.** All
+  spans in a turn share the same sampling decision; otherwise
+  you get half a trace.
+- **100% sampling for traces with errors** (tool failures,
+  guardrail blocks, parse failures).
+- **100% sampling for traces above a cost threshold** (e.g.,
+  any turn that cost > $0.10 — the long-tail expensive requests
+  are where the bugs live).
+- **100% sampling for low-confidence completions** if your model
+  exposes logprobs, or for completions that triggered a retry.
+- **Head sample 1-10%** of normal traffic for everyday
+  dashboards.
+
+The bias matters: low-volume head sampling will *miss the
+incidents you most want to debug*. Tail-based sampling with
+outcome-aware retention is the right default for LLM apps. The
+OTel Collector or a vendor like Honeycomb / Datadog supports
+this; rolling your own buffer is rarely worth it.
+
+## Cost cardinality, briefly
+
+Token / cost attributes are high-cardinality if you put `user_id`
+or `session_id` on every span — see
+`observability/cardinality.mdx` for the general warning. The
+trick:
+
+- **Span attributes**: `user_id`, `session_id`, `tenant_id`,
+  `model`, `prompt.template_id`. High cardinality is fine on
+  traces (they're sampled and stored per-trace).
+- **Aggregated metrics**: avoid `user_id` as a label; aggregate
+  by `tenant_id`, `model`, `prompt.template_id`. Otherwise
+  Prometheus / Cortex / Mimir explodes.
+
+For per-user cost reports, query the **trace store** by user,
+not a Prometheus series per user.
+
+## What you'll wish you'd captured (a checklist)
+
+The list of things that, over and over, teams discover they
+needed to log only after the incident:
+
+<Cheatsheet caption="Capture these on day one; you cannot reconstruct them later">
+| Field | Why |
+|---|---|
+| Exact prompt sent (system + messages, after templating) | Replay and debugging |
+| Model identifier, full version | Tracking regressions across upgrades |
+| Tool definitions exposed for this call | Auditing what the model *could* have done |
+| Tool calls made, with arguments | Forensics, prompt-injection investigation |
+| Response, including `finish_reason` / `stop_reason` | Distinguishing "max tokens hit" from "natural end" |
+| Token counts (prompt, completion, cached) | Cost attribution; cache efficacy |
+| Latency: TTFT and total | User experience; provider regressions |
+| Retrieval results (IDs and scores) | RAG quality debugging |
+| Guardrail decisions (block / allow / redact) | Compliance, false-positive analysis |
+| User feedback events (thumbs, regenerate) | Tying outcomes to traces |
+</Cheatsheet>
+
+## SDKs and tools (2026)
+
+The space is younger than classical APM. The names worth
+knowing:
+
+- **OpenTelemetry GenAI conventions** — vendor-neutral attribute
+  names. Use these even if your backend is proprietary.
+- **Langfuse, Helicone, Arize Phoenix, Braintrust** —
+  LLM-specific observability platforms with prompt / trace /
+  eval integration baked in.
+- **Honeycomb, Datadog, New Relic** — classical APM vendors
+  with LLM-aware extensions added in 2024–2025. Good if you're
+  already in their ecosystem.
+- **DIY**: OTel SDK + Tempo / Jaeger. Possible; you'll spend a
+  quarter on prompt/eval glue the LLM-specific tools ship.
+
+The right answer is usually "ship OTel-compliant traces and
+pick a backend that reads them." Lock-in on attribute schemas
+is the real cost; tooling can be swapped later.
+
+## What good looks like
+
+- Every agent turn produces a single trace with a clear span
+  tree.
+- Token / cost / latency are visible per turn and rolled up.
+- Prompt template id + version are on every LLM span.
+- The full rendered prompt is captured (with redaction) so
+  traces can be replayed against new models.
+- Errors and high-cost traces are sampled at 100%.
+- The on-call can answer "what did this user see, and why" by
+  opening a single trace.
+
+## The discipline
+
+- **Instrument before you need to debug.** Adding instrumentation
+  during an incident is the worst time to do it.
+- **One trace per user turn.** Everything else hangs off it.
+- **Capture the full rendered prompt, not the template.** Replay
+  needs it.
+- **Cost and tokens go on the LLM span; roll up to the root.**
+- **Tail-sample by outcome.** Head sampling at 1% loses every
+  interesting incident.
+- **Prompt versions on every span.** They will change; the
+  trace has to remember which version ran.

@@ -1,0 +1,234 @@
+export const level = 'junior';
+
+# Tokens and tokenizers
+
+A language model doesn't see text. It sees **token IDs** —
+integers that index into a vocabulary of typically 30k–200k
+sub-word units. The tokenizer is the function that maps your
+UTF-8 string to that integer sequence, and back.
+
+You can get a long way pretending tokens are words. Then you
+get a $4,000 invoice for a job you priced at $400, or a
+parser that randomly fails on Japanese input, and you have to
+learn what a token actually is.
+
+## What a tokenizer is
+
+Three families dominate:
+
+- **BPE (Byte-Pair Encoding).** Used by GPT-2/3/4, Llama,
+  Mistral, Claude. Starts from individual bytes (or
+  characters) and greedily merges the most frequent adjacent
+  pair, building a vocabulary of sub-words. `tiktoken` (OpenAI)
+  is BPE.
+- **WordPiece.** Used by BERT, DistilBERT. Similar to BPE but
+  picks merges by likelihood rather than raw frequency. Prefix
+  sub-words with `##`.
+- **SentencePiece (with Unigram).** Used by T5, mBART, ALBERT,
+  many multilingual models. Treats the input as a raw byte
+  stream (no language-specific pre-tokenization). Reversible —
+  you can detokenize and get back exactly the original bytes,
+  spaces and all.
+
+For backend folks: BPE-family is what you're hitting with
+OpenAI and Anthropic. SentencePiece is what you're hitting
+with most open-weights multilingual models.
+
+## "1 token ≠ 1 word"
+
+The lazy heuristics you'll see in vendor docs:
+
+- English: **~4 characters per token**, **~0.75 words per
+  token**, so "count words × 1.3" approximates token count.
+- Code: **~3 characters per token** — sub-words split heavily
+  on symbols.
+- Non-English: **wildly variable**. Spanish ≈ 1.5x English
+  tokens for the same meaning. Chinese, Japanese, Korean can
+  be 2–3x. Arabic and Hindi can be 3–4x. A character that's
+  one Unicode codepoint may tokenize to 3–5 BPE tokens because
+  the byte sequence wasn't seen often during tokenizer
+  training.
+
+Worked example with `tiktoken` (GPT-4o):
+
+```ts
+import { encoding_for_model } from 'tiktoken';
+const enc = encoding_for_model('gpt-4o');
+
+enc.encode('Hello, world!').length;          // 4 tokens
+enc.encode('こんにちは、世界！').length;        // 9 tokens
+enc.encode('Hello, world! '.repeat(10)).length; // 40 tokens
+```
+
+"こんにちは、世界！" is 9 Japanese characters and 9 tokens —
+worse than 1:1 in this case. GPT-4o's tokenizer
+(`o200k_base`, 200k vocab) is better at non-English than the
+older `cl100k_base` (100k) used by GPT-4, but it's still
+language-skewed.
+
+**The takeaway:** never estimate token count by counting
+words. Always run the tokenizer for the exact model you'll
+call.
+
+## Why the vocab size matters
+
+A larger vocab means:
+
+- **Fewer tokens** for the same text. Cheaper, fits more in
+  context.
+- **Bigger embedding matrix** at train time (vocab × hidden
+  dim, often 30–40% of total params for small models).
+- **More semantic chunks** per token (closer to "morphemes"
+  than "characters").
+
+GPT-4o moved from 100k to 200k vocab and saw ~20% fewer
+tokens on Asian languages at the same text. That's a direct
+price cut for those users, even at the same per-token rate.
+
+## Token-cost accounting
+
+Pricing is per-token. The bill is:
+
+```
+cost = (input_tokens × input_rate) + (output_tokens × output_rate)
+```
+
+with **output usually 3–5x more expensive than input**.
+
+Where teams lose money:
+
+- **Long system prompts repeated on every call.** A 2,000-token
+  system prompt × 1M calls/month = 2B tokens of input. At
+  ~$2.50/M (mid-tier 2025 pricing) that's $5,000 you can mostly
+  cache.
+- **Unbounded chat history.** Every turn appends to context.
+  Turn 50 costs 25x turn 2's input.
+- **Retried failures.** A malformed-JSON retry doubles the
+  bill on that request.
+- **Stuffing whole documents.** A 50-page PDF is ~25k tokens.
+  Multiply by every user query and you've built a money fire.
+
+**Prompt caching** (Anthropic, OpenAI as of 2024) lets you mark
+a stable prefix — system prompt + maybe a few retrieved docs —
+as cacheable. Subsequent calls within the cache TTL (5min for
+Anthropic, longer with explicit cache control) pay ~10% of the
+input rate for those tokens. If your system prompt is stable
+and your call rate is high, this is the single biggest cost
+lever you have.
+
+## Counting tokens client-side
+
+Both major providers ship tokenizers you can run locally:
+
+```ts
+// OpenAI: tiktoken
+import { encoding_for_model } from 'tiktoken';
+const enc = encoding_for_model('gpt-4o');
+const tokens = enc.encode(text).length;
+```
+
+```ts
+// Anthropic: @anthropic-ai/tokenizer (BPE, approximate for
+// recent Claude models — Anthropic recommends server-side
+// counting for exactness)
+import { countTokens } from '@anthropic-ai/tokenizer';
+const n = countTokens(text);
+```
+
+For Anthropic in particular: the Messages API returns
+`usage.input_tokens` and `usage.output_tokens` on every
+response. **Trust the API number for billing.** The local
+counter is for budgeting before you send.
+
+## Special tokens and chat templates
+
+The bugs that don't show up until late:
+
+LLMs don't see `"role": "user"` as a JSON field. The provider
+serializes your messages array into a single token sequence
+using a **chat template** — model-specific special tokens that
+delimit turns. For Llama 3, that's:
+
+```
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are helpful.<|eot_id|><|start_header_id|>user<|end_header_id|>
+Hi.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+```
+
+Each `<|...|>` is **one token**, not a string. The OpenAI and
+Anthropic hosted APIs apply the template for you. If you run
+an open-weights model with `vLLM` or `transformers`, you have
+to apply the template yourself (`tokenizer.apply_chat_template`)
+and **forgetting it produces garbage output** — the model has
+never seen raw "system: ... user: ..." text during fine-tuning.
+
+Off-by-one bugs:
+
+- Counting `len(messages)` as "the cost" — wrong, you have to
+  count tokens *after* template application. The template
+  itself adds ~10 tokens per turn.
+- Manually concatenating messages and forgetting a separator —
+  the model may interpret the user's text as part of the
+  system prompt.
+- Stripping special tokens from output when echoing the chat
+  history back — leave them in for the model, strip them for
+  display.
+
+## Byte fallback
+
+What happens when a tokenizer encounters bytes it's never
+seen? Modern tokenizers (BPE-with-byte-fallback,
+SentencePiece-Unigram) fall back to encoding the raw UTF-8
+bytes as individual tokens. The model still works, but each
+unknown character costs 1–4 tokens.
+
+This is why emoji and rare scripts tokenize badly. 😀 is one
+UTF-8 codepoint (4 bytes) — for `o200k_base` it's 1 token; for
+older `cl100k_base` it was 2; for some open-weights tokenizers
+it's 4 (byte-by-byte).
+
+If you're processing user-generated content that includes
+heavy emoji, code, or non-English text, *measure tokens on a
+real sample*. Don't estimate from English prose.
+
+## A worked accounting bug
+
+A team priced a summarization feature at $0.02 per call,
+based on a tokenizer count of "average input 5,000 tokens."
+
+Production: average input was 7,500 tokens, because:
+
+- They counted tokens on the text *before* the chat template
+  was applied. The template added ~50 tokens.
+- They counted tokens on the *truncated* version they'd send,
+  but a bug let some untruncated 30k-token docs through.
+- Their system prompt grew from 400 tokens to 1,200 tokens
+  over three months as PMs added "and also do X" lines, and
+  no one re-priced.
+
+Real average: $0.038. They had committed to "$0.02 per call"
+in the pricing page. The fix took a week and involved
+counting tokens at the *API boundary*, not in the input
+preprocessor.
+
+The lesson: instrument token counts as a metric *at the
+provider call site*, not just at the input step. Log
+`usage.input_tokens` from the API response. Alarm on
+percentile drift.
+
+## The discipline
+
+- Tokens are sub-word units, not words. Count them with the
+  exact tokenizer for the model you call.
+- English ≈ 0.75 words/token. Other languages can be 2–4x
+  worse. Code is denser than prose.
+- Output tokens cost 3–5x input tokens. Optimize the right
+  side of the bill.
+- Use prompt caching for stable prefixes. It's the largest
+  cost lever you have.
+- For open-weights models, apply the chat template. Forgetting
+  it produces silent garbage, not an error.
+- Log `usage.*` from API responses as a metric. Alarm on
+  p95 token count drift.
+- For embeddings (a related vector representation), see
+  `ai/embeddings-fundamentals.mdx`.

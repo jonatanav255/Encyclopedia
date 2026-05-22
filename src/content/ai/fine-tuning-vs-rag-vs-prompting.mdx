@@ -1,0 +1,275 @@
+export const level = 'senior';
+
+# Fine-tuning vs RAG vs prompting
+
+The question gets asked at every AI design review: "should we fine-
+tune the model?" The honest answer is "almost certainly not, yet."
+Of the three levers you have — prompting, retrieval, fine-tuning —
+they solve different problems, and 80% of teams that reach for
+fine-tuning needed better prompts or better retrieval.
+
+This page is the decision framework. For the building blocks
+underneath, see `ai/prompt-patterns.mdx` (if it exists),
+`ai/embeddings-fundamentals.mdx`, and
+`ai/agent-loops-and-tool-use.mdx`.
+
+## What each lever actually changes
+
+<Cheatsheet
+  columns={["Lever", "Changes", "Doesn't change"]}
+  rows={[
+    ["Prompting", "How the model uses what it already knows for a specific request", "What the model knows; its style at scale"],
+    ["Few-shot / in-context examples", "Pattern it follows for THIS response", "Underlying weights; carries over to no other call"],
+    ["RAG (retrieval)", "What the model sees as context", "How the model reasons"],
+    ["LoRA / adapter fine-tuning", "A small delta on the weights for style, format, or domain shift", "The model's general knowledge or factual recall in a useful way"],
+    ["Full fine-tune (SFT)", "All weights, deeply", "The cost calculus that made the base model rentable"],
+    ["RLHF / DPO / preference tuning", "How the model picks between responses", "Knowledge; ranks existing capabilities"],
+  ]}
+  caption="If your problem is 'the model doesn't know X,' RAG. If it's 'the model says X weirdly,' fine-tune or prompt. If it's 'the model can do X if I ask right,' prompt."
+/>
+
+The single most important sentence in this whole topic: **fine-
+tuning teaches behavior, not knowledge.** A fine-tune is good at
+"always respond in this JSON shape" or "use this brand tone of
+voice." It is terrible at "remember these 5000 facts." The latter
+is what RAG is for.
+
+## The decision tree, top down
+
+Walk this in order. Stop at the first lever that works.
+
+<Steps>
+<Step n="1" title="Can a better prompt fix it?">
+Try this first, always. The 2026 prompt-engineering toolkit:
+- Clearer instructions, fewer ambiguities.
+- A handful of well-chosen few-shot examples (3-8).
+- A system prompt that explicitly states the role and output format.
+- Chain-of-thought via "think step by step" or the provider's
+  thinking mode (Claude extended thinking, OpenAI o1-style).
+- Structured output via JSON mode / tool calling.
+
+This costs nothing to try, ships in an hour, and resolves 60-70% of
+"the model is dumb" complaints. If it works, you're done. Pin the
+prompt, version it, eval it.
+</Step>
+
+<Step n="2" title="Is the problem 'the model doesn't know this'?">
+If the model lacks a fact, no amount of prompting will conjure it.
+Two reasons it might be missing:
+- **Recency** — the fact is newer than the model's training cutoff.
+- **Privacy** — the fact is your private data the model has never
+  seen (and shouldn't).
+
+Both are RAG problems. Build a retrieval pipeline:
+- Index your data with an embedding model (or hybrid BM25 + vector).
+- At query time, retrieve top-K relevant chunks.
+- Stuff them into the prompt.
+- Cite sources back to the user.
+
+RAG can be added in a week, iterated forever, and updated by
+re-indexing — no model retrain. See `ai/embeddings-fundamentals.mdx`
+for the building blocks.
+</Step>
+
+<Step n="3" title="Is the problem 'style, format, or task shape'?">
+The model produces correct content but in the wrong format, voice,
+or structure consistently. Examples:
+- Always emit medical reports in the hospital's specific schema.
+- Match the brand's casual tone, every time.
+- Pick a label from a fixed taxonomy of 50.
+
+This is what **LoRA / SFT** is good at. You fine-tune on a few
+hundred to few thousand (input, output) pairs in the desired shape.
+The model learns the *mapping*, not new facts.
+
+Order of escalation:
+- Constrained decoding (JSON Schema mode, regex constraints) for
+  format — no fine-tune needed.
+- Few-shot examples in the prompt for style — try first.
+- LoRA fine-tune if the few-shot approach is too token-heavy, too
+  inconsistent, or you want to move from a big expensive model to
+  a smaller cheap one with style preserved.
+</Step>
+
+<Step n="4" title="Is the problem 'the base model is wrong for the domain'?">
+Rare, but real. Medical, legal, code in an obscure language,
+non-English languages with weak coverage. The base model
+fundamentally lacks the right vocabulary or reasoning pattern.
+
+Options, in order:
+- A better base model (Med-PaLM, MedGPT-style domain models, or
+  open-weights models pre-trained on your domain).
+- Continued pre-training on your domain corpus (rare; expensive;
+  usually not the right answer).
+- Full SFT on a high-quality domain dataset.
+
+This is the only place full fine-tuning earns its cost. Be sure.
+</Step>
+</Steps>
+
+## The cost / latency / risk table
+
+The full picture:
+
+<Cheatsheet
+  columns={["Approach", "Setup time", "Per-call cost vs base", "Latency vs base", "Maintenance"]}
+  rows={[
+    ["Better prompt", "Hours", "1.0-1.2× (longer input)", "+50-200ms TTFT for prefill", "Re-eval on model upgrade"],
+    ["Few-shot examples", "Hours-days", "1.2-2× (examples in context)", "+200-500ms TTFT", "Same"],
+    ["RAG", "1-3 weeks", "1.5-3× (retrieved chunks in context)", "+50-300ms (retrieval roundtrip)", "Reindex on data change; eval drift"],
+    ["LoRA fine-tune", "1-2 weeks", "Often cheaper (smaller base works)", "Same (-)", "Retrain on data shift; redo on model upgrade"],
+    ["Full SFT", "Weeks-months", "Same as base model", "Same", "Major: retrain on every base upgrade"],
+    ["RLHF / DPO", "Months", "Same", "Same", "Major; needs preference data pipeline"],
+  ]}
+  caption="Time-to-impact runs left to right; ROI typically does too."
+/>
+
+## The "model gets smarter next quarter" risk
+
+The thing that nukes most fine-tuning investments: you spend three
+months building a fine-tuned Llama-3-8B that scores 78% on your
+eval. Next quarter, GPT-5 or Sonnet-5 ships and scores 92% on the
+same eval with the same prompt — zero training, zero fine-tune.
+
+The investment didn't just under-perform; it actively held you
+back. You shipped a worse experience for 90 days while the rest of
+the field moved. The cost wasn't the GPU hours; it was the
+opportunity cost.
+
+When this risk is highest:
+
+- The base model you fine-tuned is small and the next-gen big model
+  closes the gap on your task.
+- Your training data isn't a proprietary moat (open-source examples
+  the new model already saw).
+- You're fine-tuning to improve raw capability, not to enforce a
+  specific style or format the base model can't be made to follow.
+
+When the risk is lower:
+
+- You're fine-tuning to compress (small model + LoRA produces
+  outputs as good as the big model at 1/20th the cost).
+- Your training data is genuinely private — your customer support
+  tickets, your code style, your domain corpus.
+- You need on-device or air-gapped inference where you can't call
+  GPT-5 anyway.
+
+The decision rule that ages well: **fine-tune for cost reduction
+and behavior shaping, not for capability gains.** Capability is
+what the base-model arms race delivers. Don't try to out-compete
+foundation labs at their game.
+
+## RAG patterns that actually ship
+
+RAG looks simple in a demo, hard in production. The bugs cluster:
+
+- **Chunking strategy.** Splitting docs at fixed 1000-char
+  boundaries cuts mid-sentence. Use semantic chunking, or chunk by
+  document structure (sections, headings).
+- **Pure-vector retrieval misses keywords.** A user search for
+  "error code E1024" returns nothing — the embedding model doesn't
+  encode the literal string well. **Hybrid search** (BM25 + vector,
+  combined by reciprocal rank fusion) consistently beats pure
+  vector for technical content. See `ai/embeddings-fundamentals.mdx`.
+- **Top-K is a lie.** Setting `k=5` doesn't mean you got 5 relevant
+  results; it means you got the 5 nearest in the embedding space.
+  Always rerank with a cross-encoder (Cohere Rerank, or a local
+  one). Reranking improves top-1 accuracy 20-40% in real evals.
+- **Stale index.** Your data updates; the index doesn't. Add a
+  staleness SLO. Reindex frequency depends on how fast truth
+  changes.
+- **Citation hallucination.** The model invents sources. Force
+  cite-with-doc-ID in the output, and post-verify that the doc IDs
+  exist in the retrieved set. Reject responses where they don't.
+
+## When fine-tuning is genuinely the right answer
+
+The cases that hold up:
+
+- **Style transfer at scale.** You have 100K examples of "what
+  good looks like" for your task. Few-shotting becomes
+  prohibitively expensive in tokens; fine-tune a smaller model
+  instead. Common in customer support, content moderation,
+  structured extraction.
+- **Format adherence.** The model needs to emit a specific schema
+  every time, and JSON mode + prompt isn't getting you to four-nines
+  compliance. A LoRA trained on the schema gets you there.
+- **Task that resists few-shot.** Some tasks (subtle classification,
+  domain-specific reasoning) just don't pattern-match from 8
+  examples but do from 800. Fine-tune.
+- **Cost compression.** Migrating from gpt-4o (~$2.50/M input) to
+  a fine-tuned gpt-4o-mini (~$0.15/M input) at the same quality is
+  a real, repeatable win. The win is the cost ratio, not the
+  capability.
+
+## Common anti-patterns
+
+- **Fine-tuning to teach facts.** "We'll fine-tune so it knows our
+  product docs." It will memorize some, hallucinate others, refuse
+  to update without retraining, and your eval scores will go down.
+  Use RAG.
+- **Fine-tuning before prompt iteration.** You haven't squeezed
+  the base model yet. The marginal gain from fine-tune is small
+  vs. the gain you left on the table in prompting.
+- **Training on production outputs from a bigger model.** Distillation
+  of GPT-4 outputs into a smaller fine-tune. Legally complicated
+  (TOS issues), epistemically lossy (you train on hallucinations
+  too). Some teams do it; do it with eyes open.
+- **Fine-tuning with 50 examples.** Below ~500 examples, LoRA is
+  noise. Below 2000, often noise. You need real data volume.
+- **Never re-evaluating.** You fine-tuned six months ago. The base
+  model has shipped two upgrades. Have you re-tested whether the
+  fine-tune still adds anything?
+
+## The eval discipline
+
+Whichever lever you pull, the question "did this help" has the same
+answer: **an eval set you trust**. The mistake everyone makes is
+shipping a fine-tune or a new RAG pipeline based on a 20-example
+spot-check.
+
+What "trust" looks like:
+
+- 200+ labeled examples covering the failure modes you've seen in
+  production.
+- A judge — either human, or LLM-as-judge with a calibrated rubric.
+- Run on every model swap, every prompt change, every fine-tune,
+  every RAG config change.
+- Tracked over time as a metric. If quality drops, find out which
+  change did it.
+
+A team without an eval suite cannot reason about fine-tuning ROI.
+They're guessing. See `ai/what-is-ai-engineering.mdx` for why
+this discipline matters in general.
+
+## Composability
+
+These levers compose. The real production stack:
+
+- **Strong base model** (the latest big foundation model).
+- **Versioned prompt** with carefully chosen few-shots.
+- **RAG** for the facts that aren't in the model.
+- **Tools** for actions and live data.
+- **Maybe a LoRA** on top, for style/format consistency.
+- **Constrained decoding** for structured output.
+
+Each lever fixes a class of problem. Stacking them is the norm.
+Replacing one with another is the bug — they're complementary, not
+substitutes.
+
+## The discipline
+
+- Prompt first. Always. It's free and ships today.
+- If the model doesn't *know* something, RAG. Fine-tuning won't
+  teach it facts reliably.
+- If the model produces the wrong *shape* or *voice*, fine-tune is
+  on the table — but try few-shot + constrained decoding first.
+- Fine-tune for cost reduction or behavior shaping, never for raw
+  capability gains. The base-model race will eat your investment.
+- LoRA before full SFT. Full SFT before continued pre-training.
+- Hybrid retrieval (BM25 + vector) + reranking beats pure vector
+  for almost every real corpus.
+- Every change goes through an eval suite of 200+ examples. No
+  evals, no fine-tuning.
+- Plan the upgrade path. When the next base model ships, will your
+  fine-tune still pull its weight?

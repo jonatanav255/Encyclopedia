@@ -1,0 +1,275 @@
+export const level = 'junior';
+
+# Embeddings fundamentals
+
+An embedding is a fixed-length vector of floats that
+represents the "meaning" of a piece of text (or image, audio,
+code) in a high-dimensional space. The promise: **semantically
+similar inputs land near each other**. The reality: mostly
+true, with enough corner cases to ruin your week if you don't
+know them.
+
+This page covers what embeddings are, the math you actually
+need, and the operational traps. For where embeddings fit in a
+retrieval pipeline, you'll want this plus
+`system-design/recommendation-system-architecture.mdx`.
+
+## What an embedding actually is
+
+A function `embed: text → vector ∈ R^d` where `d` is fixed
+(typically 256–4096 for text embeddings as of 2025).
+
+```ts
+const v = await embed("the cat sat on the mat");
+// v: Float32Array(1536) — 1,536 floats for OpenAI text-embedding-3-small
+```
+
+Two embeddings can be compared with a distance metric. If
+`embed("dog")` and `embed("puppy")` are close, the model has
+captured something about "they mean similar things."
+
+The vector isn't interpretable — you can't look at coordinate
+427 and say "this is the 'mammal' axis." Individual dimensions
+are a distributed representation; what you can use is the
+*relative geometry* of vectors.
+
+## Cosine vs dot vs L2
+
+The three distance/similarity functions you'll see:
+
+- **Cosine similarity** — `(a · b) / (||a|| × ||b||)`. Range
+  [-1, 1]. Measures *angle*; magnitude doesn't matter. The
+  default for text embeddings.
+- **Dot product** — `a · b`. Range unbounded. Cosine without
+  normalization — magnitude *does* matter.
+- **L2 (Euclidean) distance** — `||a - b||`. Range [0, ∞).
+  Measures actual distance in the space.
+
+For **L2-normalized** vectors (`||v|| = 1`), all three are
+mathematically equivalent up to monotonic transforms:
+
+```
+cosine(a, b) = a · b                    (when ||a||=||b||=1)
+L2(a, b)²    = 2 - 2 × (a · b)          (when ||a||=||b||=1)
+```
+
+So a vector DB that stores normalized vectors can use dot
+product internally (fastest) and you can interpret it as
+cosine. Most providers (OpenAI, Cohere, Voyage) return
+**pre-normalized** vectors for exactly this reason. Anthropic
+doesn't ship an embedding API as of late 2025 — they recommend
+Voyage AI (acquired by MongoDB in February 2025).
+
+Verify normalization on a sample before you trust it:
+
+```ts
+function norm(v: Float32Array) {
+  let s = 0;
+  for (const x of v) s += x * x;
+  return Math.sqrt(s);
+}
+// For OpenAI's text-embedding-3-*: should be ~1.0
+norm(await embed("test"));  // 0.9999...
+```
+
+If you're using a self-hosted model (`sentence-transformers`,
+`bge-*`, `nomic-embed-*`), check whether the loader normalizes
+or whether you have to do it. Half the "my retrieval results
+are weird" bugs are an un-normalized vector being compared via
+cosine.
+
+## Why you normalize
+
+Without normalization, longer text often produces vectors with
+larger magnitude (more activations firing), and dot-product
+scores will favor longer documents *for the wrong reason*. A
+query "machine learning" might dot-product-rank a 5,000-word
+ML article above a paragraph that's actually more relevant,
+purely because its embedding has a bigger norm.
+
+Normalizing forces all comparisons to be about direction —
+"what is this *about*" — not "how much text is there."
+
+## Dense vs sparse
+
+Two flavors of representation:
+
+- **Dense embeddings** — what we've been describing. Every
+  dimension has a continuous float value. Captures semantic
+  similarity well.
+- **Sparse embeddings** — most dimensions zero, a few non-zero.
+  The classic example is **BM25** (or TF-IDF), where each
+  dimension is a vocabulary term and the value is a frequency-
+  weighted score. Or **SPLADE** — a learned sparse model that
+  outputs term weights via a transformer.
+
+Dense embeddings are great at "this query means roughly the
+same as this document." They're bad at:
+
+- **Exact keyword matches** ("Python 3.12.4" → a doc mentioning
+  "Python 3.11.2" looks similar; a doc with "Python 3.12.4"
+  doesn't necessarily rank highest).
+- **Rare terms / product codes / IDs** that the embedding model
+  has never seen in training.
+- **Negation** ("not free") — embeddings often miss the "not."
+
+This is why **hybrid search** (BM25 + dense, with a learned
+reranker) consistently beats either alone in production.
+Turnbull & Grainger's *AI-Powered Search* covers this in
+depth: most real systems are a sparse retrieval stage, a dense
+retrieval stage, and a cross-encoder rerank on the union of
+top-K from each.
+
+## Dimension and cost tradeoffs
+
+Bigger vectors are richer but more expensive:
+
+| Model | Dim | Storage / 1M vecs (fp32) | Note |
+|---|---|---|---|
+| OpenAI text-embedding-3-small | 1536 (truncatable) | ~6 GB | Default; Matryoshka |
+| OpenAI text-embedding-3-large | 3072 (truncatable) | ~12 GB | Best quality |
+| Cohere embed-v3 | 1024 | ~4 GB | Multilingual |
+| Voyage voyage-3 | 1024 | ~4 GB | Anthropic's recommendation |
+| bge-large-en-v1.5 | 1024 | ~4 GB | Open weights, MIT |
+| all-MiniLM-L6-v2 | 384 | ~1.5 GB | Tiny, fast, surprisingly strong |
+
+OpenAI's `text-embedding-3-*` models support **Matryoshka
+Representation Learning** — you can truncate the vector to a
+smaller dimension (256, 512, 1024) and it still works, with
+graceful quality degradation. Use the smallest dimension that
+hits your recall target; storage and ANN-index cost are
+linear in `d`.
+
+A practical sizing exercise:
+
+- 10M documents × 1536 dim × 4 bytes (fp32) = **60 GB** raw.
+- With an ANN index (HNSW, IVF-PQ) you're at 1.5–3x that.
+- At fp16 (lossless enough for retrieval), halve it.
+- At int8 quantization (with calibration), quarter it again.
+
+Vector DBs (Qdrant, Weaviate, pgvector, Milvus, Pinecone) all
+support quantization. For anything past a million vectors,
+**don't store fp32**.
+
+## The "embeddings drift after a model upgrade" trap
+
+You indexed 50M documents with `text-embedding-ada-002`. A
+year later, `text-embedding-3-small` ships at half the price
+with better quality. You want to use it.
+
+Problem: **the embedding spaces are completely incompatible**.
+A vector from `ada-002` and a vector from `3-small` cannot be
+compared. The model maps text into a different geometry. You
+cannot mix-and-match; query vectors must come from the same
+model that produced the document vectors.
+
+Migration options, none free:
+
+1. **Re-embed everything.** 50M docs × cost per call. For
+   `3-small` at ~$0.02/M tokens, ~500 tokens/doc, this is a
+   few hundred dollars and a long batch job. Plus you need
+   to dual-write during the cutover.
+2. **Run both models in parallel** during transition. Index
+   under both, query under both, switch read traffic when
+   confidence is high.
+3. **Don't upgrade.** Old model still works. If quality is
+   "fine," the migration cost may not be worth it.
+
+The deeper trap: **the same model version is supposed to be
+stable**, but providers occasionally update underlying
+infrastructure in ways that shift vectors slightly. OpenAI
+has *historically* kept `ada-002` outputs deterministic.
+Voyage and Cohere publish version IDs (`voyage-3`,
+`voyage-3-lite`). Self-hosted with pinned weights and a
+pinned tokenizer is the only true guarantee.
+
+## Deterministic vs nondeterministic embedding APIs
+
+The provider contract you actually want is:
+
+> Same input + same model version + same parameters → exact
+> same vector, byte-for-byte.
+
+Mostly true, with exceptions:
+
+- **Batched inference** can produce small floating-point
+  differences depending on batch size and GPU. Two calls with
+  the same input might differ in the last few bits.
+- **Hardware changes** (A100 → H100) can shift outputs.
+  Providers usually pin a model to a hardware class for
+  exactly this reason.
+- **Tokenization edge cases** — leading whitespace,
+  normalization (NFC vs NFD), trailing newlines — can change
+  the input the model sees and therefore the vector.
+
+The operational consequence: **don't use embeddings as a
+cache key**. Hash the input text. If you cache by vector, a
+microscopic float shift on re-embedding turns a hit into a
+miss.
+
+Also: when comparing across two systems, normalize the input
+text the same way (`text.trim().normalize('NFC')`) before
+embedding.
+
+## Storing and searching
+
+The basic shape of a retrieval system:
+
+```
+ingest:  text → embed → vector → store(id, vector, metadata)
+query:   text → embed → vector → ANN(top_k) → return ids + scores
+```
+
+ANN = approximate nearest neighbor. Exact NN is O(N) per
+query; ANN (HNSW, IVF, ScaNN) is O(log N) with ~99% recall.
+For anything past 100k vectors, you want ANN.
+
+Index choices in 2025:
+
+- **HNSW** — graph-based, fast queries, slow build, high RAM.
+  Default in Qdrant, Weaviate, pgvector (`hnsw` op class).
+- **IVF-PQ** — partitions + product quantization. Lower RAM,
+  approximate. Used in FAISS, Milvus.
+- **ScaNN** — Google's; very fast but more setup.
+
+`pgvector` for Postgres is the lowest-friction choice if your
+data already lives in Postgres and your scale is under ~10M
+vectors. Past that, a dedicated vector DB earns its keep.
+
+## A worked retrieval bug
+
+A team built a help-docs search with OpenAI embeddings +
+pgvector. Recall was great on test queries. In prod, queries
+containing version numbers ("error in 3.12.4") returned junk.
+
+Cause: dense embeddings can't distinguish "3.12.4" from
+"3.11.2" — they're both "version-number-like." The fix
+wasn't a better embedding model; it was adding a **BM25
+stage** (Postgres `tsvector` + `ts_rank_cd`) and combining
+scores via **reciprocal rank fusion**:
+
+```ts
+function rrf(rankA: number, rankB: number, k = 60) {
+  return 1 / (k + rankA) + 1 / (k + rankB);
+}
+```
+
+RRF doesn't need calibrated scores from either side; it just
+needs ranks. Cheap, effective, the default hybrid combiner.
+
+## The discipline
+
+- An embedding is a fixed-dim vector; compare with cosine
+  (or dot, on normalized vectors).
+- Verify normalization on a sample. Half of retrieval bugs
+  are un-normalized vectors.
+- Hybrid search (BM25 + dense + rerank) beats either alone on
+  almost every realistic workload.
+- Pick the smallest dimension that hits your recall target.
+  Quantize at scale.
+- **Embedding spaces are not portable across models.**
+  Upgrading the model means re-embedding the corpus.
+- Don't cache by vector — cache by input hash. Vectors aren't
+  bit-stable enough.
+- For where this fits in a ranking system, see
+  `system-design/recommendation-system-architecture.mdx`.

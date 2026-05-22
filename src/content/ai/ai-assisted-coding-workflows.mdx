@@ -1,0 +1,253 @@
+export const level = 'mid';
+
+# AI-assisted coding workflows
+
+Copilot, Cursor, and Claude Code don't write your code for you. They
+write a *suggestion*, the same way an intern with strong pattern-matching
+and no idea what's load-bearing would. Your job is to direct, review,
+and refuse. The teams that get a real productivity lift out of these
+tools are not the teams that accept the most suggestions. They're the
+teams that ship the fewest regressions.
+
+This page is the meta-skill of programming *with* AI. For where the
+generated code actually breaks, see
+`security/owasp-top-10.mdx` and the security notes below.
+
+## What the tool is doing under the hood
+
+Three different shapes of assistance, with different failure modes:
+
+- **Inline completion** (Copilot, Cursor Tab) — predicts the next few
+  tokens given the current file and a handful of "context window" files
+  the editor decided are relevant. Latency budget: ~200ms. The model
+  is smaller and dumber than the chat one; it pattern-matches more
+  than it reasons.
+- **Chat with file context** (Cursor chat, Copilot Chat) — you
+  explicitly attach files; the bigger model reasons over them. Latency
+  3–15s. This is where you do refactors and explain-this-code.
+- **Agentic coding** (Claude Code, Cursor agent mode) — the model
+  reads, edits, and runs commands in a loop. Latency: minutes. Cost:
+  measurable per task. Failure mode: silent over-editing.
+
+The same prompt gets different quality from each. Asking inline
+completion to "refactor this function to use a strategy pattern" gets
+you a stub; asking chat gets you a real proposal; asking the agent
+gets you a PR with tests (and a 30% chance it also rewrote three
+unrelated files).
+
+## Context is the entire game
+
+The single biggest determinant of suggestion quality is what's in the
+model's context. Two teams using the same Cursor install get wildly
+different outputs because one of them has:
+
+- A clean `README.md` describing the architecture in 30 lines.
+- A `CLAUDE.md` / `.cursorrules` file with conventions ("we use pnpm,
+  not npm"; "all dates are UTC"; "errors thrown from the service
+  layer become 4xx, errors from below become 5xx").
+- Coherent file/folder names so "the auth module" actually lives
+  somewhere obvious.
+
+The other team has 400 lines of conflicting style guides in a wiki and
+a `utils/` folder with 80 files. The model will hallucinate
+conventions to fill the gap.
+
+<Callout type="info">
+The `.cursorrules` / `CLAUDE.md` file is the single highest-leverage
+artifact you can write. Five lines on what NOT to do beats a 200-line
+style guide. Put the rules that have already burned you.
+</Callout>
+
+## Prompt patterns that hold up
+
+### Refactor with a constraint, not a goal
+
+Bad: *"Refactor this to be cleaner."* The model has no objective
+function. You get a different kind of mess.
+
+Good: *"Extract the validation block into a separate function. Keep
+the public signature of `createOrder` unchanged. Don't add new
+dependencies."*
+
+Constraints are tractable. "Cleaner" is taste.
+
+### Show, don't describe
+
+If you want code in a style, paste a file that's already in that
+style. The model copies syntax patterns much more reliably than it
+follows English instructions about syntax.
+
+```ts
+// Instead of "use the repository pattern with async error handling"
+// Paste:
+// repositories/user-repo.ts (the canonical one)
+// and ask: "Build an OrderRepository with the same shape."
+```
+
+### Ask for the diff, not the file
+
+For non-trivial edits, ask for a unified diff or a search-and-replace
+pair. You'll catch unwanted edits in seconds. Asking "give me the
+whole file" hides a one-line drift in a 400-line wall of code.
+
+### Two-pass for tricky changes
+
+1. *"What would you change? Don't write code yet."* Get a plan.
+2. *"OK, do steps 1 and 2 only."* Execute incrementally.
+
+This catches the "model decided to rewrite the database layer because
+your function happened to call it" failure before any code is
+generated.
+
+## Where AI-generated code regresses
+
+Five recurring failure modes. The first three are 80% of incidents.
+
+### 1. Hallucinated APIs
+
+The model invents function names, method signatures, npm packages,
+or HTTP endpoints that look plausible. Common offenders:
+
+- `lodash.deepMerge` (it's `_.merge`).
+- `crypto.randomUuid()` (it's `crypto.randomUUID()`).
+- React hooks that don't exist (`useFetchMemo`, `useEffectOnce`).
+- npm packages that don't exist — the famous "slopsquatting"
+  vector where attackers register the hallucinated name and ship
+  malware.
+
+Mitigation: TypeScript + a real LSP catches most of these at write
+time. Without typecheck, you ship it.
+
+### 2. Security holes that pattern-match as normal code
+
+The model has been trained on a Stack Overflow dataset where half the
+answers are insecure. It will cheerfully suggest:
+
+- String-concatenated SQL (`` `SELECT * FROM users WHERE id = ${id}` ``).
+- Unsanitized `child_process.exec(userInput)`.
+- `app.use(cors())` with wide-open origins.
+- JWT verification with `algorithm: 'none'` accepted.
+- Disabled TLS verification "for testing" left in.
+
+The NYU study (Pearce et al., "Asleep at the Keyboard," IEEE S&P 2022) found
+~40% of Copilot suggestions in security-sensitive contexts contained
+a CWE. That number has come down with newer models but is not zero.
+Treat any auth, crypto, deserialization, or shell-exec suggestion as
+guilty until reviewed.
+
+### 3. Missing or fake tests
+
+Two distinct failures:
+
+- *No tests written.* The model declares the change "done."
+- *Tests that always pass.* `expect(true).toBe(true)`, or tests that
+  call the function and assert it doesn't throw. Coverage goes up;
+  signal goes to zero.
+
+Read every generated test. If you can't explain what would make it
+fail, it's not a test.
+
+### 4. Performance regressions
+
+The model defaults to readable, not fast. Expect:
+
+- `Array.find` in a hot loop where you had a `Map`.
+- `JSON.parse(JSON.stringify(x))` as a "deep clone."
+- An N+1 query where you used to have a join.
+- Re-fetching data the caller already has.
+
+Tools like Copilot don't see your perf traces. You have to.
+
+### 5. Unrelated edits in agentic mode
+
+Claude Code or Cursor agent decides your function's bug is "really" in
+a helper two directories away and rewrites it. Sometimes correct,
+often not. The PR diff is your only defense — review it before merge,
+not after.
+
+## Review discipline
+
+The asymmetry: generating code is now ~free; reviewing it is not.
+Teams that don't adjust review process end up shipping more bugs, not
+less, because human attention is unchanged while volume tripled.
+
+What changes:
+
+- **Diff size budget per PR shrinks, not grows.** AI lets you do 5
+  small PRs in the time it used to take to do 1 big one. Use that.
+- **Read the test first.** If the test is bad, the change is suspect.
+- **Run it locally** for anything non-trivial. The model claims it
+  ran the tests; it didn't.
+- **Blame yourself, not the tool.** "Copilot wrote it" is not a
+  defense in a postmortem. The author of record is the human who
+  hit merge.
+
+## When to refuse the suggestion
+
+You should reject the model's output, not "fix it up," when:
+
+- You don't understand why the suggested code works. Shipping code
+  you can't debug at 3am is a future on-call incident.
+- The suggestion involves crypto, auth, or anything where being
+  *almost right* is wrong. Re-derive it from a known-good reference.
+- The suggestion adds a dependency you wouldn't have added by hand.
+  `npm install moment` because the model knows moment exists is not
+  a justification in 2026.
+- You asked for a small change and got a sweeping one. Reset, ask
+  again with a tighter constraint.
+
+The skill being built is *taste under time pressure*. The accept-all
+flow trains a worse instinct than the type-it-yourself flow did.
+
+## Context-selection tactics
+
+For chat-with-context, what you attach matters more than what you
+say. A rough hierarchy:
+
+<Cheatsheet
+  columns={["Attach", "When", "Why"]}
+  rows={[
+    ["The file being edited", "Always", "Obvious"],
+    ["The test file for it", "Always", "Model writes to the test contract"],
+    ["A nearby file in the same style", "Refactors, new files", "Style transfer"],
+    ["Type definitions / schemas", "Anything touching DB or API", "Stops hallucinated fields"],
+    ["The README / architecture doc", "Cross-cutting changes", "Gives the model the mental model"],
+    ["The whole repo", "Never", "Drowns signal; costs more; worse output"],
+  ]}
+  caption="More context isn't better. The right context is better."
+/>
+
+## Cost and latency reality
+
+A team of 20 engineers on Cursor Pro / Claude Code is ~$400–800/mo in
+licenses. The actual model cost behind agentic flows is higher per
+seat than the inline-completion seat — agentic edits are a few cents
+to a few dollars per task, and they add up. Track it. The "AI is
+free" assumption breaks the budget around month four.
+
+Latency: inline completion under 300ms feels good; over 500ms feels
+broken and engineers turn it off. If your network is flaky or you're
+behind a corporate proxy, the local-model fallback in some tools is
+worth setting up.
+
+## Where this is going
+
+The current frontier (early 2026) is "agentic coding for well-scoped
+PRs." It works when the task is: "fix this failing test," "add a
+field to this endpoint and its consumers," "port this function from
+Python to TS." It fails when the task is open-ended or
+architecturally novel. The taste-and-direction job is not going
+anywhere; the typing job mostly has.
+
+## The discipline
+
+- Treat suggestions as proposals, not answers. The author of record
+  is you.
+- A short, opinionated rules file beats a long style guide.
+- Show the model examples; don't describe them.
+- Diff every agentic change. Reject sweeping edits.
+- Auth, crypto, and shell exec are always reviewed by a human.
+- Track license cost AND per-task model cost. They're separate
+  budgets.
+- The productivity win is in *more small PRs*, not bigger ones.
+- If you can't explain it, don't ship it.

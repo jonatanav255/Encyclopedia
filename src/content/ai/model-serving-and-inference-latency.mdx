@@ -1,0 +1,318 @@
+export const level = 'mid';
+
+# Model serving and inference latency
+
+When you call OpenAI or Anthropic, someone else is fighting this
+fight. When you self-host (vLLM, TGI, SGLang, Triton, llama.cpp), you
+inherit it. Either way, you should understand where the milliseconds
+go, because the same prompt-and-model can produce a 200ms response or
+a 12-second one depending on how the server batches, caches, and
+decodes.
+
+This page is the systems view of "why is my chatbot slow." For the
+application-level cost traps, see
+`ai/what-is-ai-engineering.mdx`. For latency primitives in general,
+see `performance/latency-vs-throughput.mdx` and
+`performance/coordinated-omission.mdx`.
+
+## The two numbers users actually feel
+
+For a chat UI:
+
+- **TTFT** — time to first token. The moment the cursor stops
+  blinking. Anything over ~1s feels broken; under 500ms feels
+  instant. For hosted APIs in 2026, expect 300–800ms TTFT for the
+  big models, 100–300ms for the small ones, more on first call
+  after a cold provider rate-limit bucket.
+- **TPOT / ITL** — time per output token (or inter-token latency).
+  Streaming smoothness. Below ~50ms/token (≈20 tok/s) feels OK for
+  reading; above 100ms/token feels slow. Bigger models stream
+  slower.
+
+Total latency = TTFT + (num_output_tokens × TPOT). Output length is
+the variable you most underestimate. A "summarize this" prompt that
+returns 50 tokens vs 800 tokens is a 15× latency swing on the same
+model.
+
+Track p50, p95, p99 separately for *each* of these. The p99 of TTFT
+under load is usually 5–10× p50.
+
+## The two phases inside one inference call
+
+Decoder-only transformers process a request in two distinct phases:
+
+<Steps>
+<Step n="1" title="Prefill (compute-bound)">
+The model ingests the prompt — system prompt, history, retrieved
+docs, the user message — in parallel. All input tokens are
+processed in one big matmul. This phase is **GPU compute-bound**.
+Time scales with input length × model size.
+
+This is what determines TTFT. A 50K-token prompt has a long prefill
+even though no output has been generated yet.
+</Step>
+
+<Step n="2" title="Decode (memory-bandwidth-bound)">
+The model emits output tokens one at a time, autoregressively. Each
+token requires re-reading the entire KV cache and the model weights
+from HBM. This phase is **memory-bandwidth-bound**, not compute.
+
+This is what determines TPOT. Doubling the GPU's FLOPS won't help
+decode much; doubling its memory bandwidth will.
+</Step>
+</Steps>
+
+Two phases, two different bottlenecks. A serving system that doesn't
+separate them is leaving throughput on the floor.
+
+## The KV cache: where memory goes
+
+Every transformer layer caches the keys and values of every token
+seen so far. KV cache size, roughly:
+
+```
+kv_bytes ≈ 2 × num_layers × num_kv_heads × head_dim × seq_len × bytes_per_value
+```
+
+For a 70B model with 80 layers, 8 KV heads, head dim 128, fp16, and
+a 32K context:
+
+```
+2 × 80 × 8 × 128 × 32768 × 2 ≈ 10.7 GB per request
+```
+
+That's per request. On an 80GB H100 holding 140GB of weights via
+tensor parallelism, you have maybe 20–30GB free for KV cache across
+all in-flight requests. That hard limit is what caps your concurrent
+sessions, not GPU compute.
+
+Two tricks that matter:
+
+- **GQA (grouped-query attention)** — fewer KV heads than query
+  heads. Llama 3 and most modern models use 8 KV heads for 64 query
+  heads. ~8× smaller cache for the same model quality.
+- **PagedAttention** (vLLM's contribution) — store KV cache in
+  fixed-size blocks (like OS pages), not contiguous per-request
+  slabs. Eliminates fragmentation. The reason vLLM exists.
+
+## Batching: where throughput comes from
+
+A naive serving loop processes one request at a time. The GPU sits
+~5% utilized; throughput is awful. The fix is batching.
+
+<Cheatsheet
+  columns={["Strategy", "What it does", "Tradeoff"]}
+  rows={[
+    ["Static batching", "Wait for N requests, run together, return together", "Long requests stall short ones; tail latency is brutal"],
+    ["Dynamic batching", "Wait up to T ms or N requests, whichever first", "Better, still TTFT cost from the wait"],
+    ["Continuous batching", "New requests join the batch on the next decode step; finished ones leave", "What vLLM/TGI/SGLang do. ~10-20× throughput vs static"],
+  ]}
+  caption="Continuous batching (a.k.a. inflight batching) is the only acceptable choice in 2026."
+/>
+
+The non-obvious bit: with continuous batching, **adding a request to
+the batch doesn't slow the others linearly.** Decode is
+memory-bandwidth bound; you're already paying to read weights from
+HBM, you may as well do 16 forward passes through them. Throughput
+goes up ~5–15× before latency materially degrades.
+
+But: prefill and decode have opposite shapes. Most systems now do
+**chunked prefill** — split a long prefill into chunks and interleave
+with ongoing decodes. Without it, one user's 100K-token prefill
+freezes everyone's stream.
+
+## Quantization: smaller weights, faster decode
+
+Decode is memory-bandwidth-bound, so smaller weights = faster decode.
+Quantization shrinks weights from fp16 (2 bytes) to int8 (1 byte) to
+4-bit (0.5 bytes). Throughput roughly doubles or quadruples; quality
+degrades a little.
+
+The 2026 menu:
+
+<Cheatsheet
+  columns={["Method", "Bits", "Typical quality loss", "Notes"]}
+  rows={[
+    ["FP16/BF16", "16", "Baseline", "What models are trained in"],
+    ["FP8", "8", "~0%", "H100+ hardware-native; very common in prod"],
+    ["INT8 (GPTQ, SmoothQuant)", "8", "~0-1%", "Post-training, cheap to apply"],
+    ["INT4 (GPTQ, AWQ)", "4", "~1-3%", "AWQ better at preserving outliers; standard for self-host"],
+    ["INT4 (GGUF Q4_K_M)", "4", "~1-3%", "llama.cpp's format; CPU-friendly"],
+    ["INT2/INT3", "2-3", "5-15%, often unusable", "Research-y. Use only if you've benchmarked your task"],
+  ]}
+  caption="AWQ and GPTQ are the names you'll see. AWQ usually wins on accuracy at INT4."
+/>
+
+The thing nobody tells you: quantization quality loss is **not
+uniform across tasks**. A model that scores 95% of fp16 on MMLU may
+score 70% on your structured-output task because INT4 wrecks the
+logit distribution in a way that breaks JSON mode. Always re-run
+*your* eval suite on the quantized model. Don't trust the model
+card.
+
+KV cache can also be quantized (FP8 KV cache, INT8 KV cache). That's
+how you fit more concurrent users at long context.
+
+## Speculative decoding
+
+A draft model (small, fast) proposes K tokens; the target model
+(big, slow) verifies all K in one forward pass. If the draft was
+right, you got K tokens for the price of one decode step. If it was
+wrong at token i, you accept i-1 and discard the rest.
+
+Numbers from real deployments:
+
+- Draft model ~1/10 the size of target.
+- Acceptance rate 60–80% on conversational text.
+- Net speedup 2–3× for decode throughput, free in quality (output
+  is mathematically identical to the target model).
+- Doesn't help TTFT — prefill is unchanged.
+
+vLLM, TGI, and SGLang all support it. The catch: you need a draft
+model with the same tokenizer. For Llama, use the smallest Llama;
+for Qwen, use the smallest Qwen. Mismatched tokenizers = no
+acceptance.
+
+Variants: **Medusa** (extra heads on the target model predict
+multiple future tokens), **EAGLE** (lighter-weight feature
+prediction). Same idea, fewer moving parts.
+
+## Streaming
+
+Server-Sent Events (SSE) is the protocol everyone uses. You stream
+chunks as the decoder produces them. The user sees text appear
+instead of staring at a spinner.
+
+What streaming does *not* do:
+
+- Reduce total token count or total cost.
+- Reduce server-side compute.
+- Help if your client buffers the response (some proxies, some
+  HTTP libraries default to buffering — test end-to-end).
+
+What it does:
+
+- Massively improves perceived latency. A 5-second response feels
+  fine when text starts at 400ms; the same response feels broken
+  when nothing happens for 5s.
+- Lets you cancel early. User closes the tab → you stop generating
+  → you stop paying. Real money on long completions.
+
+Make sure your server actually cancels the underlying inference when
+the client disconnects. Naive Express handlers keep generating; the
+provider keeps billing.
+
+```ts
+// Hook abort signal through to the SDK
+const ac = new AbortController();
+req.on('close', () => ac.abort());
+const stream = await client.messages.stream({ ... }, { signal: ac.signal });
+```
+
+## GPU vs CPU vs hosted API: the budget reality
+
+The pattern teams hit:
+
+<Steps>
+<Step n="1" title="Start on a hosted API">
+GPT-4o-mini or Claude Haiku, ~$0.50–$2 per million input tokens.
+Latency: 300-800ms TTFT. No infra. You ship in a week.
+</Step>
+
+<Step n="2" title="Bills hit $20k/month">
+Someone proposes self-hosting "to save money." A Llama-3.1-70B on
+two H100s (~$8/hr on-demand, ~$3/hr reserved) is ~$2,000–6,000/mo
+per replica. You need 3–5 replicas for HA + traffic. The
+all-in cost is $15-30k/mo before counting MLOps headcount.
+</Step>
+
+<Step n="3" title="The math sometimes works">
+Self-hosting wins when (a) you run 24/7 near peak, (b) your output
+volume is huge (long generations), (c) you've quantized aggressively,
+and (d) you have someone competent to run vLLM and not page out at
+3am when a model OOMs. For bursty traffic, hosted APIs almost
+always win.
+</Step>
+
+<Step n="4" title="Quality regression">
+The 70B self-host you swapped in scores 12% lower on your eval set
+than gpt-4o. The "savings" evaporate when you have to add a
+reranker, more retries, and a human review queue.
+</Step>
+</Steps>
+
+CPU inference (llama.cpp) is great for laptops, fine for sub-1B
+models, painful above 7B. It exists for on-device and air-gapped
+use cases, not for serving production traffic.
+
+The honest 2026 framework:
+
+- **Hosted API**: default. Until you cross ~$10k/mo *and* have
+  steady load.
+- **Self-host on GPU**: when you have either (a) data sovereignty
+  requirements, (b) genuine 24/7 high volume, (c) need for fine-
+  tuning the open model.
+- **CPU/edge**: real-time on-device (mobile, browsers with WebGPU),
+  small models, or compliance.
+
+## p99 budgets for a chat UI
+
+A typical interactive chat:
+
+```
+Client                Server               LLM provider
+  | -- POST /chat ---> |                       |
+  |                    | -- retrieval (50ms) ->|
+  |                    | -- LLM call (TTFT) -->|
+  |                    |     ...streaming...   |
+  | <-- SSE chunks --- |                       |
+```
+
+A p99 budget of "first token in 1500ms" decomposes:
+
+- Client → server network: 50ms
+- Server → vector DB roundtrip: 100ms (p99)
+- Server → LLM TTFT: 800ms (p99)
+- Buffer for GC / contention / cold cache: 550ms
+
+If you blow any of these, you blow the budget. The first thing teams
+get wrong: putting embedding generation, retrieval, *and* a synchronous
+guardrail check on the critical path. Move the guardrails to stream
+over the output, not block it.
+
+## Common failure modes when self-hosting
+
+- **OOM on a long prompt** — KV cache for a 100K-context request
+  evicts everyone else. Cap `max_model_len` per deployment; reject
+  oversized inputs at the gateway.
+- **One slow request stalls the batch.** Without chunked prefill,
+  a 50K prefill freezes decode for everyone for 2+ seconds. Enable
+  it (vLLM ≥ 0.5, default in newer versions).
+- **Eviction policy thrashes.** Under load, vLLM may evict and
+  recompute KV cache for paused requests. Output looks fine; p99
+  doubles. Watch `vllm_preempted_total` metric.
+- **Cold start after deploy.** Loading a 70B model from disk to
+  GPU takes 30-120s. Use warm replicas and slow rollouts. Never
+  scale-to-zero for production.
+- **Tokenizer mismatch with the client.** You count tokens with
+  `tiktoken`; the server is `Llama`. Your "max 4K tokens" check
+  passes, then the server rejects at 4096 of its tokens. Use the
+  *server's* tokenizer for limits.
+
+## The discipline
+
+- Measure TTFT and TPOT separately. They have different fixes.
+- KV cache, not compute, is your concurrency limit. Plan for it.
+- Continuous batching is non-negotiable. Static batching is a 2022
+  artifact.
+- AWQ INT4 quantization is the default starting point for self-
+  hosting. Re-run YOUR eval after quantizing.
+- Speculative decoding is a free 2× on decode throughput when the
+  draft model is well-matched.
+- Streaming is for UX. It doesn't save money unless you also wire
+  cancellation through to the inference call.
+- "We'll save money by self-hosting" is true ~30% of the time the
+  proposal is made. Do the math with realistic utilization, not
+  peak.
+- Cap `max_model_len` and reject oversized inputs at the edge. One
+  user with a 200K-token prompt is a thundering-herd vector.

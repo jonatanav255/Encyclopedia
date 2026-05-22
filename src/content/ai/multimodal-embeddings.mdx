@@ -1,0 +1,339 @@
+export const level = 'mid';
+
+# Multimodal embeddings
+
+A regular text embedder gives you a function `text → vector`. A
+**multimodal embedder** gives you `text → vector` *and*
+`image → vector` *into the same space*, such that an image and
+its caption land near each other.
+
+That single trick — joint embedding space — is what makes
+"search images with a text query" possible, and what powers
+half of the "AI image features" your PM keeps asking for.
+
+For the underlying retrieval mechanics, this page assumes
+you've read `ai/embeddings-fundamentals.mdx` and
+`ai/vector-search-and-anns.mdx`. The new idea here is **what
+happens when "text vectors" and "image vectors" live in the
+same coordinate system**.
+
+## CLIP and the joint space
+
+CLIP (Radford et al., OpenAI 2021) is the lineage every
+multimodal embedder traces back to. The training recipe:
+
+1. Collect 400M image-text pairs scraped from the web.
+2. Two encoders: an image tower (ViT or ResNet) and a text
+   tower (Transformer).
+3. For each batch of N pairs, compute the N × N similarity
+   matrix between every image and every caption.
+4. **Contrastive loss**: maximize similarity on the diagonal
+   (each image with its true caption), minimize off the
+   diagonal (each image with everyone else's caption).
+
+After training, the image and text encoders produce vectors in
+the same `d`-dim space (usually 512 or 768). An image of a
+golden retriever and the string "a photo of a golden retriever"
+have cosine similarity around 0.30; the same image and "a photo
+of a fighter jet" sit near 0.
+
+Two things that matter for backend folks:
+
+- The encoders are independent at inference time. You can
+  precompute and index image vectors once, then query with
+  text vectors on the fly. No model has to look at both
+  modalities at once.
+- The "joint space" is a property of training, not architecture.
+  Nothing prevents the two towers from being completely
+  different model families.
+
+## The patterns that actually ship
+
+<Cheatsheet caption="Where joint image-text embeddings earn their keep">
+| Use case | What you embed | What you search by |
+|---|---|---|
+| Text-to-image search | All images in corpus | User's text query |
+| Image-to-image search | All images in corpus | A query image |
+| Image dedup / near-duplicate detection | All images | Each new image vs index |
+| Image tagging / classification | All images | A list of candidate label texts |
+| Visual product matching | Product catalog images | A user-uploaded photo |
+| Content moderation triage | Submitted images | Reference vectors for known-bad classes |
+</Cheatsheet>
+
+The mechanics are identical across all of these — embed both
+sides, compute cosine similarity, sort. What changes is what
+goes in the index and what generates the query.
+
+A useful framing: in a regular RAG system, the index is text
+and the query is text. In a multimodal system, **the index and
+query can be any combination of modalities**, because they
+share coordinates.
+
+## Text-to-image search
+
+The walkthrough most teams build first.
+
+```ts
+// Index time: embed every image once, store the vector
+const imageVectors = await Promise.all(
+  catalog.map((img) => clip.encodeImage(img.url))
+);
+await vectorIndex.upsert(catalog.map((img, i) => ({
+  id: img.id,
+  vector: imageVectors[i],
+  metadata: { url: img.url, sku: img.sku },
+})));
+
+// Query time: embed the text, ANN search, return image refs
+const qvec = await clip.encodeText('a red leather wallet');
+const hits = await vectorIndex.search(qvec, { topK: 50 });
+```
+
+A few things worth noting:
+
+- **Image vectors compute once, queries compute on each
+  request.** Image encoding is much more expensive than text;
+  precompute aggressively. The cost model is closer to ANN
+  retrieval than to LLM inference.
+- **You normalize.** Cosine similarity, L2-normalized vectors,
+  same as any vector search.
+- **`topK` is generous.** Multimodal models are noisier than
+  text-only embedders. Pull 50–100, rerank with a stronger
+  signal if you can.
+
+## Image dedup via embeddings
+
+Specific, common, undersold use case. Perceptual hashing
+(pHash, dHash) catches exact-and-near duplicates — same image
+with crop or watermark. CLIP embeddings catch *semantic*
+duplicates — same product photographed from different angles,
+same meme reposted with different captions, same news photo
+republished with different framing.
+
+Pattern:
+
+```ts
+const v = await clip.encodeImage(newImage);
+const nearest = await vectorIndex.search(v, { topK: 1 });
+if (nearest[0].score > 0.92) {
+  // probably a duplicate; flag for review or skip ingest
+}
+```
+
+The threshold is corpus-specific. Tune on a labeled set; don't
+ship 0.92 because some blog post said so. Common bug: same
+image at different resolutions has cosine 0.99+, two different
+photos of the same product can be 0.85–0.95, two different
+products of the same category can be 0.75. The "duplicate" line
+sits somewhere in the middle and depends on what you care
+about.
+
+## "Find me products that look like this"
+
+The flagship multimodal feature. User uploads a photo of a
+chair they saw in a cafe; you return chairs in your catalog
+that look like it.
+
+```ts
+const userVec = await clip.encodeImage(uploadedPhoto);
+const candidates = await vectorIndex.search(userVec, { topK: 100 });
+
+// Optional: rerank by catalog metadata
+const filtered = candidates
+  .filter((c) => c.metadata.in_stock)
+  .filter((c) => c.metadata.price_cents < 50_000);
+```
+
+What this does well: surface visually similar items even when
+the user doesn't know the product name, model number, or
+search keywords. What it does badly:
+
+- **Fine-grained attributes.** "Same color" or "same material"
+  is hit-and-miss. CLIP knows "chair," "wooden chair," "wooden
+  armchair with leather seat" — but mixing of attribute axes
+  (texture vs shape vs color) is noisy.
+- **Composition.** "A red car next to a blue truck" is not what
+  it sounds like. CLIP encodes the *bag* of concepts; it
+  doesn't reliably know which thing is next to which. More on
+  this below.
+- **Out-of-domain images.** A blurry user phone shot vs a
+  studio catalog shot can be perceptually distant even if the
+  product is identical. Augment training or fine-tune for the
+  shift.
+
+The "look like this" feature usually ships in two halves: CLIP
+gets you to a candidate set of 100, then a domain-specific
+ranker (taxonomy match, price filter, in-stock, fine-grained
+fashion-attribute model) does the precision step. Same
+funnel-shape as text retrieval.
+
+## When CLIP fails
+
+The honest list, from least-to-most painful.
+
+### Fine-grained domains
+
+CLIP was trained on web images and web captions. "Web" means
+photos of cats, products, celebrities, screenshots, memes. It
+has never seen many CT scans, satellite tiles, electron
+microscopy, or industrial defect imagery. In those domains:
+
+- **Recall drops.** The model doesn't have learned features
+  for what matters.
+- **Cosine similarity loses meaning.** Two pathologically
+  different X-rays may sit at 0.95 because the model is
+  picking up on "is a grayscale medical-looking image" and
+  nothing finer.
+
+Fix: **fine-tune CLIP on in-domain pairs**, or use a
+domain-pretrained model (BiomedCLIP for medical, RemoteCLIP
+for satellite). The fine-tune doesn't need millions of pairs;
+tens of thousands is often enough to move recall meaningfully.
+
+### Composition and relations
+
+CLIP famously fails on prompts like:
+
+- "A red car next to a blue truck" — returns images with red
+  cars *or* blue trucks, sometimes both, rarely arranged
+  correctly.
+- "A horse on top of an astronaut" — returns astronauts on
+  horses (which it has seen in training).
+- "Three apples and one banana" — counting is approximate at
+  best.
+
+This is the **bag-of-concepts problem**. The contrastive loss
+trains the model to recognize that the concepts in the caption
+are present in the image, not that they're related as the
+caption claims. If you need composition awareness, CLIP-class
+embeddings aren't the right tool — use a vision-LLM.
+
+### Text in images
+
+CLIP sees text in images as "shape patterns," not as readable
+text. A T-shirt with "I love NYC" on it doesn't reliably match
+the text query "I love NYC." Use OCR (Tesseract, PaddleOCR,
+hosted OCR APIs) to extract image text, index it separately,
+and combine with embedding-based retrieval — hybrid search,
+multimodal edition. See `ai/hybrid-search-bm25-plus-vectors.mdx`
+for the fusion mechanics.
+
+### Adversarial inputs
+
+Specific to safety: CLIP can be fooled by typographic attacks
+— a photo of an apple with the word "iPod" written on a piece
+of paper taped to it gets classified as iPod. Practical
+implication: don't use CLIP alone for high-stakes
+classification (moderation, fraud); always combine with at
+least one orthogonal signal.
+
+## Beyond CLIP, briefly
+
+CLIP defined the recipe. The 2024–2026 landscape moved on:
+
+- **SigLIP** (Google, 2023) — same idea, sigmoid loss instead
+  of softmax, scales better to large batches, generally better
+  zero-shot recall. The drop-in CLIP upgrade.
+- **ALIGN** (Google, 2021) — larger, noisier training set
+  (1.8B pairs); CLIP's bigger sibling.
+- **OpenCLIP / EVA-CLIP** — open-weights communities iterating
+  on the original recipe with bigger backbones.
+- **CLAP** — audio-text version of the same trick. Search music
+  with text, label sounds.
+
+For anything beyond pure retrieval — answering questions about
+an image, describing what's in it, doing visual reasoning — the
+answer in 2026 is a **vision-LLM**, not an embedder:
+
+- **GPT-4o, Claude with vision, Gemini** — multimodal LLMs that
+  take images natively in the chat API.
+- **Llama 3.2 Vision, Qwen2-VL** — open-weights vision-LLMs.
+
+The split that matters in production:
+
+<Compare
+  left={{
+    title: "Multimodal embedders (CLIP, SigLIP)",
+    points: [
+      "Cheap, fast: one forward pass per item, one vector per item",
+      "Index millions of images; query in milliseconds",
+      "Good at retrieval, dedup, tagging, classification",
+      "Bad at composition, relations, fine-grained attributes",
+      "Cosine similarity is the only output",
+    ],
+  }}
+  right={{
+    title: "Vision-LLMs (GPT-4o, Claude, Gemini)",
+    points: [
+      "Expensive: per-call inference cost like any LLM",
+      "Cannot pre-index — call per query",
+      "Good at description, reasoning, composition, OCR-ish tasks",
+      "Bad at scale, latency, and your finance team's patience",
+      "Free-form text out, structured output via function calling",
+    ],
+  }}
+/>
+
+The shape that works: **CLIP-class embedder for the
+retrieval/dedup/index stage, vision-LLM for the
+"understand-this-image" stage**. They compose; pick the right
+one for each step.
+
+<Callout type="info">
+The most useful multimodal feature in most products is dull:
+"the image and the text agree." Embed both, check cosine,
+flag mismatches. Useful for moderation, ad-copy validation,
+e-commerce catalog QA. Doesn't sound impressive in a demo;
+catches real bugs.
+</Callout>
+
+## Operational notes
+
+A few things that bite in production:
+
+- **Embedding dimensions matter for cost.** 512-dim vs 1024-dim
+  is 2x storage and 2x ANN compute. Match the index dim to
+  the encoder; don't pad or truncate without renormalizing.
+- **Image preprocessing is part of the contract.** CLIP expects
+  resize-to-224, center-crop, normalize with specific
+  per-channel means and stds. Wrong preprocessing gives you
+  garbage vectors that still look numerically normal.
+- **Batch image encoding.** A single image at a time on GPU
+  wastes most of the throughput. Batch 32–128 images per
+  encoder call; the throughput delta is 10x+.
+- **Model versions are not interchangeable.** Re-embedding the
+  index on a model upgrade is the same hardship as for text
+  embedders. Plan for it; budget GPU time.
+- **Storage growth.** A million 1024-dim float32 vectors is
+  ~4GB. Ten million is 40GB. Quantization (PQ, scalar
+  quantization) is the lever; see
+  `ai/vector-search-and-anns.mdx`.
+
+## The discipline
+
+- Joint image-text embeddings work because the loss makes them
+  share coordinates. Use them anywhere you need a single
+  index across modalities.
+- CLIP is the baseline; SigLIP is the drop-in upgrade in 2026.
+- Use embedders for retrieval, dedup, tagging. Use vision-LLMs
+  for reasoning and description. Compose them.
+- Fine-grained domains need fine-tuning. Out-of-the-box CLIP
+  is a generalist.
+- Composition queries ("X next to Y") are a known CLIP weak
+  spot. Reach for a vision-LLM.
+- Image text content needs OCR + hybrid search. Don't pretend
+  the embedder reads.
+- Tune similarity thresholds on a real labeled sample of your
+  corpus. The "0.85 = duplicate" number from someone else's
+  blog is not your number.
+
+## What to learn next
+
+- `ai/embeddings-fundamentals.mdx` — the math and metrics this
+  page assumes.
+- `ai/vector-search-and-anns.mdx` — how to actually serve
+  these vectors at scale.
+- `ai/hybrid-search-bm25-plus-vectors.mdx` — fuse OCR text +
+  visual embeddings for richer retrieval.
+- `ai/rag-retrieval-pipeline.mdx` — where multimodal retrieval
+  slots into a larger system.

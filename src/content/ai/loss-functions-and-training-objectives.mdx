@@ -1,0 +1,405 @@
+export const level = 'senior';
+
+# Loss functions and training objectives
+
+Modern chat LLMs are not trained in one step. They go through
+four distinct phases, each with a different loss function, each
+shaping a different aspect of the final model. Understanding
+which phase shapes which behavior is the difference between
+"throw more data at SFT and hope" and actually fixing a problem.
+
+This page is the engineering view, not the research view. You're
+not going to train a base model. You might fine-tune one, run an
+RLHF pipeline, or decide between "add more SFT data" and "do
+preference tuning." For when each is the right answer, also see
+`ai/fine-tuning-vs-rag-vs-prompting.mdx`.
+
+## The four phases
+
+```
+[raw web text] → pre-training → base model
+                                  ↓
+[instruction/demo pairs] → SFT → instruct model
+                                  ↓
+[preference pairs] → preference tuning (RLHF/DPO/KTO) → aligned model
+                                  ↓
+[safety data + system prompts] → safety/system tuning → shipped model
+```
+
+Each phase has a different loss function. Each phase teaches the
+model something the next phase can refine but mostly cannot
+replace.
+
+<Cheatsheet
+  columns={['Phase', 'Data', 'Loss', 'What it changes']}
+  rows={[
+    ['Pre-training', 'Trillions of web tokens', 'Next-token cross-entropy', 'Knowledge, language, world model'],
+    ['SFT (supervised fine-tuning)', '10K–1M instruction/response pairs', 'Cross-entropy on the response', 'Format, follows instructions, "helpfulness shape"'],
+    ['Preference tuning', '10K–1M preference pairs (chosen, rejected)', 'PPO reward, DPO, IPO, KTO objectives', 'Taste — which of two responses is better. Honesty, refusal calibration, style'],
+    ['Safety / system tuning', 'Curated refusal data, red-team prompts', 'SFT or DPO on that subset', 'Refusal behavior, tone, persona alignment'],
+  ]}
+  caption="Each phase typically uses 1–3 orders of magnitude less data than the previous, and tunes a smaller fraction of the model's behavior."
+/>
+
+## Phase 1 — Pre-training: knowledge
+
+The base model is trained on a giant corpus (10T+ tokens for
+frontier models) with **next-token cross-entropy**:
+
+```
+L = -Σ log P(token_i | token_<i)
+```
+
+For every position in every training document, the model is asked
+"what comes next?" and penalized for assigning low probability to
+the actual next token. That's it. One loss, one task,
+unimaginable amounts of compute.
+
+What this loss gives you:
+
+- A model that has internalized the statistical regularities of
+  the training corpus — grammar, facts, code conventions,
+  reasoning patterns that show up in text.
+- **Knowledge.** Most of what a model "knows" was learned here.
+  Post-training tweaks behavior, not knowledge.
+- A latent ability to follow instructions when prompted in the
+  right way (Brown et al., GPT-3 paper — "few-shot learning").
+
+What this loss does *not* give you:
+
+- A model that follows instructions reliably without examples.
+- A model that prefers true answers over plausible-looking ones.
+- A model that refuses harmful requests.
+- A model that's pleasant to talk to. Base models talk like the
+  internet, because the internet is what they read.
+
+The base model is brilliant and unmanageable. If you've ever
+tried prompting a true base model (Llama-3 base, not Instruct)
+you know — it completes your prompt as if it were a Wikipedia
+article or a Reddit thread, depending on which it pattern-
+matches to. That's the pre-training loss in action.
+
+<Callout type="warning">
+A common misunderstanding: "we'll fix this hallucination by
+training on more accurate data." If the hallucination is a
+knowledge issue, you need pre-training-scale data (impractical)
+or retrieval (see `ai/rag-retrieval-pipeline.mdx`). If it's a
+behavior issue (model lies confidently when uncertain), you need
+preference tuning — not SFT.
+</Callout>
+
+## Phase 2 — SFT: shape
+
+After pre-training, the base model can complete text but won't
+reliably *answer* questions. Supervised fine-tuning (SFT, aka
+instruction tuning) teaches it the shape of a helpful response.
+
+The data is pairs:
+
+```
+input:  [System] You are a helpful assistant.
+        [User] Translate "good morning" to French.
+output: "Bonjour."
+```
+
+The loss is the same cross-entropy as pre-training, but
+**computed only on the response tokens**, not the prompt tokens.
+The model learns to produce text that looks like the demonstrated
+responses, conditioned on prompts that look like the demonstrated
+inputs.
+
+What changes:
+
+- The model learns to **start with an answer**, not continue the
+  prompt.
+- It learns the **format** — markdown headings, bullet lists,
+  code fences, the assistant persona.
+- It learns to follow specific instructions ("respond in JSON",
+  "be concise").
+
+What doesn't change much:
+
+- The model's knowledge. SFT on 100K examples doesn't add
+  measurable knowledge vs the base model. It can *uncover*
+  knowledge that was latent, but rarely adds new facts.
+- The model's preference for true over plausible. SFT on
+  demonstration data teaches "this is the shape of a good
+  answer," not "this is what a good answer means."
+
+This is the "you can't fix it with more SFT" point. If your model
+is producing structurally correct but factually wrong answers,
+more SFT examples mostly teach it to produce *more* structurally
+correct but factually wrong answers. The structure was never the
+problem.
+
+**LoRA / QLoRA** fine-tuning is SFT with a parameter-efficient
+twist: instead of updating all weights, train low-rank adapter
+matrices added to a few layers. ~1% of the parameters, ~95% of
+the quality on most tasks. The right default for "fine-tune for
+domain style." See `ai/fine-tuning-vs-rag-vs-prompting.mdx`.
+
+## Phase 3 — Preference tuning: taste
+
+This is where modern aligned models actually come from. The data
+is **preference pairs**: a prompt, two responses, and a label of
+which response a human (or another model) preferred.
+
+```
+prompt:    "Explain quantum entanglement to a 10-year-old."
+chosen:    "Imagine two coins that are magical twins..."
+rejected:  "Quantum entanglement is a phenomenon where the wave
+            functions of two particles become correlated..."
+```
+
+This is a different shape of training signal than SFT. SFT says
+"produce this exact text." Preference tuning says "produce
+something more like this than like that." That's a weaker, more
+robust signal — the model learns *what to prefer* rather than
+*what to imitate*.
+
+The original method, **RLHF with PPO** (Christiano et al. 2017,
+applied to LLMs by InstructGPT/Ouyang et al. 2022):
+
+<Steps>
+<Step n="1" title="Train a reward model">
+Take the SFT model, replace the LM head with a scalar head, and
+train on preference pairs with a Bradley-Terry loss:
+
+```
+L = -log σ(r(chosen) - r(rejected))
+```
+
+The reward model outputs a scalar score per response. The loss
+maximizes the score gap between chosen and rejected.
+</Step>
+
+<Step n="2" title="PPO against the reward model">
+Generate responses from the policy (SFT model), score them with
+the reward model, do reinforcement-learning updates (PPO) to
+increase reward. Add a KL penalty to keep the policy from
+drifting too far from the SFT model and gaming the reward.
+
+```
+L_PPO = -E[r(response)] + β × KL(π || π_SFT)
+```
+</Step>
+
+<Step n="3" title="Iterate">
+Reward model gets stale as the policy improves; collect new
+preference data, retrain reward model, run PPO again.
+</Step>
+</Steps>
+
+PPO works but is operationally painful: two models in memory
+(policy + reward model), unstable training, sensitive to
+hyperparameters, and easy to "reward hack" (the policy learns to
+exploit reward model quirks rather than improve).
+
+**DPO (Direct Preference Optimization)**, Rafailov et al. 2023,
+collapses the reward model and PPO into one closed-form loss
+directly on preference pairs:
+
+```
+L_DPO = -log σ( β × [log π(chosen) - log π_ref(chosen)]
+             - β × [log π(rejected) - log π_ref(rejected)] )
+```
+
+Where `π` is the model being trained and `π_ref` is a frozen
+reference (usually the SFT model). One model in memory, no
+reward model, no RL — just supervised learning on preference
+pairs. Mathematically equivalent (under certain assumptions) to
+PPO against an implicit reward model.
+
+DPO is the default in 2026 for most teams. It's not strictly
+better than PPO in every benchmark, but it's dramatically simpler
+to run, and the gap (when there is one) is small.
+
+**KTO (Kahneman-Tversky Optimization)**, Ethayarajh et al. 2024,
+removes the need for paired data — you just need "this response
+was good" or "this response was bad" labels, not pairs. Useful
+when collecting paired preferences is hard. Quality typically
+within a few points of DPO; sometimes better when paired data
+is noisy.
+
+**IPO, ORPO, SimPO** — newer variants, each fixing one or
+another pathology of DPO (length bias, distribution shift).
+The taxonomy keeps growing. For now: DPO is the safe default,
+KTO if you only have single-response labels, the others if
+you've read the papers and have a reason.
+
+## What preference tuning actually changes
+
+The phrase to internalize: **preference tuning gives the model
+taste.** It doesn't add knowledge, doesn't change format, doesn't
+make it follow new instructions. It teaches the model which of
+two valid responses is better.
+
+Behaviors that come from preference tuning, not SFT:
+
+- **Honesty.** "I don't know" instead of confidently making up
+  an answer. The model already had the latent capability to say
+  "I don't know"; preference tuning rewards using it.
+- **Calibrated refusals.** Refusing harmful requests without
+  refusing borderline-but-benign ones (the classic over-
+  refusal failure).
+- **Avoiding sycophancy.** The model not just agreeing with
+  whatever the user says.
+- **Style preferences.** Concise vs verbose, formal vs casual,
+  bullets vs prose — all shaped here.
+- **Reasoning quality.** Walking through a problem step by step
+  vs jumping to an answer.
+
+When you hear "the new model lies less" or "is less sycophantic"
+or "follows the spec better" between two versions of the same
+base model — that's preference tuning, not more SFT data.
+
+<Callout type="info">
+The asymmetry that surprises people: you can fix a *behavior*
+problem (model is too verbose, model is sycophantic, model
+hallucinates instead of saying I don't know) with a few thousand
+preference pairs. You cannot fix a *knowledge* problem (model
+doesn't know about your product) with any amount of preference
+tuning — the relevant facts have to come from pre-training data
+or retrieval.
+</Callout>
+
+## Phase 4 — Safety and system tuning
+
+The final stage shapes refusal behavior, tone, and persona
+alignment. It uses the same machinery as SFT or DPO, just with
+curated data:
+
+- Refusal demonstrations for harmful queries.
+- Compliance demonstrations for borderline queries (e.g.
+  medical information that's educational vs. operational).
+- Tone alignment ("Claude is helpful, harmless, honest"; "ChatGPT
+  is conversational but professional").
+- System prompt adherence ("when the system says be brief, be
+  brief").
+
+This is where models pick up their distinctive personality and
+where most "alignment tax" lives — the small quality regression
+on benign tasks that comes from the model being more cautious.
+
+It's also where most teams get a model from open weights into
+production. Llama-3-70B-Instruct out of the box has reasonable
+safety tuning; if you self-host and your application has
+different refusal needs (e.g. you serve medical professionals
+who *should* get specific medical information), you'll need to
+do further DPO on your refusal policy.
+
+## A worked example: "the model is too verbose"
+
+Pretend a team has shipped a customer support bot built on
+Llama-3-70B-Instruct. It's correct but writes 6-paragraph
+responses to questions that need 2 sentences. Users complain.
+
+Wrong fixes:
+
+- **Prompt engineering** ("Be concise. Use 2 sentences max.") —
+  works ~70% of the time. Fails on the 30% that matter.
+- **More SFT data** with shorter responses — partially works,
+  but you need a *lot* of data and the model still favors its
+  default verbose mode under load.
+
+Right fix: **DPO on preference pairs** where the "chosen"
+response is a concise version of the "rejected" verbose
+response. A few thousand such pairs, one fine-tuning run, and
+the model's *taste* shifts. It now prefers concise responses
+the way it previously preferred verbose ones.
+
+This is the canonical case where preference tuning earns its
+keep. The model already knew how to write concise responses
+(SFT taught the format). It just didn't *prefer* to. Preference
+tuning is the only phase that changes preference.
+
+## Cross-references and when each is the right answer
+
+For deciding which phase your problem belongs to:
+
+<Compare
+  left={{
+    title: 'You need pre-training (or retrieval)',
+    points: [
+      'Model doesn\'t know your product / proprietary data',
+      'Model is out of date on facts',
+      'Model can\'t generate code in your internal DSL',
+      'Reality: do RAG, not pre-training. See ai/fine-tuning-vs-rag-vs-prompting.mdx',
+    ],
+  }}
+  right={{
+    title: 'You need SFT',
+    points: [
+      'Model output format is wrong (you want a strict JSON shape, internal docstring conventions)',
+      'Model doesn\'t follow your specific instruction pattern',
+      'You have demonstration data ("here\'s exactly what a good response looks like")',
+      'LoRA/QLoRA is the default — full SFT is rarely worth it',
+    ],
+  }}
+/>
+
+<Compare
+  left={{
+    title: 'You need preference tuning',
+    points: [
+      'Model is technically correct but stylistically wrong',
+      'Model hallucinates when it should say "I don\'t know"',
+      'Model is sycophantic, verbose, or over-refuses',
+      'You have or can collect "this response is better than that response" labels',
+      'DPO is the safe default in 2026',
+    ],
+  }}
+  right={{
+    title: 'You need safety/system tuning',
+    points: [
+      'Refusal policy needs to be more permissive or more restrictive on a specific category',
+      'Persona / tone is off for your product',
+      'System-prompt adherence under adversarial input is weak',
+      'Same machinery as SFT/DPO, different data',
+    ],
+  }}
+/>
+
+## Operational realities
+
+A few things that bite teams running their own fine-tuning:
+
+- **Catastrophic forgetting.** Fine-tune a base model on a
+  narrow domain and it gets worse at general tasks. Mitigation:
+  mix general-purpose data into your fine-tuning corpus (5–20%),
+  use LoRA instead of full fine-tuning, or train fewer epochs.
+- **Length bias in DPO.** The model learns "longer = preferred"
+  if your preference data correlates length with quality. SimPO
+  and length-normalized DPO variants address this.
+- **Distribution shift.** If your SFT model is far from your
+  preference data's reference distribution, DPO is unstable.
+  Run an SFT pass on the preference data's "chosen" responses
+  first, then DPO.
+- **Reward hacking** (PPO only). The model finds shortcuts that
+  exploit the reward model. Symptoms: outputs that are weirdly
+  long, repetitive, or sycophantic in ways that score high but
+  read badly. KL penalty is your main defense.
+- **Evaluation is the bottleneck**, not training. You can run a
+  DPO job in a day. Knowing whether the resulting model is
+  better takes weeks of eval design. See `ai/llm-eval-design.mdx`.
+
+## What we tell people
+
+- Four phases, four losses. Each shapes a different aspect of
+  the model. Stop trying to fix everything with "more data."
+- Pre-training gives knowledge. SFT gives shape. Preference
+  tuning gives taste. Safety tuning gives refusals.
+- "The model lies less in v2" usually maps to preference tuning,
+  not more SFT, not more pre-training data.
+- You cannot fix a behavior problem with more SFT — it teaches
+  shape, not preference. Use DPO.
+- You cannot fix a knowledge problem with preference tuning —
+  it changes taste, not facts. Use retrieval.
+- DPO is the operational default in 2026. PPO works but is
+  harder to run.
+- LoRA/QLoRA is the default for SFT — full fine-tuning is
+  rarely the right answer unless you're building a foundation
+  model.
+- For "should I fine-tune at all," see
+  `ai/fine-tuning-vs-rag-vs-prompting.mdx`. The answer is
+  usually no.
