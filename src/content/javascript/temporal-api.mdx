@@ -1,0 +1,213 @@
+export const level = 'senior';
+
+# The `Temporal` API
+
+`Date` is the worst-loved global in the language. Mutation, ambiguous
+parsing, no time-zone support, month indices that start at 0 — every
+serious app reaches for `date-fns`, `luxon`, or `dayjs` to work
+around it. `Temporal` is the replacement built into the language.
+
+It reached Stage 3 in 2024 and started shipping behind flags in
+2025; in 2026 Firefox and Safari have it on by default, V8 is
+finishing the rollout. Until your minimum runtime baseline is high
+enough, `@js-temporal/polyfill` is the production answer.
+
+This page covers the API and the mental model. For the existing
+`Date` mess, see `javascript/dates.mdx`.
+
+## Why `Date` couldn't be fixed
+
+The single `Date` type tries to be five things at once:
+
+- An instant on the timeline (UTC millisecond count).
+- A calendar date in some unspecified zone.
+- A wall-clock time in some unspecified zone.
+- A duration.
+- A formatter.
+
+Most date bugs are confusion between those roles. `Temporal` splits
+them into distinct types, so the compiler / linter can tell you
+which one you have.
+
+## The types
+
+| Type | What it represents | Example |
+| --- | --- | --- |
+| `Temporal.Instant` | A point on the timeline, UTC nanoseconds | log timestamps |
+| `Temporal.ZonedDateTime` | Instant + IANA time zone + calendar | "now in Tokyo" |
+| `Temporal.PlainDateTime` | Wall clock, no zone | scheduling a recurring event |
+| `Temporal.PlainDate` | Calendar date only | birthday |
+| `Temporal.PlainTime` | Time of day, no date | "08:00 every weekday" |
+| `Temporal.PlainYearMonth` | Year + month | credit-card expiry |
+| `Temporal.PlainMonthDay` | Month + day | recurring anniversary |
+| `Temporal.Duration` | A length of time | "30 minutes" |
+
+The rule: pick the **narrowest** type that fits. A birthday is a
+`PlainDate`, not an `Instant`. A scheduled meeting is a
+`ZonedDateTime`, not a `Date`. The type checks you against your own
+ambiguity.
+
+## Basics
+
+```js
+const now      = Temporal.Now.zonedDateTimeISO();           // now, system zone
+const utcNow   = Temporal.Now.instant();                    // now, UTC nanoseconds
+const today    = Temporal.Now.plainDateISO();               // today, system zone
+const inTokyo  = Temporal.Now.zonedDateTimeISO('Asia/Tokyo');
+
+const release = Temporal.PlainDate.from('2026-05-22');
+const meeting = Temporal.ZonedDateTime.from('2026-05-22T15:00[America/New_York]');
+```
+
+`from()` parses; `toString()` round-trips. The bracketed time-zone
+suffix is from **RFC 9557** (the format JS, Java's `java.time`, and
+Python's `datetime` are converging on).
+
+## Date math, finally sane
+
+```js
+const start = Temporal.PlainDate.from('2026-05-22');
+const end   = start.add({ days: 30 });            // 2026-06-21
+const diff  = end.since(start);                   // Temporal.Duration P30D
+
+start.with({ day: 1 });                            // 2026-05-01
+start.with({ month: 12, day: 31 });               // 2026-12-31
+```
+
+Every Temporal object is **immutable**. `.add` / `.with` / `.subtract`
+return new instances; the original is untouched. No more `setDate`
+mutating-in-place footguns.
+
+## Time zones, done right
+
+```js
+const meeting = Temporal.ZonedDateTime.from(
+  '2026-11-01T01:30:00[America/New_York]',         // ambiguous: DST fall-back
+);
+// throws RangeError unless you specify which one to pick:
+
+Temporal.ZonedDateTime.from(
+  '2026-11-01T01:30:00[America/New_York]',
+  { disambiguation: 'earlier' },                   // or 'later' / 'compatible' / 'reject'
+);
+```
+
+`Date` silently picks one of the two valid instants when the wall
+clock is ambiguous (the DST fall-back hour repeats). `Temporal`
+forces you to acknowledge the ambiguity.
+
+Switching zones is explicit:
+
+```js
+const ny = Temporal.ZonedDateTime.from('2026-05-22T09:00[America/New_York]');
+const tokyo = ny.withTimeZone('Asia/Tokyo');     // same instant, Tokyo wall clock
+const wallclockTokyo = ny.toPlainDateTime();     // same wall clock, no zone
+```
+
+Two very different operations. The type system forces you to pick.
+
+<Callout type="info">
+Always store **`Instant`** (or `ZonedDateTime` with an IANA zone
+attached) in your database, never `PlainDateTime`. A wall clock
+without a zone is unusable for "when did this happen" questions —
+you can't compare it to anything.
+</Callout>
+
+## Durations
+
+```js
+const d = Temporal.Duration.from({ hours: 2, minutes: 30 });
+
+d.total({ unit: 'minutes' });           // 150
+d.add({ minutes: 15 });                  // Duration P2H45M
+d.round({ smallestUnit: 'hours' });      // Duration P3H (rounds up)
+
+const a = Temporal.PlainDate.from('2026-01-01');
+const b = Temporal.PlainDate.from('2026-12-31');
+b.since(a);                              // Duration P364D
+b.since(a, { largestUnit: 'months' });   // Duration P11M30D
+```
+
+The `largestUnit` option matters: by default `since` returns the
+duration in the smallest natural unit, so day diffs come back as
+days. Asking for months/years requires telling Temporal what
+calendar accuracy you want.
+
+## Calendars
+
+`Temporal` is calendar-aware. The default is ISO 8601 (Gregorian),
+but you can work with Hebrew, Islamic, Japanese, Buddhist, etc.:
+
+```js
+const date = Temporal.PlainDate.from('2026-05-22');
+const hebrew = date.withCalendar('hebrew');
+hebrew.toLocaleString('he-IL');     // formatted in Hebrew calendar
+```
+
+Most apps stick to ISO and use `Intl.DateTimeFormat` for display.
+
+## Interop with `Date` and ISO strings
+
+```js
+// Date → Temporal
+const d = new Date();
+const inst = d.toTemporalInstant();
+const zdt  = inst.toZonedDateTimeISO('America/Los_Angeles');
+
+// Temporal → Date (lossy: nanoseconds → milliseconds)
+const back = new Date(inst.epochMilliseconds);
+
+// strings (RFC 9557, superset of ISO 8601)
+zdt.toString();
+// "2026-05-22T09:00:00-07:00[America/Los_Angeles]"
+```
+
+`toTemporalInstant()` is the bridge from existing `Date`-using code.
+Most migrations look like: parse at the boundary into `Temporal`, do
+all logic in `Temporal`, render through `Intl.DateTimeFormat`.
+
+## Rendering
+
+```js
+const dt = Temporal.ZonedDateTime.from('2026-05-22T15:00[America/New_York]');
+
+dt.toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short' });
+// "May 22, 2026 at 3:00 PM"
+
+new Intl.DateTimeFormat('de-DE', { dateStyle: 'full' }).format(dt);
+// "Freitag, 22. Mai 2026"
+```
+
+`Intl.DateTimeFormat` accepts Temporal types directly in 2026.
+
+## Migrating from `Date`
+
+A pragmatic order:
+
+1. **Don't migrate everything.** `Date.now()` is fine for performance
+   timing; you don't need `Temporal` there.
+2. **Migrate domain logic first.** Anywhere you compute "the next
+   billing date" or "how many business days between X and Y" — that's
+   where `Temporal` pays for itself.
+3. **Boundary conversions.** Database driver returns a `Date`?
+   `.toTemporalInstant()` once at the boundary; do the rest in
+   Temporal.
+4. **Keep the polyfill while shipping.** `@js-temporal/polyfill` is
+   the same API; drop it once your runtime baseline supports
+   `Temporal` natively.
+
+## Common mistakes
+
+- **Storing `PlainDateTime` in a database.** Zoneless wall clocks
+  can't be ordered globally. Store `Instant` or `ZonedDateTime`.
+- **Mixing `Instant` and `PlainDate` math.** Adding "one day" to an
+  `Instant` is ambiguous across DST. Promote to `ZonedDateTime`
+  first, then add.
+- **Forgetting `disambiguation` for DST fall-back.** Apps that book
+  meetings in the repeated hour will throw under the default.
+- **Re-using `Duration` across calendars without `relativeTo`.** "One
+  month" depends on which month — `Duration.compare(d1, d2,
+  { relativeTo })` exists for a reason.
+- **Hand-formatting Temporal as strings.** Use
+  `Intl.DateTimeFormat` — it understands every type and respects
+  locale settings.

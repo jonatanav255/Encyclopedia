@@ -1,0 +1,221 @@
+export const level = 'senior';
+
+# SELinux, AppArmor, and the LSM framework
+
+POSIX file permissions and capabilities answer "who can do
+what to which inode" with a couple of bits per object. That's
+**discretionary access control** (DAC): the owner of a file
+decides who reads it. Production systems also want
+**mandatory access control** (MAC): a policy the *admin*
+defines that even root can't override. The Linux kernel
+exposes MAC through the **LSM** (Linux Security Modules)
+framework. SELinux and AppArmor are the two big in-tree LSMs.
+
+## LSM — hooks, not a module
+
+LSM is a set of **hook points** the kernel calls before
+performing security-sensitive operations: opening a file,
+binding a port, executing a binary, sending a signal,
+mounting a filesystem, calling certain syscalls. Each hook
+gets the subject (the running task's credentials), the
+object (inode / socket / etc.), and the requested
+operation. The LSM in use decides "allow" or "deny."
+
+```
+syscall ──▶ DAC check ──▶ LSM hook ──▶ kernel action
+                              │
+                              ▼
+                  SELinux / AppArmor / others
+                       (return -EACCES if denied)
+```
+
+The DAC check happens first. **LSM can only further restrict
+access, never grant it.** If POSIX says "no," LSM never sees
+the request. If POSIX says "yes," LSM gets to veto.
+
+Multiple LSMs can stack (since 5.x). Common in distros:
+SELinux **or** AppArmor as the major MAC, plus minor LSMs
+like Yama (ptrace scope), Lockdown (kernel image
+integrity), and Landlock (per-process unprivileged
+sandboxing — added 5.13, the user-mode equivalent of
+seccomp+filesystem).
+
+## SELinux — labels everywhere
+
+The model: every subject (process) and every object (file,
+socket, port) has a **security context** (a "label"). A
+context looks like:
+
+```
+user:role:type:level
+system_u:object_r:httpd_sys_content_t:s0
+```
+
+The **type** is the load-bearing field for most policy.
+Rules are written as **allow** statements between types:
+
+```
+allow httpd_t httpd_sys_content_t:file { read getattr };
+```
+
+"A process labeled `httpd_t` may read files labeled
+`httpd_sys_content_t`." If nginx (labeled `httpd_t`) tries
+to read `/var/log/audit/audit.log` (labeled
+`auditd_log_t`), no allow rule exists, denied.
+
+Labels are stored in extended attributes
+(`security.selinux`) on the filesystem. `ls -Z` shows them;
+`chcon` changes them; `restorecon` resets them to the
+policy default.
+
+**Modes**: `enforcing` (deny + log), `permissive` (log only
+— still emits the AVC denials so you can see what *would*
+have been blocked), `disabled` (no labels, LSM off).
+`getenforce` / `setenforce 0|1`.
+
+**Booleans** are toggles in the policy without recompiling:
+`setsebool -P httpd_can_network_connect 1`. Distros ship
+dozens for common scenarios ("can httpd read user homedirs,"
+"can samba export NFS," etc.).
+
+The classic SELinux pain: you copy `index.html` from your
+home directory to `/var/www/html`; the file keeps your
+`user_home_t` label; nginx (`httpd_t`) can't read it; you
+get 403; the AVC denial in `/var/log/audit/audit.log` looks
+like noise. `restorecon -R /var/www/html` is the fix.
+
+## AppArmor — paths, not labels
+
+AppArmor's model is **path-based profiles**. No xattrs;
+profiles match the absolute path of the binary and grant
+specific filesystem and capability permissions:
+
+```
+/usr/sbin/nginx {
+  include <abstractions/base>
+  capability net_bind_service,
+  /var/log/nginx/*.log w,
+  /etc/nginx/** r,
+  /var/www/** r,
+  network inet stream,
+}
+```
+
+The kernel checks the active profile on every relevant
+syscall and denies anything not listed. Profiles ship in
+`/etc/apparmor.d/`; `aa-status` shows what's loaded;
+`aa-complain` / `aa-enforce` toggle a single profile's
+mode.
+
+**Trade-offs vs SELinux**:
+
+- Path-based is easier to read and write. The first
+  profile a new admin writes in AppArmor takes hours;
+  SELinux can take days.
+- Path-based has a soundness gap: rename the binary, mount
+  a different filesystem at the path, hardlink — and you
+  may slip through. SELinux's labels travel with the
+  inode, so renames don't change the label.
+- SELinux's RBAC layer (the `role` field) supports
+  multi-level security used in government/military
+  systems. AppArmor doesn't try.
+
+Distros split: RHEL/Fedora/CentOS ship **SELinux**;
+Ubuntu/Debian/SUSE ship **AppArmor**. Both are good. The
+difference matters when you're writing policy, not when
+you're running an application.
+
+## Containers and MAC
+
+Container runtimes integrate with the host LSM:
+
+- **Docker on RHEL**: assigns each container a unique
+  SELinux MCS (multi-category security) label. Two
+  containers can't access each other's files even if both
+  are "root inside the container" — the MCS labels
+  disagree. This is on by default if SELinux is enforcing.
+- **Docker on Ubuntu**: applies the `docker-default`
+  AppArmor profile to every container. You can override
+  per container with `--security-opt apparmor=<profile>`.
+- **Kubernetes** lets pods request a specific
+  SELinuxOptions context or AppArmor profile via
+  `securityContext` / annotations. Pod Security Standards
+  expect the runtime's defaults at minimum.
+
+When a container can run but can't write to a mounted
+volume, the answer is often "the volume's MAC label doesn't
+match." On SELinux, `chcon -Rt container_file_t <path>` or
+add `:z` / `:Z` to the `docker run -v` flag.
+
+## seccomp, capabilities, and how they fit
+
+These are not LSMs but show up in the same conversation.
+
+| Mechanism | Scope | Layer |
+|---|---|---|
+| **DAC** (POSIX perms, ACLs) | Per object | Filesystem |
+| **Capabilities** | Splitting root into 40+ atoms | Process credentials |
+| **seccomp-bpf** | Allow/deny specific syscalls + args | Per-task syscall filter |
+| **LSM** (SELinux/AppArmor) | Type/path-based subject↔object rules | Kernel hooks |
+| **Landlock** | Unprivileged self-sandboxing | LSM (since 5.13) |
+
+A hardened service typically uses all of them: run as
+non-root (DAC), with `CAP_NET_BIND_SERVICE` only
+(capabilities), with a seccomp filter denying `ptrace`
+and friends (seccomp), under an SELinux/AppArmor profile
+that restricts filesystem and network reach (LSM). Each
+layer catches what the others miss.
+
+## Reading denials
+
+Both systems are noisy until you learn the log format.
+
+**SELinux** — `ausearch -m AVC -ts recent` shows the most
+recent AVC (Access Vector Cache) denials:
+
+```
+type=AVC msg=audit(1234): avc: denied { read } for
+  pid=4001 comm="nginx" name="index.html"
+  scontext=system_u:system_r:httpd_t:s0
+  tcontext=unconfined_u:object_r:user_home_t:s0
+  tclass=file permissive=0
+```
+
+Translates to: nginx (`httpd_t`) tried to read a file
+labeled `user_home_t`; no allow rule exists; denied.
+
+**AppArmor** — `journalctl _TRANSPORT=audit | grep
+apparmor`:
+
+```
+apparmor="DENIED" operation="open" profile="/usr/sbin/nginx"
+  name="/home/user/index.html" pid=4001 comm="nginx"
+  requested_mask="r" denied_mask="r"
+```
+
+Either way, the diagnostic flow is: reproduce in
+`permissive` / `complain` mode → collect the denials → use
+`audit2allow` (SELinux) or `aa-logprof` (AppArmor) to
+generate the rule to add → re-enable enforcement.
+
+## When LSM is the wrong layer
+
+- **Application-level authorization** (this user can edit
+  that document). LSM is per-process, not per-user-action;
+  build app authz on top.
+- **Network policy** between pods. Use a CNI's
+  NetworkPolicy or eBPF; SELinux can label sockets but
+  policy is awkward at scale.
+- **Anti-tamper for distributed binaries.** That's IMA /
+  fs-verity / signing — a different LSM-adjacent stack.
+
+LSM is *kernel-mediated MAC*. Use it for "this process
+shouldn't be able to touch that resource even if compromised."
+
+## See also
+
+- *containers-and-namespaces* — what containers actually are
+  before MAC labels are applied.
+- *user-mode-vs-kernel-mode* — the privilege boundary LSM
+  hooks live on.
+- *system-calls* — the surface seccomp filters.

@@ -1,0 +1,203 @@
+export const level = 'senior';
+
+# Web Crypto and `SubtleCrypto`
+
+`crypto.subtle` is the cross-runtime primitive layer: hashing, HMAC,
+symmetric encryption (AES-GCM, AES-CTR), asymmetric encryption (RSA-
+OAEP), signatures (ECDSA, Ed25519, RSA-PSS), and key derivation
+(PBKDF2, HKDF). It runs in browsers, Node 19+, Deno, Bun, Cloudflare
+Workers — same API everywhere.
+
+If you reach for `node:crypto` out of habit, half of what you write
+will not run in the browser, in an edge worker, or in a service worker.
+`crypto.subtle` does.
+
+## The shape of the API
+
+Every operation takes (1) the algorithm spec, (2) the key, and (3) the
+data. Everything returns a `Promise<ArrayBuffer>`:
+
+```js
+const enc = new TextEncoder();
+const data = enc.encode('hello');
+
+const hash = await crypto.subtle.digest('SHA-256', data);
+// ArrayBuffer of 32 bytes
+```
+
+The async-everywhere shape exists because the spec wants the runtime
+free to push the actual crypto into a non-JS context (WebCrypto
+implementations in browsers run in C++ or hardware-backed enclaves).
+
+## Hashing
+
+```js
+const buf = new TextEncoder().encode('hello');
+const digest = await crypto.subtle.digest('SHA-256', buf);
+const hex = [...new Uint8Array(digest)]
+  .map((b) => b.toString(16).padStart(2, '0'))
+  .join('');
+// "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+```
+
+Supported: `SHA-1`, `SHA-256`, `SHA-384`, `SHA-512`. **No MD5** — it
+doesn't exist in WebCrypto by design. If you need MD5 (for legacy
+interop only), reach for `node:crypto` or a userland lib.
+
+`SHA-1` is included for legacy compatibility — don't use it for new
+security work. Default to `SHA-256`.
+
+## HMAC
+
+```js
+const key = await crypto.subtle.importKey(
+  'raw',
+  new TextEncoder().encode('my-secret'),
+  { name: 'HMAC', hash: 'SHA-256' },
+  false,         // not extractable
+  ['sign', 'verify'],
+);
+
+const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('message'));
+const ok = await crypto.subtle.verify('HMAC', key, sig, new TextEncoder().encode('message'));
+// true
+```
+
+`verify` does the constant-time comparison for you. Never compare
+HMAC outputs yourself with `===` — that's a timing leak.
+
+## Symmetric encryption (AES-GCM)
+
+AES-GCM is the default authenticated encryption mode. It produces a
+ciphertext + auth tag in one buffer; the runtime verifies the tag
+during `decrypt` and throws if it doesn't match.
+
+```js
+const key = await crypto.subtle.generateKey(
+  { name: 'AES-GCM', length: 256 },
+  true,                          // extractable
+  ['encrypt', 'decrypt'],
+);
+
+const iv = crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV, GCM standard
+const plaintext = new TextEncoder().encode('secret');
+
+const ciphertext = await crypto.subtle.encrypt(
+  { name: 'AES-GCM', iv },
+  key,
+  plaintext,
+);
+
+// to decrypt you need the SAME key AND the same iv
+const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+new TextDecoder().decode(plain);   // "secret"
+```
+
+<Callout type="warning">
+The IV must be **unique per (key, message) pair**. Re-using an IV
+under the same key with GCM is catastrophic — an attacker who sees two
+ciphertexts under the same IV can recover the XOR of the plaintexts,
+and in many cases the GCM auth key itself. Always
+`crypto.getRandomValues(new Uint8Array(12))` per message, and store
+the IV alongside the ciphertext.
+</Callout>
+
+## Key derivation (PBKDF2 / HKDF)
+
+For deriving a key from a password (login, encrypted-at-rest fields):
+
+```js
+const password = new TextEncoder().encode('hunter2');
+const salt = crypto.getRandomValues(new Uint8Array(16));
+
+const baseKey = await crypto.subtle.importKey(
+  'raw', password, 'PBKDF2', false, ['deriveKey'],
+);
+
+const aesKey = await crypto.subtle.deriveKey(
+  { name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' },
+  baseKey,
+  { name: 'AES-GCM', length: 256 },
+  false,
+  ['encrypt', 'decrypt'],
+);
+```
+
+OWASP's 2026 recommendation for PBKDF2 with SHA-256 is **≥600,000
+iterations**. Tune up over time.
+
+For password *storage*, prefer **argon2id** (via `node:crypto.hash` or
+the `argon2` package) — WebCrypto's PBKDF2 is fine for key derivation
+but argon2 is the modern password-hashing primitive.
+
+HKDF is for deriving multiple keys from already-strong key material
+(not a password) — e.g. from an ECDH shared secret.
+
+## Signatures (Ed25519, ECDSA)
+
+```js
+const { publicKey, privateKey } = await crypto.subtle.generateKey(
+  { name: 'Ed25519' },
+  true,
+  ['sign', 'verify'],
+);
+
+const msg = new TextEncoder().encode('release-v1.2.3');
+const sig = await crypto.subtle.sign('Ed25519', privateKey, msg);
+const ok = await crypto.subtle.verify('Ed25519', publicKey, sig, msg);
+```
+
+Ed25519 in WebCrypto is stable in Node 22+ and all evergreen browsers.
+For older targets, fall back to ECDSA over `P-256`.
+
+## Random numbers
+
+```js
+crypto.getRandomValues(new Uint8Array(16));   // CSPRNG, fills in place
+crypto.randomUUID();                           // v4 UUID, hex string
+```
+
+Both are synchronous and cryptographically strong. `Math.random()` is
+not — never use it for tokens, salts, or IVs.
+
+## Exporting and storing keys
+
+```js
+// raw bytes (for symmetric keys you'll store in env)
+const raw = await crypto.subtle.exportKey('raw', aesKey);
+
+// JWK (JSON Web Key) — portable, human-readable
+const jwk = await crypto.subtle.exportKey('jwk', aesKey);
+```
+
+A key marked `extractable: false` cannot be exported — `exportKey`
+throws. Use this for keys you only need at runtime; the browser /
+runtime holds them in an opaque slot you can use but never read out.
+
+## Common mistakes
+
+- **Forgetting that everything is `ArrayBuffer`.** `digest('SHA-256',
+  ...)` does not return a hex string. Convert via `Uint8Array` →
+  `toString(16)` / `.toHex()`.
+- **IV reuse with AES-GCM.** Always per-message random.
+- **Comparing HMAC / signature outputs with `===`.** Use `verify`.
+- **Passing strings to `digest`.** It wants bytes — `new
+  TextEncoder().encode(str)` first.
+- **Using `SHA-1` for anything new.** It's there for legacy interop.
+- **Mistaking WebCrypto for a password-hashing library.** PBKDF2 is
+  KDF, not password storage. For passwords, argon2id.
+
+## When you still want `node:crypto`
+
+- **MD5** (legacy file hashing, ETag generation against old systems).
+- **Streaming hashes** for very large inputs — `crypto.createHash` can
+  be `.update`d chunk by chunk; `crypto.subtle.digest` takes a single
+  buffer.
+- **`scrypt`** — not in WebCrypto.
+- **Cipher modes WebCrypto doesn't expose** (ChaCha20-Poly1305 is
+  available in newer specs and runtimes — check before assuming).
+
+For everything else, `crypto.subtle` is the right call. Same code
+runs server-side, in workers, in the browser. See
+`node/node-crypto-deep.mdx` for the Node-specific primitives, and
+`security/secrets-management.mdx` for where to keep the keys.

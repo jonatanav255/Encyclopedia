@@ -1,0 +1,240 @@
+export const level = 'senior';
+
+# JWT pitfalls
+
+JSON Web Tokens are a useful standard for stateless authentication
+artifacts, but their flexibility is also their footgun. Most JWT
+breaches in the wild involve one of a small set of recurring
+mistakes — almost all of which the spec permits but security
+guidance forbids.
+
+This page covers the pitfalls. For the rotation and key-management
+story, see the OAuth/OIDC page.
+
+## `alg=none` confusion
+
+A JWT consists of three base64url-encoded segments:
+
+```
+HEADER.PAYLOAD.SIGNATURE
+```
+
+The header declares the algorithm:
+
+```json
+{ "alg": "HS256", "typ": "JWT" }
+```
+
+The original RFC permitted `"alg": "none"` for unsigned tokens. Some
+library implementations would happily verify a token with `alg=none`
+and an empty signature — meaning **anyone could forge a token** by
+just changing `alg` to `none` and stripping the signature.
+
+```
+eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.
+```
+
+The fix is to **never accept `alg=none`**, and ideally to explicitly
+pass the expected algorithm to the verifier rather than trusting the
+header to declare it.
+
+```js
+jwt.verify(token, secret, { algorithms: ['HS256'] });
+// not: jwt.verify(token, secret)  // ← trusts the header's alg
+```
+
+Most modern libraries refuse `alg=none` by default. Older or
+hand-rolled implementations are still found in production audits.
+
+## RS256 → HS256 algorithm confusion
+
+The classic JWT attack. Suppose your service uses RS256 (asymmetric:
+public key verifies, private key signs). The public key is shipped
+to clients, often in a JWKS endpoint.
+
+```
+{ "alg": "RS256", "typ": "JWT" }
+```
+
+An attacker takes your public key, treats it as a **shared secret**,
+and forges a token with:
+
+```
+{ "alg": "HS256", "typ": "JWT" }
+```
+
+signed with HMAC-SHA256 using the public key as the HMAC key. If
+your verifier looks at the header, sees `alg=HS256`, and uses the
+"verification key" (the RSA public key) as the HMAC secret — it
+verifies. You've granted the attacker any claim they wanted.
+
+The vulnerability: the verifier should be picking the algorithm
+**from policy**, not from the token. The fix is the same as
+`alg=none` — pass `algorithms: ['RS256']` explicitly.
+
+```js
+jwt.verify(token, publicKey, { algorithms: ['RS256'] });
+```
+
+Most current libraries fixed this around 2017–2018, but homemade
+JWT implementations and outdated dependencies still ship the bug.
+
+## `kid` (key ID) injection
+
+Tokens with multiple valid keys typically use `kid` in the header to
+say "verify with this key":
+
+```json
+{ "alg": "RS256", "kid": "2024-01-rotation" }
+```
+
+The server looks up the key by `kid` and verifies. If the lookup is
+implemented as a database query or filesystem path read with the
+`kid` value substituted in unsanitised, an attacker can inject:
+
+- **SQL injection** via `kid`:
+  `SELECT key FROM keys WHERE id = '...kid...'`
+- **Path traversal** via `kid`: `keys/../../etc/passwd` (resolving to
+  a file whose contents become the verification key — attacker picks
+  a known file).
+- **Forced known-value lookup** by pointing `kid` at a key the
+  attacker controls (e.g., a cached JWK from a different issuer).
+
+Mitigation:
+
+- Treat `kid` as user input. Validate against a whitelist of known
+  IDs.
+- Use a keyring lookup function that **only** maps known IDs to
+  known keys; reject anything else.
+- Never use `kid` to construct a filesystem path or SQL query
+  directly.
+
+## `jku` and `x5u`: trusting attacker-supplied URLs
+
+The JWT spec permits `jku` (JWK Set URL) and `x5u` (X.509 URL)
+header fields that point the verifier to **where to fetch the
+verification key from**. If you implement this naively:
+
+```
+{ "alg": "RS256", "jku": "https://attacker.example/jwks.json" }
+```
+
+The verifier fetches the attacker's JWKS, gets the attacker's
+public key, verifies — and the attacker has forged any claim they
+want.
+
+Mitigation: **never honor `jku` or `x5u` from the token itself**.
+Configure the trusted JWKS URL out of band, in your application
+config. Treat tokens with `jku` or `x5u` as suspicious.
+
+## Algorithm policy
+
+Encode the algorithm policy at the verifier level, not per-token.
+
+```ts
+const VERIFIER_OPTIONS = {
+  algorithms: ['RS256'] as const,
+  issuer: 'https://idp.example.com',
+  audience: 'https://api.example.com',
+  clockTolerance: 30,  // seconds of clock skew tolerance
+};
+```
+
+Hard-code the algorithm. Hard-code the issuer. Hard-code the
+audience. The verifier should refuse anything else regardless of
+what the token's header claims.
+
+## Storage on the client side
+
+JWTs in client storage:
+
+<Compare>
+<thead>
+<tr><th>Storage</th><th>XSS-vulnerable?</th><th>CSRF-vulnerable?</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>`localStorage`</td><td>Yes</td><td>No</td><td>Any script on the page can read it</td></tr>
+<tr><td>`sessionStorage`</td><td>Yes</td><td>No</td><td>Lost on tab close</td></tr>
+<tr><td>JS variable / memory</td><td>Yes (until page reload)</td><td>No</td><td>Lost on reload; needs re-fetch via refresh token</td></tr>
+<tr><td>`HttpOnly` cookie</td><td>No (script can't read)</td><td>Yes (auto-attached cross-site)</td><td>Pair with SameSite=Lax</td></tr>
+</tbody>
+</Compare>
+
+There is no XSS-and-CSRF-immune storage. The realistic options:
+
+- **HttpOnly cookie + SameSite=Lax**: best for typical web apps.
+  CSRF still possible via top-level GET navigation, so don't put
+  state-changing actions on GET, and add a synchronizer token for
+  sensitive POSTs.
+- **JS memory + refresh token in HttpOnly cookie**: SPA pattern.
+  Access token short-lived (5–15 min), held in memory only. Refresh
+  endpoint reads the HttpOnly cookie and issues a new access token.
+  XSS can still grab the in-memory token but only for its lifetime.
+
+**Never put refresh tokens in `localStorage`.** A single XSS bug
+gives the attacker indefinite session reuse.
+
+## Token lifetime and revocation
+
+JWTs are stateless: you can't "log someone out" by deleting a
+session row, because the token contains its own validity. Two
+approaches:
+
+- **Short access tokens + refresh tokens**: access tokens valid for
+  5–15 minutes. Logout invalidates the refresh token (which IS
+  stored server-side); the access token expires soon enough that
+  revocation latency is acceptable.
+- **Token revocation list**: maintain a server-side denylist of
+  revoked token IDs (`jti` claim). Every verify checks the list.
+  This makes verification stateful — kind of defeats the JWT story —
+  but is necessary for "logout takes effect immediately."
+
+Choose based on your threat model. Banking-grade: short tokens +
+denylist. Most apps: short tokens, no denylist, accept the
+revocation latency.
+
+## Claim validation
+
+Verify every claim that matters, not just the signature:
+
+- **`iss`** (issuer) — must equal your configured issuer.
+- **`aud`** (audience) — must equal your service's audience. Stops
+  token confusion across services that share an IdP.
+- **`exp`** (expiration) — must be in the future.
+- **`nbf`** (not-before) — must be in the past.
+- **`iat`** (issued-at) — sanity check; reject tokens issued in the
+  future or older than your max lifetime.
+- **`sub`** (subject) — the user ID. Check membership / status if
+  needed (active user, not banned).
+
+A valid signature on a token issued to a different audience by the
+same IdP is still a valid signature. Without `aud` validation,
+that's a privilege escalation across services.
+
+## Other JWT smells
+
+- **Storing PII in the payload.** JWTs are not encrypted by default
+  (use JWE for that). Anyone with the token can base64-decode the
+  payload and read it.
+- **Very long lifetimes** (days or weeks) with no revocation
+  mechanism. A leaked token is good until it expires.
+- **JWTs as session cookies for traditional web apps.** A
+  server-side session is simpler, more secure, and easier to
+  revoke. JWTs shine for cross-service / cross-domain auth, not
+  same-app session management.
+- **Custom algorithms** (`alg: PS256` is fine; `alg: MyCustomAlg`
+  is a red flag).
+
+## Quick checklist
+
+<Cheatsheet>
+- Pin `algorithms` at the verifier (`['RS256']` or `['HS256']`, not both).
+- Reject `alg=none`. Reject `jku` / `x5u` from the token.
+- `kid` is user input — validate against a key allowlist.
+- Validate `iss`, `aud`, `exp`, `nbf` on every request.
+- Short access tokens (5–15 min). Refresh tokens server-side, revocable.
+- Refresh tokens in `HttpOnly; Secure; SameSite=Lax` cookies. Never `localStorage`.
+- No PII in the payload (use JWE if you need encryption).
+- For "logout = immediate", maintain a server-side `jti` denylist.
+- Audit your JWT library version; pre-2018 versions often have algorithm-confusion bugs.
+</Cheatsheet>

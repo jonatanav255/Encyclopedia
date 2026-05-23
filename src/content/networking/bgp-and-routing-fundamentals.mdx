@@ -1,0 +1,256 @@
+export const level = 'senior';
+
+# BGP and routing fundamentals
+
+Inside one office, routing is easy: every machine on the
+LAN ARPs for the gateway, the gateway forwards everything
+not local. Across the internet, no single entity owns the
+map. The internet is a federation of tens of thousands of
+networks (**Autonomous Systems**) that learn each other's
+reachability by gossiping. **BGP** (Border Gateway Protocol)
+is the gossip protocol. It's how packets find paths between
+your laptop and a server you've never connected to.
+
+## Two regimes of routing
+
+Routing protocols split cleanly into:
+
+- **IGPs** (Interior Gateway Protocols) — used **inside**
+  one AS. OSPF (link-state) and IS-IS dominate. Each
+  router floods topology to all others; each independently
+  computes shortest paths (Dijkstra). Convergence: milli-
+  seconds to seconds.
+- **EGPs** (Exterior Gateway Protocols) — used **between**
+  ASes. **BGP** is the only one anyone uses. Path-vector,
+  not shortest-path: ASes advertise *which AS-path*
+  reaches a prefix, peers apply policy and pick a winner.
+  Convergence: seconds to minutes.
+
+The split exists because the two problems are different.
+Inside an AS you trust everyone; the goal is "find the
+fastest path." Between ASes you don't trust anyone; the
+goal is "express business policy."
+
+## Autonomous Systems and ASNs
+
+An **AS** is a network under one administrative control
+with one routing policy. Examples: AT&T (AS7018), Google
+(AS15169), Cloudflare (AS13335), your home ISP. Each gets
+an **ASN** (32-bit integer) from a regional internet
+registry (ARIN, RIPE, APNIC…).
+
+Hand-wavy size: there are ~75,000 ASes globally. Roughly
+divides into:
+
+- **Tier 1** transit providers (~15 of them — Lumen,
+  Cogent, NTT, Telia, Tata, …). Settlement-free peering
+  with each other; sell transit to everyone else.
+- **Tier 2** regional networks that buy transit from Tier
+  1 and may peer at IXPs.
+- **Tier 3** edge networks (your ISP, an enterprise) that
+  only buy.
+- **Content/cloud networks** (Google, AWS, Cloudflare,
+  Meta) which peer aggressively at IXPs and run their
+  own private backbones.
+
+The hierarchy is fuzzy in practice. What matters: every AS
+has zero or more **transit providers** (upstreams it pays
+to reach the rest of the internet) and zero or more
+**peers** (networks it exchanges traffic with directly).
+
+## Prefixes, not addresses
+
+BGP advertises **prefixes** in CIDR notation:
+`8.8.8.0/24`, `2607:f8b0::/32`. A router carries roughly
+one million IPv4 prefixes and a few hundred thousand IPv6
+prefixes in its **routing table** as of 2024 (the
+"default-free zone" view). Forwarding decisions use
+**longest-prefix match**: of all prefixes matching the
+destination, pick the most specific.
+
+```
+Destination 8.8.8.8 matches:
+  8.0.0.0/8     ← coarse
+  8.8.0.0/16    ← finer
+  8.8.8.0/24    ← finest — this one wins
+```
+
+Aggregation is critical for table size. ARIN allocates
+`8.8.8.0/24` *as part of* a larger block; Google could
+advertise just the supernet and shave entries. They don't,
+because more-specific announcements give them traffic-
+engineering control. The result: the global table grows
+~5-10% per year.
+
+## What a BGP UPDATE looks like
+
+A BGP session is just a TCP connection on port 179 between
+two routers (eBGP across ASes, iBGP within one AS). After
+OPEN, the routers send UPDATEs:
+
+```
+UPDATE:
+  withdrawn = [10.0.0.0/16]
+  attributes:
+    AS_PATH = [13335, 174, 7018]    ← path
+    NEXT_HOP = 198.51.100.1         ← next router
+    ORIGIN = IGP
+    MED = 100                       ← multi-exit discriminator
+    LOCAL_PREF = 100
+    COMMUNITIES = [13335:0]         ← tags
+  reachable = [104.16.0.0/12, ...]
+```
+
+The route says: "to reach `104.16.0.0/12`, the AS path is
+13335 → 174 → 7018; next hop is `198.51.100.1`." Receivers
+validate, apply local policy (filters and re-rankings),
+install the winner in the **RIB** (Routing Information
+Base), and re-announce to their own peers with **their own
+ASN prepended** to AS_PATH.
+
+The forwarding path uses the **FIB** (Forwarding
+Information Base): a compiled, longest-prefix-match-
+optimized form of the RIB sitting in line cards.
+
+## Path selection — policy first, then attributes
+
+When multiple routes reach the same prefix, BGP picks one
+in a strict order. (Cisco's version, near-universally
+implemented):
+
+1. **Weight** (Cisco-only, local).
+2. **LOCAL_PREF** (per-AS, set by import policy).
+3. Locally-originated > learned.
+4. **Shortest AS_PATH**.
+5. Lowest ORIGIN type.
+6. Lowest **MED** (typically only compared if both routes
+   come from the same neighbor AS).
+7. eBGP > iBGP.
+8. Lowest IGP cost to NEXT_HOP.
+9. Tie-break (router ID, etc.).
+
+The shape: **policy attributes** (LOCAL_PREF) override
+**topology attributes** (AS_PATH length), which override
+**neighbor attributes** (MED). This is how operators
+encode "prefer customer routes over peer routes over
+transit" — set LOCAL_PREF as routes come in.
+
+## Communities — tagging the routes
+
+A **BGP community** is a 32-bit (or extended, 64-bit) tag
+attached to a route. Standardized format `<ASN>:<value>`.
+Networks use them to:
+
+- **Signal traffic engineering preferences** ("send this
+  traffic via Frankfurt, not Amsterdam" → `13335:0:100`).
+- **Apply scoped routing** ("only announce to peers in
+  Europe" → `13335:1000`).
+- **Blackhole DDoS targets** (`<provider>:666` is the
+  community for "drop this prefix on ingress"). The most
+  reliable defense against a volumetric attack: blackhole
+  the victim IP upstream.
+
+Communities are documented per-network and gluing them
+together is most of an internet operator's day-to-day.
+
+## The dark side — BGP has no real auth
+
+BGP was designed in 1989 when the internet was friendlier.
+A BGP speaker simply *asserts* "I own these prefixes." If
+your upstreams accept it, the world believes you. Three
+flavors of problem:
+
+- **Hijacks**: AS X announces a prefix it doesn't own,
+  routing traffic to itself. Sometimes accidental (typo);
+  sometimes deliberate (bitcoin theft via certificate
+  re-issuance, surveillance). Famous incidents: Pakistan
+  Telecom blackholing YouTube globally (2008), Indosat
+  routing 100k+ prefixes (2014), MyEtherWallet DNS
+  hijack via BGP (2018).
+- **Route leaks**: AS X announces routes to peers it
+  shouldn't (violating "customer-peer-transit" valley-free
+  routing rules), creating an unintended transit path.
+- **Path manipulation**: prepending fake ASNs to make a
+  path look longer than it is.
+
+Mitigations are stacking up but slowly:
+
+- **RPKI** (Resource Public Key Infrastructure) — a
+  signed claim from a regional registry that an AS is
+  authorized to originate a prefix. Routers validate
+  incoming UPDATEs against the RPKI database; invalid
+  ones get dropped or de-preferred. Coverage was ~30% in
+  2022, climbing.
+- **BGPsec** — signed AS_PATHs. Almost no deployment;
+  protocol overhead is severe.
+- **Route filtering and Internet Routing Registry (IRR)
+  validation** — operational discipline, slow to adopt.
+- **MANRS** (Mutually Agreed Norms for Routing Security)
+  — best-practice commitment program.
+
+You as an app developer don't fix BGP. You do care
+because: BGP outages happen ("Cloudflare-level" incident
+every few years), DDoS is mitigated at BGP level, and
+your geographic latency depends on whose path your packets
+take.
+
+## How an anycast IP actually works
+
+A single IP, advertised by many ASes from many locations.
+`8.8.8.8` is announced by Google from 100+ locations. Your
+ISP's BGP picks the topologically closest, and packets land
+there. The same IP gives sub-10ms latency from anywhere
+on earth. Anycast is the engine behind public DNS,
+Cloudflare, modern CDN PoPs, and DDoS mitigation
+("absorb the attack on the closest PoP, not at the
+origin").
+
+Anycast caveat: only works for stateless or
+session-internal protocols. UDP DNS is fine. TCP works if
+the routing stays stable for the duration of the
+connection — usually true at the AS level for seconds-long
+sessions, sometimes not. QUIC's connection IDs help here.
+
+## Looking at BGP from outside
+
+You don't have a router, but you can see the routing
+world:
+
+- **Looking glasses** — public web tools at major
+  networks: lg.he.net (Hurricane Electric), lg.telia.net.
+  Issue `show ip bgp <prefix>` from various PoPs.
+- **bgp.tools, bgpview.io** — web UIs over global BGP
+  data.
+- **RIPE RIS / RouteViews** — research projects that
+  collect BGP feeds globally; raw MRT dumps available.
+- **`traceroute -A` / `mtr`** — reverse-resolves ASNs at
+  each hop. Tells you which networks your packets cross.
+- **`whois -h whois.cymru.com " -v 8.8.8.8"`** — Cymru's
+  IP-to-ASN service.
+
+Useful for debugging. "Why is my CDN slow from Lagos?"
+often answers itself when you see the AS-path drags
+through Frankfurt and back.
+
+## The view from your code
+
+Your app code never speaks BGP. Three things matter:
+
+1. **Anycast** — the IP your client connects to may be
+   reachable in multiple physical locations. Don't assume
+   client geography from server IP.
+2. **Asymmetric paths** — the route from client to server
+   and server to client may go through different ASes.
+   Asymmetric latency is normal.
+3. **BGP outages** are rare but global. Build retries with
+   geographic failover; cache DNS for a sensible TTL;
+   don't tie liveness to one anycast IP.
+
+## See also
+
+- *nat-and-private-networks* — what happens *inside* one
+  AS before BGP kicks in at the border.
+- *cdns-how-they-work* — anycast + BGP-driven steering is
+  the foundation of every modern CDN.
+- *dns* (http topic) — how a DNS query *finds* a server
+  before BGP routes the bytes.

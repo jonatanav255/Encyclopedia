@@ -1,0 +1,153 @@
+export const level = 'senior';
+
+# Roaring bitmaps
+
+A **roaring bitmap** is a compressed bitmap that stores a set of
+32-bit integers. It outperforms both plain bitsets and run-length
+encodings (`WAH`, `EWAH`) on real data and has become the
+standard "set of integers" representation in databases, search
+engines, and analytics systems.
+
+If you've used Lucene/Elasticsearch, Druid, ClickHouse, Pinot,
+or InfluxDB, you've used roaring bitmaps — they're how those
+systems implement filters, intersections, and aggregations at
+the scale of billions of document IDs.
+
+## Why not a plain bitset?
+
+A plain bitset for 32-bit integers needs `2^32 / 8 = 512 MB`.
+For dense ranges that's fine; for sparse sets it's catastrophic
+overhead. Storing the single integer `1_000_000` would cost
+512 MB.
+
+A naive sorted array uses 4 bytes per element — efficient for
+sparse sets, terrible for dense ones (`{0..1_000_000}` is 4 MB
+as an array but 125 KB as a bitset).
+
+Roaring bitmaps **pick the best representation per chunk** based
+on actual density. The compression isn't a tradeoff; it's
+adaptive.
+
+## The structure
+
+A roaring bitmap splits the 32-bit integer space into chunks of
+2^16 = 65,536 consecutive values. The high 16 bits index a sorted
+array of **containers**; the low 16 bits address within a container.
+
+Three container types:
+
+| Container | Used when chunk has | Size |
+| --- | --- | --- |
+| **Array** | ≤ 4096 elements (sparse) | 2 bytes per element |
+| **Bitmap** | > 4096 elements (dense) | 8 KB (fixed: 2^16 bits) |
+| **Run** | Long runs of consecutive integers | 4 bytes per run |
+
+The 4096 threshold is the crossover where a bitmap becomes
+smaller than an array (2 × 4096 = 8192 bytes = 8 KB = bitmap
+size). The library picks per chunk on every insert.
+
+Run containers are added if the bitmap has long contiguous
+spans; `runOptimize()` (or auto-conversion on bulk ops) walks
+containers and converts the wins.
+
+## Operations
+
+All set operations work container-by-container, exploiting the
+fact that the container array is sorted by high bits:
+
+- **Union (OR)**, **intersection (AND)**, **difference (ANDNOT)**,
+  **symmetric difference (XOR)**.
+
+Each container pair has a specialized routine:
+
+| Left × Right | Result |
+| --- | --- |
+| Array × Array | Galloping merge → Array (or Bitmap if too big) |
+| Array × Bitmap | Iterate array, test bits |
+| Bitmap × Bitmap | Word-by-word AND on the 1024 × 64-bit words; SIMD-friendly |
+| Run × any | Iterate runs, apply per-range |
+
+Typical bench numbers from the CRoaring project: intersecting two
+million-element bitmaps in microseconds, not milliseconds. The
+bitmap-bitmap intersection is essentially memory-bandwidth-bound.
+
+## Cardinality and rank/select
+
+Cardinality (`|S|`) is the sum of cardinalities of all containers.
+Each container caches its count — O(number of containers), not
+O(n).
+
+`rank(k)` (how many set bits are ≤ k) and `select(i)` (the i-th
+set bit) run in O(log #containers + per-container cost) — both
+sub-millisecond on million-element bitmaps. These are exactly
+the operations search engines need for paginating and ranking
+filtered results.
+
+## Serialization
+
+Roaring has a **portable binary format** with a fixed cookie and
+type bytes per container, allowing a JVM, C++, Go, Rust, and
+Python implementation to all read each other's bitmaps. Lucene
+uses it for its `LiveDocs` and DocValues; databases use it for
+on-disk indexes.
+
+The format also enables **memory-mapped queries** — a bitmap on
+disk can be searched without copying or deserializing, since the
+container layout matches the in-memory layout.
+
+## Where they appear in production
+
+- **Apache Lucene / Elasticsearch / OpenSearch** — per-segment
+  live-docs bitmap, filter caches, and `DocIdSet` implementations
+  use roaring. Boolean queries combine roaring bitmaps.
+- **Apache Druid** — every column's "value to docs" inverted
+  index is a roaring bitmap per value.
+- **Apache Pinot** — bitmap and inverted indexes both use
+  roaring.
+- **ClickHouse** — set indexes use roaring; the `groupBitmap`
+  aggregate function exposes them at the SQL level.
+- **InfluxDB** (TSI engine), **TileDB**, **Pilosa/Molecula** —
+  all roaring-based.
+- **Redis** — not in core, but the `RedisBitmap` module and
+  `RedisStack` for inverted indexes use roaring under the hood.
+
+The pattern: a system that needs to filter or intersect large
+ID sets fast and compactly almost certainly reaches for roaring.
+
+## 32-bit vs 64-bit
+
+Vanilla roaring is 32-bit (0 to 2^32 - 1). For larger key spaces
+there's **`Roaring64Map`** — a sorted map from 32-bit high bits
+to 32-bit roaring bitmaps. Effectively a two-level decomposition.
+ClickHouse, Pilosa, and others use the 64-bit variant for
+document IDs at billion-doc scale.
+
+## Comparison to alternatives
+
+| Structure | Strength | Weakness |
+| --- | --- | --- |
+| Plain bitset | O(1) test, fast SIMD | Huge memory on sparse data |
+| Sorted array | Compact on sparse | Slow intersection on dense |
+| WAH / EWAH | RLE compression | Random access slow, set ops slow on mixed densities |
+| **Roaring** | Adaptive; fast on all densities | More complex; container metadata overhead on tiny sets |
+| HyperLogLog | O(1) cardinality, tiny memory | Approximate; no set membership |
+
+Bloom filters and HyperLogLog answer different questions
+(membership probability, cardinality estimate) without storing
+the actual elements. Roaring stores them.
+
+## When to reach for one
+
+- You're storing **sets of integer IDs** (document IDs, row IDs,
+  user IDs in a segment).
+- Sets are big (10K+) and you need fast set operations between
+  them.
+- Memory matters but you also need O(1) membership and ordered
+  iteration.
+- You don't need approximate cardinality — for that, HyperLogLog
+  is better.
+
+For application code: most languages have a library
+(`roaring-bitmap` in npm, `croaring` Python bindings,
+`roaringbitmap` Go, the Java reference implementation). Don't
+roll your own.

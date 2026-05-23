@@ -1,0 +1,184 @@
+export const level = 'mid';
+
+# Clocks and time
+
+"What time is it?" is a more dangerous question than it sounds. A
+single machine has at least two clocks, they don't agree, they can
+each go wrong in different ways, and most code reaches for the wrong
+one. This page is the language- and OS-level view — distributed
+clocks (Lamport, vector, hybrid logical) live in system-design.
+
+## Two clocks, two purposes
+
+Every modern OS exposes (at least) two clocks. They look similar but
+do very different jobs.
+
+<Compare
+  left={{
+    title: 'Wall-clock — "what time is it?"',
+    points: [
+      'CLOCK_REALTIME on Linux, system clock on Windows, Date.now() in JS',
+      'Calendar time — seconds since Unix epoch (1970-01-01 UTC)',
+      'Disciplined by NTP/PTP — can jump forwards or backwards',
+      'Can be set by the user (or `ntpd` slew)',
+      'Use for: timestamps, log lines, "valid until", scheduling for a wall-clock instant',
+      'Never use for: measuring how long something took',
+    ],
+  }}
+  right={{
+    title: 'Monotonic — "how much time passed?"',
+    points: [
+      'CLOCK_MONOTONIC on Linux, QueryPerformanceCounter on Windows, performance.now() in JS',
+      'Counts time since some unspecified epoch (often boot)',
+      'Never jumps backwards; not affected by NTP step adjustments',
+      'No relation to calendar time — only differences are meaningful',
+      'Use for: timeouts, durations, intervals, benchmark intervals, retry backoff',
+      'Never use for: stamping events for later interpretation',
+    ],
+  }}
+/>
+
+The bug pattern people keep writing:
+
+```js
+// WRONG: wall clock for a duration
+const start = Date.now();
+await doWork();
+const elapsed = Date.now() - start;
+// If NTP stepped the clock backwards during doWork(), elapsed is negative.
+// If it stepped forwards, elapsed is wildly too large.
+
+// RIGHT: monotonic clock
+const start = performance.now();
+await doWork();
+const elapsed = performance.now() - start;
+```
+
+Browsers ship both as `Date.now()` and `performance.now()`. Node
+exposes the same pair (`Date.now()` vs `performance.now()` and
+`process.hrtime.bigint()`). Linux kernel: `clock_gettime(CLOCK_REALTIME, …)`
+vs `clock_gettime(CLOCK_MONOTONIC, …)`.
+
+## How a wall clock actually moves
+
+NTP (Network Time Protocol) is what keeps a machine's wall clock
+roughly synchronized with civil time. The two ways it can adjust:
+
+- **Step.** Instantaneous jump to the correct time. Used when the
+  machine is more than a small threshold (default 128 ms on most
+  Linux NTP daemons) off. *This is why wall-clock durations can be
+  negative.*
+- **Slew.** Gradually adjust the clock's *rate* so it catches up
+  over minutes. The wall clock effectively runs at 0.95× or 1.05×
+  for a while. Durations measured against the wall clock during a
+  slew are off by that ratio.
+
+The kernel itself doesn't draw the distinction between "small wall
+clock change" and "OS-was-suspended-then-resumed": waking a laptop
+from suspend can step the wall clock by hours.
+
+PTP (Precision Time Protocol) is the higher-precision sibling used
+in datacenters — microseconds to nanoseconds of accuracy with
+hardware timestamps. Same idea, smaller error budget.
+
+## Leap seconds
+
+Civil time (UTC) is occasionally adjusted by a second to track
+Earth's rotation. The naive implementation: 23:59:60 actually exists
+as a wall-clock value for one second on insertion days.
+
+In practice, two strategies in production:
+
+- **Step.** The clock reads 23:59:59 twice, or 00:00:00 starts a
+  second late. Native to POSIX, breaks lots of code (timestamps go
+  backwards, durations can be zero or negative).
+- **Smear.** Spread the extra second across a window — Google's 24-
+  hour linear smear is the canonical implementation. The clock runs
+  ~0.0012% slow during the smear window. AWS and most cloud
+  providers do this now. Code that uses `CLOCK_MONOTONIC` doesn't
+  care; code that uses wall-clock timestamps gets sub-millisecond
+  errors instead of duplicate seconds.
+
+The practical advice: **don't write leap-second-aware code.** Use a
+smearing NTP setup and stop trying to handle 23:59:60 by hand.
+
+## Time zones, UTC, and storage
+
+Two rules that solve 90% of timezone bugs:
+
+1. **Store timestamps in UTC.** A `TIMESTAMPTZ` in Postgres, a
+   `BIGINT` of Unix epoch ms, an ISO-8601 string with a `Z` suffix
+   — any UTC representation. Never store local time without an
+   offset; "2026-06-01 14:00" with no zone is unrecoverable.
+2. **Convert to a local zone only at the presentation edge.** UI
+   layer, log formatter, report renderer. The user's timezone is a
+   *display preference*, not a property of the data.
+
+The hard problems aren't UTC ↔ local conversion. They are:
+
+- **DST transitions.** "2026-03-08 02:30" doesn't exist in US
+  Eastern (clocks skip from 02:00 to 03:00). "2026-11-01 01:30"
+  exists *twice* (the hour repeats). Always parse with explicit zone
+  data; libraries like `Luxon`, `date-fns-tz`, or `Temporal` (now
+  shipping in browsers and Node) handle this correctly.
+- **Future timestamps in a named zone.** "9 AM on 2030-01-15 in
+  America/Los_Angeles" is a future event whose *UTC instant depends
+  on whether the US has changed its DST rules by then*. Store the
+  named-zone form, not a pre-computed UTC instant, when the wall-
+  clock intent matters more than the absolute instant.
+- **IANA TZ database updates.** `tzdata` is updated several times a
+  year as countries change their rules. Stale `tzdata` in a
+  container image means wrong offsets for the next year. Pin and
+  update like any dependency.
+
+## `Date` is the worst API in JavaScript
+
+A few of the footguns:
+
+- `new Date('2026-01-15')` parses as UTC; `new Date('2026-01-15T00:00')`
+  parses as local time. Same library, opposite semantics, no warning.
+- `Date.getMonth()` is 0-indexed; `getDate()` is 1-indexed. Day-of-
+  week is 0-indexed (Sunday=0).
+- `Date` mutates: `d.setHours(0)` modifies `d` in place. There's no
+  immutable variant.
+- Timezone handling is the host's local zone with no way to ask for
+  another one.
+
+The replacement: **`Temporal`**, now shipping as a built-in in
+Node 22+ and modern browsers (and polyfillable everywhere else).
+Immutable, zone-aware, distinguishes "instant in time" from "wall-
+clock date" from "year-month" from "duration" as separate types.
+New code should reach for `Temporal` first; `Date` only for code
+that has to interop with old APIs.
+
+## Time in production code
+
+A short list of patterns that pay for themselves:
+
+- **Inject the clock.** Pass a `clock: () => Date` (or
+  `now: () => number`) into anything that reads time. Production
+  passes the real one; tests pass a fake. "We can't test timeouts"
+  becomes "we ship 10 ms tests for hour-long timeouts."
+- **Monotonic for timeouts and retries.** Anything that says "do
+  this every N seconds" or "give up after N seconds" — monotonic.
+  Cron-style "do this at 2 AM" — wall-clock.
+- **Don't compare timestamps across machines without clock
+  synchronization.** Even with NTP, machines easily disagree by
+  10-100 ms. If you need ordering of events from different sources,
+  reach for logical clocks (see the system-design pages on Lamport,
+  hybrid logical clocks).
+- **Pin timestamp precision in your storage.** Postgres `TIMESTAMP`
+  is microseconds; MySQL `DATETIME` is seconds without a precision
+  argument; MongoDB BSON dates are milliseconds. Mismatched
+  precisions silently truncate.
+- **Beware container time.** Containers inherit the host's clock by
+  default (`/etc/localtime` mount, kernel time). Setting `TZ=UTC` in
+  the container env affects the *display* in `date` and library
+  output, not the underlying clock.
+
+<Callout type="info">
+The single rule that catches the most bugs: **use the monotonic
+clock for any duration; the wall clock only when you need to put a
+calendar timestamp on something.** If you keep this straight, most
+clock bugs disappear.
+</Callout>

@@ -1,0 +1,224 @@
+export const level = 'senior';
+
+# `using`, `await using`, and `Disposable`
+
+The `using` declaration is "RAII for JavaScript" — a way to declare
+a resource and have it cleaned up deterministically when its scope
+exits, without writing `try/finally`. It landed in TypeScript 5.2
+(September 2023) and in V8 / Node 22+; it's available in modern
+browsers from 2024 on.
+
+It's not a syntactic shortcut for `try/finally` — it's a guarantee
+the runtime upholds, integrated with the iterator protocol, with a
+well-defined error model.
+
+## The protocol
+
+A "disposable" is an object with a `[Symbol.dispose]()` method (sync)
+or `[Symbol.asyncDispose]()` (async). When the `using` (or
+`await using`) binding goes out of scope, the runtime calls that
+method.
+
+```ts
+function openFile(path: string): Disposable & { read(): string } {
+  const handle = fs.openSync(path, 'r');
+  return {
+    read() { return fs.readFileSync(handle, 'utf8'); },
+    [Symbol.dispose]() { fs.closeSync(handle); },
+  };
+}
+
+{
+  using file = openFile('input.txt');
+  console.log(file.read());
+}   // <- fs.closeSync runs here, automatically
+```
+
+The block exits; `Symbol.dispose` runs. Even if the block throws.
+Even if you `return` early. Even if multiple `using` bindings exist
+in the same scope (they dispose in reverse declaration order, like
+C++ destructors).
+
+## `await using` for async cleanup
+
+```ts
+async function getDbConnection(): Promise<AsyncDisposable & { query: ... }> {
+  const conn = await pool.acquire();
+  return {
+    query: (sql) => conn.query(sql),
+    async [Symbol.asyncDispose]() { await pool.release(conn); },
+  };
+}
+
+async function getUser(id: string) {
+  await using db = await getDbConnection();
+  return db.query('select * from users where id = $1', [id]);
+}   // <- await pool.release runs here
+```
+
+`await using` waits for the asyncDispose promise before continuing
+past the block. If the body throws, the dispose still runs (and
+that's still awaited).
+
+## Built-in `Disposable` types
+
+The 5.2+ lib types:
+
+```ts
+interface Disposable {
+  [Symbol.dispose](): void;
+}
+interface AsyncDisposable {
+  [Symbol.asyncDispose](): PromiseLike<void>;
+}
+```
+
+You'll see these as return types in modern libraries — anywhere a
+resource (file, connection, lock, subscription, timer, AbortController
+linkage) needs explicit teardown.
+
+## `DisposableStack` and `AsyncDisposableStack`
+
+When you collect multiple disposables conditionally, push them onto a
+stack:
+
+```ts
+function setup() {
+  using stack = new DisposableStack();
+
+  const file  = stack.use(openFile('a.txt'));
+  const lock  = stack.use(acquireLock('row-42'));
+  const timer = stack.adopt(setInterval(tick, 1000), clearInterval);
+
+  return stack.move();   // hand ownership to the caller
+}
+
+{
+  using owned = setup();
+  // ... use owned ...
+}   // all three resources cleaned up
+```
+
+- `use(d)` — push an existing `Disposable` onto the stack.
+- `adopt(value, onDispose)` — push a value with a custom cleanup fn
+  (handy for non-disposable handles like `setInterval` ids).
+- `defer(fn)` — push a no-arg cleanup function.
+- `move()` — transfer ownership to a new stack. The current stack is
+  emptied; disposing it is a no-op. Use to return ownership from a
+  function without leaking on the early-return path.
+
+`DisposableStack` is what makes the proposal practical for real
+code, because most setup steps are conditional.
+
+## Error model
+
+If both the body and the dispose throw, the runtime throws a
+`SuppressedError`:
+
+```ts
+{
+  using r = {
+    [Symbol.dispose]() { throw new Error('dispose failed'); },
+  };
+  throw new Error('body failed');
+}
+// SuppressedError {
+//   error: Error('dispose failed'),
+//   suppressed: Error('body failed'),
+// }
+```
+
+Both errors are preserved — the most recent (dispose) is `.error`;
+the prior one is `.suppressed`. You can walk the chain. This is the
+piece `try/finally` got wrong: `finally` that throws silently
+swallows the body error.
+
+## Idiomatic shapes
+
+### Locks
+
+```ts
+function acquire(name: string): Disposable {
+  redis.set(`lock:${name}`, '1', { nx: true });
+  return { [Symbol.dispose]() { redis.del(`lock:${name}`); } };
+}
+
+{
+  using lock = acquire('row-42');
+  // critical section
+}   // lock released even if we throw
+```
+
+### AbortController as a disposable
+
+```ts
+function abortable(): Disposable & { signal: AbortSignal } {
+  const ctrl = new AbortController();
+  return {
+    signal: ctrl.signal,
+    [Symbol.dispose]() { ctrl.abort(); },
+  };
+}
+
+async function fetchAll() {
+  using a = abortable();
+  // any fetch using a.signal aborts on scope exit
+  await fetch(url, { signal: a.signal });
+}
+```
+
+### Test fixtures
+
+```ts
+test('user can sign in', async () => {
+  await using db = await testDb();
+  await using server = await startServer(db);
+
+  // ... assertions ...
+});   // db + server cleaned up, even on assertion failure
+```
+
+This is the killer use case in test code. No `afterEach` boilerplate,
+no leaking state when a test throws.
+
+## Configuration
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "ESNext.Disposable"]
+  }
+}
+```
+
+`ESNext.Disposable` adds `Disposable`, `AsyncDisposable`,
+`DisposableStack`, `AsyncDisposableStack`, and the `Symbol.dispose` /
+`Symbol.asyncDispose` properties. With `target: ES2022` or lower, TS
+**downlevels** `using` to equivalent `try/finally` calling the dispose
+method. With `ESNext` it emits the syntax verbatim.
+
+## Common mistakes
+
+- **Forgetting `await` on `await using`.** Without it, you've used the
+  sync `using` form and the `Symbol.dispose` lookup fails (only
+  `Symbol.asyncDispose` is defined on the object). TypeScript catches
+  this at the binding site.
+- **Returning a `using` binding from a function.** The dispose runs
+  *before* the return value escapes the function. Use
+  `DisposableStack.move()` to hand ownership over.
+- **Using `using` for things that don't have a clear end of life.**
+  Long-lived caches and connection pools shouldn't be `using` — they
+  should outlive any single scope.
+- **Throwing in `Symbol.dispose` and ignoring `SuppressedError`.** If
+  you write a `catch (e)`, branch on `e instanceof SuppressedError` to
+  surface both failures.
+- **Mixing sync and async disposables in a `DisposableStack`.** Use
+  `AsyncDisposableStack` if you need either; it accepts both.
+
+## When you don't need this
+
+For ad-hoc one-resource cleanup in a single function, a plain
+`try/finally` is still fine. `using` pays off when you have multiple
+resources, early returns, or shared cleanup logic — i.e. when the
+`finally` block was already getting messy.

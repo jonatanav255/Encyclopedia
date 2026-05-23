@@ -37,6 +37,13 @@ export const bank: QuestionBank = {
         '**Readiness** (`epoll`, `kqueue`, `select`/`poll`): the kernel tells you "this FD has data — come do the read yourself." You\'re still on the hook for a `read()` syscall per ready FD. This is what every event-loop server (nginx, Node, Redis, Envoy) is built on — one thread sitting in `epoll_wait`, woken whenever any of thousands of FDs becomes ready.\n\n**Completion** (`io_uring`, Windows `IOCP`): you say "do this I/O for me"; the kernel does it and tells you when the buffer is filled. No post-readiness syscall. Submissions and completions go through ring buffers — you can batch many ops without a syscall per op.\n\nWhy both exist: `epoll` doesn\'t help with **regular files** (they\'re always "ready" — the actual `read()` still blocks on disk). That\'s why Node\'s libuv uses a thread pool to fake async disk I/O. `io_uring` actually solves async disk I/O on Linux, plus reduces syscall overhead in the network hot path. At millions of ops/sec, dropping the per-op syscall is the difference between scaling and not.',
     },
 
+    {
+      level: 'mid',
+      question: 'Why is `Date.now()` the wrong choice for measuring how long an HTTP request took?',
+      answer:
+        '`Date.now()` reads the **wall clock** (`CLOCK_REALTIME` on Linux), which can be **stepped or slewed by NTP** at any moment. If the system clock is more than ~128 ms off, the NTP daemon steps it instantaneously — possibly backwards. Wake a laptop from suspend and the wall clock can jump by hours. So:\n\n```js\nconst start = Date.now();\nawait fetchThing();\nconst elapsed = Date.now() - start;\n// elapsed can be negative, zero, or wildly wrong.\n```\n\nThe right tool is the **monotonic clock**: `performance.now()` in the browser and Node, `process.hrtime.bigint()` for nanosecond precision, `clock_gettime(CLOCK_MONOTONIC, …)` at the syscall level. It only goes forwards, never jumps for NTP, and is meant for measuring *differences*.\n\nThe split that catches the most bugs: **wall clock for timestamps (stamping log lines, storing "created_at," scheduling against civil time); monotonic clock for durations (timeouts, retries, benchmarks, rate limiters)**. Most "we get sporadic 0 ms latencies" or "p99 jumped to 24 hours" bugs are wall-clock-for-duration in disguise.',
+    },
+
     // --- senior ---
     {
       level: 'senior',
@@ -49,6 +56,12 @@ export const bank: QuestionBank = {
       question: 'Explain the layered runtime stack when you type `docker run nginx`. What does each layer actually do?',
       answer:
         'Roughly:\n\n```\ndocker CLI -> docker daemon -> containerd -> runc -> kernel\n```\n\n- **CLI / API** (`docker`, `crictl`, `podman`): user-facing commands.\n- **High-level runtime** (`containerd`, `CRI-O`): image pulling, lifecycle, networking via CNI plugins, storage via overlayfs.\n- **Low-level runtime** (`runc`, `crun`, `youki`): the thin OCI shim. Reads `config.json`, calls `clone()` with all the namespace flags, sets up rootfs via `pivot_root`, configures cgroups, drops capabilities, applies seccomp, then `execve`s the entrypoint.\n- **Kernel**: namespaces, cgroups, seccomp, overlayfs, capabilities — the actual isolation primitives.\n\nKubernetes goes `kubelet -> CRI (containerd or CRI-O) -> runc -> kernel`. **There is no "container" kernel object** — just a process tree with constraints applied. `ps aux` on the host sees container processes as regular processes with weird namespace memberships. You can run runc directly with a hand-written `config.json` and skip Docker entirely; it\'s educational and proves there\'s no magic.',
+    },
+    {
+      level: 'senior',
+      question: 'A user reports that a meeting scheduled at "9 AM Pacific on March 8" fired at the wrong time. You stored the timestamp as a UTC ISO string. What\'s the failure mode?',
+      answer:
+        'Storing **as a pre-computed UTC instant** was the bug. "9 AM Pacific" looks like a single instant, but its UTC value depends on the timezone rules in effect on that date — and **DST transitions** flip the offset twice a year. If you compute the UTC equivalent today (when Pacific is UTC-8) and the meeting is on March 8 (after DST starts, when Pacific is UTC-7), your stored instant is one hour off.\n\nTwo other shapes of the same bug:\n\n- **The non-existent local time.** 2026-03-08 02:30 in US Eastern doesn\'t exist — clocks jump from 02:00 to 03:00. Naive parsing might silently round or throw.\n- **The doubly-existent local time.** 2026-11-01 01:30 in US Eastern occurs twice (once at UTC-4, once at UTC-5). "What time is it?" needs an offset disambiguator.\n\nThe rule: when the **wall-clock intent** matters more than the absolute instant — recurring meetings, "send report at 9 AM in user\'s zone," scheduled jobs in a named region — store the local datetime *plus* the IANA zone name (`{date: "2026-03-08T09:00", zone: "America/Los_Angeles"}`), and resolve to UTC at execution time. When the **absolute instant** matters more — "the order was created at this moment" — store UTC and forget local time.\n\nA bonus footgun: containers ship with stale `tzdata`. Pin and update the IANA timezone database like any other dependency, or rules change under you when a country alters their DST policy.',
     },
   ],
 };

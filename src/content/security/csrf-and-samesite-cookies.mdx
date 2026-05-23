@@ -1,0 +1,199 @@
+export const level = 'mid';
+
+# CSRF and SameSite cookies
+
+**Cross-Site Request Forgery (CSRF)** is the attack where a malicious
+site, opened in the victim's browser, causes the browser to send an
+authenticated request to your site. The victim's session cookie rides
+along automatically. Your server can't tell the difference between a
+legitimate request and one the user didn't intend to make.
+
+```html
+<!-- attacker.example -->
+<form action="https://bank.example/transfer" method="POST">
+  <input name="to" value="attacker" />
+  <input name="amount" value="1000" />
+</form>
+<script>document.forms[0].submit();</script>
+```
+
+If the victim is logged in to `bank.example` and visits
+`attacker.example`, the browser POSTs with their session cookie
+attached. The bank treats it as the user's intent.
+
+CSRF only works against state-changing requests authenticated by
+**ambient credentials** — cookies, HTTP Basic auth, or client TLS
+certificates that the browser sends automatically. Auth headers
+(`Authorization: Bearer ...`) aren't ambient; a cross-origin page
+can't read your token from `localStorage`, so token-auth APIs aren't
+classically CSRF-vulnerable. Cookies are.
+
+## SameSite is the modern primary defense
+
+`SameSite` is a cookie attribute that tells the browser when to
+attach the cookie cross-site. Three values:
+
+<Compare>
+<thead>
+<tr><th>Value</th><th>Sent on cross-site requests?</th><th>Use for</th></tr>
+</thead>
+<tbody>
+<tr><td>`Strict`</td><td>Never</td><td>Highest security; breaks top-level navigation from external links (user clicks Google result, lands on your site logged out)</td></tr>
+<tr><td>`Lax`</td><td>Only on top-level GET navigations (link clicks)</td><td>Modern default; blocks form POSTs, image tags, iframes, fetch</td></tr>
+<tr><td>`None`</td><td>Always (requires `Secure`)</td><td>Third-party widgets, cross-site embeds — opt in deliberately</td></tr>
+</tbody>
+</Compare>
+
+```http
+Set-Cookie: session=abc123; HttpOnly; Secure; SameSite=Lax; Path=/
+```
+
+All major browsers since 2020 default unset SameSite to `Lax`. That
+single change blocked most classical CSRF overnight — the form POST
+in the example above no longer carries the cookie.
+
+<Callout type="warn">
+**SameSite=Lax is not a complete CSRF defense.** Two gaps remain:
+
+1. **GET-based state changes.** If your endpoint changes state on GET
+   (`/logout`, `/delete?id=42`), Lax still sends the cookie because
+   the browser treats top-level navigation as user intent. Don't
+   mutate state on GET. Period.
+2. **Same-site, different-subdomain attacks.** SameSite considers
+   `evil.example.com` and `app.example.com` the same site (eTLD+1).
+   A compromised subdomain can still CSRF a sibling. Use distinct
+   sites for security boundaries, or layer in token-based defenses.
+</Callout>
+
+## Synchronizer token pattern
+
+The classical defense, still the right backup layer:
+
+1. Server generates a random token, stores it server-side bound to
+   the session.
+2. Server embeds the token in the form (or in a meta tag for SPAs).
+3. Browser submits form including the token.
+4. Server checks: token in request equals token bound to session.
+
+```html
+<form method="POST" action="/transfer">
+  <input type="hidden" name="csrf_token" value="<%= csrfToken %>" />
+  ...
+</form>
+```
+
+Properties: token is unguessable, scoped per session, single-use
+(rotate after submit) or per-form. Defeats CSRF because the attacker
+can't read the token (cross-origin same-origin policy stops them).
+
+The token has to be **bound to the session**, not just random. A
+floating token unrelated to who's signed in lets an attacker fetch
+their own token and use it against any victim.
+
+## Double-submit cookie
+
+A stateless variant: server sets a CSRF cookie with a random value,
+client JavaScript reads that cookie and copies the value into a
+request header (`X-CSRF-Token`). Server checks: cookie value equals
+header value.
+
+```js
+// client
+fetch('/api/transfer', {
+  method: 'POST',
+  credentials: 'include',
+  headers: {
+    'X-CSRF-Token': readCookie('csrf'),
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ to, amount }),
+});
+```
+
+Why it works: the attacker site can't read the victim's cookie
+(same-origin policy), so it can't construct a request where header
+matches cookie. The attacker can set their own cookies on the
+victim, but only on their own domain — not yours.
+
+Pitfalls:
+- Use `__Host-` prefix on the CSRF cookie so subdomain attacks can't
+  inject a matching cookie.
+- The cookie must not be `HttpOnly` (JS needs to read it). The
+  session cookie stays `HttpOnly`; the CSRF cookie is the readable
+  shadow.
+- Sign the cookie value (HMAC with a server secret + session id) so
+  an attacker who plants a cookie on a subdomain still can't forge a
+  valid token.
+
+## Custom-header defense (CORS preflight)
+
+For JSON APIs that only accept requests with a custom header
+(`X-Requested-With: XMLHttpRequest` or `Content-Type: application/json`
+on a request not in the CORS "simple" set), the browser forces a
+**preflight** OPTIONS request before the actual request. A cross-site
+form can't send custom headers, so the preflight never succeeds and
+the real request never fires.
+
+This is why modern JSON APIs without forms are largely immune to
+CSRF as long as:
+
+- The server **only accepts** `application/json` (rejects
+  `application/x-www-form-urlencoded` and `multipart/form-data`,
+  which don't trigger preflight).
+- CORS rules don't allow arbitrary origins for credentialed
+  requests.
+
+```js
+// reject simple-form content types
+if (req.headers['content-type'] !== 'application/json') {
+  return res.status(415).end();
+}
+```
+
+This is the cheapest CSRF defense and works well for SPA + JSON-API
+shapes. It does nothing for traditional HTML form apps.
+
+## Picking a defense
+
+<Steps>
+<Step n="1" title="Set SameSite=Lax (or Strict) on session cookies">
+Default for everything new. Strict only if you can tolerate the
+"click external link, land logged out" UX.
+</Step>
+<Step n="2" title="Never mutate state on GET">
+Idempotent GET is REST hygiene; it's also a CSRF requirement.
+</Step>
+<Step n="3" title="Add a second layer for sensitive actions">
+For money movement, password change, email change — synchronizer
+token or double-submit. Belt and suspenders.
+</Step>
+<Step n="4" title="Use __Host- prefixed cookies">
+`Set-Cookie: __Host-session=...; Secure; Path=/; SameSite=Lax`. The
+prefix is a server-enforced contract that the cookie was set with
+Secure, no Domain, and Path=/. Stops subdomain takeover from
+injecting cookies.
+</Step>
+</Steps>
+
+## What about CORS?
+
+CORS is not a CSRF defense. CORS controls what cross-origin
+JavaScript can **read**; the CSRF attacker doesn't need to read the
+response. The browser still sends the request — and the side
+effects on the server happen — even if CORS blocks the response from
+being read by the attacker's script.
+
+The relevant browser machinery for CSRF is SameSite + preflight, not
+CORS access-control headers.
+
+## Quick checklist
+
+<Cheatsheet>
+- Session cookies: `HttpOnly; Secure; SameSite=Lax; __Host-` prefix.
+- No state mutation on GET.
+- For state-changing JSON endpoints: require `Content-Type: application/json` (forces preflight).
+- For state-changing form endpoints: synchronizer token bound to session.
+- For SPAs needing stateless: double-submit with HMAC-signed CSRF cookie.
+- Subdomains are not a security boundary by default — treat them as untrusted.
+- Audit: a logged-out user, opening a malicious page, cannot make any state change to your app.
+</Cheatsheet>

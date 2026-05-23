@@ -40,7 +40,7 @@ export const bank: QuestionBank = {
       level: 'mid',
       question: 'Why use a connection pool, and what happens if you size it wrong?',
       answer:
-        'Each Postgres connection costs ~10MB RAM (it forks a process) and ~10-50ms to establish (TCP + TLS + auth). Without a pool, every request pays this cost.\n\nWrong sizes:\n\n- **Too small**: requests queue, latency spikes, eventually `connectionTimeoutMillis` errors.\n- **Too large**: Postgres hits `max_connections`, refuses new connections; the DB itself spends time context-switching between many backend processes.\n\nFor most Node services on a managed Postgres, `max: 10` per process is reasonable. Multiply by number of process replicas to know your total — keep it below Postgres\'s `max_connections` with headroom.',
+        'Each Postgres connection costs ~10MB RAM (it forks a process) and ~10-50ms to establish (TCP + TLS + auth). Without a pool, every request pays this cost.\n\nWrong sizes:\n\n- **Too small**: requests queue, latency spikes, eventually `connectionTimeoutMillis` errors.\n- **Too large**: Postgres hits `max_connections`, refuses new connections; the DB itself spends time context-switching between many backend processes.\n\nFor most Node services on a managed Postgres, `max: 10` per process is reasonable. Multiply by number of process replicas to know your total — keep it below Postgres\'s `max_connections` with headroom. Upstream Postgres defaults `max_connections` to 100; managed services (RDS, Cloud SQL) scale it with instance size, so check the actual value before sizing pools.',
     },
     {
       level: 'mid',
@@ -171,6 +171,13 @@ export const bank: QuestionBank = {
       question: 'When would you reach for a NoSQL database over Postgres?',
       answer:
         'Specific use cases, not "we need NoSQL because it scales." (1) **Document stores** (MongoDB, Firestore) when your data is genuinely document-shaped and the schema varies per record. (2) **Wide-column** (Cassandra, ScyllaDB) for write-heavy workloads at huge scale with simple queries — time-series, event logs. (3) **Key-value** (Redis, DynamoDB) for low-latency lookups on known keys. (4) **Graph** (Neo4j) for graph-traversal queries that would be N joins in SQL. For 90% of CRUD apps, Postgres with JSONB columns covers the "I need flexible schemas" case without giving up transactions, joins, and SQL.',
+    },
+
+    {
+      level: 'mid',
+      question: 'You see `EXPLAIN ANALYZE` showing estimated 10 rows but actual 10,000. What\'s likely wrong?',
+      answer:
+        'A 1000× row-count misestimate is the planner working from bad information. Three likely causes, roughly in order of frequency:\n\n1. **Stale statistics.** Bulk imports, large `UPDATE`s, and recent `TRUNCATE` + reload all leave the planner with the previous distribution. Run `ANALYZE table_name;`. Autovacuum schedules this automatically, but only when row-change thresholds are crossed.\n\n2. **Correlated columns.** Postgres assumes columns are independent and multiplies selectivities. `WHERE country = \'JP\' AND city = \'Tokyo\'` is correlated — almost every "Tokyo" row is in Japan — so the planner badly underestimates. Fix with extended statistics: `CREATE STATISTICS ON country, city FROM addresses; ANALYZE addresses;`. The planner then knows the joint distribution.\n\n3. **Coarse histograms on skewed columns.** The default `default_statistics_target = 100` samples 30k rows per column. For columns with heavy-tailed distributions, that misses the long tail. Bump per-column: `ALTER TABLE t ALTER COLUMN c SET STATISTICS 1000;`.\n\nWhy it matters: a wrong estimate at a low node propagates up. A nested loop the planner thinks will run 10 times actually runs 10,000 — what should be 50ms becomes 50 seconds. Always check `EXPLAIN ANALYZE` row estimates against actuals; the cost numbers themselves are meaningless without that comparison.',
     },
 
     // staff

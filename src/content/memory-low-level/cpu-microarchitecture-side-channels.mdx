@@ -1,0 +1,229 @@
+export const level = 'staff';
+
+# CPU microarchitecture side channels
+
+A side channel is an information leak that doesn't go
+through the documented interface. Microarchitectural side
+channels leak through state the CPU keeps for performance
+— caches, branch predictors, TLBs, store buffers — that
+the ISA pretends doesn't exist. The 2018 Spectre and
+Meltdown disclosures made this a defended-against, OS-level
+concern instead of an academic curiosity.
+
+## The shared mental model
+
+Modern CPUs are not the simple in-order machines the C
+abstract machine assumes. They:
+
+1. **Speculate** past conditional branches and indirect
+   calls, executing both sides of an `if` ahead of time.
+2. **Reorder** loads and stores aggressively, only
+   committing in program order.
+3. **Cache** addresses, predictions, and translations in
+   many small structures.
+
+When the CPU eventually decides a speculation was wrong, it
+rolls back the **architectural** state (registers, memory).
+What it does **not** roll back is the **microarchitectural**
+state: cache lines pulled in during the bad speculation
+stay warm. An attacker observes this residual state by
+timing subsequent accesses.
+
+The general recipe of a microarch attack:
+
+```
+1. Train a CPU predictor so it speculates the way you want.
+2. Trigger speculation in a victim context that touches secret-dependent
+   addresses ("Mem[secret * 4096]").
+3. The bad speculation is rolled back — but the cache line
+   it touched stays.
+4. Time access to the candidate lines. The fast one tells
+   you the secret.
+```
+
+The shared cache is the *channel*. The bad speculation is
+the *gadget*. The architecture's promise that "rolled-back
+work is invisible" is the broken assumption.
+
+## Cache side channels — the bedrock
+
+Even without speculation, caches leak. The CPU has finite
+cache; an attacker's accesses and a victim's accesses
+contend for the same sets.
+
+**FLUSH+RELOAD**: attacker shares memory with the victim
+(read-only mapping of a library), flushes a target line
+(`clflush`), waits, then times the reload. Fast = victim
+re-touched it; slow = victim ignored it. Leaks ~one bit per
+fixed line per measurement.
+
+**PRIME+PROBE**: attacker fills a cache set with their own
+data, waits, then times their own re-access. Slow lines
+were evicted — by the victim accessing the same set. Works
+across processes without shared memory.
+
+**EVICT+TIME**: time the victim itself. Slower runs hit
+DRAM; faster ran from cache. Leaks coarser signal but works
+across boxes when timing is exposed.
+
+These are the lego bricks the speculative attacks combine
+with a CPU predictor's misbehavior.
+
+## Spectre v1 — bounds-check bypass
+
+```c
+if (x < array1_size)              // ← branch
+    y = array2[array1[x] * 4096]; // speculative load
+```
+
+Train the predictor with many in-bounds `x`. Now feed an
+out-of-bounds `x`. The predictor still says "taken"; the
+CPU speculatively reads `array1[x]` (a secret byte at
+attacker-chosen offset), then reads `array2[secret * 4096]`.
+The eventual bounds check rolls back the registers — but
+not the cache. FLUSH+RELOAD over the 256 candidate cache
+lines reveals `secret`.
+
+**Mitigation**: language-level. Insert a speculation
+barrier between the bounds check and the dependent load
+(`__builtin_speculation_safe_value`, `_mm_lfence`, the
+Linux `array_index_nospec` macro). The kernel sprinkles
+these on syscall paths and the `BPF` interpreter. Compilers
+also emit "speculative load hardening" — predicating the
+load's address on the branch's outcome.
+
+## Spectre v2 — branch target injection
+
+Indirect branches (`call rax`, virtual method calls) use
+the **indirect branch predictor**, which doesn't tag
+predictions strongly by full address. An attacker process
+trains the predictor by repeatedly executing a `call` to a
+chosen gadget. The victim's *legitimate* indirect call then
+mispredicts to the attacker's gadget, executing it
+speculatively in the victim's privilege.
+
+**Mitigations**:
+
+- **IBRS / IBPB / STIBP** — microcode flags that flush or
+  isolate predictor state at privilege transitions and
+  context switches. Real cost on syscall-heavy workloads.
+- **Retpoline** — replace `call rax` with a sequence
+  that's "predictable to predict to a safe trap." On Skylake-
+  era Intel, the kernel and compiled binaries paid a
+  measurable hot-path tax for this. Later silicon does
+  branch-target isolation in hardware, allowing retpoline
+  to be turned off.
+
+## Meltdown — load-then-fault
+
+The original surprise: a load to a kernel address from
+user space *does* speculatively retrieve the byte before
+the privilege check fires. Within the speculation window,
+that byte feeds a cache-leak gadget. Reverses to direct
+kernel-memory read from user space — devastating.
+
+**Mitigation**: **KPTI** (Kernel Page Table Isolation).
+The kernel's pages are simply not mapped into the user
+process's page table — there's nothing to speculatively
+load. Cost: a CR3 write on every syscall and return
+(~50-200ns each). Visible in `vmstat` as elevated context-
+switch cost on syscall-heavy workloads (Postgres, Redis,
+busy database backends).
+
+Meltdown affected pre-Coffee-Lake Intel and IBM POWER. AMD
+and ARM (mostly) did the right thing originally; Apple
+Silicon was designed post-disclosure and doesn't need KPTI.
+
+## MDS, L1TF, Zombieload, RIDL, Fallout — buffer leaks
+
+A second family of attacks dropped in 2018-2019: data
+**transiently forwarded from microarchitectural buffers**
+(line-fill buffers, load ports, store buffers) into a
+speculative load. The attacker doesn't even need to
+mispredict their own path — the CPU forwards stale bytes
+from buffers belonging to *other* hyperthreads.
+
+**Mitigations**:
+
+- **`MD_CLEAR`** microcode: zero the buffers on every
+  privilege transition. Mandatory on affected Intel.
+- **Disable SMT** for security-critical workloads. Cloud
+  providers offer SMT-off VM shapes. Half your cores, no
+  cross-thread data leak.
+
+## Microarchitectural Data Sampling and HT
+
+The cleanest mitigation for many of these is "don't run
+mutually-distrusting code on the same physical core." That
+makes hyper-threading itself the problem on shared hosts.
+Public clouds responded with:
+
+- **Co-scheduling** — when one VM gets a core, both
+  hyperthreads go to the same tenant.
+- **SMT off** — half the throughput, no cross-thread
+  leakage.
+- **Confidential computing enclaves** (SGX, AMD SEV-SNP,
+  Intel TDX) — encrypted memory + attestation, so even a
+  rogue hypervisor can't read tenant memory.
+
+## What you do as an application developer
+
+Mostly: trust the OS to mitigate and the runtime to insert
+speculation barriers. Specific extras for sensitive code:
+
+- **Constant-time crypto**: no data-dependent branches, no
+  data-dependent array indices. Libraries like libsodium,
+  BoringSSL, Go's `crypto/subtle` exist for this.
+- **Avoid timing-sensitive primitives in user-input paths**:
+  `===` on a secret string short-circuits on the first
+  mismatch and leaks length via timing. Use a constant-time
+  comparator.
+- **`SharedArrayBuffer` + high-resolution timers** in
+  browsers were exactly the Spectre attacker's toolbox.
+  Browsers responded by reducing `performance.now()`
+  resolution and gating `SharedArrayBuffer` behind
+  cross-origin isolation. If you ask for COI, treat the
+  granted high-res timers with respect.
+- **Don't roll your own JIT** without speculation
+  hardening. V8, JSC, Wasmtime all have layers of
+  Spectre mitigation; a hobbyist JIT does not.
+
+## The throughput tax, in real numbers
+
+Order of magnitude on modern hardware with mitigations on:
+
+| Workload | Slowdown |
+|---|---|
+| Pure CPU-bound (no syscalls) | ~0% |
+| Web server, normal mix | 3-8% |
+| Postgres / Redis (syscall-heavy) | 5-15% |
+| Network packet routing | 10-30% |
+| Database scan with KPTI on old Intel | up to 20% |
+
+These are mitigations *currently* shipping. The numbers got
+better with each silicon generation as fixes moved into
+hardware (Cascade Lake → Ice Lake → Sapphire Rapids).
+
+## When the threat model says "don't bother"
+
+- **Single-tenant servers** running only your own code,
+  network-isolated. The attack surface is your own
+  binaries; speculation channels add little. Many cloud
+  workloads disable mitigations selectively for this case.
+- **Compute clusters** where users already have shell. The
+  side channel is the *least* of your worries.
+- **Air-gapped embedded systems**.
+
+Side-channel mitigations are paid for in throughput. Pay
+where the threat is real (multi-tenant cloud, browsers,
+shared hardware); skip where it isn't.
+
+## See also
+
+- *cpu-pipelining-and-branch-prediction* — the speculation
+  these attacks weaponize.
+- *cache-coherence-mesi* — why cache state leaks across
+  cores.
+- *tlb-and-huge-pages* — KPTI's cost is mostly TLB churn.
+- *processes-vs-threads* — why same-process leakage (within
+  a browser tab) was the original Spectre threat model.

@@ -1,0 +1,209 @@
+export const level = 'senior';
+
+# Inference-time reasoning and thinking budgets
+
+The 2024-2026 shift in frontier model behavior wasn't another step
+up in training scale — it was the discovery that you can **spend
+more compute at inference time** and get better answers without
+retraining anything.
+
+OpenAI's o-series, Anthropic's extended thinking on Claude, Google's
+Gemini Thinking, and DeepSeek-R1 all share the same shape: the model
+produces a long internal **reasoning trace** before its final
+answer, and the trace is paid for in tokens you can dial up or down
+at request time.
+
+## What "thinking" actually is
+
+There's no architectural mystery. A "reasoning model" is a model
+post-trained (typically with RL on verifiable problems — math,
+coding, logic) to do long chain-of-thought *before* committing to an
+answer. The output structure is:
+
+```
+<thinking>
+Let me work through this. The user asked …
+First I'll check whether …
+Hmm, that doesn't account for …
+Actually, the right approach is …
+</thinking>
+<answer>
+The result is 42, because …
+</answer>
+```
+
+The thinking block:
+
+- **Is generated token-by-token like any other text.** Same
+  transformer, same decoding loop.
+- **Counts as output tokens** for billing purposes (sometimes at a
+  separate "reasoning" rate).
+- **Is usually hidden from the user** — providers return a summary
+  or a count of reasoning tokens, not the raw trace, partly for UX
+  and partly for IP reasons.
+- **Is what you're paying for**, not the post-hoc answer.
+
+The empirical result: on benchmarks like AIME, MATH, GPQA, and
+competitive-programming tasks, accuracy scales roughly with the
+*log of reasoning tokens used*. More thinking → better answers, with
+diminishing returns past a model-specific point.
+
+## The budget knob
+
+Every reasoning-capable provider exposes a way to control how much
+thinking happens. The APIs vary; the concept is the same.
+
+<Cheatsheet caption="Reasoning controls across major providers (semantics vary, check current docs)">
+| Provider | Knob | Shape |
+|---|---|---|
+| OpenAI o-series / Responses API | `reasoning.effort` | `'low' / 'medium' / 'high'` — categorical |
+| Anthropic Claude (extended thinking) | `thinking.budget_tokens` | Integer cap on reasoning tokens |
+| Google Gemini Thinking | `thinkingConfig.thinkingBudget` | Integer cap |
+| DeepSeek-R1 (self-host) | Implicit — the model decides | Length governed by training |
+</Cheatsheet>
+
+The integer-budget shape is the more useful one from an engineering
+view: you can put a number on the cost of a request. The
+categorical shape is easier for product surfaces ("quick answer vs.
+deep analysis") but harder to budget against.
+
+## Where the budget actually helps
+
+Reasoning isn't a universal upgrade — it's **slow and expensive**.
+A reasoning model can emit 5,000-50,000 hidden tokens before the
+visible answer, costing 10-100× a non-reasoning call on the same
+prompt and adding seconds of latency.
+
+The tasks where it pays for itself:
+
+- **Math and formal logic.** Where step-by-step is the only way to
+  get correctness, the difference is dramatic — sometimes 30-60
+  percentage points on hard problems.
+- **Multi-step coding.** Refactors that touch many files, debugging
+  a non-trivial test failure, "explain this stack trace and fix the
+  root cause." The thinking trace catches the alternative
+  hypotheses a non-reasoning model would skip.
+- **Adversarial / careful tasks** — proofs of correctness, security
+  analysis, ambiguous-spec interpretation, "find what's wrong with
+  this argument."
+- **Tool-use planning.** A reasoning trace before the first tool
+  call cuts wrong-tool selection rates significantly. Worth the
+  budget on agentic loops where each tool call is expensive.
+
+Where reasoning is **wasted money**:
+
+- **Simple lookups, format conversions, classification.** A
+  non-reasoning model at `T=0` gets these right at 99%+.
+- **Creative tasks.** Thinking trace tends to push toward "safer"
+  outputs. Use a non-reasoning model with temperature for
+  brainstorming.
+- **Latency-sensitive flows.** Reasoning adds 2-15 s of TTFT in
+  practice. A user-facing chat UI doesn't feel right at 8 s before
+  any text appears.
+
+The decision: **route by query class**. A small classifier (or
+even a regex) sends easy queries to a fast non-reasoning model and
+escalates the hard 10-20% to a reasoning model with a budget. This
+"cheap router + expensive worker" pattern keeps p99 cost reasonable
+while preserving quality on the long tail.
+
+## Setting a sensible budget
+
+A starting heuristic for integer budgets:
+
+<Cheatsheet caption="Suggested starting budgets — tune on your eval">
+| Task shape | Budget | Why |
+|---|---|---|
+| Simple lookup / format / classify | 0 (use non-reasoning model) | Reasoning is overhead here |
+| Reading-comprehension Q&A from retrieved docs | 1k–2k tokens | Most of the lift comes early |
+| Code review / refactor across a few files | 4k–8k tokens | Needs to consider alternatives |
+| Math, debugging, planning | 8k–16k tokens | Where the curve still rewards length |
+| Open-ended research / long-form synthesis | 32k+ tokens | The bottom of the diminishing-returns curve |
+</Cheatsheet>
+
+Two things to watch:
+
+- **Diminishing returns are model-specific.** A reasoning model
+  trained on heavy budgets uses them well; one trained on shorter
+  budgets plateaus earlier. Run your own ablation on a held-out
+  eval — plot accuracy vs. budget at 1k, 4k, 16k, 64k. The elbow
+  is where you set the production budget.
+- **Budgets are caps, not targets.** The model decides when to stop
+  thinking; the budget is a hard limit. Most requests finish well
+  under the cap. So **measure mean reasoning tokens used, not just
+  the cap, when you forecast cost.**
+
+## Streaming and visibility
+
+Reasoning traces are usually hidden by default. The user-visible
+output starts after the thinking block ends, which means TTFT for
+the answer (not the thinking) can be 5-30 seconds.
+
+The UX patterns that work:
+
+- **Show a "thinking…" indicator with elapsed time.** Sets the
+  expectation. 10 s without feedback feels like a hang; 10 s with
+  "Thinking — 8s" feels intentional.
+- **Stream a summary of the reasoning if the provider exposes
+  one.** OpenAI's Responses API and Anthropic's extended thinking
+  both surface a sanitized summary. Better UX than "blank screen
+  for 15 s, then a wall of text."
+- **For agentic loops, log the reasoning trace internally.** Don't
+  show it to the user, but capture it in your traces — when an
+  agent picks the wrong tool, the reasoning is what tells you why.
+- **Set client-side timeouts that account for thinking.** Default
+  fetch timeouts (30 s in many libraries) are tight for a 16k-token
+  budget. Increase deliberately; don't just let the connection
+  hang.
+
+## Cost modeling with reasoning tokens
+
+Two changes to the basic cost formula:
+
+```
+# Without reasoning
+cost = (input_tokens × input_rate) + (output_tokens × output_rate)
+
+# With reasoning
+cost = (input_tokens × input_rate)
+     + (reasoning_tokens × reasoning_rate)
+     + (visible_output_tokens × output_rate)
+```
+
+In 2026, `reasoning_rate` is usually equal to `output_rate` (you
+pay output prices for the hidden thinking). Some providers
+discount it slightly; check current pricing.
+
+The cost trap: a casual `effort: 'high'` setting on a chat app can
+turn $0.01/call into $0.30/call without changing the visible
+output. **Track p50/p95/p99 of reasoning tokens used as a metric**
+and alert on drift, the same way you'd track input/output tokens.
+
+## Reasoning and tool use
+
+Modern reasoning models can interleave reasoning with tool calls —
+think, call a tool, see the result, think more, call another tool.
+This is more powerful than the older "decide on tool, call, return"
+pattern, and is what makes Deep Research-style agents work.
+
+The implications:
+
+- **Reasoning compounds across tool calls.** A 10-step agent with
+  3k tokens of reasoning per step is 30k+ tokens of thinking
+  alongside whatever the tool returns. Budget cumulatively.
+- **Cache aggressively.** Reasoning tokens are *not* cached by
+  prompt-cache mechanisms (they're freshly generated each call).
+  But the prompt prefix — system instructions, tool definitions,
+  retrieved docs — should be. The savings compound on long
+  agentic loops.
+- **Capped budgets per turn, not per session.** A per-session cap
+  causes the model to ration thinking in unpredictable ways; a
+  per-turn cap is easier to reason about and to bill for.
+
+<Callout type="info">
+The biggest lever isn't picking the highest budget your customer
+will pay for. It's **routing**: send the 80% of easy queries to a
+non-reasoning model and reserve the budget for the 20% that need
+it. That single change is usually worth more than fine-tuning the
+budget on the reasoning side.
+</Callout>

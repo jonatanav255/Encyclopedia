@@ -1,0 +1,166 @@
+export const level = 'senior';
+
+# String algorithms
+
+Generic substring search with `String.prototype.indexOf` runs in
+O(n·m) worst case. For long texts, repeated searches, or
+pattern-heavy workloads (log scanning, DNA, fuzzy match, code
+search) you want algorithms with better guarantees. This page
+covers the four that come up most: **KMP**, **Rabin-Karp**,
+**Z-algorithm**, and **Aho-Corasick**.
+
+## The naive baseline
+
+```js
+function naive(text, pat) {
+  for (let i = 0; i + pat.length <= text.length; i++) {
+    let j = 0;
+    while (j < pat.length && text[i + j] === pat[j]) j++;
+    if (j === pat.length) return i;
+  }
+  return -1;
+}
+```
+
+Worst case O((n - m + 1)·m). Pathological input: `text = "aaaa...aab"`,
+`pat = "aaab"`. Each starting position re-compares almost the entire
+pattern. Real-world strings rarely hit the worst case, which is
+why naive search wins benchmarks for short patterns.
+
+## KMP — Knuth-Morris-Pratt
+
+Builds a **failure function** (also called LPS — longest proper
+prefix that is also a suffix) from the pattern, then uses it to
+skip re-comparing characters that already matched. O(n + m).
+
+The failure function:
+
+```js
+function buildLPS(pat) {
+  const lps = new Array(pat.length).fill(0);
+  let len = 0;
+  for (let i = 1; i < pat.length; ) {
+    if (pat[i] === pat[len]) {
+      lps[i++] = ++len;
+    } else if (len > 0) {
+      len = lps[len - 1]; // back off
+    } else {
+      lps[i++] = 0;
+    }
+  }
+  return lps;
+}
+```
+
+For `pat = "ababaca"`, `lps = [0,0,1,2,3,0,1]`. After a mismatch at
+position `i`, jump the pattern pointer back to `lps[i-1]` instead
+of zero — the prefix already matched, no need to re-check it.
+
+Use when: you search the **same pattern** repeatedly in different
+texts, or you need a worst-case linear bound. The LPS table is
+the reusable part.
+
+## Rabin-Karp — rolling hash
+
+Hash the pattern once. Roll a window of the same length across
+the text and compare hashes. On hash match, verify character by
+character. Expected O(n + m); worst case O(n·m) with bad hash
+collisions.
+
+```js
+function rabinKarp(text, pat) {
+  const B = 257n, MOD = (1n << 61n) - 1n; // a Mersenne prime
+  let patHash = 0n, winHash = 0n, pow = 1n;
+  for (let i = 0; i < pat.length; i++) {
+    patHash = (patHash * B + BigInt(pat.charCodeAt(i))) % MOD;
+    winHash = (winHash * B + BigInt(text.charCodeAt(i))) % MOD;
+    if (i < pat.length - 1) pow = (pow * B) % MOD;
+  }
+  for (let i = 0; i + pat.length <= text.length; i++) {
+    if (winHash === patHash && text.slice(i, i + pat.length) === pat) {
+      return i;
+    }
+    if (i + pat.length < text.length) {
+      const out = BigInt(text.charCodeAt(i));
+      const inn = BigInt(text.charCodeAt(i + pat.length));
+      winHash = ((winHash + MOD - (out * pow) % MOD) * B + inn) % MOD;
+    }
+  }
+  return -1;
+}
+```
+
+The win: searching for **many patterns** of the same length is
+trivial — hash each, store in a set, hit-test the rolling hash
+against the set. That's the standard plagiarism / dedup trick
+(used by `rsync`'s rolling checksum).
+
+Pick a good hash. Single-modulus polynomial hashes get attacked
+in CTFs all the time; production code uses double hashing or
+a 2^61-1 Mersenne field.
+
+## Z-algorithm
+
+Computes the **Z-array**: `z[i]` = length of the longest
+substring starting at `i` that matches a prefix of the string.
+O(n).
+
+Used for:
+
+- Pattern matching: build `Z` of `pat + "$" + text`. Any `z[i] ==
+  pat.length` after the separator is a match position.
+- Periodicity detection: smallest period of a string is
+  `n - z[n-1]` if it divides `n`.
+- Counting distinct substrings (combined with suffix arrays).
+
+Conceptually simpler than KMP — one array, no failure-function
+back-off logic. KMP and Z are interchangeable for substring
+search; Z wins when you need prefix-of-self information.
+
+## Aho-Corasick — multi-pattern search
+
+KMP on a trie. Build a trie of all patterns, add **failure links**
+(generalized LPS) connecting each node to the longest proper
+suffix that is also a prefix of any pattern. Scan the text once,
+following goto edges and failure links; collect matches at each
+accept state.
+
+Time: O(N + M + Z) where N = text, M = total pattern length, Z =
+match count. The classic use case: `fgrep -f patterns.txt
+huge.log` — scan once, report every match of any pattern.
+
+Production users:
+
+- **`grep -F` / `fgrep`** when multiple `-e` patterns are given.
+- **Snort** / **Suricata** IDS rule matching.
+- **YARA** malware-signature scanning.
+- Anti-spam / content filters with thousands of forbidden phrases.
+
+If you ever find yourself running N separate `String.includes`
+calls in a hot loop, you want Aho-Corasick.
+
+## Suffix arrays and suffix automata
+
+For arbitrary substring queries on a fixed text — search engines,
+genome analysis, code-search backends — preprocess the text into
+a **suffix array** (sorted list of all suffix indices, O(n log n)
+to build, then O(m log n) queries) or a **suffix automaton**
+(linear-size automaton recognizing all substrings, O(n) build).
+See **Suffix arrays and suffix trees** in the data-structures
+topic.
+
+## Picking one
+
+| Need | Algorithm |
+| --- | --- |
+| One short pattern, one search | Naive / `indexOf` |
+| Worst-case linear, single pattern | KMP or Z |
+| Many patterns of same length | Rabin-Karp + hash set |
+| Many patterns of varying length | Aho-Corasick |
+| Arbitrary substring queries on fixed text | Suffix array / automaton |
+| Fuzzy / approximate match | Edit distance DP, BK-tree |
+
+For most application code: `indexOf` is fine, and the JS engine's
+built-in is heavily optimized. Reach for these algorithms when
+you've measured a real bottleneck or when the problem genuinely
+demands multi-pattern search.

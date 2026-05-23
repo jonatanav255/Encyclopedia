@@ -1,0 +1,251 @@
+export const level = 'senior';
+
+# Log sampling and tail sampling
+
+Once a service does more than a few thousand requests per second,
+logging every event becomes the dominant cost in your observability
+budget — often more than compute. Sampling is how you keep value
+without paying for every byte.
+
+The hard part isn't "drop some logs"; it's dropping the right ones
+so the data you keep is still useful during an investigation. This
+page is about doing that for **logs** and **traces** specifically;
+metrics aren't sampled because they're already aggregations.
+
+## What sampling tries to preserve
+
+Three desirable properties, partially in tension:
+
+1. **Trend accuracy.** Aggregates computed from the sample
+   approximate the true aggregates. "Error rate is 0.4%" should be
+   true whether you keep 1% or 100% of logs.
+2. **Outlier preservation.** The interesting events — errors,
+   anomalies, slow requests — are exactly the ones you want during
+   an incident. They're also rare, so naive uniform sampling
+   throws most of them away.
+3. **Trace completeness.** When a trace is kept, all spans of that
+   trace should be kept; when a request's log line is kept, the
+   surrounding log lines for the same request should be kept too.
+   Half a story is worse than no story.
+
+Good sampling buys (1) and (2) cheaply; (3) requires more careful
+machinery.
+
+## Three families of sampling
+
+<Compare>
+<thead>
+<tr><th>Family</th><th>When decision is made</th><th>Cost</th><th>Outlier-aware?</th></tr>
+</thead>
+<tbody>
+<tr><td>Head-based</td><td>At trace/request start</td><td>Free</td><td>No (outcome unknown)</td></tr>
+<tr><td>Tail-based</td><td>After completion, in a buffering Collector</td><td>Buffer memory + processing</td><td>Yes — sample by status/duration/attrs</td></tr>
+<tr><td>Dynamic / adaptive</td><td>Per stream, adjusts rate over time</td><td>Stateful coordinator</td><td>Partial — by stream, not per event</td></tr>
+</tbody>
+</Compare>
+
+Production stacks combine all three. A typical shape: head-sample at
+10% as the baseline floor, override to 100% via tail sampling on
+errors and slow traces, plus a dynamic limiter that drops the rate
+further when total volume exceeds budget.
+
+## Head-based sampling in practice
+
+The decision is made at the **start** of the trace and encoded in
+the trace flags so every downstream service makes the same call:
+
+```js
+import { ParentBasedSampler, TraceIdRatioBasedSampler } from
+  '@opentelemetry/sdk-trace-base';
+
+const sampler = new ParentBasedSampler({
+  root: new TraceIdRatioBasedSampler(0.1),  // 10% baseline
+});
+```
+
+`ParentBased` is the key choice for distributed correctness: if a
+trace is already started upstream with the "sampled" flag,
+downstream services honor it. Without parent-based, each service
+re-decides and traces fracture.
+
+Common strategies layered on top:
+
+- **Always-on for important users.** Edge service decides at trace
+  start: enterprise tier? force-sample.
+- **Per-operation budget.** Guarantee at least K traces per
+  operation per window, even if K traces would exceed the global
+  rate. Catches low-volume endpoints that uniform sampling misses.
+- **Rate limiter.** Cap total traces/sec to bound cost even if
+  ratio implies more.
+
+Head-based gets you cheap, distributed-consistent sampling. It can
+never give you "keep all errors" because the error hasn't happened
+yet at decision time.
+
+## Tail-based sampling: the OTel Collector pattern
+
+Tail sampling buffers all spans of a trace until the trace is
+complete (or `decision_wait` elapses), then runs policies over the
+complete trace to decide whether to keep it.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 60s
+    num_traces: 50000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: rare-endpoint
+        type: string_attribute
+        string_attribute:
+          key: http.route
+          values: [/admin/.*]
+      - name: baseline
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+```
+
+The policy structure is "OR" — a trace matching any policy is kept.
+This gives you 100% of errors, 100% of slow requests, 100% of
+specific routes, plus a baseline 5% for everything else.
+
+<Callout type="warn">
+**`decision_wait` is the most common misconfiguration.** It must
+exceed your longest expected trace duration, or you'll sample on
+incomplete traces — under-sampling exactly the slow requests you
+want to keep. For systems with long-tail dependencies, 60–120s is
+typical. Memory cost scales with `decision_wait × throughput`; budget
+accordingly.
+</Callout>
+
+The Collector also needs all spans of a trace to land in the **same
+instance** for the policy to see the whole picture. Sharded
+Collectors must use consistent hashing on `trace_id` (the
+`load_balancing` exporter in front of a Collector pool).
+
+## Log sampling: the per-request decision
+
+For logs, the decision usually piggybacks on the trace sampling
+decision. The pattern:
+
+- If the trace is sampled (head or tail), keep all logs for that
+  trace.
+- If not sampled and log level ≥ WARN, keep anyway.
+- If not sampled and log level < WARN, drop (or aggregate to a
+  counter metric).
+
+```js
+// pseudocode
+function shouldLog(entry, span) {
+  if (entry.level >= 'warn') return true;
+  if (span?.isRecording()) return true;          // trace is sampled
+  if (entry.endpoint === '/admin') return true;   // always log this
+  return Math.random() < BASELINE_LOG_RATE;       // 1-5% baseline
+}
+```
+
+Properties:
+
+- Coverage of errors is 100%.
+- Coverage of important endpoints is configurable.
+- Sampled-trace coverage is full — you can reconstruct what
+  happened on those requests.
+- Volume drops 95–99% vs unsampled.
+
+The catch: aggregations computed from logs are now skewed.
+**Replace counting-by-grepping-logs with metrics.** A counter
+`http_requests_total{endpoint,status}` is exact; counting log entries
+is sampled and wrong. Use logs for forensics, metrics for rates.
+
+## Dynamic sampling
+
+Useful when traffic varies wildly. Examples: Honeycomb's dynamic
+sampling sets per-key sample rates based on observed rate of that
+key — high-volume routes get sampled hard, rare routes are kept in
+full.
+
+```
+sample_rate(key) = base_rate * sqrt(events_per_minute(key))
+```
+
+The square-root term means the sample rate scales sub-linearly with
+volume: a 10× more frequent key gets ~3.2× sampled, not 10×. Rare
+keys stay nearly full; common keys thin out. Aggregated reweighted,
+the total event rate stays close to budget and rare endpoints stay
+observable.
+
+Implementation needs a coordinator that tracks per-key rates over a
+window and broadcasts updated sample rates. Honeycomb's
+`dynsampler-go` library is the reference implementation.
+
+## Reweighting
+
+When you sample, downstream aggregations need to know the sample
+rate to reconstruct correct totals. The convention: every sampled
+event carries its rate as an attribute.
+
+```json
+{
+  "trace_id": "...",
+  "service": "checkout",
+  "duration_ms": 220,
+  "sample_rate": 10
+}
+```
+
+A query for "errors per minute" then sums `1 / sample_rate` per
+event, not just counts events. A 10×-sampled event represents 10
+real ones; weight accordingly. Tools that don't natively support
+reweighting (basic log indexers) will under-count sampled data —
+this is the trap to watch for.
+
+## What to sample, what not to
+
+Always sample (drop most):
+
+- DEBUG / TRACE level logs.
+- Successful health-check pings.
+- Successful cache lookups.
+- Normal request entry logs (use metric counter instead).
+
+Never sample (keep all):
+
+- ERROR / FATAL logs.
+- Audit / compliance events.
+- Security-relevant events (auth failures, privilege escalations).
+- Anything you'd be subpoenaed for.
+
+The sampling policy should treat the latter as immutable.
+
+## Sampling and SLOs
+
+A subtle problem: if you sample at 10% and your SLO is 99.9%, you
+might not have enough sampled errors to compute the SLO accurately.
+At 99.9%, errors are 0.1% of requests — 10×-sampling them halves
+that to 0.05% measurable, with high variance.
+
+Two fixes:
+
+- **Don't sample for SLO computation.** Compute SLO from
+  unsampled metrics (`http_requests_total{status}`), not from logs.
+- **Sample errors at 100%.** As above — never sample errors. SLO
+  computation from sampled-by-status logs is then accurate.
+
+## Quick checklist
+
+<Cheatsheet>
+- Head-sample at 10–20% as the baseline floor (ParentBased + TraceIdRatio).
+- Tail-sample at the Collector: 100% of errors, 100% of slow (above p95), plus baseline percentage. `decision_wait` ≥ longest trace duration.
+- Log sampling piggybacks on trace decision; always keep WARN+.
+- Carry `sample_rate` on every sampled event; reweight in aggregations.
+- Use metrics — not log counts — for rates and SLO computation.
+- Dynamic sampling (Honeycomb-style) when traffic shape varies wildly across keys.
+- Never sample errors, audit events, or security events.
+- Verify: pick 5 recent customer issues, find each in the sampled data. If half are missing, sample more.
+</Cheatsheet>

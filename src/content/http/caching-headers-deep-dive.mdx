@@ -1,0 +1,292 @@
+export const level = 'mid';
+
+# HTTP caching headers — deep dive
+
+HTTP caching is the highest-leverage performance feature
+ever shipped, and almost every backend gets it wrong. The
+default behavior is "cache nothing or cache too much"; the
+right behavior is "cache aggressively at the edge, validate
+cheaply, invalidate predictably." The whole machinery lives
+in five response headers and one request header. Once you
+know which header does what, the rest is policy.
+
+## The two questions every cache asks
+
+For each response, an HTTP cache (browser, CDN, proxy)
+decides:
+
+1. **Is it fresh?** If yes → serve from cache without
+   touching the origin.
+2. **If stale, can I validate cheaply?** If yes → ask the
+   origin "is this still good?" Origin replies `304 Not
+   Modified` (no body) or `200 OK` (new body).
+
+Freshness is set by **`Cache-Control: max-age=N`** (or the
+older `Expires`). Validation uses **`ETag`** /
+**`If-None-Match`** and **`Last-Modified`** /
+**`If-Modified-Since`**.
+
+That's the whole game. The headers below are how you tune
+it.
+
+## `Cache-Control` — the one that matters
+
+`Cache-Control` lives on responses (mostly) and requests
+(rarely). The response directives:
+
+| Directive | Effect |
+|---|---|
+| **`max-age=N`** | Fresh for N seconds. |
+| **`s-maxage=N`** | Like `max-age` but only shared caches (CDNs/proxies) obey. |
+| **`public`** | Any cache may store. |
+| **`private`** | Only the end-user's browser may store. CDNs and corporate proxies must not. |
+| **`no-cache`** | May store, but **must revalidate** before serving. (Counter-intuitively, this does NOT mean "no caching".) |
+| **`no-store`** | Don't store at all. |
+| **`must-revalidate`** | If stale, can't serve without revalidating. |
+| **`stale-while-revalidate=N`** | Serve stale for up to N more seconds, while a background revalidation runs. |
+| **`stale-if-error=N`** | Serve stale for N seconds if the origin returns 5xx. |
+| **`immutable`** | The content will *never* change. Browsers won't even revalidate on reload. |
+
+The directives compose. A typical "great" header for a
+fingerprinted JS asset:
+
+```
+Cache-Control: public, max-age=31536000, immutable
+```
+
+"Cache for a year, in any cache, and don't bother
+revalidating — the file name will change before the
+content does."
+
+For an API JSON response that you want CDN-cached for a
+minute with quick recovery from errors:
+
+```
+Cache-Control: public, max-age=60, stale-while-revalidate=600,
+               stale-if-error=86400
+```
+
+Reads: "Fresh for 60s. For the next 10 minutes after that,
+serve stale immediately while refreshing in the background.
+If the origin is down, serve stale for up to 24h."
+
+## `Expires` — the old way
+
+`Expires: Thu, 22 May 2026 12:00:00 GMT` is the
+HTTP/1.0-era absolute-time version of `max-age`. If both
+are present, `Cache-Control` wins. Only set `Expires` for
+very old clients; modern stacks should use
+`Cache-Control`.
+
+## ETag and Last-Modified — the validators
+
+When a response is stale, the cache revalidates by re-asking
+the origin **with** the response's validators:
+
+- **`ETag: "abc123"`** is a server-chosen opaque token
+  identifying the response's content. Client sends back
+  `If-None-Match: "abc123"`; origin returns `304` if the
+  token still matches.
+- **`Last-Modified: ...`** is a timestamp. Client sends
+  `If-Modified-Since: ...`; origin returns `304` if the
+  resource hasn't changed since.
+
+ETag is preferred — finer-grained, tolerant of clock skew.
+Set it to a content hash or a versioned identifier. Strong
+ETag vs weak (`W/"abc"`) ETag: weak means "semantically
+equivalent but may have byte-level differences" (gzip
+re-compression, e.g.). Most servers emit strong ETags by
+default.
+
+A revalidation costs **one round trip** but **no body**.
+That's the magic: a stale-but-validatable cache is
+near-free.
+
+## Vary — partitioning the cache
+
+A cache keys by URL by default. If your response depends on
+a *request* header — `Accept-Encoding` (gzip vs br),
+`Accept-Language`, `Authorization` — then the cache must
+key by URL+header. Express that with `Vary`:
+
+```
+Vary: Accept-Encoding, Accept-Language
+```
+
+The CDN now stores separate copies per
+(URL, Accept-Encoding, Accept-Language) tuple.
+
+**Common bug**: dynamic responses that omit `Vary` and get
+served to the wrong client. The German page reaches the
+French user; the `gzip` response reaches the
+`Accept-Encoding: br` client and breaks the browser.
+
+**Common bug 2**: over-varying. `Vary: User-Agent` shatters
+the cache into millions of entries (one per UA string).
+Never `Vary: User-Agent` — find a coarser signal.
+
+## Public vs private — the CDN/browser split
+
+Two caches in the chain:
+
+```
+client browser cache  ──  CDN/proxy shared cache  ──  origin
+       (private)              (shared, public)
+```
+
+- **`public`** says any cache may store. Use for assets
+  and shared resources.
+- **`private`** keeps the response in the user's browser
+  but forbids the CDN from storing it. Use for
+  personalized responses (`Hello, ${user.name}`).
+- **No directive + a `Set-Cookie`** → shared caches refuse
+  to store by default. Many CDNs strip `Set-Cookie`s and
+  cache anyway only if you opt in.
+
+**Common bug**: serving `Cache-Control: max-age=3600` on a
+response that varies per logged-in user, no `private` set,
+and the CDN cheerfully caches one user's response for an
+hour, serving it to everyone else who hits the same URL.
+This is **the** most common authentication catastrophe.
+
+Rule of thumb: any response based on the request's
+`Authorization` or `Cookie` header is `private` (or
+`no-store` if truly sensitive).
+
+## no-cache, no-store, and the confusion
+
+Three directives that sound similar and aren't:
+
+- **`no-store`** — don't write to cache. Use for sensitive
+  data the user shouldn't have on disk.
+- **`no-cache`** — write to cache, but always revalidate
+  before serving. The cache *is* used; it's just not
+  trusted without an origin check. Counter-intuitive
+  naming.
+- **`must-revalidate`** — like `no-cache` but only when
+  the entry is stale. Same as no `must-revalidate` for
+  fresh entries.
+
+For "never cache, ever":
+
+```
+Cache-Control: no-store
+```
+
+Just that. Forget the cargo-culted `no-cache, no-store,
+must-revalidate, max-age=0` — `no-store` does everything
+needed.
+
+## Cacheability by method and status
+
+By default:
+
+| Method | Cacheable? |
+|---|---|
+| GET, HEAD | Yes |
+| POST | Only if explicit `Cache-Control` and an explicit `Content-Location` |
+| PUT, DELETE, PATCH | No |
+
+| Status | Cacheable? |
+|---|---|
+| 200, 203, 204, 206 | Yes |
+| 300, 301, 308 | Yes (long-lived) |
+| 302, 307, 404, 405, 410, 414, 501 | Yes if explicitly set |
+| 4xx, 5xx generally | No |
+
+Setting `Cache-Control: max-age=N` on a 404 prevents the
+"every page request thunders a 404 to origin" problem when
+a broken link gets shared.
+
+## The mental model: cache layers, not one cache
+
+A request typically traverses 3-4 caches:
+
+```
+client → browser cache → CDN edge → origin shield → origin
+```
+
+Each makes its own freshness decision. `s-maxage` lets you
+say "CDN, hold this for 5 minutes; browser, you can keep
+it for 30 seconds":
+
+```
+Cache-Control: max-age=30, s-maxage=300, public
+```
+
+Browsers obey `max-age=30`. CDNs obey `s-maxage=300`. The
+browser revalidates 10× more often than the CDN, but each
+of those revalidations is a `304` at the CDN — no origin
+load.
+
+## Cache purging — the missing API
+
+HTTP itself doesn't define an "invalidate cache" endpoint.
+CDN purging is a vendor-specific operation: Cloudflare's
+`POST /zones/.../purge_cache`, Fastly's `PURGE` method,
+AWS CloudFront's invalidations API. All are eventually
+consistent — expect seconds to minutes.
+
+The robust pattern for "I just published a new article":
+
+1. **Fingerprint static assets** (`app.a3f2.js`) so they
+   change URLs and don't need purging.
+2. **Short TTL on HTML** (60s) so stale content disappears
+   on its own.
+3. **Issue an explicit purge** via CDN API for known-stale
+   paths.
+4. **Stale-while-revalidate** to absorb traffic on
+   purge-induced cache misses.
+
+## The minimal correct setup
+
+A reasonable default policy for a server:
+
+```
+Static assets (fingerprinted):
+  Cache-Control: public, max-age=31536000, immutable
+
+HTML pages:
+  Cache-Control: public, max-age=0, s-maxage=60,
+                 stale-while-revalidate=600
+  ETag: "..."
+
+API responses (cacheable):
+  Cache-Control: public, max-age=10,
+                 stale-while-revalidate=60
+  ETag: "..."
+
+API responses (per-user):
+  Cache-Control: private, no-store
+
+Auth-bearing or sensitive:
+  Cache-Control: no-store
+```
+
+This combination gives you near-zero origin load for assets,
+a fast CDN tier for HTML, sub-minute API response caching,
+and correct behavior for personalized and sensitive
+responses.
+
+## Debugging
+
+- **`curl -I url`** — see the response headers.
+- **Response headers** — `X-Cache: HIT|MISS` (most CDNs),
+  `Age: <seconds>` (RFC standard, how long this entry has
+  been in cache), `Cache-Status: <chain>` (newer RFC 9211
+  format showing the full chain).
+- **Browser devtools → Network → Disable cache** during
+  development; check `from disk cache` / `from
+  memory cache` markers.
+- **`curl -H 'If-None-Match: "abc"'`** to manually test
+  revalidation.
+
+## See also
+
+- *content-negotiation* — `Vary` is what makes
+  negotiation cacheable.
+- *range-requests* — cache behavior with partial-content
+  responses (206) has its own rules.
+- *versions* (HTTP versions) — H2/H3 cache behavior is
+  mostly identical to H1, but server push interacted with
+  it strangely (push is now removed).

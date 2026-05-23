@@ -1,0 +1,195 @@
+export const level = 'senior';
+
+# Pointer tagging and pointer compression
+
+Pointers on a 64-bit machine are wasteful. The hardware
+exposes 64 bits, but real virtual address spaces are
+48 bits (x86-64) or 52 bits (newer Arm). That leaves
+**12-16 high bits** doing nothing — runtimes and language
+implementations have spent decades stealing them. Pointer
+*tagging* packs metadata into the unused bits.
+Pointer *compression* goes further: store only the offset
+within a known heap region, halving the size of every
+reference.
+
+## What "unused bits" actually means
+
+On x86-64, virtual addresses are **canonical**: bits 48-63
+must equal bit 47 (sign-extended). The CPU faults on any
+non-canonical access. So a 64-bit pointer carries 17
+redundant high bits (the sign extension) plus typically
+2-3 low bits that are zero because allocators align to
+8 or 16 bytes.
+
+```
+  63          47                       3 2 1 0
+  S S S S ... S [-------- 48 bits -------] 0 0 0
+  └─ sign-extend ─┘                       └ alignment
+```
+
+That's ~17 high bits + 3 low bits free per pointer. You can
+encode flags, types, ref-counts, generation numbers — *if*
+you're disciplined about masking them off before
+dereferencing.
+
+## Low-bit tagging — the language-implementer's hack
+
+SBCL, OCaml, V8, every modern Lisp: the low bits encode the
+type tag. With 3 bits free (8-byte alignment):
+
+```
+... xxx 000   → heap pointer
+... xxx 001   → small integer ("fixnum"), shift right to get value
+... xxx 010   → string (heap pointer, but a different kind)
+... xxx 011   → cons cell
+```
+
+This is why fixnums in dynamic languages are 1 bit narrower
+than the machine word: V8's SMI is a 31-bit int on 32-bit
+builds, a 32-bit int on 64-bit builds (with extra bits
+elsewhere). Arithmetic on tagged fixnums is one extra shift
+per op — cheap. **Dispatch on type** becomes "AND with the
+tag mask, compare." No vtable, no object header.
+
+## High-bit tagging — the GC trick
+
+JavaScriptCore (Safari) and HotSpot use **NaN-boxing**: every
+JS value is stored as a 64-bit double, and the IEEE-754
+NaN encodings (51 bits of payload) carry non-double values
+as tagged "boxes":
+
+```
+0x7FF8 0000 0000 0000 ... 0x7FFF FFFF FFFF FFFF
+        ^ NaN range — 51 bits of payload to encode
+          pointers, booleans, undefined, integer, string
+```
+
+A 47-bit pointer fits comfortably in the NaN payload. Every
+JS value is one 64-bit register. No "is it a double or an
+object" branch on the hot path — you check the high bits.
+
+The downside: every pointer load has to mask. Modern CPUs
+hide this well, but it's not free.
+
+## ARM's Top-Byte Ignore (TBI) — hardware help
+
+ARMv8 made the trick official: **the top 8 bits of an
+address are ignored by load/store instructions** (Top-Byte
+Ignore, on by default in user mode). You can stash an
+arbitrary byte in bits 56-63 of any pointer; the hardware
+strips it before the MMU sees it.
+
+Used by:
+
+- **HWASAN** (hardware-assisted AddressSanitizer): each
+  allocation gets a random tag byte; loads/stores check
+  that the pointer's tag matches the shadow memory's tag.
+  Catches use-after-free with ~2x slowdown vs ASAN's
+  ~10x.
+- **MTE** (Memory Tagging Extension, ARMv8.5+): the
+  hardware *checks* the tag and faults on mismatch.
+  Spectre-grade memory safety with single-digit overhead.
+  Pixel 8 and later ship it; Linux kernel uses it for
+  KASAN.
+
+x86 has nothing equivalent in mainline silicon. Intel's
+LAM (Linear Address Masking) shipped in Sapphire Rapids
+(2023) and AMD's UAI (Upper Address Ignore) shipped in
+Zen 4 — both finally give x86 a TBI-style high-byte
+ignore. Software is just starting to use them.
+
+## Pointer compression — V8 and the JVM
+
+If your heap fits in 4 GiB, every pointer can be a **32-bit
+offset** from a known base. V8 (since Chrome 80, 2020) and
+HotSpot's "compressed oops" (since 6u23, 2010) both do this:
+
+```
+real_pointer = heap_base + (uint64_t)compressed_offset
+```
+
+Halves the size of every reference in the heap. Cache
+behavior improves dramatically — twice as many object
+pointers per cache line.
+
+V8's design:
+
+- **4 GiB cage** per isolate. All heap objects live within
+  this cage; all references between them are 32-bit
+  offsets. The cage's base is randomized at startup.
+- **External pointers** (to non-heap objects, e.g. C++
+  data backing TypedArrays) live outside the cage and
+  used to be raw 64-bit pointers. Spectre made those a
+  liability — a compromised renderer could craft any
+  64-bit address. V8 added the **External Pointer
+  Table**: a per-isolate table of real pointers, indexed
+  by 32-bit handles. The heap never sees a raw 64-bit
+  pointer, only handles.
+- **Sandboxed pointers**: a longer-term V8 effort to put
+  *all* pointers (heap, code, externals) behind tables,
+  so memory-corruption bugs in the renderer can never
+  forge an arbitrary pointer.
+
+HotSpot's "compressed oops":
+
+- Default if max heap < 32 GiB. Above that, `UseCompressedOops`
+  is turned off automatically and pointers go back to 64 bits.
+- The shift trick: align objects to 8 bytes, store the
+  offset >> 3 in 32 bits, decode as `(offset << 3) + base`.
+  Buys 32 GiB of heap from a 32-bit field. (Sub-shifted
+  variant: `UseCompressedClassPointers` for class metadata
+  in `Metaspace`.)
+
+When you bump your JVM heap from 31 to 33 GiB and your app
+suddenly uses 30% more RAM, this is why — pointers just
+doubled in size.
+
+## Cost: dereference penalty
+
+Pointer compression isn't free. Every reference load now
+does:
+
+```
+real = base + (uint32_t)slot
+```
+
+One extra add. The CPU hides it via address-generation
+units, but in tight pointer-chasing loops (linked lists,
+trees) it's measurable.
+
+The cache-line win usually dominates. A B-tree with 16-byte
+keys and compressed 32-bit child pointers fits twice the
+fanout per cache line vs 64-bit pointers. That's a real win
+on memory-bound workloads. Pointer compression is a bet that
+cache misses cost more than an extra ADD instruction —
+and on modern CPUs, that bet pays.
+
+## Cheat sheet
+
+| Technique | Free bits used | Where you see it |
+|---|---|---|
+| **Low-bit tagging** | 2-3 alignment bits | Lisps, OCaml, V8 SMI |
+| **High-bit (NaN) boxing** | 51 NaN-payload bits | JSC, LuaJIT, Dart |
+| **TBI / LAM / UAI** | High byte ignored by HW | HWASAN, MTE, future x86 ASAN |
+| **Pointer compression** | Use 32-bit offset within a cage | V8, HotSpot, .NET |
+| **Tagged offsets** | Tag *inside* the offset | Some GCs for color bits |
+
+## When *not* to bother
+
+- Heaps > 32 GiB: pointer compression often turns off
+  automatically; the cost of indirection eats the win.
+- C and Rust apps: you typically just don't have spare
+  bits to give up. Use `Box<dyn Trait>` and pay the vtable.
+- Hot pointer-chasing where one extra ADD per load
+  measurably matters. Profile before committing.
+
+## See also
+
+- *cache-lines-and-locality* — why halving pointer size
+  matters in the first place.
+- *data-alignment-and-padding* — why the low bits are
+  always zero.
+- *gc-tricolor-marking* — many GCs steal a low or high bit
+  for the mark color.
+- *false-sharing* — what happens when you pack too much
+  into one cache line.

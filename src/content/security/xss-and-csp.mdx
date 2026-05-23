@@ -1,0 +1,225 @@
+export const level = 'mid';
+
+# XSS and Content Security Policy
+
+**Cross-site scripting (XSS)** is execution of attacker-controlled
+JavaScript in a victim's browser, in the context of your origin.
+Once running, that script reads the user's cookies, calls your APIs
+as the user, scrapes the DOM, and exfiltrates whatever it wants. XSS
+is consistently in the OWASP Top 10 because it's easy to introduce
+and hard to fully eliminate.
+
+The defense story has three layers: **don't introduce XSS sinks** in
+your code, **escape correctly** when you do, and **deploy CSP** as
+the runtime safety net that catches what slips through.
+
+## The three classical XSS shapes
+
+- **Reflected**: attacker-controlled input in a URL is reflected
+  back unescaped into the response.
+
+  ```
+  GET /search?q=<script>fetch('/api/key').then(r=>r.text()).then(send)</script>
+  ```
+
+  Response embeds `q` into the page; script runs. Often delivered as
+  a phishing link.
+
+- **Stored**: attacker submits content that's saved server-side and
+  rendered to other users (forum post, comment, profile name). One
+  payload, many victims.
+
+- **DOM-based**: no server reflection at all. JS reads
+  `location.hash` or `document.referrer` and writes it into the DOM
+  via `innerHTML` / `eval` / `Function`. Server never sees the
+  payload.
+
+## Encoding context matters
+
+Escaping is contextual. The right escaping depends on **where in the
+document the value lands**.
+
+<Compare>
+<thead>
+<tr><th>Context</th><th>Required escaping</th></tr>
+</thead>
+<tbody>
+<tr><td>HTML body text (`<div>X</div>`)</td><td>HTML-escape `&lt; &gt; &amp; &quot; &#39;`</td></tr>
+<tr><td>HTML attribute (`<a href="X">`)</td><td>HTML-attribute escape; quote the attribute</td></tr>
+<tr><td>URL attribute (`href="X"`)</td><td>Validate scheme (no `javascript:`); URL-encode</td></tr>
+<tr><td>Inline JS (`<script>var x = "X"</script>`)</td><td>JS-string-escape; avoid entirely if possible</td></tr>
+<tr><td>Inline CSS (`<style>color: X</style>`)</td><td>CSS-escape; restrict to known-safe property values</td></tr>
+<tr><td>Event handler (`onclick="X"`)</td><td>Don't. Use addEventListener instead.</td></tr>
+</tbody>
+</Compare>
+
+Modern frameworks (React, Vue, Svelte, Angular) handle HTML and
+attribute escaping automatically when you use `{value}` /
+`{{ value }}` interpolation. The escape hatches (`dangerouslySetInnerHTML`,
+`v-html`) bypass it — review every use.
+
+Server-side templating engines vary. Pick auto-escaping templates
+(Pug, Nunjucks with autoescape, Handlebars with `{{ }}`); avoid raw
+output (`{{{ }}}` in Mustache/Handlebars) without sanitization.
+
+## CSP: the runtime safety net
+
+Content Security Policy is a response header (or `<meta>` tag) that
+tells the browser **which sources are allowed to run/load/connect**.
+If a script tries to execute from a disallowed source, the browser
+refuses.
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-r4nd0m'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+```
+
+CSP wins because it's a defense that fires **after** an XSS sink has
+been hit. Even if an attacker successfully injects a `<script>` tag,
+CSP can prevent it from executing.
+
+### Nonces vs hashes vs `unsafe-inline`
+
+`script-src 'self'` blocks inline `<script>` blocks entirely. That
+breaks legitimate inline scripts in your app. Three ways to permit
+them safely:
+
+- **Nonces (recommended)**: server generates a per-request random
+  token, includes it in the CSP header and on every inline
+  `<script nonce="...">`. Attacker-injected scripts won't have the
+  nonce.
+
+  ```http
+  Content-Security-Policy: script-src 'nonce-2727e8...' 'strict-dynamic'
+  ```
+
+  ```html
+  <script nonce="2727e8...">/* legit */</script>
+  ```
+
+- **Hashes**: hash the contents of each inline script, list the
+  hashes in CSP. Works when inline scripts are static.
+
+  ```
+  script-src 'sha256-Bx5p...'
+  ```
+
+- **`'unsafe-inline'`**: permits all inline scripts. Defeats the
+  purpose of CSP for XSS. Avoid unless you literally can't
+  refactor.
+
+### `'strict-dynamic'`
+
+`'strict-dynamic'` tells the browser: "if a script is trusted via
+nonce or hash, scripts it dynamically loads are also trusted." This
+lets a small nonced bootstrap script load the rest of your app
+without listing every CDN URL. Combined with nonces, this is the
+modern best practice CSP and is what Google and CSP Evaluator
+recommend.
+
+```http
+Content-Security-Policy:
+  script-src 'nonce-r4nd0m' 'strict-dynamic' https:;
+  object-src 'none';
+  base-uri 'none';
+```
+
+The `https:` is a fallback for old browsers that don't understand
+`strict-dynamic`; modern browsers ignore it once nonces and
+strict-dynamic apply.
+
+### Other directives worth setting
+
+- `object-src 'none'` — blocks `<object>` / `<embed>` (legacy Flash
+  vector).
+- `base-uri 'none'` — prevents `<base>` injection that hijacks
+  relative URLs.
+- `frame-ancestors 'none'` — modern replacement for
+  `X-Frame-Options`; blocks clickjacking via iframes.
+- `form-action 'self'` — restricts where forms can POST to.
+- `upgrade-insecure-requests` — auto-upgrades `http:` subresources
+  to `https:`.
+
+## Trusted Types (the next layer)
+
+Trusted Types is a newer browser API (Chrome/Edge, Firefox behind
+flag in 2026) that makes the dangerous DOM sinks (`innerHTML`,
+`eval`, `document.write`, `setTimeout(string)`) refuse string
+arguments — they require special "trusted type" objects produced by
+a policy function you define.
+
+```http
+Content-Security-Policy: require-trusted-types-for 'script'; trusted-types default
+```
+
+```js
+trustedTypes.createPolicy('default', {
+  createHTML: (input) => DOMPurify.sanitize(input),
+});
+```
+
+Now `el.innerHTML = userInput` throws unless `userInput` came through
+your policy. This eliminates DOM-based XSS at the language level
+rather than depending on every developer to remember to sanitize.
+
+## Reporting and rollout
+
+Two CSP modes:
+
+- `Content-Security-Policy: ...` enforces.
+- `Content-Security-Policy-Report-Only: ...` doesn't enforce, just
+  reports violations to `report-to` / `report-uri`.
+
+Standard rollout:
+
+<Steps>
+<Step n="1" title="Deploy in Report-Only">
+Set a tight CSP in `Report-Only` mode. Wire the `report-to` group to
+a collector (a small endpoint that stores reports, or a service like
+Report URI / Sentry).
+</Step>
+<Step n="2" title="Watch reports for a week or two">
+Real users will surface every inline script, every CDN domain, every
+third-party iframe your code depends on. Catalogue.
+</Step>
+<Step n="3" title="Tighten and enforce">
+Refactor offenders (inline scripts → external + nonce; broad URL
+patterns → specific CDNs). Flip to enforcing mode. Keep
+`Report-Only` parallel for stricter future rules.
+</Step>
+<Step n="4" title="Iterate toward strict-dynamic + nonces">
+Goal state: `script-src 'nonce-...' 'strict-dynamic'`, no
+`unsafe-inline`, no `unsafe-eval`, no wildcards. Run CSP Evaluator
+(Google) periodically.
+</Step>
+</Steps>
+
+## Sanitization libraries
+
+When you genuinely need to render attacker-influenced HTML (user
+profile bios, rich comments), don't try to write your own escaper.
+Use **DOMPurify**:
+
+```js
+import DOMPurify from 'dompurify';
+el.innerHTML = DOMPurify.sanitize(userHtml, {
+  ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'a', 'p', 'ul', 'li'],
+  ALLOWED_ATTR: ['href'],
+  ALLOWED_URI_REGEXP: /^https?:/,
+});
+```
+
+DOMPurify is maintained, audited, fast, and stays current with
+browser parser quirks. Rolling your own regex-based sanitizer is a
+known anti-pattern with a long history of bypasses.
+
+## Quick checklist
+
+<Cheatsheet>
+- Frameworks: use built-in interpolation. Audit every `dangerouslySetInnerHTML`, `v-html`, `innerHTML`.
+- Validate URL schemes anywhere `href` / `src` accepts a user value (no `javascript:`).
+- Deploy CSP: `script-src 'nonce-...' 'strict-dynamic'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`.
+- Roll CSP out via Report-Only first; iterate with real reports.
+- For user-rendered HTML: DOMPurify, with a tight tag/attr allowlist.
+- For new apps: enable Trusted Types (`require-trusted-types-for 'script'`).
+- Test with the CSP Evaluator; "C" or below is not production-ready.
+</Cheatsheet>

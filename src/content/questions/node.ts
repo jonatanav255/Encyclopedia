@@ -34,7 +34,7 @@ export const bank: QuestionBank = {
       level: 'mid',
       question: 'In Node, what is the difference between `setTimeout(fn, 0)` and `setImmediate(fn)`?',
       answer:
-        'Different phases of the event loop. From the main module the order is non-deterministic. **From inside an I/O callback** (the poll phase), `setImmediate` runs in the next **check** phase, immediately after. `setTimeout(fn, 0)` waits for the next loop iteration to reach the **timers** phase. Mental model: `setImmediate` = next phase, `setTimeout(0)` = next iteration.',
+        'Different phases of the event loop. **At the top level on Node 11+, the order is deterministic**: `setTimeout(fn, 0)` fires first, then `setImmediate(fn)` — the timers phase runs before the check phase on the first iteration. (Pre-Node 11 it was genuinely racey; that\'s a footgun you can stop worrying about.) **From inside an I/O callback** (the poll phase), `setImmediate` runs in the next **check** phase, immediately after. `setTimeout(fn, 0)` waits for the next loop iteration to reach the **timers** phase. Mental model: `setImmediate` = next phase, `setTimeout(0)` = next iteration.',
     },
     {
       level: 'mid',
@@ -307,6 +307,20 @@ export const bank: QuestionBank = {
       question: 'When would you use `child_process.fork` vs `spawn` vs `worker_threads`?',
       answer:
         '**`spawn`** — generic process launch. Use for shelling out to external binaries (`ffmpeg`, `git`, `curl`). Streams stdio. No JS-specific features.\n\n**`fork`** — spawn another Node script with a built-in `process.send`/`message` IPC channel. Use for "Node helper process" (worker farm without thread sharing, or sandboxing to avoid one Node\'s crash bringing down the parent). Each fork has its own memory.\n\n**`worker_threads`** — V8 isolates in the same process. Use for CPU-bound JS work that would block the event loop (image processing, parsing huge JSON, cryptography). Shared memory possible via `SharedArrayBuffer`; transfer ownership of Buffers without copying. Lower overhead than `fork` (no separate OS process).\n\n**Decision tree**: external program → `spawn`. CPU-bound JS → `worker_threads`. Need OS-level isolation or want to run a different JS file as a separate Node process → `fork`.',
+    },
+
+    // --- node:crypto ---
+    {
+      level: 'senior',
+      question: 'You\'re verifying a webhook signature. Why is `if (signature === expected)` a bug, and what should you use instead?',
+      answer:
+        '`===` on strings compares byte-by-byte and short-circuits on the first difference. The time taken correlates with how many leading bytes match — so an attacker who can issue many requests can measure response times and recover the secret signature one byte at a time. Use `crypto.timingSafeEqual(a, b)`, which compares Buffers in constant time relative to length. Two things to remember: (1) the buffers must be the same length, so length-check first (`a.length === b.length`) — the length itself is already public, so leaking it is fine. (2) `Buffer.compare` is *not* constant-time either; the only safe primitive is `timingSafeEqual`. Same rule applies to comparing API keys, password reset tokens, and JWTs.',
+    },
+    {
+      level: 'mid',
+      question: 'What three values do you need to persist per AES-GCM-encrypted message, and what goes wrong if you mix them up?',
+      answer:
+        '**Iv, ciphertext, auth tag.** The IV (12 bytes for GCM) must be unique per (key, message) pair — re-using one under the same key lets an attacker XOR the ciphertexts and recover plaintext. The ciphertext is the actual encrypted payload. The auth tag (16 bytes) is what GCM uses to detect tampering — without `decipher.setAuthTag(tag)` before `decipher.final()`, decryption either silently returns garbage or throws "unable to authenticate data." Persist all three; the key stays in your KMS / env / vault, never in the row. A common layout is a single Buffer: `iv (12) || ciphertext (n) || tag (16)`, split on the way back out.',
     },
 
     // staff

@@ -1,0 +1,200 @@
+export const level = 'senior';
+
+# React Compiler
+
+The **React Compiler** is an optimizing build-time pass that turns
+straightforward component code into the equivalent of code you'd
+write with manual `useMemo`, `useCallback`, and `React.memo`
+sprinkled everywhere — without you doing the sprinkling.
+
+It went stable with **React 19.0 in April 2025**, ending a multi-year
+beta as the "React Forget" project. As of 2026 it is the default
+recommendation for new apps and a routine adoption for established
+ones.
+
+## What it actually does
+
+The compiler reads your component and computes, statically, which
+values depend on which inputs. Where the original React runtime
+would re-execute every line on every render, the compiled version
+caches values keyed by their dependencies and reuses them across
+renders.
+
+A rough mental model of the transformation:
+
+```jsx
+// You write:
+function Cart({ items, tax }) {
+  const subtotal = items.reduce((s, i) => s + i.price, 0);
+  const total = subtotal * (1 + tax);
+  const onCheckout = () => api.checkout(items);
+  return <Checkout total={total} onClick={onCheckout} />;
+}
+
+// The compiler emits the moral equivalent of:
+function Cart({ items, tax }) {
+  const $ = useMemoCache(3);
+  const subtotal = $[0] === items
+    ? $[1]
+    : ($[0] = items, $[1] = items.reduce((s, i) => s + i.price, 0));
+  const total = /* memo on (subtotal, tax) */;
+  const onCheckout = /* memo on (items) */;
+  return <Checkout total={total} onClick={onCheckout} />;
+}
+```
+
+The exact emitted code uses an internal cache slot ABI shipped with
+the React runtime — you don't write `useMemoCache` yourself. The
+point is that **every derived value and every JSX element gets a
+cache slot**, and re-renders only recompute the slots whose inputs
+changed.
+
+The downstream effect: a parent re-render no longer forces a child
+to re-render, because the JSX element the parent returns is itself a
+cached reference-equal value when its props haven't changed. You get
+the `React.memo` behavior without the wrapper.
+
+## What the compiler refuses to optimize
+
+The compiler is conservative. If it can't prove a function is a
+pure-enough React component — meaning render is deterministic in its
+props/state/context and free of unguarded side effects — it skips
+that function and emits a `"use no memo"` annotation. Your code
+still runs; it just doesn't get the speedup.
+
+Common reasons a component falls out:
+
+<Cheatsheet caption="Patterns that defeat the compiler's safety analysis">
+| Pattern | Why it's rejected |
+|---|---|
+| Mutating props or state during render | Render is supposed to be pure; mutation defeats memoization |
+| Reading from a mutable module-level variable | The compiler can't see when the value changes |
+| Calling hooks conditionally or in loops | Already a Rules-of-Hooks violation; compiler refuses |
+| Using `eval` or `with` | Can't analyze data flow |
+| Reading `ref.current` during render | Refs aren't reactive — escape hatch only |
+</Cheatsheet>
+
+You can opt a single function out explicitly with the directive:
+
+```jsx
+function LegacyThing() {
+  'use no memo';
+  // The compiler will skip this function.
+}
+```
+
+Use it as a temporary safety valve, not a habit. If a component
+keeps tripping the analyzer, that's usually a real Rules-of-React
+violation worth fixing.
+
+## What it doesn't do
+
+A list of common misunderstandings:
+
+- **It doesn't replace the reconciler.** Fiber still diffs the tree;
+  the compiler just makes "props identical to last render" the
+  common case so the reconciler skips work.
+- **It doesn't skip effects.** `useEffect` still runs when its deps
+  change. The compiler can stabilize the deps (so an effect doesn't
+  re-fire on every render), but effects are still effects.
+- **It doesn't make slow renders fast.** If `items.reduce(...)` is
+  genuinely O(n) over a million items, it's still O(n) — the
+  compiler just runs it once per `items` change instead of once per
+  render. For *truly* expensive synchronous work, you still need
+  `useTransition` or `useDeferredValue`.
+- **It isn't a transpiler step you can ignore.** It's a real Babel /
+  SWC plugin that emits transformed JS. Source maps work; debugging
+  the original code works; the compiled output is what runs.
+
+## Adoption
+
+There are two phases worth doing in order.
+
+**1. Add the linter.** `eslint-plugin-react-compiler` (often packaged
+inside `eslint-plugin-react-hooks` in 2026) flags patterns the
+compiler can't optimize, with the same diagnostics the compiler
+itself uses. Fix lint errors first; then enable the compiler. This
+turns a "the compiler silently bails out of half my files" surprise
+into a normal CI signal.
+
+**2. Enable the compiler.** Most build setups now wire it up
+implicitly:
+
+<Cheatsheet caption="Toolchain integration">
+| Toolchain | Where |
+|---|---|
+| Next.js 15+ | `experimental.reactCompiler` in `next.config.js` (no-config in newer versions) |
+| Vite | `babel-plugin-react-compiler` in your React Babel preset |
+| Expo | `experiments.reactCompiler` in `app.json` |
+| Manual Babel | Add `babel-plugin-react-compiler` before `@babel/preset-react` |
+</Cheatsheet>
+
+After enabling, run the linter once over the codebase and read the
+output. Files with many bailouts usually have one root cause (a
+shared mutable store accessed during render, a global cache, etc.)
+that fixes a cluster at once.
+
+<Callout type="info">
+You don't have to delete existing `useMemo`/`useCallback` calls to
+adopt the compiler. They keep working; they're just no longer doing
+useful work. Remove them in a normal refactor cadence — chasing
+every site at once is busywork.
+</Callout>
+
+## What changes about how you write code
+
+The day-to-day effect is small and freeing:
+
+- **Stop manually memoizing.** Don't reach for `useMemo` /
+  `useCallback` / `React.memo` unless the compiler bails out and you
+  have a profiler trace showing the cost.
+- **Inline object and function props freely.** `<Child config={{
+  url: '/api' }} />` no longer punishes you with constant child
+  re-renders.
+- **Lift expensive computations up.** A reduce over 10k items at the
+  top of a component, with no deps that change every render, only
+  runs once per real input change. You can stop hoisting it
+  defensively.
+- **Lean on Rules of React.** The compiler's safety analysis assumes
+  your render is pure. Side effects in render, mutation of incoming
+  props, and reads of mutable singletons all defeat optimization and
+  are bugs anyway. Strict mode in dev catches most of them.
+
+The new mental rule: **write the obvious code; let the compiler
+worry about memoization.** Manual memoization is now what reaching
+for inline assembly was in 2010 — possible, occasionally needed,
+mostly an admission that something else went wrong.
+
+## When manual memoization still matters
+
+Not zero — just rare. Cases where you still drop a `useMemo` /
+`useCallback` by hand:
+
+- The compiler explicitly bailed out (linter or build log told you)
+  and you can't easily refactor.
+- A non-React consumer needs a stable function reference — passing a
+  callback to `addEventListener` on `window`, or to a third-party
+  library that diffs by identity.
+- An expensive `useEffect` dep that's a derived value — sometimes
+  cleaner to memo the dep than to refactor the effect.
+
+If you find yourself adding manual memos for a "normal" parent →
+child prop, that's a smell. Investigate why the compiler skipped
+that function instead.
+
+## Profiling in a compiled world
+
+The React DevTools Profiler still works, but the flamegraph
+typically gets thinner. The renders you're left with after enabling
+the compiler are *actual* renders driven by state/prop changes —
+which means the profiler is now signal, not mostly noise.
+
+The "Why did this render?" feature is most useful in two scenarios:
+
+- A component re-renders even though "nothing changed" — usually a
+  prop *is* changing reference-wise and you missed it.
+- A component doesn't re-render when you expected it to — usually a
+  mutation rather than an immutable update.
+
+Both bugs existed pre-compiler; they're just easier to spot now that
+the baseline is "skip if unchanged."

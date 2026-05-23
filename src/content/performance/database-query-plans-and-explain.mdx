@@ -1,0 +1,313 @@
+export const level = 'senior';
+
+# Database query plans and EXPLAIN
+
+When a query is slow, the answer is rarely "the database is slow."
+It's "the planner chose a strategy that doesn't fit the data." A
+sequential scan over 10 million rows when an index lookup would
+return 12. A nested-loop join when a hash join would be 100×
+faster. A sort spilling to disk that fits comfortably in memory.
+
+`EXPLAIN` is the database telling you what it intends to do.
+`EXPLAIN ANALYZE` runs the query and tells you what it actually did,
+with timing per step. Reading those outputs fluently is what
+separates "the query is slow, let me add a random index" from "the
+estimate at this step is wrong by 1000×, here's the fix."
+
+This page is focused on Postgres because its `EXPLAIN` is the
+clearest, but the concepts transfer.
+
+## What a plan is
+
+A query plan is a tree of operators. The root produces the final
+result; children feed their parents. Each operator has a strategy
+(seq scan, index scan, hash join, sort, etc.), estimated and actual
+row counts, and a cost.
+
+```sql
+EXPLAIN ANALYZE
+SELECT u.name, COUNT(o.id) AS order_count
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.signup_date > '2025-01-01'
+GROUP BY u.name;
+```
+
+```
+GroupAggregate  (cost=120.50..150.20 rows=200 width=40)
+                (actual time=2.4..5.1 rows=187 loops=1)
+  Group Key: u.name
+  ->  Sort  (cost=120.50..125.50 rows=2000 width=32)
+            (actual time=2.3..3.8 rows=1924 loops=1)
+        Sort Key: u.name
+        Sort Method: quicksort  Memory: 142kB
+        ->  Hash Join  (cost=18.00..98.00 rows=2000 width=32)
+                       (actual time=0.5..2.1 rows=1924 loops=1)
+              Hash Cond: (o.user_id = u.id)
+              ->  Seq Scan on orders o  (cost=0..50.00 rows=5000)
+                                        (actual time=0.01..0.8 rows=5000)
+              ->  Hash  (cost=17.50..17.50 rows=40 width=24)
+                        (actual time=0.4..0.4 rows=42)
+                    ->  Index Scan using users_signup_idx on users u
+                        (cost=0.28..17.50 rows=40 width=24)
+                        (actual time=0.05..0.35 rows=42)
+                        Index Cond: (signup_date > '2025-01-01')
+Planning Time: 0.3 ms
+Execution Time: 5.4 ms
+```
+
+Reading this:
+
+- **Execution Time** at the bottom is the answer.
+- **Operators** are indented to show parent/child. Leaves run first.
+- Each line shows `(estimated cost / rows)` and
+  `(actual time / actual rows)`.
+- **Big mismatches between estimated and actual rows are bugs** —
+  the planner made a bad choice because its statistics were wrong.
+
+## The plan-node types worth knowing
+
+### Scans (how data comes off disk)
+
+- **Seq Scan**: read every row of the table. Fast when most rows
+  match. Slow when you want a few rows from many.
+- **Index Scan**: walk an index, then visit the heap for each match.
+  Fast for selective predicates.
+- **Index Only Scan**: walk an index, no heap visit. Only possible
+  when every column needed is in the index (and the visibility map
+  is up to date). Often dramatically faster.
+- **Bitmap Heap Scan + Bitmap Index Scan**: build a bitmap of rows
+  to fetch, then read the heap in physical order. Faster than
+  Index Scan when the result set is moderate (hundreds to
+  thousands).
+
+The big choice the planner makes per table: seq scan vs index. The
+threshold is roughly 5–10% of rows — past that, seq scan is faster
+because index scans incur random I/O.
+
+### Joins
+
+- **Nested Loop**: for each row in the outer table, look up matches
+  in the inner. O(n × m) worst case but O(n × log m) with an index
+  on the inner join key. Best when outer is tiny.
+- **Hash Join**: build a hash table from the smaller side, probe
+  with the larger. O(n + m). Best when both sides are non-tiny and
+  fit in memory.
+- **Merge Join**: requires both sides sorted on the join key. Then
+  walks them in parallel. O(n + m) but adds sort cost if not
+  pre-sorted. Best when one side is already sorted (e.g., index
+  order).
+
+A classic regression: planner thinks the outer side has 10 rows
+(stale stats), picks Nested Loop; reality is 10 million rows; query
+takes hours. The fix is usually `ANALYZE` (refresh stats) or hint
+the planner.
+
+### Other
+
+- **Sort**: explicit sort. Watch `Sort Method`: `quicksort` (in
+  memory) is fine; `external merge` (disk) is bad — raise `work_mem`
+  or reduce result size.
+- **Aggregate / GroupAggregate / HashAggregate**: GROUP BY
+  implementations. `HashAggregate` is fastest when groups fit in
+  memory.
+- **Materialize**: cache the result of a subplan because it's
+  scanned multiple times.
+- **Gather / Gather Merge**: parallel plan boundary — workers
+  produce rows, the leader collects.
+
+## The four signals of a bad plan
+
+When you read `EXPLAIN ANALYZE`, look for:
+
+<Steps>
+<Step n="1" title="Row estimate vs actual mismatch">
+The number Postgres expected vs the number it got. Off by 10× is
+worth investigating; off by 1000× explains the slow query by itself.
+
+```
+->  Seq Scan on orders  (cost=0..50.00 rows=40)
+                        (actual time=0.5..2200 rows=2,400,000)
+```
+
+Estimated 40, got 2.4M. The plan above this node was built assuming
+40 rows. Every subsequent decision is wrong.
+
+Causes: stale stats (`ANALYZE` not run), poor histogram resolution
+(`ALTER TABLE ... ALTER COLUMN ... SET STATISTICS 1000`),
+correlated columns (the planner assumes independence; reality has
+dependencies), expressions the planner can't analyse.
+</Step>
+
+<Step n="2" title="Sequential scans on large tables">
+A `Seq Scan` on a 100M-row table reading 100 rows of output is a
+bug. Either no usable index exists, or the planner thinks the index
+is worse (often because of bad stats).
+
+`EXPLAIN (ANALYZE, BUFFERS)` shows `Buffers: shared read=12345` —
+read pages from disk. A huge number here means cold cache. After
+the first run, it should drop to `Buffers: shared hit=12345`.
+</Step>
+
+<Step n="3" title="Nested Loop with large outer">
+A Nested Loop joining 1M rows on the outer to an unindexed inner
+table is O(1M × 1M) = quadratic. The planner thought one of them was
+small. Check estimates.
+
+Fixes: `ANALYZE` to refresh stats; rewrite to provide a better
+estimate; or `enable_nestloop = off` in a session as a diagnostic
+(don't leave it off globally).
+</Step>
+
+<Step n="4" title="Sort spills to disk">
+`Sort Method: external merge  Disk: 1024kB` means the sort didn't
+fit in `work_mem` and spilled. Disk sorts are 10–100× slower than
+memory sorts. Either raise `work_mem` for the session, reduce the
+result set before sorting, or eliminate the sort with an index that
+provides the desired order.
+</Step>
+</Steps>
+
+## Reading actual time correctly
+
+`actual time=X..Y rows=R loops=L`:
+
+- `X` is time to first row produced.
+- `Y` is time to last row produced.
+- `loops=L` means this operator was executed L times (common inside
+  a Nested Loop's inner side).
+
+**The actual cost of an operator is `Y × L`, not just `Y`.** A
+Bitmap Index Scan with `actual time=0.2..0.5 rows=10 loops=50000` is
+not 0.5ms — it's 25 seconds total, because it ran 50,000 times.
+This is the most common reading error.
+
+## EXPLAIN options worth knowing
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ...
+```
+
+- **`ANALYZE`** — actually run the query. Without it, only
+  estimates. Caveat: `ANALYZE` on an UPDATE/DELETE actually
+  modifies data. Wrap in a transaction and rollback if you don't
+  want the change.
+- **`BUFFERS`** — show pages read from cache vs disk. Reveals cold
+  vs hot performance.
+- **`SETTINGS`** — show non-default settings that may affect the
+  plan.
+- **`WAL`** — show WAL volume produced.
+- **`FORMAT JSON | XML | YAML`** — machine-readable output. Tools
+  like depesz.com / explain.dalibo.com visualise these nicely.
+
+## Indexes the planner will actually use
+
+A common surprise: "I added an index but the query is still slow."
+Reasons the planner ignores an index:
+
+- **Function on the indexed column.** `WHERE lower(email) = 'x'`
+  doesn't use `idx(email)` unless you create `idx(lower(email))`.
+- **Wrong column order in composite index.** `idx(a, b)` works for
+  predicates on `a`, or `a AND b`, but not `b` alone.
+- **Implicit type cast.** `WHERE user_id = '42'` (string) against
+  an integer column may skip the index.
+- **Selectivity too low.** If the predicate matches > ~5% of rows,
+  seq scan wins. Planner is right.
+- **Stats say the predicate matches a lot.** Even when actually it
+  matches few rows. Refresh stats with `ANALYZE`.
+
+Use `pg_stat_user_indexes` to see which indexes are actually used.
+Unused indexes (zero scans over weeks) are dead weight — they slow
+writes and waste space.
+
+## Some recurring patterns
+
+- **N+1 in disguise.** The planner shows a Nested Loop with the
+  inner doing an Index Scan and `loops=10000`. That's 10,000 index
+  lookups. Often the calling code is in a loop issuing many small
+  queries; the same is true even when batched into one query if the
+  planner chose Nested Loop. Look for `loops` > 1000.
+
+- **Hash join exceeds memory.** `Hash Batches: 16 Memory Usage:
+  131072kB` means the hash spilled across 16 partitions. Each
+  partition is rebuilt and re-probed. Raise `work_mem` or reduce
+  the join size with earlier filtering.
+
+- **Wrong join order.** Planner joined `large × small` instead of
+  `small × large`. Often due to bad estimates; sometimes due to
+  `join_collapse_limit` being too low for the query complexity.
+
+- **CTE materialization.** In older Postgres versions, `WITH` was
+  always materialized — sometimes a barrier to optimization. Since
+  Postgres 12, the planner can inline CTEs unless you use `WITH ...
+  AS MATERIALIZED`. Audit old code that relied on the materialization
+  optimization fence.
+
+## A diagnostic flow
+
+When a query is slow:
+
+<Steps>
+<Step n="1" title="EXPLAIN (ANALYZE, BUFFERS) it">
+Get the plan with actual numbers and buffer access.
+</Step>
+
+<Step n="2" title="Find the row estimate that's off">
+The first big mismatch from leaves upward is usually the cause.
+Everything above it built on wrong assumptions.
+</Step>
+
+<Step n="3" title="Check stats">
+`SELECT * FROM pg_stats WHERE tablename = '...'` for histograms on
+the columns involved. If stats are stale, `ANALYZE table`.
+</Step>
+
+<Step n="4" title="Check indexes">
+Does an index that could serve this query exist? Is it being used?
+`EXPLAIN` will show `Index Scan` or `Index Only Scan` if so. If
+not, why not — check the function/cast/selectivity reasons above.
+</Step>
+
+<Step n="5" title="Try forcing a different plan">
+`SET enable_nestloop = off; EXPLAIN ANALYZE ...` to see what
+alternative the planner would have used. Compares cost; sometimes
+reveals the planner was right and the slowness is something else.
+</Step>
+
+<Step n="6" title="Rewrite if needed">
+Split a complex query into stages; add a composite index; reshape
+the WHERE to be index-friendly; add a materialized view for an
+expensive aggregation.
+</Step>
+</Steps>
+
+## What this doesn't replace
+
+Reading plans is necessary, not sufficient. The two related
+disciplines:
+
+- **Indexing strategy** — knowing what indexes a table should have
+  given its access patterns. See `data/indexing`.
+- **N+1 query elimination** — knowing when the app is making 1000
+  small queries instead of 1 big one. See `performance/n-plus-one-queries`.
+
+A query that's fast in isolation can still be a problem if executed
+a thousand times per request. A query that's slow per call can be
+fine if it's called rarely. Plans answer "is this query
+well-served by the database?"; the app-level question is "is this
+query being called the right number of times?"
+
+## Quick checklist
+
+<Cheatsheet>
+- Use `EXPLAIN (ANALYZE, BUFFERS)` — don't analyse from `EXPLAIN` alone.
+- Compare estimated vs actual rows. Mismatch > 10× = stats problem.
+- Watch for `loops` > 1 — multiply by per-loop time for real cost.
+- Sort: `Sort Method: external merge` = spilled to disk = raise `work_mem` or reduce data.
+- Hash Join: `Hash Batches > 1` = hash spilled = same fix.
+- Nested Loop with large outer = suspect; check estimates.
+- Seq Scan on large table for few rows = missing or unused index.
+- `ANALYZE table` to refresh stats; `pg_stats` to inspect histograms.
+- Unused indexes (`pg_stat_user_indexes.idx_scan = 0`) are dead weight.
+- Use depesz.com or explain.dalibo.com for plan visualisation on complex queries.
+</Cheatsheet>

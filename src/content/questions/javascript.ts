@@ -498,5 +498,27 @@ export const bank: QuestionBank = {
       answer:
         'The cursor never closes. The async iterator protocol has three methods: `next()`, `return()`, and `throw()`. When a consumer breaks early or throws inside the loop, the runtime calls `iterator.return()` to signal "I\'m done, clean up." If you didn\'t implement `return()`, the cursor leaks — connection stays open, lock stays held. Fix: either implement `async return() { await cursor.close(); return { done: true }; }` on the object, or use an `async function*` generator with `try/finally` — the runtime calls `return()` for you, which translates to running the `finally` block. The generator form is almost always cleaner.',
     },
+
+    // --- web crypto ---
+    {
+      level: 'senior',
+      question: 'Why must the IV passed to AES-GCM be unique per (key, message)?',
+      answer:
+        'GCM is a counter-mode AEAD: it derives a keystream from `(key, iv)` and XORs it into the plaintext. Two messages encrypted under the same `(key, iv)` use the same keystream, so XORing the ciphertexts yields the XOR of the plaintexts — readable for most real-world data. Worse, an attacker who collects two GCM ciphertexts with the same `iv` can often recover the GHASH authentication key and forge messages. The fix is `crypto.getRandomValues(new Uint8Array(12))` per message (96 bits is the spec-mandated length), stored alongside the ciphertext and auth tag.',
+    },
+    {
+      level: 'mid',
+      question: 'What\'s the difference between `crypto.subtle` and `node:crypto`, and when do you reach for each?',
+      answer:
+        '`crypto.subtle` (WebCrypto) is the cross-runtime standard: browsers, Node 19+, Deno, Bun, Cloudflare Workers. Reach for it when you want one piece of code to run everywhere. `node:crypto` is Node-only but covers things WebCrypto doesn\'t: MD5, `scrypt`, streaming hashes via `createHash().update().digest()` for files that don\'t fit in memory, certificate parsing, FIPS-mode hooks. For password hashing, neither — use `argon2` or `crypto.scrypt`. For HMAC, AES-GCM, ECDSA / Ed25519 signatures, hashing of small inputs: `crypto.subtle`. The mental rule: portable by default, drop to `node:crypto` for the things it uniquely does.',
+    },
+
+    // --- temporal ---
+    {
+      level: 'senior',
+      question: 'Why should you store `Temporal.Instant` (or `ZonedDateTime`) in a database, not `PlainDateTime`?',
+      answer:
+        'A `PlainDateTime` is a wall clock with no time zone — "2026-11-01 01:30." On the DST fall-back hour that timestamp exists *twice* (once before the clock turns back, once after), and the type has no way to tell you which one. You can\'t order it globally against rows from another zone, you can\'t convert it back to an instant without ambiguity, and any DST-transition operation throws. Store an `Instant` (or a `ZonedDateTime` if the calendar/zone context matters for display) so every row has an unambiguous point on the timeline. Render to local wall clock at the edge via `Intl.DateTimeFormat`.',
+    },
   ],
 };

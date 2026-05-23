@@ -1,0 +1,321 @@
+export const level = 'senior';
+
+# Workflow engines and durable execution
+
+A workflow engine like **Temporal**, **Cadence**, **Restate**, or
+AWS **Step Functions** turns the messy business of "a multi-step
+process that might span hours, days, or weeks, calls external
+services that fail, and needs to survive process restarts" into
+ordinary-looking code. The engine remembers where you were, retries
+what failed, and runs forward from the right place after every
+restart.
+
+This is a different shape of problem from messaging patterns and
+sagas. Sagas (see `architecture/sagas`) coordinate distributed
+transactions across services with compensating actions. Workflow
+engines provide **durable execution**: a programming model where
+your code's local variables, loops, and control flow persist
+indefinitely, with the engine replaying the history to reconstruct
+state.
+
+## The problem they solve
+
+A typical e-commerce order:
+
+1. Reserve inventory.
+2. Charge the credit card.
+3. Send confirmation email.
+4. Wait 24 hours; if not shipped, escalate.
+5. After shipping, wait for delivery confirmation.
+6. After delivery, wait 14 days; close the return window; mark
+   complete.
+
+This spans hours to weeks. It calls external services that fail.
+Some steps are blocking; some are time-based; some are
+event-driven. Processes restart. Hardware fails.
+
+The naive implementations:
+
+- **Job queue with stages**. Each step is a job that enqueues the
+  next. State is persisted between steps. Works for simple
+  pipelines; gets ugly with branching, waits, and cancellations.
+- **Cron + database state machine**. A scheduled task checks the
+  state and advances orders. Works; verbose; hard to reason about
+  with many states.
+- **State machine code with explicit checkpoints**. Hand-rolled
+  durable execution. Possible; tedious; bug-prone.
+
+Workflow engines abstract this. The workflow code reads like
+straight-line procedural code; the engine handles persistence,
+retry, and recovery underneath.
+
+## Durable execution: the key idea
+
+In Temporal, a workflow looks like ordinary code:
+
+```ts
+import { proxyActivities, sleep } from '@temporalio/workflow';
+
+const acts = proxyActivities<typeof activities>({
+  startToCloseTimeout: '30s',
+  retry: { maximumAttempts: 5 },
+});
+
+export async function processOrder(orderId: string) {
+  await acts.reserveInventory(orderId);
+  const charge = await acts.chargeCard(orderId);
+  await acts.sendConfirmation(orderId);
+
+  await sleep('24 hours');
+
+  const shipped = await acts.hasShipped(orderId);
+  if (!shipped) {
+    await acts.escalate(orderId);
+  }
+
+  await acts.waitForDelivery(orderId);
+  await sleep('14 days');
+  await acts.closeOrder(orderId);
+}
+```
+
+`sleep('24 hours')` actually means it. The worker process can die,
+be redeployed, be migrated to a new node — when something picks up
+this workflow, execution resumes exactly where it was. The local
+variables (`charge`, `shipped`) are correct on resumption.
+
+How? The engine records every workflow step (activity calls, sleeps,
+timers, signals) in an event history. On replay, the engine walks
+the workflow code from the top, and when it hits an activity call
+it's already executed, returns the cached result instead of calling
+again. When it reaches a step that hasn't run yet, it executes for
+real.
+
+The implication: **workflow code must be deterministic.** No
+`Date.now()`, no `Math.random()`, no environment variables, no
+network calls, no file I/O — everything non-deterministic happens
+in activities (which are not replayed; their results are cached).
+
+## The activity / workflow split
+
+The model imposes a discipline:
+
+<Compare>
+<thead>
+<tr><th>Workflow code</th><th>Activity code</th></tr>
+</thead>
+<tbody>
+<tr><td>Deterministic</td><td>Whatever you want</td></tr>
+<tr><td>Replays on every recovery</td><td>Runs once per call (engine remembers result)</td></tr>
+<tr><td>No I/O, no time, no randomness</td><td>All of the above</td></tr>
+<tr><td>Tiny, sequencing logic</td><td>Actual work (DB writes, API calls)</td></tr>
+<tr><td>Should be quick to replay</td><td>Bounded duration; retries managed by engine</td></tr>
+</tbody>
+</Compare>
+
+Workflows orchestrate; activities do. A typical service has many
+activities (`chargeCard`, `sendEmail`, `reserveInventory`) and
+fewer, longer workflows that compose them.
+
+## Signals and queries
+
+Workflows aren't just batch — they respond to external events
+during their lifetime.
+
+- **Signals**: external events the workflow can wait for. "User
+  confirmed delivery." "Customer cancelled order."
+
+  ```ts
+  import { defineSignal, setHandler, condition } from '@temporalio/workflow';
+
+  export const cancelSignal = defineSignal('cancel');
+
+  export async function processOrder(orderId: string) {
+    let cancelled = false;
+    setHandler(cancelSignal, () => { cancelled = true; });
+
+    await acts.reserveInventory(orderId);
+    if (cancelled) { await acts.refund(orderId); return; }
+    // ...
+  }
+  ```
+
+  An external system sends a signal:
+  ```ts
+  await client.workflow.getHandle(orderId).signal(cancelSignal);
+  ```
+
+- **Queries**: external reads of workflow state. "What stage is
+  this order at?"
+
+  ```ts
+  export const stageQuery = defineQuery<string>('stage');
+  let stage = 'pending';
+  setHandler(stageQuery, () => stage);
+  ```
+
+Queries are read-only; they don't change history. Signals are
+recorded in history (so they replay correctly).
+
+## Retries and timeouts
+
+The engine handles retries with configurable policy:
+
+```ts
+const acts = proxyActivities<typeof activities>({
+  startToCloseTimeout: '30s',
+  scheduleToCloseTimeout: '10m',
+  heartbeatTimeout: '5s',
+  retry: {
+    initialInterval: '1s',
+    maximumInterval: '1m',
+    backoffCoefficient: 2,
+    maximumAttempts: 10,
+    nonRetryableErrorTypes: ['InvalidArgument'],
+  },
+});
+```
+
+Per-activity policy. Exponential backoff. Non-retryable error types
+fail the workflow without retry. The workflow sees a single
+`await` per activity — the engine handles the retry loop
+underneath.
+
+For long-running activities, **heartbeats** are how the engine
+knows the worker is still alive. The activity periodically calls
+`Context.heartbeat()`; if it stops, the engine considers the
+activity dead and retries.
+
+## Compensation: sagas, formalised
+
+Workflows handle compensation cleanly — they're just `try/catch`:
+
+```ts
+export async function processOrder(orderId: string) {
+  await acts.reserveInventory(orderId);
+  try {
+    await acts.chargeCard(orderId);
+  } catch (e) {
+    await acts.releaseInventory(orderId);    // compensate
+    throw e;
+  }
+  await acts.shipOrder(orderId);
+}
+```
+
+For multi-step sagas, you can use the saga pattern explicitly with
+compensation stacks. The workflow framework gives you the durable
+execution; the saga pattern is the rollback discipline.
+
+## Use cases that fit
+
+- **Multi-step processes that span time** — onboarding flows,
+  document review pipelines, claim processing.
+- **Long-running orchestrations** — provisioning a cloud
+  environment, deploying a release across stages.
+- **Human-in-the-loop** — wait for approval signal.
+- **Periodic processes that can fail mid-step** — billing runs,
+  reconciliation jobs.
+- **Compensable transactions across services** — sagas.
+
+## Use cases that don't fit
+
+- **High-throughput stateless request handling.** Workflows have
+  per-execution overhead (event history, replay). 100k req/s of
+  short workflows is fighting the model. Use a job queue.
+- **Real-time low-latency.** Workflow scheduling has latency
+  measured in tens of milliseconds. Not for sub-ms paths.
+- **Simple sequential jobs.** A single-step background job doesn't
+  need durable execution. Use BullMQ or a simple worker.
+- **Stateful in-memory computation.** Workflows are for
+  orchestration, not analytics. Don't try to hold a large dataset
+  in workflow local variables.
+
+The dividing line: if you'd rather your code's `await` actually mean
+"wait 7 days and resume here" than "throw if I can't reach the
+queue right now," workflow engines are the right tool.
+
+## Operating the engine
+
+Temporal / Cadence are stateful — they need a database (Cassandra,
+Postgres, MySQL) for event history and visibility. Operating them
+yourself is non-trivial:
+
+- Stateful cluster with quorum and replication.
+- Database growth proportional to workflow history (compaction
+  matters).
+- Worker capacity sized to expected concurrency.
+- Visibility (search, dashboards) needs Elasticsearch.
+
+**Temporal Cloud** (managed) removes most of this — pay per action.
+For small teams, this is usually the right choice unless
+self-hosting is a hard constraint.
+
+**Restate** is a newer player that bundles the storage into the
+engine (RocksDB), simpler to operate. **AWS Step Functions** is a
+managed alternative with a different programming model (JSON state
+machine definitions, less code-like).
+
+## Deterministic-execution gotchas
+
+The single most common bug class: non-determinism in workflow code.
+
+```ts
+// ❌ Workflow code:
+const id = crypto.randomUUID();           // non-deterministic
+const now = Date.now();                   // non-deterministic
+const items = await db.query(...);        // I/O — must be activity
+```
+
+```ts
+// ✅ Workflow code:
+const id = await acts.generateId();        // activity decides
+const now = await workflow.currentTime();  // engine-provided clock
+const items = await acts.queryItems();     // wrapped in activity
+```
+
+Library upgrades that change ordering of an Array iteration are
+classic break vectors — they change the replay path. Pin library
+versions; document the deterministic surface area.
+
+The engine usually detects non-determinism on replay and fails the
+workflow with a clear error ("history mismatch"). Test by running
+workflow replay in CI against historical histories.
+
+## Versioning
+
+Workflows live for weeks; deploys happen daily. A workflow started
+under v1 code may still be running when v2 ships. Three strategies:
+
+- **Backward-compatible changes only.** Add new branches behind a
+  version check; never delete or reorder.
+- **Patch API.** Temporal's `patched(versionId)` lets a workflow
+  detect "am I running before or after this patch?" and behave
+  accordingly.
+
+  ```ts
+  if (patched('use-new-pricing')) {
+    await acts.priceWithDiscount(orderId);
+  } else {
+    await acts.priceWithoutDiscount(orderId);
+  }
+  ```
+
+- **Workflow rename + migration.** Big breaking changes get a new
+  workflow type; old workflows complete on old code; new starts go
+  to the new workflow.
+
+## Quick checklist
+
+<Cheatsheet>
+- Use workflow engines for: long-running orchestrations, multi-step processes spanning hours+, human-in-loop, compensable sagas.
+- Don't use for: high-throughput stateless requests, real-time low-latency paths, simple single-step jobs.
+- Workflow code MUST be deterministic. No I/O, no time, no randomness. Move all of that to activities.
+- Activities have retry policies; the workflow sees one `await`. Configure per-activity timeouts.
+- Long activities: heartbeat regularly so the engine knows they're alive.
+- Signals: external events into a workflow. Queries: read-only status.
+- Versioning: use `patched()` API or rename workflow type for breaking changes.
+- Pin library versions referenced from workflow code (determinism).
+- Test replays against historical event histories in CI.
+- For most teams: Temporal Cloud or AWS Step Functions over self-hosting.
+</Cheatsheet>

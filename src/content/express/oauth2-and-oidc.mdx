@@ -1,0 +1,237 @@
+export const level = 'senior';
+
+# OAuth2 & OIDC in Express
+
+The protocol theory lives in `security/oauth-oidc.mdx`. This page is
+the **Express wiring** — Authorization Code + PKCE end-to-end with
+`openid-client`, validating ID tokens against JWKS in middleware,
+and rotating refresh tokens inside the session.
+
+Two flows you actually write in a Node service:
+
+- **Authorization Code + PKCE** — "Log in with Google/Microsoft/Okta."
+  Your server holds the client secret (or doesn't need one).
+- **JWT bearer auth on an API** — incoming tokens issued by some
+  identity provider (Auth0, Cognito, Okta); your job is to validate
+  them.
+
+Both share one library: `openid-client` for issuing/redeeming, `jose`
+for low-level token verification.
+
+```bash
+pnpm add openid-client jose express-session
+```
+
+## Don't write the redirect dance yourself
+
+A "log in with Google" flow involves: building an `/authorize` URL
+with the right scopes, generating a PKCE verifier + challenge,
+storing `state` and `nonce` in the session, handling the callback,
+exchanging the code at the token endpoint, validating the ID token's
+signature against the provider's JWKS, checking issuer / audience /
+expiry / nonce, then fetching userinfo. `openid-client` does every
+step.
+
+```ts
+import * as openid from 'openid-client';
+
+let config: openid.Configuration;
+
+async function init() {
+  const issuer = new URL('https://accounts.google.com');
+  config = await openid.discovery(
+    issuer,
+    process.env.GOOGLE_CLIENT_ID!,
+    process.env.GOOGLE_CLIENT_SECRET!,
+  );
+}
+await init();   // run at boot
+```
+
+`discovery` fetches the provider's `/.well-known/openid-configuration`
+once and caches the endpoints + JWKS URI. The resulting `Configuration`
+is what every other call takes.
+
+## Authorization Code + PKCE
+
+### Start the flow
+
+```ts
+router.get('/auth/google', async (req, res) => {
+  const code_verifier = openid.randomPKCECodeVerifier();
+  const code_challenge = await openid.calculatePKCECodeChallenge(code_verifier);
+  const state = openid.randomState();
+  const nonce = openid.randomNonce();
+
+  // stash for the callback. session-bound so the user can't tamper.
+  req.session.oauth = { code_verifier, state, nonce };
+
+  const url = openid.buildAuthorizationUrl(config, {
+    redirect_uri: 'https://app.example.com/auth/google/callback',
+    scope: 'openid email profile',
+    state,
+    nonce,
+    code_challenge,
+    code_challenge_method: 'S256',
+  });
+
+  res.redirect(url.href);
+});
+```
+
+Three secrets travel with the request: `state` (CSRF), `nonce`
+(replay), `code_verifier` (PKCE). All three live in the session — the
+browser never sees the verifier, and `state` / `nonce` are validated
+on return.
+
+### Handle the callback
+
+```ts
+router.get('/auth/google/callback', async (req, res) => {
+  const stored = req.session.oauth;
+  if (!stored) return res.status(400).send('no in-flight auth');
+
+  const tokens = await openid.authorizationCodeGrant(
+    config,
+    new URL(req.originalUrl, 'https://app.example.com'),
+    {
+      pkceCodeVerifier: stored.code_verifier,
+      expectedState: stored.state,
+      expectedNonce: stored.nonce,
+    },
+  );
+
+  // tokens.id_token is already signature-, issuer-, audience-, nonce-checked
+  const claims = tokens.claims()!;
+  const userInfo = await openid.fetchUserInfo(config, tokens.access_token, claims.sub);
+
+  delete req.session.oauth;
+  req.session.userId = await upsertUserFromIdp(claims, userInfo);
+
+  // store the refresh token (NOT the access token) for later renewals
+  req.session.refreshToken = tokens.refresh_token;
+
+  res.redirect('/');
+});
+```
+
+`authorizationCodeGrant` does the redemption + ID token validation in
+one call. If anything fails — wrong state, expired code, bad
+signature, mismatched nonce, audience doesn't match your client ID —
+it throws before any code runs.
+
+<Callout type="warning">
+**Never** store the access token in the session and use it on
+incoming requests as if it were a session token. Access tokens expire
+in 30-60 minutes and are scoped for downstream APIs, not your app.
+Your app's session is its own thing — driven by the session cookie,
+nothing else. The IdP's role ends after the callback.
+</Callout>
+
+### Refresh-token rotation
+
+When you call the downstream API on the user's behalf, exchange the
+refresh token for a fresh access token as needed:
+
+```ts
+async function getAccessToken(req): Promise<string> {
+  const refresh = req.session.refreshToken;
+  if (!refresh) throw new Error('no refresh token');
+
+  const tokens = await openid.refreshTokenGrant(config, refresh);
+
+  // some IdPs (Google, Okta) rotate the refresh token on every use.
+  // store the new one if present.
+  if (tokens.refresh_token) req.session.refreshToken = tokens.refresh_token;
+
+  return tokens.access_token;
+}
+```
+
+Rotation means: if a refresh token is ever used twice, the IdP
+revokes the whole family. A leaked refresh token gets caught the next
+time the legitimate user logs in. Implement the storage correctly and
+this works automatically.
+
+## JWT bearer on incoming requests
+
+When another service authenticates with a bearer JWT (machine-to-
+machine, mobile clients, SPAs holding tokens), validate the signature
+against the IdP's JWKS:
+
+```ts
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const JWKS = createRemoteJWKSet(new URL('https://example.auth0.com/.well-known/jwks.json'));
+
+export function requireJwt(req, res, next) {
+  const header = req.get('authorization');
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'no token' });
+  const token = header.slice(7);
+
+  jwtVerify(token, JWKS, {
+    issuer: 'https://example.auth0.com/',
+    audience: 'https://api.example.com',
+    algorithms: ['RS256', 'ES256'],          // PIN the algs you accept
+  }).then(({ payload }) => {
+    req.user = payload;
+    next();
+  }).catch(() => res.status(401).json({ error: 'invalid token' }));
+}
+```
+
+Things `requireJwt` does that hand-rolled code skips:
+
+- **JWKS caching + rotation.** `createRemoteJWKSet` fetches the keys,
+  caches them, and refetches when a new `kid` is seen. Provider key
+  rotation works without restarts.
+- **Algorithm pinning.** Without it, an attacker can downgrade a
+  token to `alg: none` or trick you into accepting an HS256 token
+  using your public key as the HMAC secret. **Always** pin algs.
+- **`iss` / `aud` / `exp` / `nbf` checks.** Done inside `jwtVerify`.
+  Missing `aud` on a token meant for another service is a common
+  cross-service confused-deputy bug.
+
+## Wiring it together
+
+```ts
+app.use(express.json());
+app.use(session({ /* ... */ }));
+
+// browser flow — populates req.session.userId
+app.use('/auth', oauthRouter);
+
+// session-based protected routes
+app.use('/me', requireSession, meRouter);
+
+// API routes consumed by other services
+app.use('/api', requireJwt, apiRouter);
+```
+
+`requireSession` and `requireJwt` are not interchangeable. Browsers
+use sessions; machines use JWTs. Some routes accept either — write a
+fallback middleware that tries the session first, then the bearer
+token.
+
+## Common mistakes
+
+- **No `state` validation.** Without it, the callback endpoint
+  accepts any code, from anywhere, including attacker-initiated
+  flows.
+- **Storing the access token in cookies and treating it as the
+  session.** It expires fast, it's scoped wrong, and refreshing it
+  needs the refresh token anyway. Use sessions.
+- **Accepting any `alg`.** `jose`'s default is to require you to
+  pass `algorithms` — that's intentional. Don't pass them as
+  `['none']` or wildcard.
+- **No `aud` check.** A token issued for another microservice is
+  signed by the same IdP. Without `aud`, your service accepts it.
+- **JWKS fetched per request.** `createRemoteJWKSet` caches; reuse
+  the instance across requests. Re-creating it on every call defeats
+  the cache and DOSes your IdP.
+- **No refresh token rotation handling.** If the IdP rotates and you
+  don't store the new value, the next refresh fails.
+- **Sticking with `passport-google-oauth20`-style strategies for
+  everything.** Passport is fine for trivial flows but tends to hide
+  the protocol. `openid-client` keeps you closer to the spec and
+  works the same way for every OIDC provider.

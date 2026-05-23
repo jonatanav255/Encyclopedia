@@ -1,0 +1,217 @@
+export const level = 'senior';
+
+# MTU, path MTU, and fragmentation
+
+Every link layer between you and your destination has a
+maximum-size frame it accepts. **MTU** (Maximum Transmission
+Unit) is the largest IP packet that fits in one frame on a
+given link. When the IP layer hands a packet to a link
+whose MTU is smaller than the packet, something has to give
+— either the sender shrinks the packet, or somebody on
+the path fragments it. Both paths are full of subtle
+breakage that turns into "everything works except a few
+specific connections."
+
+## The numbers you should know
+
+| Link | MTU | Why |
+|---|---|---|
+| Ethernet (standard) | **1500** | The fundamental constant |
+| Ethernet "jumbo frames" | 9000 | Configured per LAN; not internet-safe |
+| WiFi | 1500 | Matches Ethernet |
+| PPPoE (DSL) | 1492 | 8 bytes PPP overhead |
+| GRE tunnel | 1476 | 24 bytes encapsulation overhead |
+| IPsec (transport) | ~1438 | Variable; IPsec adds 50-100 bytes |
+| WireGuard | 1420 | Default; configurable |
+| IPv6 mandatory minimum | **1280** | RFC 8200 — every IPv6 path must carry it |
+| IPv4 mandatory minimum | 576 | RFC 791 |
+
+**1500 is the default on basically everything** because that
+was the Ethernet limit in 1980 and nobody renegotiated. The
+implication: any tunnel or encapsulation eats into that.
+
+## What's inside a 1500-byte Ethernet frame
+
+```
+[ Ethernet header 14 ] [ IP header 20+ ] [ TCP header 20+ ] [ payload ]
+                       └────────── MTU (1500) ──────────────────────┘
+```
+
+The **MTU** is the IP-layer payload — what's left after the
+link headers. The **MSS** (Maximum Segment Size) is the
+TCP-layer payload — what's left after IP and TCP headers
+too:
+
+```
+MSS_v4 = MTU - 20 (IP) - 20 (TCP) = 1460
+MSS_v6 = MTU - 40 (IP) - 20 (TCP) = 1440
+```
+
+TCP advertises its MSS in the SYN's options. Both sides
+take the smaller advertised value. With IPsec or a tunnel,
+both sides advertise their *local* MSS without knowing the
+tunnel's smaller path MTU — which is where breakage starts.
+
+## Fragmentation — the bad old days
+
+IPv4 supports **fragmentation**: any router on the path may
+split an oversized packet into pieces, mark them with
+fragment offsets, and the destination reassembles. Lovely
+in theory. Painful in practice:
+
+- **Inefficient.** Every fragment carries a full IP header.
+  Reassembly is CPU-heavy.
+- **Drops cascade.** Lose one fragment and the whole
+  original packet is gone (destination times out reassembly,
+  application sees nothing).
+- **Stateful at the destination.** A 64KB reassembly buffer
+  per source/ID pair — DoS target.
+- **Middleboxes hate it.** Firewalls, NATs, and load
+  balancers often inspect L4 headers. Non-first fragments
+  don't *have* L4 headers. Many drop them outright.
+
+For these reasons, IPv4 fragmentation is widely considered
+broken in practice. The DF (Don't Fragment) bit lets the
+sender say "drop, don't fragment me." Modern stacks set DF
+on TCP segments by default.
+
+**IPv6 removed router-level fragmentation entirely.** Only
+the source can fragment, using an extension header. In
+practice IPv6 endpoints discover the path MTU and send no
+larger packets, and the network never fragments.
+
+## Path MTU Discovery (PMTUD)
+
+The dance for finding the smallest MTU on the path:
+
+1. Sender sets DF=1 and emits a packet at its local MTU
+   (1500).
+2. Some hop on the path has MTU 1476 (GRE tunnel).
+3. That router drops the packet and sends back an **ICMP
+   Type 3 Code 4** ("Fragmentation Needed and DF set"),
+   reporting its MTU.
+4. Sender shrinks its segment size for that destination,
+   retransmits.
+5. Process repeats if another smaller link exists farther
+   down. Eventually the sender has the **path MTU**.
+
+For IPv6, the same shape with ICMPv6 Type 2 ("Packet Too
+Big").
+
+When PMTUD works, you never see it. When it fails, you get
+**the PMTUD black hole**: the sender keeps emitting
+1500-byte packets, some middlebox silently drops them
+(because someone disabled ICMP somewhere), and the connection
+hangs after the SYN/ACK. The classic "small things work,
+big things don't" pattern.
+
+## The PMTUD black hole and how it manifests
+
+Symptoms:
+
+- `curl` hangs after `> GET / HTTP/1.1`. Headers go
+  through; the response body never arrives.
+- SSH connects, but the first `ls` of a big directory
+  freezes.
+- VPN clients work for messages, fail for file transfers.
+
+Mechanism: SYN handshake fits in tiny packets and works.
+TCP starts sending full-MSS segments. They hit a 1476-MTU
+link with DF=1, get dropped, the ICMP "too big" reply is
+blocked by some upstream firewall (a *classic* IT
+misconfiguration — "block all ICMP" looks safe). Sender
+retransmits the same large packet. Same thing. Forever.
+
+Diagnostic:
+
+```bash
+ping -M do -s 1472 destination     # 1472 + 28 = 1500 — DF set
+ping -M do -s 1448 destination     # try smaller, find the limit
+tracepath destination              # built-in PMTU discovery
+```
+
+`tracepath` is the easiest — it walks the path testing
+MTUs and reports the minimum.
+
+## TCP MSS clamping — the operator's hack
+
+When you control a tunnel and know the path MTU is, say,
+1420, you don't trust PMTUD to work. Instead you **clamp
+the MSS** in passing TCP SYNs:
+
+```bash
+iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
+  -j TCPMSS --clamp-mss-to-pmtu
+
+# Or fixed:
+iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
+  -j TCPMSS --set-mss 1380
+```
+
+The firewall rewrites the MSS option inside every TCP SYN
+crossing the tunnel. Both endpoints think the *other* side
+advertised a smaller MSS. They send smaller segments.
+Black hole avoided.
+
+VPN providers and cloud providers do this for you (AWS
+clamps to the right MSS on Transit Gateways automatically).
+On your own tunnels, configure it explicitly.
+
+## UDP and QUIC don't have MSS
+
+UDP has no negotiation step. The application picks the
+datagram size; if it's larger than the path MTU, you get
+fragmentation (bad on v4) or "packet too big" ICMP and
+loss (on v6).
+
+QUIC solves this in protocol. It does its **own** PMTUD by
+sending **PMTU probes** (padded packets of trial size) and
+backing off if they get lost. The first connection RTT
+discovers the path MTU; subsequent packets stay within it.
+QUIC also requires the path supports **at least 1200 bytes**
+(close to IPv6's 1280-byte minimum) — any QUIC-capable
+deployment must guarantee this. Below 1200 → no QUIC.
+
+DNS over UDP traditionally had a 512-byte ceiling for
+this reason; EDNS0 raised it but applications using large
+responses fall back to TCP.
+
+## When you should care
+
+- **Building a VPN or tunnel**: set the MSS clamp. Always.
+- **Running containers across an overlay** (Kubernetes
+  with VXLAN, Calico/IPIP, Cilium with VXLAN): the
+  overlay eats 50-100 bytes. Either the CNI clamps for
+  you, or you'll see PMTUD black holes for pod-to-external
+  TCP. Test with a big `curl` to an external 1500-MTU
+  service.
+- **Working in restrictive enterprise networks**: ICMP is
+  often blocked. PMTUD doesn't work. Symptom: large
+  downloads stall.
+- **Performance**: jumbo frames (9000) within a datacenter
+  reduce per-packet overhead. They require *every* link
+  to support it; one default-MTU device in the path and
+  you're back to fragmentation hell. Common inside a
+  switch fabric; never across the internet.
+
+## QA cheatsheet
+
+- **`ping -M do -s 1472 host`** — fails if MTU < 1500. Halve
+  the size to find the limit.
+- **`tracepath host`** — walks the path probing MTUs.
+- **`ss -ti`** — shows TCP path MTU per connection (the
+  `pmtu:` field).
+- **`ip route`** — `mtu` and `lock mtu` per route override
+  PMTUD per destination.
+- **Wireshark** — look for ICMP Type 3 Code 4 (v4) or Type
+  2 (v6) to confirm PMTUD is working.
+
+## See also
+
+- *tcp-three-way-handshake* — MSS is exchanged in SYN
+  options.
+- *tcp-vs-udp* — UDP's lack of MSS makes MTU a pure
+  application concern.
+- *quic-under-the-hood* — QUIC's in-protocol PMTU probing.
+- *nat-and-private-networks* — NAT devices are common
+  culprits for swallowing ICMP "too big."

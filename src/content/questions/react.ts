@@ -214,7 +214,7 @@ export const bank: QuestionBank = {
       level: 'senior',
       question: 'When you add `React.memo` to a component, why does it sometimes not prevent re-renders?',
       answer:
-        '`React.memo` does a **shallow comparison of props**. If the parent passes a new object or function reference each render — `<Memoed config={{ url }} />` or `<Memoed onClick={() => ...} />` — the prop "changes" by reference every time, defeating memo. Two fixes: (1) `useMemo`/`useCallback` in the parent to stabilize references. (2) `React.compiler` (when adopted) auto-memoizes. Memo also doesn\'t help when context changes — `React.memo` checks props only; context updates re-render consumers regardless.',
+        '`React.memo` does a **shallow comparison of props**. If the parent passes a new object or function reference each render — `<Memoed config={{ url }} />` or `<Memoed onClick={() => ...} />` — the prop "changes" by reference every time, defeating memo. Two fixes: (1) `useMemo`/`useCallback` in the parent to stabilize references. (2) Adopt the React Compiler (stable since React 19, April 2025) — it auto-memoizes both the component and the references the parent passes. Memo also doesn\'t help when context changes — `React.memo` checks props only; context updates re-render consumers regardless.',
     },
 
     // staff
@@ -321,6 +321,20 @@ export const bank: QuestionBank = {
       question: 'When would you use `useImperativeHandle` over just forwarding a DOM ref?',
       answer:
         'When the parent shouldn\'t have full DOM access. `useImperativeHandle` exposes a **chosen API** instead of the raw element — `{ play, pause, seek }` for a video player, `{ scrollToBottom, focus }` for a chat panel. The wins: (1) the component owns its DOM and can swap implementations (HLS player → custom) without changing the parent, (2) the parent can\'t do things you didn\'t intend (`.style.display = "none"`), (3) the API contract is explicit and typed.\n\nDon\'t use it for "just need to focus" — pass the DOM ref through. Use it when you have multiple coordinated DOM elements and want to expose intentional verbs over them.',
+    },
+
+    // --- react compiler ---
+    {
+      level: 'mid',
+      question: 'What does the React Compiler actually do at build time, and what does it *not* do?',
+      answer:
+        'The React Compiler (stable since React 19.0, April 2025) is a Babel/SWC plugin that statically analyzes each component and **inserts the equivalent of `useMemo` / `useCallback` / `React.memo` everywhere it\'s safe to do so**. Every derived value and every JSX element gets a cache slot keyed by its dependencies. A re-render only recomputes slots whose inputs changed; everything else returns reference-equal from the cache, so children skip their own re-renders for free.\n\nWhat it does **not** do:\n\n- It doesn\'t replace Fiber. Reconciliation still happens; the compiler just makes "props identical to last render" the common case.\n- It doesn\'t skip effects. `useEffect` still re-runs when its deps change — the compiler can stabilize the deps, not the effect.\n- It doesn\'t make slow code fast. An O(n) reduce over a million items is still O(n); the compiler just runs it once per real input change instead of once per render. For genuinely expensive synchronous work you still need `useTransition` or `useDeferredValue`.\n- It doesn\'t silently optimize unsafe code. If it can\'t prove a function is a pure-enough component (mutation during render, conditional hooks, mutable module-level reads), it emits a `"use no memo"` bailout and skips optimization for that function — code still runs, just without the speedup.\n\nThe practical rule after adopting: **write the obvious code; stop reaching for manual memos unless the linter tells you the compiler bailed out**.',
+    },
+    {
+      level: 'senior',
+      question: 'When does the React Compiler bail out of a component, and how do you tell?',
+      answer:
+        'The compiler\'s safety analysis is conservative — when in doubt, it emits a `"use no memo"` directive for that function and leaves it unoptimized. Common bailout causes:\n\n- **Mutation during render** — `props.items.push(x)`, `state.field = y`. Render is supposed to be pure; mutation breaks the dependency analysis.\n- **Reading a mutable module-level variable** — `let counter = 0; function C() { return <div>{counter++}</div> }`. The compiler can\'t see when `counter` changes.\n- **Conditional or in-loop hooks** — already a Rules-of-Hooks violation; the compiler refuses.\n- **Reading `ref.current` during render** — refs aren\'t reactive; using them as render inputs defeats memoization.\n- **`eval` or `with`** — can\'t do data-flow analysis.\n\nHow to tell: install `eslint-plugin-react-compiler` (often bundled with `eslint-plugin-react-hooks` in 2026). It flags the same patterns the compiler itself rejects, with diagnostics. Run it once on adoption and read the output — bailouts usually cluster around one root cause (a shared mutable store, a global cache) that fixes ten files at once.\n\nLast-resort escape hatch: add `\'use no memo\';` at the top of a single function to opt it out explicitly. Use it as a temporary safety valve while you refactor, not as a long-term workaround.',
     },
 
     // --- polymorphic components ---

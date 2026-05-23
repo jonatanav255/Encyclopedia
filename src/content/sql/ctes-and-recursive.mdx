@@ -1,0 +1,233 @@
+export const level = 'mid';
+
+# CTEs and recursive queries
+
+A **common table expression (CTE)** is a named subquery you can
+reference later in the same statement. The `WITH` keyword
+introduces one. CTEs make long queries readable and unlock
+**recursive queries** that plain SQL can't express.
+
+Standard SQL since SQL:1999. Supported in Postgres, MySQL 8.0+,
+SQL Server, Oracle, SQLite 3.8.3+.
+
+## Basic non-recursive CTEs
+
+```sql
+WITH active_users AS (
+  SELECT id, email FROM users WHERE last_seen > NOW() - INTERVAL '30 days'
+),
+top_purchasers AS (
+  SELECT u.id, SUM(o.total) AS spend
+  FROM active_users u
+  JOIN orders o ON o.user_id = u.id
+  GROUP BY u.id
+)
+SELECT * FROM top_purchasers WHERE spend > 1000;
+```
+
+Three benefits over deeply nested subqueries:
+
+1. **Readability** — each CTE has a name and a clear scope.
+2. **Reusability** — reference the same CTE multiple times in
+   the main query.
+3. **Composition** — later CTEs can reference earlier ones.
+
+## Postgres: optimization fence (before vs after PG 12)
+
+Through **Postgres 11**, every CTE was materialized — the planner
+executed it as a separate step, even if inlining would have been
+faster. The "CTE is a fence" rule was a real perf foot-gun.
+
+**Postgres 12+** changed the default: a CTE referenced exactly
+once and without `RECURSIVE` / volatile functions / data
+modification is **inlined** like a regular subquery. To force
+the old behavior:
+
+```sql
+WITH cheap_filter AS MATERIALIZED (
+  SELECT id FROM huge_table WHERE expensive_predicate(...)
+)
+SELECT * FROM cheap_filter
+JOIN other_table USING (id);
+```
+
+`AS MATERIALIZED` forces materialization. `AS NOT MATERIALIZED`
+forces inlining. Without either keyword, the planner decides.
+
+MySQL 8.0 inlines by default; SQL Server has always inlined.
+Don't carry "CTEs are slow in Postgres" advice forward — that
+was specifically pre-PG-12.
+
+## Recursive CTEs
+
+The killer feature. A recursive CTE has two parts joined by
+`UNION ALL`:
+
+1. **Anchor query** — the base case, executed once.
+2. **Recursive query** — references the CTE name itself, runs
+   repeatedly until no new rows are produced.
+
+```sql
+WITH RECURSIVE numbers(n) AS (
+  SELECT 1                       -- anchor
+  UNION ALL
+  SELECT n + 1 FROM numbers      -- recursive
+  WHERE n < 10
+)
+SELECT n FROM numbers;
+-- returns 1..10
+```
+
+`UNION ALL` (not `UNION`) is required — `UNION` deduplicates
+each iteration and is usually a bug.
+
+## Traversing hierarchies
+
+The textbook use case: organizational charts, comment threads,
+category trees, anything self-referencing.
+
+```sql
+WITH RECURSIVE org AS (
+  SELECT id, name, manager_id, 1 AS depth
+  FROM employees
+  WHERE id = 42                            -- start from a specific person
+  UNION ALL
+  SELECT e.id, e.name, e.manager_id, o.depth + 1
+  FROM employees e
+  JOIN org o ON e.manager_id = o.id        -- e reports to o
+)
+SELECT * FROM org ORDER BY depth;
+```
+
+That returns the subtree below employee 42. Swap the join
+direction (`o.manager_id = e.id`) to walk **upward** to all
+ancestors instead.
+
+## Graph traversal — finding paths
+
+Recursive CTEs can implement BFS on a graph stored as an edges
+table. The trick is tracking visited nodes to avoid cycles:
+
+```sql
+WITH RECURSIVE paths AS (
+  SELECT
+    from_node AS start,
+    to_node AS end,
+    ARRAY[from_node, to_node] AS path,
+    weight AS total
+  FROM edges
+  WHERE from_node = 'A'
+  UNION ALL
+  SELECT
+    p.start,
+    e.to_node,
+    p.path || e.to_node,
+    p.total + e.weight
+  FROM paths p
+  JOIN edges e ON p.end = e.from_node
+  WHERE NOT (e.to_node = ANY(p.path))      -- cycle guard
+    AND array_length(p.path, 1) < 10       -- depth limit (safety!)
+)
+SELECT * FROM paths WHERE end = 'Z' ORDER BY total LIMIT 1;
+```
+
+Two safety patterns are essential:
+
+- **Cycle check** — track visited nodes in an array; skip already-
+  visited.
+- **Depth bound** — `array_length(...) < N` prevents runaway
+  recursion on bugs or unexpected data shapes.
+
+Postgres lets you set `SET LOCAL statement_timeout` as a third
+safety net.
+
+## Generating series
+
+Postgres has `generate_series()` for sequences, but recursive
+CTEs are portable:
+
+```sql
+WITH RECURSIVE dates AS (
+  SELECT DATE '2026-01-01' AS d
+  UNION ALL
+  SELECT d + INTERVAL '1 day' FROM dates
+  WHERE d < DATE '2026-12-31'
+)
+SELECT d FROM dates;
+```
+
+Useful for filling gaps in time-series queries (one row per day
+even when no events occurred).
+
+## Common patterns
+
+### Running totals (when window functions can't reach)
+
+Window functions handle most running totals (see **Window
+functions**), but **resetting** running totals at a condition
+needs recursion or a self-join with bounds.
+
+### Gaps and islands
+
+Classic SQL puzzle: find contiguous runs of a sequence. Often
+solved with window functions (`ROW_NUMBER` differencing trick),
+but recursive CTEs can encode arbitrary "run continues if X"
+predicates.
+
+### Bill of materials
+
+A part contains sub-parts, each of which contains sub-parts.
+"How much copper goes into this engine?" is a recursive sum:
+
+```sql
+WITH RECURSIVE bom AS (
+  SELECT part_id, sub_part_id, qty FROM components WHERE part_id = 'engine-7'
+  UNION ALL
+  SELECT b.part_id, c.sub_part_id, b.qty * c.qty
+  FROM bom b JOIN components c ON c.part_id = b.sub_part_id
+)
+SELECT sub_part_id, SUM(qty) AS total_qty
+FROM bom
+WHERE sub_part_id IN (SELECT id FROM raw_materials WHERE material = 'copper')
+GROUP BY sub_part_id;
+```
+
+## Modifying CTEs
+
+In Postgres, you can do `INSERT`, `UPDATE`, `DELETE` in a CTE
+and use the result in the outer query (`RETURNING`):
+
+```sql
+WITH archived AS (
+  DELETE FROM tasks
+  WHERE done = true AND completed_at < NOW() - INTERVAL '90 days'
+  RETURNING *
+)
+INSERT INTO archive_tasks SELECT * FROM archived;
+```
+
+Atomic move-and-archive in one statement. The order of operations
+when the same CTE modifies and reads is subtle — each statement
+sees the same snapshot, so reads inside the CTE don't see the
+modifications. Read the docs carefully here.
+
+MySQL and SQL Server don't support data-modifying CTEs the same
+way.
+
+## Performance and gotchas
+
+- **No early termination beyond row production.** A recursive
+  CTE runs until the recursive part produces zero new rows. If
+  you only need one path, you may compute many; consider
+  `LIMIT` plus `MATERIALIZED` to force the planner to stop early.
+- **Memory.** All intermediate rows live until the statement
+  ends. Wide rows × deep recursion can blow up RAM.
+- **Plan visibility.** `EXPLAIN ANALYZE` shows the CTE as a
+  separate node. Check actual vs estimated row counts — recursive
+  CTEs often have terrible estimates.
+
+When you find yourself reaching for recursive CTEs frequently for
+serious graph work, consider whether a graph database (Neo4j,
+Memgraph) or Postgres extensions (Apache AGE) are a better fit.
+For occasional hierarchy queries, plain recursive CTEs are the
+right tool.

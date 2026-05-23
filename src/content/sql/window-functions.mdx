@@ -1,0 +1,213 @@
+export const level = 'mid';
+
+# Window functions
+
+Window functions compute aggregates and rankings **across rows
+without collapsing them**. Where `GROUP BY` returns one row per
+group, a window function returns one row per input row with a
+computed value alongside.
+
+They've been standard SQL since SQL:2003 and Postgres since 8.4
+(2009). They replace whole categories of self-joins, subqueries,
+and application-side post-processing.
+
+## The anatomy
+
+```sql
+SELECT
+  user_id,
+  amount,
+  SUM(amount) OVER (PARTITION BY user_id ORDER BY created_at)
+    AS running_total
+FROM transactions;
+```
+
+Three parts inside `OVER (...)`:
+
+1. **PARTITION BY** — splits rows into groups. Each window
+   function computes independently per partition. Optional;
+   default is one partition (the whole result).
+2. **ORDER BY** — orders rows inside each partition. Required
+   for ranking and ordered aggregates. Optional otherwise.
+3. **Frame** — `ROWS` or `RANGE` clause defining which rows
+   contribute to each output. Defaults vary; see below.
+
+## Ranking functions
+
+| Function | Behavior |
+| --- | --- |
+| `ROW_NUMBER()` | Sequential, no ties (1, 2, 3, 4, ...) |
+| `RANK()` | Standard with gaps for ties (1, 2, 2, 4, ...) |
+| `DENSE_RANK()` | Standard without gaps (1, 2, 2, 3, ...) |
+| `NTILE(n)` | Buckets the partition into `n` roughly equal groups |
+| `PERCENT_RANK()` | `(rank - 1) / (rows - 1)` |
+| `CUME_DIST()` | Cumulative distribution: rows ≤ current / total |
+
+**Top-N per group** is the canonical use:
+
+```sql
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY category ORDER BY score DESC) AS rn
+  FROM products
+)
+SELECT * FROM ranked WHERE rn <= 3;
+```
+
+Top-3 products per category. Without window functions this is a
+correlated subquery or a self-join — both slower, both more
+fragile.
+
+## Offset functions
+
+- **`LAG(col, n, default)`** — value `n` rows earlier in the
+  partition. Defaults: `n=1`, no default (returns NULL).
+- **`LEAD(col, n, default)`** — value `n` rows later.
+- **`FIRST_VALUE(col)`** / **`LAST_VALUE(col)`** — value of `col`
+  at the first or last row of the frame.
+- **`NTH_VALUE(col, n)`** — value at the `n`-th row of the frame.
+
+Compute day-over-day change:
+
+```sql
+SELECT
+  date,
+  revenue,
+  revenue - LAG(revenue) OVER (ORDER BY date) AS daily_change
+FROM daily_metrics;
+```
+
+Find sessions where the user did action X then action Y:
+
+```sql
+SELECT user_id, event_at
+FROM (
+  SELECT
+    user_id,
+    event_at,
+    event_name,
+    LAG(event_name) OVER (PARTITION BY user_id ORDER BY event_at) AS prev_event
+  FROM events
+) t
+WHERE event_name = 'purchase' AND prev_event = 'view_cart';
+```
+
+## Frames — `ROWS` vs `RANGE`
+
+The frame clause controls which rows in the partition contribute
+to each row's aggregate. The default depends on whether
+`ORDER BY` is present:
+
+- **No `ORDER BY`** → frame is the entire partition.
+- **`ORDER BY` present, no explicit frame** → `RANGE BETWEEN
+  UNBOUNDED PRECEDING AND CURRENT ROW` (a footgun, see below).
+
+Explicit frames:
+
+```sql
+SUM(x) OVER (ORDER BY t ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+-- 7-day trailing sum (current row + 6 prior rows)
+
+AVG(x) OVER (ORDER BY t ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING)
+-- 7-row centered moving average
+```
+
+`ROWS` counts **rows**; `RANGE` is value-based. With `ORDER BY
+created_at RANGE BETWEEN INTERVAL '1 hour' PRECEDING AND CURRENT
+ROW`, you get a 1-hour sliding window measured by the actual
+timestamp value, not row count.
+
+**The `RANGE` default footgun**: when multiple rows share the
+same `ORDER BY` value, the default `RANGE` frame includes **all
+of them** as a single "peer group." Two rows with the same date
+both see each other's value in a "running total." Use `ROWS` if
+you want strict row-by-row semantics.
+
+## Running totals and moving averages
+
+The two most common production patterns:
+
+```sql
+-- Running total
+SELECT
+  date,
+  amount,
+  SUM(amount) OVER (ORDER BY date ROWS UNBOUNDED PRECEDING) AS total_to_date
+FROM transactions;
+
+-- 30-day moving average
+SELECT
+  date,
+  value,
+  AVG(value) OVER (ORDER BY date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
+    AS ma_30
+FROM daily_signals;
+```
+
+Time series tools (Grafana, dbt, BI dashboards) lean heavily on
+these. Migrating an "I sort-of did this in Python after the
+query" pipeline into pure SQL is often a 10× perf win.
+
+## Named windows
+
+If you reference the same window definition multiple times, name
+it with `WINDOW`:
+
+```sql
+SELECT
+  user_id,
+  amount,
+  SUM(amount)   OVER w AS running_sum,
+  COUNT(*)      OVER w AS running_count,
+  AVG(amount)   OVER w AS running_avg
+FROM tx
+WINDOW w AS (PARTITION BY user_id ORDER BY created_at);
+```
+
+Same logical plan, less duplication, easier to maintain.
+
+## Performance
+
+The query planner usually executes window functions by:
+
+1. Sorting input by `PARTITION BY` + `ORDER BY`.
+2. Streaming through the sorted output, maintaining per-window
+   state.
+
+Critical implication: **a covering index on `(partition_col,
+order_col)`** lets the planner skip the sort. Without it, large
+partitions sort to disk and the query gets slow.
+
+Multiple window functions with the **same** window share the
+sort. Different windows mean separate sorts — combine where you
+can, name them with `WINDOW`.
+
+Window functions run **after `WHERE`** but **before `LIMIT`**.
+Filtering on a window result requires a subquery or CTE:
+
+```sql
+-- Doesn't work: window function in WHERE
+SELECT *, ROW_NUMBER() OVER (...) AS rn FROM t WHERE rn = 1;
+
+-- Wrap it
+SELECT * FROM (
+  SELECT *, ROW_NUMBER() OVER (...) AS rn FROM t
+) s WHERE rn = 1;
+```
+
+## When window functions aren't enough
+
+- **Recursive computations** (cumulative max with reset
+  conditions, gaps-and-islands with complex predicates) sometimes
+  exceed what windows can express. Use recursive CTEs.
+- **Cross-partition references** — a window only sees rows in
+  its own partition. Comparing across partitions needs a join.
+- **OLAP at scale** — for billion-row aggregations, dedicated
+  OLAP engines (DuckDB, ClickHouse, BigQuery) are orders of
+  magnitude faster than OLTP Postgres on the same window query.
+
+For everyday application reporting and analytics, window functions
+are the right reach. Most queries that use a self-join, a
+correlated subquery, or "post-process in code" are window
+functions in disguise.

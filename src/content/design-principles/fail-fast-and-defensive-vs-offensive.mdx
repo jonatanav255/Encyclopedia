@@ -1,0 +1,177 @@
+export const level = 'mid';
+
+# Fail-fast, defensive vs offensive programming
+
+Three names, one question: **when a precondition is violated, do you
+crash, recover, or pretend it didn't happen?**
+
+The three positions:
+
+- **Fail-fast** (Jim Shore, 2004) — detect violations as early as
+  possible and stop. Loud crash at the source > silent corruption
+  downstream.
+- **Defensive programming** — assume callers will misuse the
+  function. Validate inputs, return sentinel values, handle every
+  imaginable error.
+- **Offensive programming** (sometimes called "assertion-based") —
+  document a contract; trust callers to honor it; assert (and crash)
+  when they don't.
+
+These are not opposed *if you locate them correctly*: defensive at
+the system boundary, offensive inside the boundary, fail-fast as the
+default failure mode in both.
+
+## Fail-fast as a default
+
+The argument is simple. Bugs detected near their cause are cheap to
+fix; bugs detected far from their cause require a debugger session
+to find. So **make detection as close to the cause as possible.**
+
+Some shapes:
+
+- **Validate at the function entry.** A function that requires a
+  positive integer should throw on `-1` immediately, not at line 40
+  of a downstream consumer.
+- **Crash on impossible states.** If your code reaches a `switch`
+  case the type system says can't happen, throw — don't `return
+  null`. The "impossible" case will eventually happen; you want a
+  stack trace, not a missing record.
+- **Don't catch what you can't handle.** A blanket `try/catch` that
+  logs and continues is a fail-slow pattern. The exception was a
+  *signal*; eating it turns one bug into many.
+- **Constructor-time validation.** A `User({ email: null })` that
+  succeeds and produces a half-initialized object is a slow failure.
+  Constructor failure is fast.
+
+The cost is real: more crashes in dev, occasional dev-time crashes
+on edge cases users wouldn't have triggered, occasional friction in
+chaotic legacy code. The benefit is that production bugs are *closer
+to their causes*, debug sessions get shorter, and silent data
+corruption becomes rare.
+
+## The "be liberal in what you accept" critique
+
+Postel's law — "be conservative in what you do, liberal in what you
+accept" — is the opposite stance. It built the early internet
+(forgiving parsers, lots of broken HTTP clients still working) and
+it built decades of security bugs (forgiving parsers that accept
+exploit payloads other parsers reject differently).
+
+The modern consensus, roughly:
+
+- **For protocols**: be strict. HTTP/2 and HTTP/3 are dramatically
+  less forgiving than HTTP/1.1 — a single mis-encoded byte fails the
+  request — and HPACK / QPACK header smuggling exploits got harder
+  as a result.
+- **For UIs**: be forgiving. Users mistype things; reject them at
+  the boundary and explain why, but don't crash on a stray space.
+- **For internal APIs**: be strict. The cost of forgiveness compounds
+  across every caller; the benefit is small because callers are your
+  own team.
+
+The principle isn't "always be strict" — it's **decide where
+strictness lives, then be ruthlessly consistent inside it.**
+
+## Defensive at the boundary, offensive inside
+
+The clean split:
+
+<Compare
+  left={{
+    title: 'Boundary code (defensive)',
+    points: [
+      'HTTP handlers, public library functions, message-queue consumers, anything reading user input',
+      'You don\'t control the caller; treat input as hostile by default',
+      'Validate types, ranges, encodings, sizes; reject with a clear error',
+      'Never trust the wire even if it claims to be JSON',
+      'Convert sentinel/error states into typed values before passing inward',
+    ],
+  }}
+  right={{
+    title: 'Interior code (offensive)',
+    points: [
+      'Functions called only by your own well-typed callers',
+      'Document preconditions; assert them; let the assertion crash dev',
+      'Skip "what if" branches the type system rules out',
+      'Don\'t re-validate what the boundary already validated',
+      'Trust your colleagues to read the contract',
+    ],
+  }}
+/>
+
+This composition is what people actually mean by "fail-fast": **at
+the boundary, fail fast and gracefully; in the interior, fail fast
+and loudly.** Boundary code returns an error code; interior code
+crashes.
+
+The failure mode of *only* doing defensive is duplicated validation
+at every layer — every function checks every argument is non-null,
+and you've reinvented dynamic typing on top of your static type
+system. The failure mode of *only* offensive is one bad request
+crashing a worker.
+
+## Assertions vs guards
+
+Two superficially similar constructs:
+
+- **An assertion** says "this can't be wrong; if it is, our
+  reasoning is broken — crash, please." Aimed at programmers.
+- **A guard** says "this might be wrong; here's the handling."
+  Aimed at users (or upstream code).
+
+They look identical (`if (x < 0) throw …`) but they're for different
+audiences and should have different behaviors. Assertions can be
+disabled in production (C `assert`, Rust `debug_assert!`) on the
+theory that they catch programmer errors that should be fixed before
+ship. Guards must run in production because they handle real-world
+input.
+
+Mixing them up is a recurring bug:
+
+- **Assertion used as guard**: a `panic!` on missing-but-optional
+  config crashes the service when it should have used a default.
+- **Guard used as assertion**: a "shouldn't happen" branch returning
+  `null` and continuing, hiding a real type-level bug.
+
+## Avoiding the worst patterns
+
+A short bestiary:
+
+- **Catch-all that logs and continues.** `try { … } catch (e) {
+  log.error(e); }` with no rethrow. The bug is hidden; the system
+  drifts into a corrupt state; the log line is read by nobody.
+- **`if (x)` instead of `if (x !== null)`**. Treats `0`, `""`, and
+  `false` as "missing." Silent semantic bugs.
+- **Wrapping every function body in null-checks.** Reinvents nullable
+  types worse than the type system already does it. Use
+  non-nullable types and validate at the entry.
+- **Returning sentinel values from interior code.** `-1` for "not
+  found" in a function that already has a real `Option<T>` or
+  `Result<T, E>` available. The next caller will forget to check.
+- **Catching `Throwable` in Java** (or `Exception` in Python with no
+  filter). Catches `OutOfMemoryError` and similar things you really
+  do want to crash on.
+
+## When fail-fast is wrong
+
+Not every system. The cases where forgiveness is the better default:
+
+- **A user-facing UI** where a single missing field shouldn't blow
+  away a 20-minute draft. Validate locally; degrade gracefully;
+  preserve work.
+- **A retry-safe background job** where a transient input issue
+  should park the job for inspection, not crash the whole worker.
+- **A long-running system that batches across millions of inputs.**
+  One bad record shouldn't stop the batch — log it, dead-letter it,
+  continue.
+
+The pattern in each: **a clearly defined "things that can go wrong"
+boundary, with a place for the bad ones to go.** Without that
+boundary, "be forgiving" becomes "be silent," which is the worst of
+both worlds.
+
+<Callout type="info">
+Useful rule of thumb: **crash on programmer errors; handle user
+errors.** Confusing the two is the most common version of this
+principle going wrong.
+</Callout>

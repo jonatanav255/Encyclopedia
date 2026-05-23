@@ -320,7 +320,7 @@ export const bank: QuestionBank = {
       level: 'senior',
       question: 'When would you choose Valibot or ArkType over Zod in 2026?',
       answer:
-        '**Valibot** when bundle size matters (frontend, edge runtime) — its pipe-style modular API tree-shakes to ~5 KB vs Zod\'s ~50 KB minified. **ArkType** when you do heavy type-level work — its parser-as-types approach gives excellent inference performance and TypeScript-syntax-inspired schemas. **Zod** stays the default for backend Node services: mature, broad ecosystem (Express middleware, OpenAPI generators, tRPC, Drizzle integrations), no real bundle constraint server-side. All three give equivalent type inference and structured errors; the choice is bundle + ergonomics, not capabilities.',
+        '**Valibot** when bundle size matters (frontend, edge runtime) — its pipe-style modular API tree-shakes to ~1–2 KB for typical schemas. **Zod v4** core sits around ~22 KB min / ~8 KB gz; Zod Mini gets down to ~2 KB gz if you really need it. **ArkType** when you do heavy type-level work — its parser-as-types approach gives excellent inference performance and TypeScript-syntax-inspired schemas. **Zod** stays the default for backend Node services: mature, broad ecosystem (Express middleware, OpenAPI generators, tRPC, Drizzle integrations), no real bundle constraint server-side. All three give equivalent type inference and structured errors; the choice is bundle + ergonomics, not capabilities.',
     },
 
     // --- testing types ---
@@ -427,6 +427,28 @@ export const bank: QuestionBank = {
       question: 'What does `as const satisfies T` give you that either alone doesn\'t?',
       answer:
         '`as const` freezes the value as deeply-readonly literals (`{ readonly mode: \'dark\' }`) but doesn\'t check it against any type. `satisfies T` checks against the type while keeping the inferred (still-widened) value type. Combining them: **frozen, narrow, AND validated**. Canonical use is config/routes/enums-as-objects: `const routes = { home: { path: \'/\' }, profile: { path: \'/profile\' } } as const satisfies Record<string, { path: string }>`. You get `keyof typeof routes` = `\'home\' | \'profile\'` (precise key union), every `path` typed as its literal string, and a compile error if you forget to add `path` to a new route. The four-way matrix: annotation = check + widen, `as` = no check + widen, `satisfies` = check + narrow, `as const satisfies` = check + readonly narrow.',
+    },
+
+    // --- using / disposable ---
+    {
+      level: 'senior',
+      question: 'When does `using` beat `try/finally`, and what does it offer that `try/finally` doesn\'t?',
+      answer:
+        '`using` shines when you have multiple resources, early returns, or shared cleanup logic — anywhere the `finally` block was already getting nested or duplicated. Two things `try/finally` doesn\'t give you: (1) **deterministic reverse-order cleanup** when multiple `using` bindings exist in a scope — they dispose in the opposite order they were declared, matching how they were set up. (2) A clean **error model** via `SuppressedError`: if both the body and the dispose throw, both errors are preserved (`.error` is the most recent, `.suppressed` is the prior one). A `finally` that throws silently swallows the body error. For a single one-shot resource in a small function, plain `try/finally` is still fine — `using` pays off as soon as the cleanup graph gets non-trivial.',
+    },
+    {
+      level: 'senior',
+      question: 'A function builds up several `using` resources and wants to return the bundle. What goes wrong, and how do you fix it?',
+      answer:
+        'The dispose runs at the closing brace of the function, *before* the return value escapes — so the caller gets references to already-cleaned-up resources. The fix is `DisposableStack.move()`: collect the resources on a stack, then call `.move()` to transfer ownership to a new stack that the caller binds with `using`. The original stack is emptied, so its dispose is a no-op; the new stack disposes in the caller\'s scope. Example: `function setup() { using stack = new DisposableStack(); const a = stack.use(openA()); const b = stack.use(openB()); return stack.move(); } { using owned = setup(); /* a and b alive here */ }`. Without `move()`, you\'d leak on every early-return path during setup.',
+    },
+
+    // --- Zod v4 sizing (companion to the existing Valibot/Ark question) ---
+    {
+      level: 'mid',
+      question: 'Roughly how big is Zod v4 in a frontend bundle, and when do you reach for Zod Mini or Valibot?',
+      answer:
+        '**Zod v4 core**: ~22 KB minified / ~8 KB gzipped — bigger than people expect, because v4 absorbed features (errors, async, top-level schemas) Zod 3 left out. **Zod Mini**: ~2 KB gzipped — same API shape, fewer features, designed for size-constrained targets. **Valibot**: tree-shakes to ~1–2 KB for typical schemas thanks to its pipe-style modular API. Backend Node service? Zod, no question — bundle doesn\'t matter, ecosystem is broad. Mobile web bundle where every KB hurts? Valibot, or Zod Mini if you want to stay in the Zod ecosystem. All three give equivalent type inference and structured errors; bundle is the only axis on which they meaningfully differ.',
     },
   ],
 };

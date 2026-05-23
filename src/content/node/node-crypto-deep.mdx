@@ -1,0 +1,245 @@
+export const level = 'senior';
+
+# `node:crypto` in depth
+
+`node:crypto` is the kitchen sink — hashes, HMACs, ciphers, key
+derivation, signatures, certificate parsing, prime generation, FIPS-
+mode hooks, and a near-complete `WebCrypto` implementation on
+`crypto.subtle`. Most apps use a small slice of it.
+
+This page covers what you actually reach for in a backend Node
+service, the right primitives, and the common pitfalls. For the
+cross-runtime API see `javascript/web-crypto-subtle.mdx`; for the
+"where do I put the secret key" question see
+`security/secrets-management.mdx`.
+
+## When `node:crypto` vs `crypto.subtle`
+
+| Need | Reach for |
+| --- | --- |
+| Same code on browser + Node + edge | `crypto.subtle` |
+| Streaming hash of a large file | `node:crypto` (`createHash`) |
+| `scrypt` / `chacha20-poly1305` | `node:crypto` |
+| MD5 (legacy ETag, etc.) | `node:crypto` |
+| Constant-time buffer comparison | `crypto.timingSafeEqual` |
+| RSA key generation, certificate signing | `node:crypto` |
+| Password hashing | `argon2` (userland) or `crypto.scrypt` |
+
+If two equivalent primitives exist, prefer `crypto.subtle` — it's
+portable. Drop to `node:crypto` when you need a Node-only feature.
+
+## Hashing
+
+The classic interface is incremental and stream-friendly:
+
+```js
+import { createHash } from 'node:crypto';
+
+const h = createHash('sha256');
+fs.createReadStream('big.bin').on('data', (c) => h.update(c)).on('end', () => {
+  console.log(h.digest('hex'));
+});
+```
+
+Or one-shot:
+
+```js
+import { hash } from 'node:crypto';   // Node 21.7+ / 20.12+
+hash('sha256', 'hello', 'hex');       // direct digest, no createHash needed
+```
+
+Algorithm names follow OpenSSL: `sha256`, `sha512`, `sha3-256`,
+`blake2b512`, `md5` (legacy only). The set is whatever your OpenSSL
+build supports — `crypto.getHashes()` lists them.
+
+## HMAC
+
+```js
+import { createHmac } from 'node:crypto';
+
+const tag = createHmac('sha256', secret).update(payload).digest();
+```
+
+For verification, **always** use `crypto.timingSafeEqual`:
+
+```js
+import { timingSafeEqual } from 'node:crypto';
+
+if (tag.length !== expected.length) return false;   // length leaks anyway
+return timingSafeEqual(tag, expected);
+```
+
+`Buffer.compare` and `===` are not constant-time. The classic mistake
+is `if (sig === expected)` for webhook signatures — observable timing
+differences are enough to forge over a long enough campaign.
+
+## Symmetric encryption
+
+`crypto.subtle`'s AES-GCM is what you want. The `node:crypto` `Cipheriv`
+API still works:
+
+```js
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+
+const key = randomBytes(32);              // 256-bit
+const iv = randomBytes(12);                // 96-bit, GCM standard
+
+const cipher = createCipheriv('aes-256-gcm', key, iv);
+const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+const tag = cipher.getAuthTag();          // 16 bytes — store this!
+
+// decrypt
+const decipher = createDecipheriv('aes-256-gcm', key, iv);
+decipher.setAuthTag(tag);
+const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+```
+
+Three values to persist per message: **iv**, **ciphertext**, **tag**.
+Forget any one and decryption fails.
+
+<Callout type="warning">
+Never use `aes-256-cbc` for new code. CBC without an HMAC is
+malleable; CBC with a separately-computed HMAC is the
+"encrypt-then-MAC" pattern most apps get wrong (padding oracles,
+order-of-operations bugs). GCM is authenticated by construction —
+the tag check catches tampering before any plaintext is returned.
+</Callout>
+
+`chacha20-poly1305` is the other modern AEAD — slightly faster on
+CPUs without AES-NI, available since Node 12 in `createCipheriv`.
+
+## Password hashing
+
+**Do not use SHA / HMAC / PBKDF2 for passwords.** Use one of:
+
+- **`argon2`** (the `argon2` npm package, native binding to libsodium's
+  reference implementation) — the OWASP recommendation for new code.
+- **`crypto.scrypt`** — built in to Node, no native dependency.
+  Memory-hard, well-vetted.
+- **`bcrypt`** — still acceptable; the `bcrypt` package is widely
+  deployed. See `express/auth-basics.mdx`.
+
+```js
+import { scrypt, randomBytes } from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(scrypt);
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const key = await scryptAsync(password, salt, 64);
+  return `${salt.toString('hex')}:${key.toString('hex')}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [saltHex, keyHex] = stored.split(':');
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(keyHex, 'hex');
+  const actual = await scryptAsync(password, salt, expected.length);
+  return timingSafeEqual(actual, expected);
+}
+```
+
+Tune `scrypt` parameters (`N`, `r`, `p`) for ~250ms per hash on your
+production hardware. The defaults are conservative.
+
+## Key derivation (HKDF)
+
+When you have key material and need to derive multiple sub-keys
+(encryption key, signing key, integrity key) from it:
+
+```js
+import { hkdfSync } from 'node:crypto';
+
+const encKey  = hkdfSync('sha256', master, salt, Buffer.from('encryption'), 32);
+const sigKey  = hkdfSync('sha256', master, salt, Buffer.from('signing'), 32);
+```
+
+The `info` parameter (4th arg) domain-separates the outputs. Two
+different `info` values + the same input give independent keys.
+
+## Asymmetric: signing and verifying
+
+```js
+import { generateKeyPairSync, sign, verify } from 'node:crypto';
+
+const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+
+const sig = sign(null, Buffer.from('release-v1.0'), privateKey);
+const ok = verify(null, Buffer.from('release-v1.0'), publicKey, sig);
+```
+
+`Ed25519` is the modern default: small keys, small signatures, no
+parameter to misconfigure. RSA is still needed for JWT/JWK
+ecosystems that don't accept `EdDSA`.
+
+Keys are `KeyObject`s; export with `.export({ type, format })` to
+PEM or DER:
+
+```js
+privateKey.export({ type: 'pkcs8', format: 'pem' });
+publicKey.export({ type: 'spki', format: 'pem' });
+```
+
+## JWTs without a library (when you need to)
+
+For HS256 JWTs the whole thing is 30 lines around `createHmac` +
+`timingSafeEqual`. For RS256 / ES256, prefer `jose` — it handles
+JWKS rotation, key type checks, and the edge cases (empty alg, alg
+confusion attacks). Hand-rolled JWT validation is where most
+"alg: none" CVEs come from.
+
+## Random and UUIDs
+
+```js
+import { randomBytes, randomUUID, randomInt } from 'node:crypto';
+
+randomBytes(16);           // Buffer, CSPRNG
+randomUUID();              // v4 UUID string
+randomInt(0, 1000);         // uniform, no modulo bias
+```
+
+`randomInt(min, max)` does proper rejection sampling — `randomBytes(4)
+% N` does not (modulo bias when N doesn't divide 2^32 evenly).
+
+## Constant-time comparisons
+
+```js
+import { timingSafeEqual } from 'node:crypto';
+
+timingSafeEqual(a, b);    // both must be same-length Buffer
+```
+
+Use for: signature comparison, token comparison, magic-string
+comparison. Anywhere a timing side channel could leak whether a guess
+was partially correct.
+
+The two-buffer signature requires same length. Compare lengths first
+(`a.length === b.length`) and fail fast — length is already public,
+the timing leak there is fine.
+
+## FIPS mode
+
+If you operate under FIPS 140-2/3 compliance, Node can run against a
+FIPS-validated OpenSSL build. `crypto.getFips()` returns 1 if active.
+In FIPS mode many algorithms are disabled (notably MD5, blowfish);
+`Ed25519` availability depends on the validated build version. Test
+against the actual deployment environment, not your laptop.
+
+## Common mistakes
+
+- **Comparing HMAC / signature output with `===`.** Use
+  `timingSafeEqual`.
+- **Re-using IVs with AES-GCM.** Each (key, iv) pair must be unique.
+- **Treating PBKDF2 as a password store.** It's a KDF; passwords want
+  argon2 / scrypt / bcrypt.
+- **`Math.random()` for tokens.** Not a CSPRNG. Use `randomBytes` or
+  `randomUUID`.
+- **Trusting the `alg` header in incoming JWTs.** Always pin which
+  algorithms you accept; reject everything else.
+- **Putting private keys in env vars and forgetting they're logged.**
+  Many tools log env on crash. Use a KMS, key files with strict perms,
+  or a vault.
+- **Forgetting `setAuthTag` on GCM decryption.** Decryption "works"
+  for a moment, then `final()` throws. The error message ("Unsupported
+  state or unable to authenticate data") is unmemorable.

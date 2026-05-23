@@ -379,6 +379,34 @@ export const bank: QuestionBank = {
         'Standardize on a **structured error response**: `{ "error": { "code": "VALIDATION_FAILED", "message": "...", "fields": [{ "field": "email", "issue": "invalid format" }] } }`. The `code` is machine-readable (stable across versions); `message` is human-readable (can change); `fields` lists field-level issues for forms.\n\n**Wire it via a custom error class** + 4-arg error middleware: `class HttpError extends Error { constructor(status, code, message, fields?) {} }`. Throwing `new HttpError(400, \'VALIDATION_FAILED\', \'...\', issues)` lets the middleware extract everything.\n\n**Pair with Zod**: in validation, transform Zod issues into the `fields` array. Consumers get a consistent shape regardless of which validator raised the error.\n\n**For 5xx errors**: include a `requestId` so users can quote it when they report bugs and you can find their logs immediately. Don\'t expose stack traces in production — log them server-side, return a generic message.\n\n**Document the shape** in your API docs as part of the contract — clients can write one error handler that works for every endpoint.',
     },
 
+    // --- passkeys / webauthn ---
+    {
+      level: 'senior',
+      question: 'What\'s the right value for `rpID` when adding passkeys to an Express app served from `https://app.example.com`?',
+      answer:
+        'Either `app.example.com` or `example.com` — your eTLD+1, **no scheme, no port, no path**. The common mistakes are `https://app.example.com`, `app.example.com/auth`, or omitting it and relying on the default. Choice between the parent (`example.com`) and the subdomain depends on cross-subdomain reach: passkeys created under `app.example.com` won\'t work from `admin.example.com`, so if you have multiple subdomains using the same auth, use the parent. The companion `origin` value *does* include scheme — `https://app.example.com` — and must match exactly what the browser sends. Both are checked by `verifyRegistrationResponse` / `verifyAuthenticationResponse` from `@simplewebauthn/server`; getting them wrong throws on every login.',
+    },
+    {
+      level: 'mid',
+      question: 'Where do you store the challenge between the WebAuthn start and finish endpoints?',
+      answer:
+        'In the session. The flow is: (1) `/webauthn/login/start` calls `generateAuthenticationOptions()`, which returns a fresh random challenge; you write it to `req.session.webauthnChallenge` and return the options to the browser. (2) The browser does `navigator.credentials.get()` with the challenge embedded; the user authenticates locally; the response (signed by the passkey) comes back. (3) `/webauthn/login/finish` reads the stored challenge, passes it as `expectedChallenge` to `verifyAuthenticationResponse()`, and on success deletes it. Storing the challenge anywhere unauthenticated (a hidden form field, localStorage) breaks the security model — the whole point is that the *server* holds the challenge so the browser response can\'t be replayed. Expire stale challenges (5-10 minutes) and delete on successful verify so they\'re one-shot.',
+    },
+
+    // --- oauth2 / oidc in express ---
+    {
+      level: 'senior',
+      question: 'Why store the OAuth refresh token in the session and never the access token?',
+      answer:
+        'Access tokens are short-lived (30-60 min) and scoped for *downstream APIs*, not your app — they\'re what you present to the resource server, not what authenticates the user to your endpoints. If you store an access token and use it as your session, your users get silently logged out every 30 minutes and you\'re building a worse version of express-session. Refresh tokens are the long-lived bit: store them in `req.session.refreshToken`, exchange them via `openid-client.refreshTokenGrant()` whenever you need a fresh access token to call the IdP\'s downstream API. Your app\'s session is its own thing, identified by the session cookie. The IdP\'s role ends after the callback. Bonus: many IdPs rotate the refresh token on every use — store the new one each time, so a leaked old token is detected and the family revoked.',
+    },
+    {
+      level: 'staff',
+      question: 'For an Express service that accepts JWT bearer tokens from a 3rd-party IdP, what does `jose.jwtVerify` do that hand-rolled JWT validation tends to miss?',
+      answer:
+        '**JWKS caching + rotation.** `createRemoteJWKSet(jwksUri)` fetches the IdP\'s signing keys once, caches them, and refetches when a token arrives with a `kid` it doesn\'t recognize. IdP key rotation works with zero restarts; reusing the JWKS instance across requests is mandatory or you\'ll DOS the IdP.\n\n**Algorithm pinning.** `jose` requires you to pass `algorithms: [\'RS256\']` (or whatever you accept). Without it you\'re vulnerable to `alg: none` and the classic HS256-using-the-public-key-as-secret attack.\n\n**`iss` / `aud` / `exp` / `nbf` checks** are done in one call. A token issued for *another* microservice in the same IdP tenant is signed by the same key — missing `audience` is how you accept tokens meant for someone else (confused-deputy bug).\n\nHand-rolled validation almost always skips one of these. Use `jose`; don\'t reinvent.',
+    },
+
     // staff
     {
       level: 'staff',

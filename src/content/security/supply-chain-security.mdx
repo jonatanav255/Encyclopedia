@@ -1,0 +1,277 @@
+export const level = 'senior';
+
+# Supply chain security
+
+When an attacker can't break into your service directly, they break
+in through something you depend on — a package, a build tool, a CI
+runner, a container base image. The 2024 XZ backdoor, the 2021
+codecov bash uploader compromise, the recurring npm typosquats, the
+Shai-Hulud worm targeting popular packages — these are all supply
+chain attacks, and they keep working because most orgs don't treat
+their build pipeline with the same paranoia as their production
+servers.
+
+This page is the **organizational** view: provenance, attestation,
+SBOMs, allowlists, signing. For Node-specific hardening (lockfiles,
+`pnpm` semantics, ignored builds), see `node/hardening-supply-chain`.
+
+## The threat model
+
+A typical service has hundreds of direct dependencies and tens of
+thousands of transitive ones. Each is code that runs in your build
+environment, sometimes at install time (post-install scripts), and
+runs in production. A malicious or compromised dependency has all
+the access your service has.
+
+The attack surface has four major doors:
+
+<Diagram>
+```
+┌─────────────────┐     ┌──────────────────┐     ┌────────────────┐
+│  Source code    │ →   │  Build pipeline  │ →   │  Artifact      │
+│  (git)          │     │  (CI runners,    │     │  (container,   │
+│                 │     │   build tools)   │     │   binary, npm  │
+│                 │     │                  │     │   tarball)     │
+└─────────────────┘     └──────────────────┘     └────────────────┘
+        ↑                       ↑                       ↓
+        │                       │                       │
+   compromised             compromised             distributed
+   developer / VCS         dependency /            to consumers
+                           build tool              (you, customers)
+```
+</Diagram>
+
+Each arrow is an attack surface. Each box can be compromised.
+
+## SLSA: a framework for talking about it
+
+**SLSA** (Supply-chain Levels for Software Artifacts, pronounced
+"salsa") is a framework from Google / OpenSSF for measuring how
+trustworthy an artifact's provenance is. Levels 1 through 4:
+
+<Compare>
+<thead>
+<tr><th>Level</th><th>What it requires</th><th>What it prevents</th></tr>
+</thead>
+<tbody>
+<tr><td>L1</td><td>Build process is scripted; provenance generated</td><td>Manual builds with no record</td></tr>
+<tr><td>L2</td><td>Hosted build service; provenance is signed; source is version-controlled</td><td>Tampering by people without CI access</td></tr>
+<tr><td>L3</td><td>Hardened, ephemeral, isolated builders; provenance non-falsifiable</td><td>Tampering by people who control the build environment</td></tr>
+<tr><td>L4</td><td>Two-party review of all changes; hermetic, reproducible builds</td><td>Single-actor compromise; ensures reproducibility</td></tr>
+</tbody>
+</Compare>
+
+Most orgs land at L2 with GitHub Actions / GitLab CI plus signed
+provenance. L3 takes deliberate effort (hardened runners, isolated
+build environments). L4 is rare — required reproducibility plus
+two-party review is expensive.
+
+The point of the framework isn't to hit a level; it's to give you a
+vocabulary for the gaps.
+
+## Provenance and Sigstore
+
+**Provenance** is a signed statement of "this artifact was built
+from this source, using this builder, at this time." Without
+provenance, you have to trust whoever hands you a binary. With
+provenance, you can verify.
+
+**Sigstore** is the open-source ecosystem for signing software
+without managing long-lived signing keys. It combines:
+
+- **Cosign** — sign and verify containers, blobs, files.
+- **Fulcio** — short-lived certificate authority. You authenticate
+  via OIDC (GitHub Actions, Google, etc.); Fulcio issues a
+  certificate bound to your identity, valid for ~10 minutes. Sign
+  the artifact, throw away the key.
+- **Rekor** — transparency log. Every signature is recorded in an
+  append-only log. Verifiers check Rekor to confirm a signature
+  isn't backdated or forged.
+
+```bash
+# Sign a container image (no keys to manage)
+cosign sign ghcr.io/myorg/api@sha256:abc...
+
+# Verify
+cosign verify ghcr.io/myorg/api@sha256:abc... \
+  --certificate-identity-regexp "https://github.com/myorg/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+The verify call asserts: "this image was signed by a GitHub Action
+running in our org." Anyone in the org can sign (via OIDC); nobody
+outside can. No shared HSM, no key rotation.
+
+**Adoption**: npm publishes provenance for packages signed via
+GitHub Actions since 2023; PyPI added trusted publishers in 2023;
+Maven Central / Gradle support is rolling. Container registries
+(GHCR, ECR, Artifact Registry) sign images via Sigstore natively.
+
+## SBOMs
+
+A **Software Bill of Materials** is a structured list of every
+component in an artifact — direct and transitive dependencies, with
+versions and (ideally) license info. Two main formats: **SPDX**
+(Linux Foundation) and **CycloneDX** (OWASP).
+
+```bash
+# Generate
+syft myimage:1.0 -o cyclonedx-json > sbom.json
+
+# Scan against known vulnerabilities
+grype sbom:./sbom.json
+```
+
+What SBOMs enable:
+
+- **Vulnerability response**. When CVE-2025-X is disclosed in
+  `lodash@4.17.20`, you grep SBOMs across your fleet to find every
+  service that ships it. Without SBOMs, you re-run dependency audits
+  on every repo. With SBOMs, it's a script.
+- **License compliance**. Lawyers asking "do we ship any GPLv3
+  code?" used to take weeks. With SBOMs, minutes.
+- **Procurement**. Customers (especially government, especially
+  post EO-14028) increasingly require SBOMs from vendors.
+
+The discipline: every release produces an SBOM, attached to the
+artifact as an attestation, signed via Sigstore.
+
+## Allowlists, not blocklists
+
+For npm/PyPI/etc., the default policy "anyone can publish; we
+install whatever the lockfile says" is broken. The defenses are:
+
+- **Lockfiles + pinned versions**. `pnpm-lock.yaml` / `package-lock.json` /
+  `poetry.lock`. CI uses `--frozen-lockfile`. A new attacker package
+  doesn't sneak in because it's not in the lockfile.
+- **Registry allowlist**. Configure your package manager to install
+  only from your internal registry (Artifactory, Verdaccio, ECR), which
+  proxies the upstream and caches approved packages.
+- **Manual approval for new dependencies**. Tooling like Renovate
+  can require explicit approval for first-time additions.
+- **Known-malicious blocklists**. Socket.dev, Snyk, GitHub
+  Dependabot — flag known-bad packages, but only catch known bad.
+  An unknown malicious package is invisible to blocklists.
+
+The asymmetry: blocklists are reactive (catch yesterday's attacks).
+Allowlists are proactive (block tomorrow's attacks by default).
+
+## Dependency review at the org level
+
+A pattern that works at scale: **a small security or platform team
+reviews new dependencies before they enter the org's allowlist**.
+Engineers can still add anything to a sandbox / experiment repo; for
+anything shipped to prod, the dependency needs to be in the
+allowlist.
+
+Criteria reviewers check:
+
+- Maintainership (one solo maintainer = higher risk).
+- Recency of last commit (abandoned packages are common
+  takeover targets).
+- Number of weekly downloads (popular ≠ safe, but very obscure is a
+  flag).
+- Whether the package has any post-install scripts (`postinstall`
+  scripts run arbitrary code during `pnpm install`).
+- Whether transitive deps are themselves on the allowlist.
+- License compatibility.
+
+This sounds bureaucratic. In practice, the queue is small once the
+org has been operating it for a year — most needs are met by the
+existing allowlist.
+
+## CI runner hardening
+
+The CI environment runs your build. If it's compromised, every
+artifact is compromised.
+
+- **Ephemeral runners**. Each job runs on a fresh VM/container,
+  destroyed after. A persistent runner that built yesterday's
+  release also built last week's, and last month's — one compromise
+  poisons forward and back.
+- **Least-privilege secrets**. Production deploy credentials are
+  scoped to the production deploy job; build jobs can't read them.
+  GitHub Actions OIDC federation eliminates long-lived deploy
+  secrets entirely.
+- **Pinned action versions by SHA, not tag**. `actions/checkout@v4`
+  is a moving target; `actions/checkout@8e5e7e5...` is a fixed commit
+  that can't be retroactively rewritten.
+
+  ```yaml
+  - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+  ```
+
+- **No `pull_request_target`** combined with code execution from PR
+  branches. This is the dangerous combo that has caused multiple
+  high-profile CI compromises — the workflow runs with
+  write-permission secrets while executing untrusted PR code.
+
+## Base image discipline
+
+Container base images are dependencies too. `FROM node:22-slim` is
+trusting Docker Hub and the maintainer of the node image.
+
+- **Pin by digest, not tag**: `FROM node:22-slim@sha256:abc...` so a
+  retroactive tag rewrite can't change what you build on.
+- **Distroless or minimal base**: less surface = fewer CVEs.
+  `gcr.io/distroless/nodejs22` ships with just Node and its
+  dependencies; no shell, no package manager.
+- **Scan images** at build time and periodically thereafter.
+  `trivy image`, `grype`, `snyk container`.
+- **Rebuild regularly** even without code changes. CVEs in your base
+  image only get patched if you rebuild. Weekly automatic rebuilds
+  are common.
+
+## A reasonable target state
+
+For an org of moderate maturity:
+
+<Steps>
+<Step n="1" title="Lockfiles + frozen installs">
+Every repo. CI uses `--frozen-lockfile`. No `npm install` ever in
+CI. (pnpm and npm equivalents.)
+</Step>
+<Step n="2" title="Internal registry proxy">
+All package managers point at internal registry. Allowlist enforced
+there. Upstream packages cached.
+</Step>
+<Step n="3" title="Signed artifacts (Sigstore)">
+Every container image, every published npm/PyPI package, signed via
+CI OIDC. Verification required at deploy time.
+</Step>
+<Step n="4" title="SBOMs attached to releases">
+Generated in CI, signed, attached as attestation. Vulnerability
+queries are SBOM lookups, not dependency-tree walks.
+</Step>
+<Step n="5" title="Pinned actions, ephemeral runners, OIDC deploy">
+No long-lived secrets in CI. Actions pinned by SHA. Ephemeral
+runners.
+</Step>
+<Step n="6" title="Dependency review for new additions">
+Allowlist owned by platform / security team. New deps reviewed
+against criteria.
+</Step>
+<Step n="7" title="Base image pinning + automated rebuilds">
+Digest-pinned bases. Weekly rebuild even without code change.
+</Step>
+</Steps>
+
+This is the minimum. None of it is exotic in 2026 — every step has
+mature tooling and battle-tested patterns. The hard part is
+prioritising the work and getting org-wide adoption.
+
+## What this doesn't cover
+
+- **Insider threats** — a compromised maintainer or a malicious
+  developer with commit rights. Two-party review (SLSA L4) is the
+  partial answer; otherwise, audit logs and revocation are the
+  fallback.
+- **Hardware / firmware compromise** — the supply chain extends past
+  software into silicon. Out of scope for typical app teams.
+- **Compromised IdPs and code-signing keys** — Sigstore mitigates
+  the latter (short-lived keys, transparency log). The former is a
+  general identity problem.
+
+Supply chain security is open-ended; the win is staying ahead of the
+attacker's marginal effort. Make the cheap attacks expensive, and
+most attackers move on.

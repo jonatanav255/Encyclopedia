@@ -1,0 +1,290 @@
+export const level = 'senior';
+
+# Rate limiting and abuse
+
+Rate limiting protects a service from being **overwhelmed** — by
+honest spikes, by buggy clients, by scrapers, and by deliberate
+abuse. It's also a primary defense against credential stuffing,
+brute force, and resource exhaustion attacks. Most production
+incidents that "weren't supposed to be possible" trace back to
+something that should have been rate-limited and wasn't.
+
+For the Express middleware-shaped story (`express-rate-limit`,
+key derivation, response shape), see `express/rate-limiting`. This
+page is about **algorithms and strategy** — what limiter to pick,
+where to put it, and how abuse detection works beyond simple
+counters.
+
+## The four algorithms
+
+<Compare>
+<thead>
+<tr><th>Algorithm</th><th>How it works</th><th>Smoothness</th><th>Memory</th></tr>
+</thead>
+<tbody>
+<tr><td>**Fixed window**</td><td>Count requests per calendar window (e.g., per minute)</td><td>Burst at window boundaries</td><td>1 counter per key</td></tr>
+<tr><td>**Sliding window log**</td><td>Store every request timestamp; count those in last N seconds</td><td>Smooth</td><td>O(requests) per key — expensive</td></tr>
+<tr><td>**Sliding window counter**</td><td>Two adjacent fixed windows; weight by overlap</td><td>Approximately smooth</td><td>2 counters per key</td></tr>
+<tr><td>**Token bucket**</td><td>Bucket of tokens refills at fixed rate; each request consumes one</td><td>Smooth; allows configurable burst</td><td>2 numbers per key (tokens, last-refill)</td></tr>
+<tr><td>**Leaky bucket**</td><td>Requests queue; queue drains at fixed rate</td><td>Smooth; absorbs bursts</td><td>1 queue per key</td></tr>
+</tbody>
+</Compare>
+
+### Fixed window
+
+The simplest. "100 requests per minute" means a counter that resets
+at the top of every minute. Cheap, but the boundary problem is
+real:
+
+```
+00:59:55  : 100 requests (within budget for 00:59 window)
+01:00:00  : window resets
+01:00:01  : 100 more requests (within budget for 01:00 window)
+→ 200 requests in 6 seconds
+```
+
+Honest clients are usually fine. Sophisticated abusers aim for
+window boundaries.
+
+### Sliding window log
+
+Track every request timestamp. To check, count timestamps in the
+last 60 seconds. Smooth but memory-heavy at scale — at 1000 req/s
+per key, you're storing 60,000 timestamps continuously.
+
+Used in low-volume / per-user contexts where memory is fine and
+exact correctness matters.
+
+### Sliding window counter
+
+A practical approximation. Maintain counters for the current window
+and the previous window. The effective count is a weighted blend
+based on how far through the current window you are:
+
+```
+weighted = prev_count * (1 - elapsed_fraction) + current_count
+```
+
+At 30 seconds into a 1-minute window, the limit considers 50% of the
+previous window plus 100% of the current. Close to truly smooth,
+with only two counters per key. This is what most production
+limiters (Cloudflare, AWS WAF, Redis-cell, redis-rate-limiter) use.
+
+### Token bucket
+
+Each key has a bucket with capacity `B` and refill rate `R` per
+second. Each request consumes one token. If the bucket is empty,
+the request is rejected (or queued, depending on policy).
+
+```
+function allow(key) {
+  const now = Date.now() / 1000;
+  let { tokens, lastRefill } = read(key);
+  tokens = Math.min(B, tokens + (now - lastRefill) * R);
+  lastRefill = now;
+  if (tokens >= 1) {
+    tokens -= 1;
+    write(key, { tokens, lastRefill });
+    return true;
+  }
+  write(key, { tokens, lastRefill });
+  return false;
+}
+```
+
+Trade-offs:
+
+- **Allows configurable burst**. Capacity `B` is how many requests
+  can land at once before refill rate dominates.
+- **Smooth steady-state behavior**.
+- Two values per key, atomic update easy in Redis.
+
+This is the algorithm to reach for by default for most service-side
+rate limiting.
+
+### Leaky bucket
+
+Requests enter a queue of fixed depth. The queue drains at a fixed
+rate. Bursts past queue depth are dropped.
+
+Useful when you genuinely want to **smooth** traffic to a downstream
+that doesn't tolerate spikes (legacy systems, expensive operations).
+The trade-off versus token bucket is that leaky bucket adds latency
+(queued requests wait) where token bucket adds rejection (over-budget
+requests fail fast).
+
+## Where to limit: layers of defense
+
+A single rate limit at one layer is never sufficient. The mature
+pattern is layered:
+
+<Diagram>
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Edge / WAF      │  Per-IP, per-ASN, per-country               │
+│ (Cloudflare,    │  DDoS protection, bot mitigation            │
+│  AWS WAF)       │  Cheap, defense against high-volume floods  │
+├──────────────────────────────────────────────────────────────┤
+│ API Gateway /   │  Per-API-key, per-route                     │
+│ Load Balancer   │  Coarse limits for paying tiers             │
+├──────────────────────────────────────────────────────────────┤
+│ Service         │  Per-user, per-action, per-resource         │
+│ middleware      │  Business-logic-aware limits                │
+├──────────────────────────────────────────────────────────────┤
+│ Application     │  Per-operation cost-based (CPU budget)      │
+│ logic           │  GraphQL query complexity, etc.             │
+└──────────────────────────────────────────────────────────────┘
+```
+</Diagram>
+
+The edge handles raw flood. By the time traffic reaches the service,
+the question is "is this user behaving reasonably?" — a different
+shape of limit.
+
+## Distributed rate limiting
+
+Single-process counters work until you have multiple instances. Two
+common approaches:
+
+- **Centralized store (Redis)**. Every instance checks/increments a
+  shared counter. Redis is fast enough for millions of req/s with
+  proper deployment. Atomic operations via `INCR`, `INCRBY`, Lua
+  scripts, or Redis-cell module.
+- **Per-instance approximation**. Each instance maintains its own
+  counter, sized so that `instances * per_instance_limit ≈
+  total_limit`. Over-permissive (a user could hit each instance
+  independently) but cheap and locally consistent. OK for soft
+  limits where exactness doesn't matter.
+
+For hard limits (paid quotas, abuse prevention), centralized.
+For soft limits (fairness, smoothing), per-instance is fine.
+
+### Redis token bucket
+
+```
+-- Redis Lua script
+-- KEYS[1] = rate limit key
+-- ARGV[1] = max tokens (capacity)
+-- ARGV[2] = refill rate (tokens/sec)
+-- ARGV[3] = now (epoch seconds, float)
+-- ARGV[4] = requested tokens
+local max     = tonumber(ARGV[1])
+local rate    = tonumber(ARGV[2])
+local now     = tonumber(ARGV[3])
+local cost    = tonumber(ARGV[4])
+
+local data = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(data[1]) or max
+local ts     = tonumber(data[2]) or now
+
+local refill = (now - ts) * rate
+tokens = math.min(max, tokens + refill)
+
+local allowed = tokens >= cost
+if allowed then tokens = tokens - cost end
+
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(max / rate))
+
+return { allowed and 1 or 0, math.floor(tokens) }
+```
+
+This is roughly what production limiters look like — atomic,
+fast, key TTL'd to bound memory.
+
+## Key selection: what to limit on
+
+This is often the most important decision. The same algorithm tuned
+on different keys produces wildly different protection.
+
+- **By IP** — coarse; behind a CDN/LB you may see one IP for many
+  users (NAT, corporate proxies). Use as a floor, not the only key.
+- **By IP + User-Agent** — better, still spoofable.
+- **By user ID** (for authenticated traffic) — the right shape for
+  most business-logic limits.
+- **By API key** — coarse, but matches paid quotas.
+- **By endpoint** — login and password-reset endpoints get harder
+  limits than read endpoints.
+- **By IP + endpoint** — useful for "5 wrong logins per IP per
+  hour" patterns.
+
+For credential stuffing specifically: limit on `username` (not just
+IP). An attacker rotating IPs can't easily rotate usernames.
+
+## Beyond counting: abuse detection
+
+Counters catch volume; sophisticated abuse uses low volume.
+
+- **Velocity checks across signals.** "This user just created an
+  account, added a payment method, and tried to make 10 high-value
+  purchases in 60 seconds." Each individual rate is fine; the
+  pattern is suspicious.
+- **Fingerprinting.** Browser fingerprint, TLS fingerprint (JA3),
+  HTTP header order — clients abusing your API often look unlike
+  real users.
+- **Anomaly detection.** Time-of-day patterns, geographic patterns,
+  endpoint patterns. A user who normally hits 3 endpoints suddenly
+  hitting 100 is worth flagging.
+- **Honeypots.** Hidden form fields, fake "test123" API keys, link
+  trapping. Bots fall for them; humans don't.
+- **CAPTCHAs and proof-of-work.** Friction added when abuse is
+  suspected but not certain. Soft block: prove you're human before
+  proceeding.
+
+These belong in a dedicated abuse-detection layer (Cloudflare Bot
+Management, AWS WAF Bot Control, in-house). They're not rate
+limiters; they're rate-limit informers.
+
+## Response shape
+
+When a limit is hit, the response should help honest clients
+recover:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 1716387123
+
+{
+  "error": "rate_limited",
+  "message": "Slow down: 100 requests/minute exceeded. Retry in 30s."
+}
+```
+
+The IETF `RateLimit-*` headers (draft RFC) are becoming standard.
+`Retry-After` is the universal signal — clients implementing
+exponential backoff respect it.
+
+Don't expose limit internals to abusers — they'll calibrate. But
+expose them to authenticated users via documentation and headers,
+so honest clients can self-pace.
+
+## Failure modes
+
+- **Limit too loose**: doesn't prevent the bad thing.
+- **Limit too tight**: blocks honest users (the bug report rate is
+  the leading signal).
+- **Limit on the wrong key**: catches honest NAT users while letting
+  abusers through.
+- **Limit storage outage**: Redis goes down → limits fail open
+  (everyone allowed) or fail closed (everyone blocked). Both are
+  bad. Mitigate with local per-instance fallback when Redis is
+  unavailable.
+- **Drift across instances**: each instance has slightly different
+  state; user sees inconsistent behavior. Acceptable if limits are
+  soft; not if they're hard.
+
+## Quick checklist
+
+<Cheatsheet>
+- Layered limits: edge (per-IP), gateway (per-API-key), service (per-user), app (per-operation).
+- Default algorithm: sliding-window counter or token bucket; both well-supported.
+- Distributed: Redis Lua scripts for atomicity. Bound memory with TTL.
+- Key selection matters more than algorithm. Per-user > per-IP for auth'd traffic.
+- Login / password-reset / signup endpoints: strict per-IP + per-username limits.
+- Return `429` with `Retry-After`; honor `RateLimit-*` headers for clients.
+- Pair with abuse detection (velocity, fingerprint, anomaly) — counters alone don't catch sophisticated abuse.
+- Test failure mode (Redis down) explicitly; don't fail-open silently.
+</Cheatsheet>

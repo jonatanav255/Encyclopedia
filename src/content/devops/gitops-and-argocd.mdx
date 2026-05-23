@@ -1,0 +1,312 @@
+export const level = 'senior';
+
+# GitOps and ArgoCD
+
+**GitOps** is the discipline of using a Git repository as the
+single source of truth for the desired state of a system — usually
+Kubernetes, but the pattern generalises — and using an automated
+agent to continuously reconcile the running state to match the
+repo. Push-button rollback is `git revert`. Drift between
+environments is detected automatically. There are no "deploy
+scripts" run from laptops.
+
+The most common implementations are **ArgoCD** and **FluxCD**, both
+Kubernetes-native, both reconciliation-loop-based, both CNCF
+graduated.
+
+## Why GitOps
+
+The pre-GitOps shape, even at companies running Kubernetes well:
+
+- Engineers run `kubectl apply` from their machines (or CI does).
+- The state of the cluster diverges from any one repo over time.
+- Rollback is "run the previous CI job," assuming it still
+  exists.
+- Audit is "who ran the deploy at 02:31:14?" — hard to answer.
+- A misconfigured cluster has no canonical source to compare
+  against.
+
+GitOps inverts this: the cluster is **read-only to humans** for
+production changes; all changes go through PRs against the
+config repo; an agent in the cluster pulls and applies.
+
+Properties this buys:
+
+- **Auditable**. Every change is a commit; `git log` is the deploy
+  history.
+- **Reversible**. `git revert <bad-commit>` rolls back. The agent
+  picks it up and reconciles.
+- **Drift detection**. If someone bypasses GitOps and `kubectl
+  apply`s by hand, the agent notices and either alerts or
+  auto-reverts (configurable).
+- **Self-healing**. If a Deployment is deleted accidentally, the
+  agent re-creates it from the repo.
+- **Disaster recovery**. Lost the cluster? Point a new ArgoCD at
+  the repo; it reconstructs everything.
+
+## The reconciliation loop
+
+GitOps agents run a loop:
+
+<Diagram>
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │                                                             │
+   ▼                                                             │
+[Git repo]  ──poll──►  [Agent in cluster]  ──compare──►  [Cluster state]
+   │                          │                                 ▲
+   │                          │                                 │
+   └──────────────────────────┴──apply diffs (kubectl)──────────┘
+```
+</Diagram>
+
+The agent (ArgoCD application controller, Flux source controller +
+kustomize controller) polls the repo every N seconds, compares the
+desired manifests to actual cluster state, and applies any
+differences. If the cluster is correct, it does nothing.
+
+This means the cluster eventually converges, regardless of what
+order CI jobs ran or which deploy was first. The repo is the only
+truth.
+
+## Repo structure
+
+The pattern that works at scale: separate **application source**
+from **deployment config**.
+
+```
+my-org/
+├── api-service/                  # application code
+│   └── ...
+├── frontend-service/             # application code
+│   └── ...
+└── deploy/                       # GitOps repo
+    ├── base/
+    │   ├── api-service/
+    │   │   ├── deployment.yaml
+    │   │   ├── service.yaml
+    │   │   └── kustomization.yaml
+    │   └── frontend-service/
+    │       └── ...
+    ├── overlays/
+    │   ├── staging/
+    │   │   ├── api-service/
+    │   │   │   ├── kustomization.yaml
+    │   │   │   └── patches.yaml
+    │   │   └── ...
+    │   └── production/
+    │       └── ...
+    └── argocd/
+        └── applications.yaml     # ArgoCD application definitions
+```
+
+The application's CI builds an image and writes the new tag into
+the appropriate overlay in the `deploy` repo (via PR or automation).
+ArgoCD watches `deploy`; it pulls and reconciles.
+
+The split matters: application code and deploy config evolve at
+different cadences. Application repos shouldn't be the source of
+truth for cluster config — it makes cross-cluster orchestration and
+rollback per-environment tedious.
+
+## ArgoCD shape
+
+A minimal ArgoCD `Application`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-service-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/deploy
+    targetRevision: main
+    path: overlays/production/api-service
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: api-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+```
+
+Three behaviour flags worth knowing:
+
+- **`automated`**: ArgoCD auto-applies changes. Without it, sync is
+  manual (a button click in the UI).
+- **`prune`**: ArgoCD deletes resources removed from the repo.
+  Without it, removed resources linger.
+- **`selfHeal`**: ArgoCD reverts manual changes made in the cluster.
+  Without it, manual `kubectl edit` persists until the next repo
+  change.
+
+A typical production setup: `automated: true`, `prune: true`,
+`selfHeal: true`. Drift gets reverted automatically; the repo is
+truly the source of truth.
+
+## Image tagging strategies
+
+The interesting question: how does a new image tag get into the
+deploy repo?
+
+<Compare>
+<thead>
+<tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr>
+</thead>
+<tbody>
+<tr><td>**CI PR**</td><td>CI builds image, opens PR against deploy repo with new tag</td><td>Human review on every change; slows deploys; cleanest audit trail</td></tr>
+<tr><td>**CI direct commit**</td><td>CI builds image, commits directly to deploy repo</td><td>Fast; less review; needs branch protection to keep meaningful</td></tr>
+<tr><td>**ArgoCD Image Updater**</td><td>ArgoCD watches image registry; updates tag in repo when new images appear</td><td>Loose coupling; deploys happen "magically"; needs allowlists to keep safe</td></tr>
+</tbody>
+</Compare>
+
+For most production setups, CI direct commit to a staging overlay
+(auto-deploy to staging on every main push) plus PR for promoting
+to production (human-in-the-loop) is a workable balance.
+
+## Progressive delivery: Argo Rollouts and Flagger
+
+ArgoCD by itself does "deploy this manifest." For canary deployments,
+blue/green, traffic shifting, and metric-driven rollouts, pair with:
+
+- **Argo Rollouts**: a custom `Rollout` resource that replaces
+  `Deployment` with built-in canary/blue-green strategies. Steps
+  through traffic percentages, calls metric providers (Prometheus,
+  Datadog) to validate, auto-rollback on failure.
+
+  ```yaml
+  apiVersion: argoproj.io/v1alpha1
+  kind: Rollout
+  spec:
+    strategy:
+      canary:
+        steps:
+          - setWeight: 5
+          - pause: { duration: 10m }
+          - analysis: { templates: [{ templateName: success-rate }] }
+          - setWeight: 25
+          - pause: { duration: 10m }
+          - setWeight: 50
+          - pause: { duration: 10m }
+          - setWeight: 100
+  ```
+
+- **Flagger**: similar functionality, slightly different shape,
+  works with Flux.
+
+Both implement what the cloud people called "automated canary
+deployment." The GitOps integration is the win — the rollout
+definition is in the repo, the metrics gates are in the repo, the
+whole pipeline is reviewable as code.
+
+## ApplicationSets: managing many apps
+
+A single cluster might have 200 services. Hand-authoring 200
+`Application` manifests is tedious. ArgoCD's `ApplicationSet` generates
+them from templates:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/my-org/deploy
+        directories:
+          - path: overlays/production/*
+  template:
+    metadata: { name: '{{path.basename}}-prod' }
+    spec:
+      source:
+        repoURL: https://github.com/my-org/deploy
+        path: '{{path}}'
+      destination:
+        namespace: '{{path.basename}}'
+      ...
+```
+
+This creates one `Application` per subdirectory of
+`overlays/production/`. Adding a new service is "create the
+directory"; the rest is generated.
+
+## Multi-cluster
+
+ArgoCD can manage many clusters from one control plane. Either:
+
+- **Hub-and-spoke**: one ArgoCD running in a "management" cluster
+  manages all others.
+- **Per-cluster ArgoCD**: each cluster runs its own ArgoCD reading
+  from the same repo (or per-cluster repos).
+
+Hub-and-spoke gives centralised visibility but makes the management
+cluster a SPOF for deploys. Per-cluster is more resilient but
+distributes the operational burden.
+
+## Secrets and GitOps
+
+The awkward part: secrets shouldn't be in Git, but GitOps says
+everything should. Three patterns:
+
+- **Sealed Secrets**: encrypt secrets with a cluster public key
+  before committing. Only the cluster's controller can decrypt.
+  Works for small numbers of secrets.
+- **External Secrets Operator (ESO)**: a Kubernetes operator that
+  syncs secrets from external managers (Vault, AWS Secrets Manager,
+  GCP Secret Manager) into Kubernetes `Secret` resources. The repo
+  has the `ExternalSecret` definition (pointer + mapping), the
+  actual secret value lives in the manager.
+- **Vault sidecar / CSI driver**: pods get secrets injected at
+  runtime from Vault. Repo has the pod's Vault role/path; the
+  secret never touches Kubernetes Secret.
+
+ESO is the most common modern choice — it's GitOps-native (the
+manifest is in the repo) but doesn't put plaintext in Git.
+
+## Operational concerns
+
+- **Repo permissions matter.** Whoever can write to the deploy
+  repo can change production. Treat it as production-equivalent:
+  branch protection, required reviews, signed commits.
+- **Drift alerts.** ArgoCD reports out-of-sync applications.
+  Alert on persistent out-of-sync (longer than a few minutes) —
+  indicates either a real divergence or a manifest the agent can't
+  apply.
+- **RBAC for ArgoCD**. Engineers should be able to see and sync
+  their own apps; production sync may require a privileged role or
+  PR + auto-sync only.
+- **Disaster recovery.** Periodic backup of ArgoCD's state (or
+  rely on the fact that everything is in Git and can be
+  reconstructed). The latter is the GitOps win — DR is "point new
+  ArgoCD at the repo."
+
+## What GitOps isn't
+
+- It isn't a CI system. CI still builds and tests; GitOps deploys.
+- It isn't a configuration management tool for the application
+  code; it's for the deployment manifests.
+- It isn't free of human judgement — PRs still need review;
+  promotion between environments still wants gates.
+- It isn't strictly Kubernetes — Flux can sync Terraform, Helm
+  releases, OCI artifacts. The pattern generalises.
+
+## Quick checklist
+
+<Cheatsheet>
+- Source of truth: Git repo with manifests (or Kustomize / Helm renderings).
+- Agent in cluster (ArgoCD / Flux) reconciles continuously.
+- `automated + prune + selfHeal` for true GitOps in prod.
+- Separate application source from deploy config (separate repos or clearly separate paths).
+- CI builds images; deploy is a commit to the deploy repo (PR for prod, direct for staging is common).
+- Pair with Argo Rollouts / Flagger for canary / blue-green / metric-driven rollouts.
+- ApplicationSets for managing many similar apps from one template.
+- Secrets via External Secrets Operator (or Sealed Secrets / Vault CSI) — never plaintext in Git.
+- Branch protection on the deploy repo is production-grade — treat write access seriously.
+- Alert on persistent drift; investigate every out-of-sync application.
+</Cheatsheet>

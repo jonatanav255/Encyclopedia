@@ -100,26 +100,40 @@ await pipeline(res.body, createWriteStream('out.bin'));
 
 ## Connection pooling and keep-alive
 
-Node's native fetch uses `undici` under the hood. By default it
-**doesn't** maintain a global keep-alive pool — each call may open a
-fresh TCP connection. For high-throughput callers, share an agent:
+Node's native fetch uses `undici` under the hood, and **pooling is on
+by default**. The global `Agent` keeps connections alive
+(`keepAliveTimeout: 4_000` ms) and lets each origin open up to
+`Infinity` connections in parallel. So you do get keep-alive for free
+— the real question is whether the defaults fit your workload.
+
+The two knobs you usually want to tune:
+
+- `keepAliveTimeout` — bump it up (10–30s) for chatty downstreams so
+  you actually re-use sockets between bursts.
+- `connections` — cap the per-origin pool so one runaway code path
+  doesn't open thousands of sockets to the same host.
 
 ```js
 import { Agent, setGlobalDispatcher } from 'undici';
 
-setGlobalDispatcher(new Agent({ keepAliveTimeout: 10_000, connections: 50 }));
+setGlobalDispatcher(new Agent({
+  keepAliveTimeout: 10_000,  // longer than the default 4s
+  connections: 50,           // cap per-origin (default: Infinity)
+}));
 ```
 
-Or per-request:
+Or per-request, when one client needs different limits than the rest
+of the app:
 
 ```js
 const agent = new Agent({ connections: 10 });
 const res = await fetch(url, { dispatcher: agent });
 ```
 
-Without keep-alive, you pay TCP+TLS handshake on every call. To the
-same host, that adds tens of ms per request — sometimes more than
-the request itself.
+The reason to care: a fresh TCP+TLS handshake to the same host adds
+tens of ms per call — sometimes more than the request itself. Pooling
+hides that, but only if `keepAliveTimeout` exceeds the gap between
+your calls.
 
 ## Retries and backoff
 
@@ -194,9 +208,9 @@ or `got`.
 
 ## HTTP/2 and HTTP/3
 
-Native fetch supports HTTP/1.1 transparently. For HTTP/2, undici 7+
-accepts `allowH2: true` on an `Agent`; set it via
-`setGlobalDispatcher(new Agent({ allowH2: true }))` and global
+Native fetch supports HTTP/1.1 transparently. For HTTP/2, undici
+supports `allowH2: true` on an `Agent` (added in undici 5.x); set it
+via `setGlobalDispatcher(new Agent({ allowH2: true }))` and global
 `fetch` picks it up. Or use `node:http2` directly. HTTP/3 (QUIC)
 isn't in the stdlib yet. For inbound traffic the proxy in front of
 Node handles modern protocols; for outbound, HTTP/1.1 is usually

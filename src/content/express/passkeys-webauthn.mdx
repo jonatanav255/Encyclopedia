@@ -1,0 +1,225 @@
+export const level = 'senior';
+
+# Passkeys and WebAuthn
+
+A passkey is a public/private keypair stored by the user's device (or
+synced via iCloud Keychain, Google Password Manager, 1Password) and
+unlocked by a local gesture — Face ID, Touch ID, Windows Hello, or a
+PIN. The site only sees the **public** key. There is no password,
+nothing to phish, and nothing the server can leak. In 2026 every
+serious authentication system supports passkeys as the primary
+factor.
+
+The protocol is **WebAuthn**. The Express story is largely about
+ferrying browser-generated JSON to and from a verification library —
+the real cryptography happens on the device.
+
+## The high-level flow
+
+There are two ceremonies, with the same shape:
+
+| | Registration | Authentication |
+| --- | --- | --- |
+| Goal | enroll a new credential | prove possession of an existing one |
+| Browser API | `navigator.credentials.create()` | `navigator.credentials.get()` |
+| Server: issue | `generateRegistrationOptions()` | `generateAuthenticationOptions()` |
+| Server: verify | `verifyRegistrationResponse()` | `verifyAuthenticationResponse()` |
+| Server stores | public key + credential ID | (just updates `signCount`) |
+
+Both ceremonies pivot around a server-issued **challenge** — a fresh
+random value the client must sign. The challenge is one-shot and
+short-lived; storing it in the session is the standard pattern.
+
+## The library
+
+Don't roll this. Use `@simplewebauthn/server` (and its companion
+`@simplewebauthn/browser` on the client). It tracks the spec, handles
+attestation formats, and rejects malformed responses for you.
+
+```bash
+pnpm add @simplewebauthn/server @simplewebauthn/browser
+```
+
+## Registration
+
+```ts
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+} from '@simplewebauthn/server';
+
+const rpName = 'Example';
+const rpID = 'example.com';           // the eTLD+1, NO scheme, NO path
+const origin = `https://${rpID}`;
+
+router.post('/webauthn/register/start', async (req, res) => {
+  const user = req.user!;
+  const existing = await db.credentials.findByUserId(user.id);
+
+  const options = await generateRegistrationOptions({
+    rpName,
+    rpID,
+    userName: user.email,
+    userID: Buffer.from(user.id),
+    attestationType: 'none',              // we don't need attestation
+    excludeCredentials: existing.map((c) => ({ id: c.id, type: 'public-key' })),
+    authenticatorSelection: {
+      residentKey: 'required',             // discoverable credential = passkey
+      userVerification: 'preferred',
+    },
+  });
+
+  req.session.webauthnChallenge = options.challenge;   // store for verify step
+  res.json(options);
+});
+
+router.post('/webauthn/register/finish', async (req, res) => {
+  const expected = req.session.webauthnChallenge;
+  if (!expected) return res.status(400).json({ error: 'no challenge' });
+
+  const verification = await verifyRegistrationResponse({
+    response: req.body,
+    expectedChallenge: expected,
+    expectedOrigin: origin,
+    expectedRPID: rpID,
+  });
+
+  if (!verification.verified || !verification.registrationInfo) {
+    return res.status(400).json({ error: 'registration failed' });
+  }
+
+  const { credential } = verification.registrationInfo;
+  await db.credentials.create({
+    userId: req.user!.id,
+    id: credential.id,                    // base64url, the credential id
+    publicKey: credential.publicKey,      // Uint8Array of COSE public key
+    counter: credential.counter,           // for replay detection
+    transports: credential.transports,     // ['internal', 'hybrid', 'usb', ...]
+  });
+
+  delete req.session.webauthnChallenge;
+  res.json({ ok: true });
+});
+```
+
+## Authentication
+
+```ts
+import {
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from '@simplewebauthn/server';
+
+router.post('/webauthn/login/start', async (req, res) => {
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: 'preferred',
+    // allowCredentials omitted -> discoverable credential flow
+    // (browser shows account picker — the passkey way)
+  });
+
+  req.session.webauthnChallenge = options.challenge;
+  res.json(options);
+});
+
+router.post('/webauthn/login/finish', async (req, res) => {
+  const expected = req.session.webauthnChallenge;
+  if (!expected) return res.status(400).json({ error: 'no challenge' });
+
+  // the response includes the credential id; look up the stored key
+  const stored = await db.credentials.findById(req.body.id);
+  if (!stored) return res.status(400).json({ error: 'unknown credential' });
+
+  const verification = await verifyAuthenticationResponse({
+    response: req.body,
+    expectedChallenge: expected,
+    expectedOrigin: origin,
+    expectedRPID: rpID,
+    credential: {
+      id: stored.id,
+      publicKey: stored.publicKey,
+      counter: stored.counter,
+      transports: stored.transports,
+    },
+  });
+
+  if (!verification.verified) {
+    return res.status(401).json({ error: 'verification failed' });
+  }
+
+  // bump the counter (and reject if it ever goes backward; see below)
+  await db.credentials.updateCounter(stored.id, verification.authenticationInfo.newCounter);
+
+  // start your normal session
+  req.session.userId = stored.userId;
+  delete req.session.webauthnChallenge;
+  res.json({ ok: true });
+});
+```
+
+## RP ID and origin — the two values to get right
+
+These trip everyone up the first time.
+
+- **`rpID`** is your eTLD+1 — `example.com`, not `https://example.com`,
+  not `app.example.com`, not `example.com/auth`. Passkeys created
+  with `rpID: 'app.example.com'` won't work from `admin.example.com`.
+  Use the parent domain unless you specifically want isolation.
+- **`origin`** is the full scheme + host the browser sends. Must
+  match exactly: `https://example.com` (no trailing slash). For
+  localhost dev, `http://localhost:3000` is allowed by browsers as a
+  special case.
+
+If you serve multiple subdomains, set `rpID` to the parent and the
+passkey works across all of them. If you allow native apps, accept
+both an `https://` origin and an `android:apk-key-hash:...` or
+`apple-app-site-association` origin via `expectedOrigin: [a, b]`.
+
+## Counter / replay detection
+
+Every authenticator response includes a monotonically increasing
+counter. If a stored counter is `42` and the next response says `40`,
+something is wrong — either the credential was cloned, or you're
+seeing a replayed response. `verifyAuthenticationResponse` will
+reject it.
+
+Synced passkeys (iCloud Keychain etc.) often report counter `0`
+forever. That's not a bug — the spec allows it. Don't reject `0`s
+specifically; only reject backward movement when both sides are
+non-zero.
+
+## Where this fits in the auth stack
+
+Passkeys replace passwords; they don't replace **sessions**. The
+post-login state is still a session cookie (`express-session`) or a
+short-lived JWT — same as before. WebAuthn is the *bootstrap* of the
+session, not the session itself.
+
+For account recovery: have at least one fallback (email magic link,
+recovery code, second device). A user with one passkey on a lost
+device is locked out forever otherwise.
+
+<Callout type="info">
+Browsers expose `PublicKeyCredential.isConditionalMediationAvailable()`
+to power "autofill UI" — passkey suggestions appear in the username
+field itself, no separate button. This is what makes the UX feel like
+"just sign in." See the simplewebauthn docs for the conditional flow.
+</Callout>
+
+## Common mistakes
+
+- **`rpID` includes scheme or port.** It doesn't. Domain only.
+- **Mismatched `rpID` across registration and login.** Stored keys are
+  scoped to the `rpID` they were created under. Don't change it.
+- **No challenge in the session.** Or: the same challenge re-used
+  across requests. Generate a fresh one, store it, delete it on
+  verify, expire it after ~5 minutes.
+- **Storing the public key in the wrong format.** Use whatever the
+  library returns; don't `.toString()` it. Round-trip via Buffer if
+  your DB needs a string column.
+- **Treating passkeys as 2FA.** They *are* the first factor. Adding a
+  TOTP step after a passkey is theatre — the passkey already proved
+  device possession + user presence.
+- **Skipping origin checks in dev.** Localhost works; once you're on
+  a real domain, the origin check catches most XSS-borne credential
+  abuse. Don't disable it.

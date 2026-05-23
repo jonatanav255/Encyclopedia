@@ -1,0 +1,271 @@
+export const level = 'senior';
+
+# Parallel collections and reductions
+
+Parallel collections are libraries that take a sequential
+collection API (`map`, `filter`, `reduce`, `groupBy`) and
+fan it across cores automatically. The library splits the
+input into chunks, runs the operations on each chunk
+concurrently, then merges. It's the "embarrassingly
+parallel" pattern, generalized into a stdlib feature.
+
+Done well, you get N-way speed-up for one line of code
+change. Done poorly, you get *worse* throughput than
+sequential because of overhead. The line between the two
+is sharper than people expect.
+
+## The shape of the API
+
+```scala
+// Scala 2 parallel collections
+val sum = (1 to 1_000_000).par.map(_ * 2).sum
+
+// Java streams
+int sum = list.parallelStream().mapToInt(x -> x * 2).sum();
+
+// .NET PLINQ
+int sum = source.AsParallel().Select(x => x * 2).Sum();
+
+// Rust Rayon
+let sum: i64 = (1..1_000_000).into_par_iter().map(|x| x * 2).sum();
+```
+
+Same shape: take the collection, swap the iterator for a
+parallel one, the rest of the chain stays. The runtime
+splits work onto a thread pool (a fork-join pool in JVM
+land, a work-stealing pool in Rayon, etc.) and merges the
+results.
+
+## What "splittable" requires
+
+A parallel collection must support **efficient splitting**:
+given a range or collection, divide it into roughly-equal
+halves in O(1) or O(log n). Array-backed types split
+trivially (slice indices). `ArrayList` works well; `LinkedList`
+emphatically does **not** — splitting a linked list requires
+walking half of it.
+
+The JDK's `Spliterator` interface formalizes this: `trySplit`
+must be cheap, and the resulting halves should be roughly
+balanced. Spliterators advertise their characteristics
+(`SIZED`, `SUBSIZED`, `ORDERED`, `IMMUTABLE`, …) so the
+framework knows what optimizations are safe.
+
+The cost of splitting is part of the "is this worth
+parallelizing" calculus. Splitting a `Stream` from a Java
+`Iterator<File>` walking a directory tree may dominate the
+work itself.
+
+## Reductions: associativity is non-negotiable
+
+A parallel reduction can run as:
+
+```
+((a ⊕ b) ⊕ c) ⊕ d        // sequential
+(a ⊕ b) ⊕ (c ⊕ d)        // tree
+```
+
+Both must give the same answer. That requires `⊕` to be
+**associative**. Commutativity is *not* required as long as
+the framework preserves order (most do for `reduce`; some
+collectors don't).
+
+Examples and the trap:
+
+| Op | Associative? | Safe for parallel reduce |
+|---|---|---|
+| Integer sum | Yes | Yes |
+| Integer product | Yes | Yes |
+| Min, max | Yes | Yes |
+| String concat | Yes | Yes (but watch alloc cost) |
+| Set union | Yes | Yes |
+| **Floating-point sum** | **No** | Result varies run-to-run |
+| Subtraction | No | **Wrong answer** |
+| Average | Not directly | Reduce to (sum, count), divide at end |
+
+Float-sum non-associativity is the classic gotcha. `(a + b)
++ c ≠ a + (b + c)` when the magnitudes differ. A parallel
+sum of a million doubles produces a slightly different
+result on each run (depending on how chunks landed on
+threads). For most analytics, this is fine; for
+reproducibility-sensitive contexts (replay-driven trading,
+audit), it's a bug.
+
+The fix: use **Kahan summation** (deterministic
+compensated-sum algorithm) inside each chunk, then combine
+chunks. Frameworks rarely ship this — write it yourself.
+
+## Map vs reduce vs fold
+
+Parallel APIs distinguish:
+
+- **`map`** — pure, independent per-element. Trivially
+  parallelizable.
+- **`reduce(identity, op)`** — combine all elements with
+  an associative binary op. Parallelizable if `op` is
+  associative.
+- **`fold`** — like reduce but with an initial accumulator
+  that may have different type. Parallelizable only if you
+  also provide a **combiner** (`accumulator + accumulator
+  → accumulator`). JDK's `Stream.collect(Collector)` is
+  the canonical example.
+
+A common bug is reaching for the sequential `fold` shape
+on a parallel stream:
+
+```java
+list.parallelStream()
+    .reduce("", (acc, s) -> acc + s, (a, b) -> a + b);
+```
+
+This works (concat is associative) but allocates O(N²)
+characters across the merging — every combiner call
+re-copies its operands. Use a `StringBuilder` collector
+instead.
+
+## When parallel collections lose
+
+The cost model is:
+
+```
+parallel_time ≈ work / N + overhead
+```
+
+Where overhead is split + thread dispatch + framework
+bookkeeping + merge. If `work / N < overhead`, you lose.
+
+Empirically on modern hardware:
+
+- **< 10,000 elements**: parallel is almost always slower.
+  The thread pool wake-up and split cost dominates.
+- **Cheap per-element ops** (`map(x -> x + 1)`): parallel
+  often loses up to N=100k+. Memory bandwidth is your
+  bottleneck, not CPU; more threads just contend.
+- **Heavy per-element work** (compression, regex match,
+  cryptographic hash): parallel wins quickly, often at
+  N=100s.
+
+Benchmark, don't assume. JMH (JVM), Criterion (Rust),
+BenchmarkDotNet (.NET) — pick one and measure.
+
+## Side effects: the cardinal sin
+
+```java
+// Sequential — works.
+List<Integer> dest = new ArrayList<>();
+src.forEach(dest::add);
+
+// Parallel — race condition.
+src.parallelStream().forEach(dest::add);
+```
+
+`ArrayList.add` is not thread-safe. A parallel `forEach`
+with a side-effecting consumer is a data race. The "right"
+parallel idiom is the `collect` pattern:
+
+```java
+List<Integer> dest = src.parallelStream()
+                        .collect(Collectors.toList());
+```
+
+`Collectors.toList` knows how to combine per-thread
+intermediate lists in the merge phase.
+
+The rule of thumb: **inside a parallel pipeline, no
+side effects to shared state**. Either return values
+through the framework's reduction machinery or wait until
+the pipeline completes.
+
+## Ordering
+
+A parallel `map` preserves order in the output by default;
+a parallel `forEach` does **not** (it processes whichever
+chunk is ready). When you need parallel work but ordered
+output, use `forEachOrdered` (or the equivalent — name
+varies by library). It costs throughput because chunks may
+wait on slower predecessors.
+
+The mental model: think of parallel pipelines as a
+work-stealing pool. Order is something you opt back in to;
+the default is "fastest."
+
+## Maps and groupings — the merge gets ugly
+
+```scala
+list.par.groupBy(_.kind)
+```
+
+Each thread builds a local `Map[Kind, List[Item]]`; the
+merge unions every per-thread map, *concatenating* the
+list values per key. The concat dominates for highly-
+skewed keys.
+
+For sums-by-key or counts-by-key, prefer
+`groupingBy(..., counting())` — the inner aggregation is
+itself a reduction, mergeable in O(1) per key per
+chunk-pair.
+
+## Work-stealing under the hood
+
+Most parallel-collection implementations dispatch onto a
+**fork-join work-stealing pool**:
+
+- The collection splits recursively into chunks until each
+  chunk is below a threshold (`Spliterator.estimateSize()
+  < threshold`).
+- Each worker thread keeps a deque of chunks. It pops from
+  its own end (LIFO, cache-warm); idle workers steal from
+  *others'* opposite end (FIFO, work-stealing).
+- Recursive split + steal balances skewed workloads:
+  chunks that turn out to be expensive get re-split, idle
+  workers pick up the new shards.
+
+The JDK reuses **one** common ForkJoinPool by default
+(`ForkJoinPool.commonPool()`) sized to `processors - 1`.
+Every `parallelStream()` in your process shares it. A
+blocking I/O call inside a parallel stream can stall the
+pool for *every* other parallel stream in the JVM. The fix
+is to submit to your own pool:
+
+```java
+ForkJoinPool myPool = new ForkJoinPool(8);
+myPool.submit(() -> src.parallelStream()...).get();
+```
+
+Or, more idiomatically: **don't put I/O in parallel
+streams**. Use a structured-concurrency or virtual-thread
+pool for I/O-bound work; parallel collections are for
+CPU-bound transformations of in-memory data.
+
+## When the model fits
+
+- In-memory CPU-bound transformations over large
+  collections.
+- Embarrassingly parallel per-element work (compression,
+  hashing, regex, image processing of pixel arrays).
+- Aggregations with associative reductions.
+- Fan-out followed by a single combiner.
+
+## When to reach for something else
+
+- **I/O-bound work**: use async or virtual threads. A
+  parallel stream of HTTP calls will exhaust the
+  common pool and block other parallel streams.
+- **Streaming / unbounded inputs**: use a reactive library
+  (Reactor, Akka Streams) or Kafka Streams. Parallel
+  collections need a finite, splittable source.
+- **Distributed work**: use Spark or Flink. Parallel
+  collections stop scaling at one machine.
+- **Hot loops where the JIT has already vectorized**:
+  parallel-stream overhead may eat the AVX win.
+
+## See also
+
+- *work-stealing-and-schedulers* — the pool model parallel
+  collections sit on.
+- *fan-out-fan-in-and-pipelines* — the same shape at the
+  distributed-systems level.
+- *backpressure-in-concurrent-systems* — why streaming
+  needs more than a parallel collection.
+- *concurrency-vs-parallelism* — the distinction this
+  topic is firmly on the *parallelism* side of.

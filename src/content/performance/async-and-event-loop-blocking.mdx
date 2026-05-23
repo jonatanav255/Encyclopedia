@@ -1,0 +1,261 @@
+export const level = 'mid';
+
+# Async and event-loop blocking
+
+Node's performance story is built on a single-threaded event loop:
+one OS thread serializes all JavaScript execution while delegating
+I/O to the kernel via libuv. The model works well as long as no
+single JS task hogs the loop. The moment something does, every
+other in-flight request is paused — the service goes from concurrent
+to serial.
+
+"Don't block the event loop" is the headline rule. Recognizing what
+actually blocks it — and what tools you have to keep blocking work
+off the main thread — is the harder skill.
+
+## What blocks the loop
+
+The event loop is blocked by any **synchronous** JS work that takes
+non-trivial time. The usual suspects:
+
+- **CPU-bound loops.** Hashing in a loop, JSON parsing a 50MB
+  payload, regex against a long string, parsing a large CSV
+  synchronously.
+- **Sync APIs masquerading as innocuous.** `fs.readFileSync`,
+  `crypto.pbkdf2Sync`, `JSON.parse` on a big object,
+  `zlib.gunzipSync`. The `Sync` suffix is a red flag in any request
+  path.
+- **Catastrophic regexes.** Backtracking on
+  `/^(a+)+$/.test('aaaaaaaaaaaa!')` — exponential in input length.
+  ReDoS attacks weaponise this.
+- **Synchronous error stacks.** Building a 500-line stack trace
+  inside a hot loop. Each `Error()` walks the V8 frame chain.
+- **Async functions that aren't.** `await Promise.resolve()` inside
+  a 100k-element loop yields control but still runs every iteration
+  on the main thread.
+
+What does **not** block the loop:
+
+- Awaiting an HTTP, DB, file, or socket I/O — libuv handles those in
+  the kernel/thread pool while the loop runs other work.
+- `setTimeout`, `setImmediate`, `queueMicrotask` — they enqueue work
+  on the loop; they don't run synchronously.
+- Promise resolution itself — microtask scheduling is cheap.
+
+The principle: I/O is free (asynchronous); CPU isn't.
+
+## Detecting blocked loops
+
+Node has built-in detection. The simplest:
+
+```js
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+
+setInterval(() => {
+  console.log({
+    mean: h.mean / 1e6,    // ms
+    p99: h.percentile(99) / 1e6,
+    max: h.max / 1e6,
+  });
+  h.reset();
+}, 5000);
+```
+
+Healthy services: p99 event loop delay under 10ms. Anything over
+50ms means requests are getting paused; over 200ms is broken.
+
+In production, expose loop delay as a Prometheus histogram:
+
+```js
+import client from 'prom-client';
+const loopDelay = new client.Histogram({
+  name: 'nodejs_eventloop_delay_seconds',
+  help: 'Event loop delay',
+  buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1],
+});
+setInterval(() => {
+  loopDelay.observe(h.percentile(99) / 1e9);
+  h.reset();
+}, 1000);
+```
+
+Alerts on this metric catch event-loop regressions before users do.
+
+## The four ways to handle CPU work
+
+When you must do CPU work, the loop has options ordered by
+escalation:
+
+<Steps>
+<Step n="1" title="Yield periodically with setImmediate">
+For CPU loops that can be broken into chunks, yield control between
+chunks so other requests can interleave:
+
+```js
+async function hashAll(items) {
+  const results = [];
+  for (let i = 0; i < items.length; i++) {
+    results.push(hash(items[i]));
+    if (i % 100 === 0) {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+  return results;
+}
+```
+
+The `setImmediate` yields after the current iteration, letting other
+queued work run before the next chunk. Doesn't reduce total CPU but
+reduces tail latency on other in-flight requests.
+</Step>
+
+<Step n="2" title="Use a built-in async API instead">
+Many "fast sync" APIs have async counterparts in the worker pool:
+
+- `crypto.pbkdf2`, `crypto.scrypt` (async via libuv thread pool).
+- `fs.promises.readFile`, `fs.promises.writeFile`.
+- `zlib.gunzip`, `zlib.deflate` (async variants exist).
+
+These dispatch to the libuv thread pool (default 4 threads), so the
+event loop stays free. Cheapest fix when available.
+</Step>
+
+<Step n="3" title="worker_threads for arbitrary CPU work">
+For computation without a built-in async API — image processing,
+PDF generation, encryption beyond what crypto offers — spin up a
+worker:
+
+```js
+import { Worker } from 'node:worker_threads';
+
+function runInWorker(task) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('./worker.js', { workerData: task });
+    worker.on('message', resolve);
+    worker.on('error', reject);
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`exit ${code}`));
+    });
+  });
+}
+```
+
+Better: a **worker pool** to avoid spawn cost per task. Libraries
+like `piscina` give you a pool with auto-scaling, queueing, and
+backpressure:
+
+```js
+import Piscina from 'piscina';
+
+const pool = new Piscina({ filename: './worker.js' });
+const result = await pool.run({ data });
+```
+
+Workers share nothing by default (no shared memory unless you opt in
+to `SharedArrayBuffer`). Each has its own V8 instance. Message
+passing has cost — only worth it for tasks > 10ms of CPU.
+</Step>
+
+<Step n="4" title="Native addons or out-of-process services">
+For sustained heavy CPU (image transcoding, ML inference, large
+matrix ops), the right answer is usually **not Node**. Run a Python
+service, a Go service, an Imagemagick subprocess. Node calls out
+over IPC or HTTP.
+
+Node's strength is I/O concurrency. Don't fight it by trying to do
+GPU work in the event loop.
+</Step>
+</Steps>
+
+## Async-but-still-blocking: the foot-guns
+
+Async doesn't automatically mean non-blocking:
+
+```js
+// Looks async, runs entirely on main thread:
+async function processAll(items) {
+  for (const item of items) {
+    await processSync(item);   // processSync is CPU
+  }
+}
+```
+
+Each `await` yields once, but `processSync` still runs on the loop.
+You've turned one big block into many small blocks with brief yields
+between — better than nothing, but not a true offload.
+
+```js
+// Genuinely concurrent (overlaps I/O):
+async function fetchAll(urls) {
+  return Promise.all(urls.map(fetch));
+}
+
+// Sequential I/O — looks async, runs serially:
+async function fetchAllSlow(urls) {
+  const results = [];
+  for (const u of urls) results.push(await fetch(u));
+  return results;
+}
+```
+
+The first version overlaps all the fetches; the second waits for
+each in turn. Same `await`s; very different latency.
+
+## Backpressure and unbounded queues
+
+A subtler blocker: not the loop, but **memory** filling up because
+something is producing faster than the loop can consume.
+
+```js
+// Reads a 10GB file into memory:
+const data = await fs.promises.readFile('big.csv');
+// Process...
+
+// Streams it without buffering:
+const stream = fs.createReadStream('big.csv');
+for await (const chunk of stream) {
+  await process(chunk);
+}
+```
+
+Streams give you backpressure — the producer pauses when the
+consumer is slow. Without it, an infinite loop of "read everything
+into memory" eventually OOMs and the process dies. Symptoms look
+like "blocked event loop" but the cause is upstream.
+
+For async iterators and queues, use libraries that respect
+backpressure: `for await` over readable streams, p-queue with
+concurrency limits, BullMQ with bounded queues.
+
+## Profiling blocked work
+
+When the metric says the loop is blocked but you don't know where:
+
+- **`--cpu-prof`** flag generates a V8 CPU profile of the process.
+  Open in Chrome DevTools → Performance. Look for tall, narrow JS
+  frames — those are CPU hot spots.
+- **`async_hooks` / `node --inspect`** for tracking what triggered
+  the long task.
+- **Continuous profiling** (Pyroscope, Datadog Continuous Profiler,
+  Sentry Profiling) — running flame graphs from production.
+
+A common shape: 100ms latency spikes correlate with a 200ms loop
+delay measurement. The flame graph shows `JSON.parse` at 80ms.
+You've found your culprit.
+
+## Quick checklist
+
+<Cheatsheet>
+- Measure event loop delay (`monitorEventLoopDelay`); alert on p99 > 50ms.
+- No `*Sync` APIs in request paths (`fs.readFileSync`, `crypto.pbkdf2Sync`, `JSON.parse` on big input, sync `zlib`).
+- Use async crypto, async fs, async zlib by default.
+- For CPU work > 10ms: `worker_threads` (or `piscina` for pooling).
+- Heavy sustained CPU: out-of-process (Python/Go/native) over IPC.
+- Yield CPU-bound loops with `setImmediate` every N iterations.
+- Watch for ReDoS — anchor regexes, bound input, prefer linear-time engines (`re2`).
+- Stream large data; don't buffer it all into memory.
+- Production: continuous profiler to spot regressions in flame graphs.
+</Cheatsheet>
